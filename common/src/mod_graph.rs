@@ -198,8 +198,9 @@ pub fn build_plan(
     // 引く routing / 辺は合成側が飛ばす)。 以下の `pos` はこの列の位置。
     let sources: Vec<&ModSource> = song.mod_sources.iter().filter(|m| m.enabled).collect();
     let n = sources.len();
+    let lookup = PlanLookup::new(song, &sources);
     // 1. 辺を集める。id → 元の位置。
-    let pos_of = |id: u32| sources.iter().position(|m| m.id == id);
+    let pos_of = |id: u32| lookup.source_pos.get(&id).copied();
     // adj[dst] = 入ってくる (src_pos, param, depth, polarity)
     let mut adj: Vec<Vec<RawEdge>> = vec![Vec::new(); n];
     // r.md #115: バイパス中の routing も辺にしない。
@@ -224,18 +225,14 @@ pub fn build_plan(
     // automation lane で動く。ここで拾わないと routing も lane も保存されるのに
     // 深さは永久に静止したまま = 設計正本が禁じている「保存はされるのに効かない」。
     let mut depth_src: Vec<RawDepth> = Vec::new();
-    fn depth_slot(
-        v: &mut Vec<RawDepth>,
-        rid: u32,
-    ) -> usize {
-        match v.iter().position(|(id, ..)| *id == rid) {
-            Some(i) => i,
-            None => {
-                v.push((rid, Vec::new(), None));
-                v.len() - 1
-            }
-        }
-    }
+    // `routing_id` → `depth_src` の位置 (初出順に積む)。
+    let mut depth_slot_of: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut depth_slot = |v: &mut Vec<RawDepth>, rid: u32| {
+        *depth_slot_of.entry(rid).or_insert_with(|| {
+            v.push((rid, Vec::new(), None));
+            v.len() - 1
+        })
+    };
     for r in routings() {
         if let AutomationTarget::ModRoutingDepth { routing_id } = &r.target
             && let Some(src) = pos_of(r.source_id)
@@ -245,17 +242,17 @@ pub fn build_plan(
         }
     }
     // lane 側 (置き場は対象 routing と同じ)。
-    for rid in routings().map(|r| r.id).collect::<Vec<_>>() {
-        let target = AutomationTarget::ModRoutingDepth { routing_id: rid };
-        let owner = song.mod_routing_owner(rid).unwrap_or(MASTER_TRACK_ID);
-        if let Some(store) = lane_store(song, owner, &target) {
-            let i = depth_slot(&mut depth_src, rid);
+    for r in routings() {
+        let target = AutomationTarget::ModRoutingDepth { routing_id: r.id };
+        let owner = lookup.routing_owner.get(&r.id).copied().unwrap_or(MASTER_TRACK_ID);
+        if let Some(store) = lookup.lane_store(owner, &target) {
+            let i = depth_slot(&mut depth_src, r.id);
             depth_src[i].2 = Some(store);
         }
     }
-    let base_depth_of = |rid: u32| {
-        song.all_mod_routings().find(|r| r.id == rid).map_or(0.0, |r| r.depth)
-    };
+    let depth_group_of: std::collections::HashMap<u32, usize> =
+        depth_src.iter().enumerate().map(|(i, (rid, ..))| (*rid, i)).collect();
+    let base_depth_of = |rid: u32| lookup.routing_depth.get(&rid).copied().unwrap_or(0.0);
 
     // 2. DFS でトポロジカル順を作り、back-edge を delayed に落とす。
     let mut order: Vec<usize> = Vec::with_capacity(n);
@@ -298,25 +295,25 @@ pub fn build_plan(
     // 「dst から v へ流れる」= `reaches(v, dst)`、「v から src へ流れる」=
     // `v` が `src` の上流 = `reaches(src, v)` ではなく src から adj を辿って v に届くこと。
     let mut in_cycle = vec![false; n];
+    // `down[u]` = u が変調するノード (`adj` の逆向き)。
+    let mut down: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (v, edges) in adj.iter().enumerate() {
+        for &(u, ..) in edges {
+            down[u].push(v);
+        }
+    }
     for &(dst, src) in &back_edges {
         // src の上流 (= src へ流れ込む全ノード)。dst も必ず含む。
-        let mut upstream_of_src = vec![false; n];
-        upstream_of_src[src] = true;
-        let mut stack = vec![src];
-        while let Some(v) = stack.pop() {
-            for &(u, ..) in &adj[v] {
-                if !upstream_of_src[u] {
-                    upstream_of_src[u] = true;
-                    stack.push(u);
-                }
-            }
-        }
-        for (v, &up) in upstream_of_src.iter().enumerate() {
-            if up && reaches(&adj, v, dst) {
+        let upstream_of_src = flood(n, src, |v| adj[v].iter().map(|e| e.0));
+        // dst の下流 (= adj を辿ると dst に届くノード、dst 自身を含む)。
+        let downstream_of_dst = flood(n, dst, |v| down[v].iter().copied());
+        for (v, (&up, &downstream)) in upstream_of_src.iter().zip(&downstream_of_dst).enumerate() {
+            if up && downstream {
                 in_cycle[v] = true;
             }
         }
     }
+    let back_edge_set: std::collections::HashSet<(usize, usize)> = back_edges.iter().copied().collect();
 
     // 4. slot 割当 (order = トポロジカル順)。
     let mut slot_of_pos = vec![0u16; n];
@@ -332,15 +329,12 @@ pub fn build_plan(
     let rate_modulated: Vec<bool> = (0..n)
         .map(|i| {
             adj[i].iter().any(|(_, p, ..)| *p == ModParam::Rate)
-                || lane_store(
-                    song,
-                    sources[i].owner_track_id,
-                    &AutomationTarget::ModSourceParam {
-                        source_id: sources[i].id,
-                        param: ModParam::Rate,
-                    },
-                )
-                .is_some()
+                || lookup
+                    .lane_store(
+                        sources[i].owner_track_id,
+                        &AutomationTarget::ModSourceParam { source_id: sources[i].id, param: ModParam::Rate },
+                    )
+                    .is_some()
         })
         .collect();
     // `audio_dep[x]` = x の **出力**が音に依存するか (どの param 経由でも伝播する)。
@@ -392,11 +386,8 @@ pub fn build_plan(
                 src_slot: slot_of_pos[s],
                 depth,
                 polarity,
-                delayed: back_edges.contains(&(pos, s)),
-                depth_group: depth_src
-                    .iter()
-                    .position(|(rid, ..)| *rid == routing_id)
-                    .and_then(|i| u16::try_from(i).ok()),
+                delayed: back_edge_set.contains(&(pos, s)),
+                depth_group: depth_group_of.get(&routing_id).and_then(|&i| u16::try_from(i).ok()),
             })
             .collect();
         // lane 上書きの対象を集める (engine が刻みごとに解決する)。
@@ -405,7 +396,7 @@ pub fn build_plan(
                 continue;
             }
             let target = AutomationTarget::ModSourceParam { source_id: src.id, param };
-            if let Some(store) = lane_store(song, src.owner_track_id, &target) {
+            if let Some(store) = lookup.lane_store(src.owner_track_id, &target) {
                 lane_params.push(LaneParam { slot: slot_u16, param, store });
             }
         }
@@ -419,11 +410,7 @@ pub fn build_plan(
             retrigger,
             anchor_secs: anchor,
             base: base_params(&src.kind),
-            owner_track_index: song
-                .tracks
-                .iter()
-                .position(|t| t.id == src.owner_track_id)
-                .and_then(|i| u32::try_from(i).ok()),
+            owner_track_index: lookup.track_pos.get(&src.owner_track_id).copied(),
         });
         slot_ids.push(src.id);
     }
@@ -450,22 +437,74 @@ pub fn build_plan(
     ModPlan { nodes, slot_ids, generation, lane_params, depth_groups, slot_index }
 }
 
-/// `from` から辺を辿って `to` に到達できるか (輪の塗り分け用)。
-fn reaches(adj: &Adjacency, from: usize, to: usize) -> bool {
-    let mut seen = vec![false; adj.len()];
-    let mut stack = vec![from];
+/// `n` 個のノードのうち、`start` から `next` を辿って届くものの印 (`start` 自身を含む。輪の塗り分け用)。
+fn flood<I: Iterator<Item = usize>>(n: usize, start: usize, next: impl Fn(usize) -> I) -> Vec<bool> {
+    let mut seen = vec![false; n];
+    seen[start] = true;
+    let mut stack = vec![start];
     while let Some(v) = stack.pop() {
-        if v == to {
-            return true;
-        }
-        for &(u, ..) in &adj[v] {
-            if !seen[u] {
-                seen[u] = true;
+        for u in next(v) {
+            if !std::mem::replace(&mut seen[u], true) {
                 stack.push(u);
             }
         }
     }
-    false
+    seen
+}
+
+/// `build_plan` が id / target で song を探さないための表 (曲 1 枚につき 1 回作る)。
+struct PlanLookup<'a> {
+    /// 有効な source の `id` → 位置 (同じ id は先頭)。
+    source_pos: std::collections::HashMap<u32, usize>,
+    /// track id → 位置 (同じ id は先頭)。
+    track_pos: std::collections::HashMap<u32, u32>,
+    /// `ModRouting::id` → 持ち主の track id (`Song::mod_routing_owner` と同じ) / 深さ (並びで先頭の routing)。
+    routing_owner: std::collections::HashMap<u32, u32>,
+    routing_depth: std::collections::HashMap<u32, f32>,
+    /// レーンがある (置き場, target)。
+    lane_targets: std::collections::HashSet<(ParamStoreAt, &'a AutomationTarget)>,
+}
+
+impl<'a> PlanLookup<'a> {
+    fn new(song: &'a Song, sources: &[&ModSource]) -> Self {
+        let mut source_pos = std::collections::HashMap::new();
+        for (i, m) in sources.iter().enumerate() {
+            source_pos.entry(m.id).or_insert(i);
+        }
+        let mut track_pos = std::collections::HashMap::new();
+        for (i, t) in song.tracks.iter().enumerate() {
+            if let Ok(i) = u32::try_from(i) {
+                track_pos.entry(t.id).or_insert(i);
+            }
+        }
+        let mut routing_owner = std::collections::HashMap::new();
+        let mut routing_depth = std::collections::HashMap::new();
+        let owned = song.tracks.iter().flat_map(|t| t.mod_routings.iter().map(move |r| (t.id, r)));
+        for (owner, r) in owned.chain(song.song_mod_routings.iter().map(|r| (MASTER_TRACK_ID, r))) {
+            routing_owner.entry(r.id).or_insert(owner);
+            routing_depth.entry(r.id).or_insert(r.depth);
+        }
+        let track_lanes = song.tracks.iter().enumerate().filter_map(|(i, t)| {
+            Some((ParamStoreAt::Track(u32::try_from(i).ok()?), t.automation_lanes.as_slice()))
+        });
+        let lane_targets = track_lanes
+            .chain(std::iter::once((ParamStoreAt::Song, song.song_lanes.as_slice())))
+            .flat_map(|(at, lanes)| lanes.iter().map(move |l| (at, &l.target)))
+            .collect();
+        Self { source_pos, track_pos, routing_owner, routing_depth, lane_targets }
+    }
+
+    /// `owner_track_id` のモジュレーターのツマミを指す `target` のレーンがある置き場 (`0` = legacy は master)。
+    fn lane_store(&self, owner_track_id: u32, target: &AutomationTarget) -> Option<ParamStoreAt> {
+        let owner = if owner_track_id == 0 { MASTER_TRACK_ID } else { owner_track_id };
+        // `Song::param_store_at` と同じ規則。
+        let store = if owner == MASTER_TRACK_ID {
+            ParamStoreAt::Song
+        } else {
+            ParamStoreAt::Track(*self.track_pos.get(&owner)?)
+        };
+        self.lane_targets.contains(&(store, target)).then_some(store)
+    }
 }
 
 /// 各ソースが「audio に依存する鎖」に載っているか (follower から到達可能か)。
@@ -495,14 +534,6 @@ fn audio_dependency(
         }
     }
     dep
-}
-
-/// `owner_track_id` の置き場に `target` の automation lane があれば、その置き場。
-fn lane_store(song: &Song, owner_track_id: u32, target: &AutomationTarget) -> Option<ParamStoreAt> {
-    // legacy の `owner_track_id == 0` は master (`Song::mod_source_owner` と同じ読み)。
-    let owner = if owner_track_id == 0 { MASTER_TRACK_ID } else { owner_track_id };
-    let store = song.param_store_at(owner)?;
-    song.lanes_at(store).iter().any(|l| &l.target == target).then_some(store)
 }
 
 /// **`ModParam` の「今の値」(plain) を読む唯一の口。** ラックのツマミ / オートメーション
@@ -915,7 +946,7 @@ fn seed_phases(plan: &ModPlan, rt: &mut ModRuntime, table: Option<&ModPhaseTable
 /// - `bpm` は次の刻みのテンポ (`SongTempo` カーブ + その変調。変調は 1 刻み前の値)。
 #[must_use]
 pub fn next_mark(
-    song: &Song,
+    tempo: TempoSource<'_>,
     plan: &ModPlan,
     rt: &ModRuntime,
     mark: PhaseMark,
@@ -923,15 +954,43 @@ pub fn next_mark(
     dt_secs: f64,
 ) -> PhaseMark {
     let beat = mark.beat + dt_secs * mark.bpm / 60.0;
-    let base = f64::from(crate::automation::evaluate_song_tempo(song, beat));
-    let bpm = crate::automation::apply_modulation(
+    let base = f64::from(tempo.base_at(beat));
+    let bpm = crate::automation::apply_modulation_over(
         &AutomationTarget::SongTempo,
         base,
-        &song.song_mod_routings,
+        tempo.routings.iter(),
         |id| plan.slot_of(id).map(|s| rt.value(s)),
+        |r| r.depth,
     )
     .max(1.0);
     PhaseMark { beat, secs: (tick_index + 1) as f64 * dt_secs, bpm }
+}
+
+/// テンポを決めるもの (テンポ lane とテンポ宛の変調)。刻みごとの [`next_mark`] が `song_lanes` /
+/// `song_mod_routings` を探さないように、song 側の置き場の索引から 1 度だけ解く。
+#[derive(Debug, Clone, Copy)]
+pub struct TempoSource<'a> {
+    song: &'a Song,
+    lane: Option<crate::song_index::LaneView<'a>>,
+    routings: crate::song_index::TargetRoutings<'a>,
+}
+
+impl<'a> TempoSource<'a> {
+    /// `store` は `song` の song 側の置き場 ([`crate::song_index::SongIndex::song_store`])。
+    #[must_use]
+    pub fn new(song: &'a Song, store: crate::song_index::ParamStore<'a>) -> Self {
+        Self {
+            song,
+            lane: store.enabled_lane(&AutomationTarget::SongTempo),
+            routings: store.routings_for(&AutomationTarget::SongTempo),
+        }
+    }
+
+    /// 変調前のテンポ ([`crate::automation::evaluate_song_tempo`] と同じ規則)。
+    #[must_use]
+    pub fn base_at(self, beat: f64) -> f32 {
+        crate::automation::song_tempo_in_clip(self.song, self.lane.map(|v| (v.lane, v.arrangement_clip(beat))), beat)
+    }
 }
 
 /// `from_tick`..`to_tick` を [`next_mark`] の規則で回す共有ループ。
@@ -939,7 +998,7 @@ pub fn next_mark(
 fn walk(
     plan: &ModPlan,
     rt: &mut ModRuntime,
-    song: &Song,
+    tempo: TempoSource<'_>,
     dt_secs: f64,
     mut mark: PhaseMark,
     ticks: std::ops::Range<i64>,
@@ -968,7 +1027,7 @@ fn walk(
                 tick_index: k,
             },
         );
-        mark = next_mark(song, plan, rt, mark, k, dt_secs);
+        mark = next_mark(tempo, plan, rt, mark, k, dt_secs);
     }
     mark
 }
@@ -985,7 +1044,7 @@ pub fn locate(
     plan: &ModPlan,
     rt: &mut ModRuntime,
     table: Option<&ModPhaseTable>,
-    song: &Song,
+    tempo: TempoSource<'_>,
     sample_rate: u32,
     target_tick: i64,
 ) {
@@ -1019,7 +1078,7 @@ pub fn locate(
     let dt_secs = f64::from(MOD_TICK_FRAMES) / f64::from(sample_rate.max(1));
     let start = b as i64 * MOD_PHASE_BREAKPOINT_TICKS;
     rt.next_tick = start;
-    let end = walk(plan, rt, song, dt_secs, mark, start..target_tick, |_, _| {});
+    let end = walk(plan, rt, tempo, dt_secs, mark, start..target_tick, |_, _| {});
     let (beat, secs) = (end.beat, end.secs);
     // Audio tier は replay で再現できない (音に依存する) ので閉形式でシードし直す。
     for (slot, node) in plan.nodes.iter().enumerate() {
@@ -1111,12 +1170,13 @@ impl ModPhaseTable {
         prevs.reserve(n_breakpoints);
         let mut rt = ModRuntime::default();
         rt.install(plan);
-        let mark0 = PhaseMark {
-            beat: 0.0,
-            secs: 0.0,
-            bpm: f64::from(crate::automation::evaluate_song_tempo(song, 0.0)).max(1.0),
-        };
-        walk(plan, &mut rt, song, dt_secs, mark0, 0..total_ticks, |rt, mark| {
+        let store = crate::song_index::ParamStoreIndex::build(&song.song_lanes, &song.song_mod_routings);
+        let tempo = TempoSource::new(
+            song,
+            crate::song_index::ParamStore::new(&song.song_lanes, &song.song_mod_routings, &store),
+        );
+        let mark0 = PhaseMark { beat: 0.0, secs: 0.0, bpm: f64::from(tempo.base_at(0.0)).max(1.0) };
+        walk(plan, &mut rt, tempo, dt_secs, mark0, 0..total_ticks, |rt, mark| {
             for (slot, on) in integrated.iter().enumerate() {
                 if *on {
                     phases[slot].push(rt.phase(u16::try_from(slot).unwrap_or(u16::MAX)));
@@ -1548,19 +1608,17 @@ mod tests {
         let sr = 48_000u32;
         let dt_secs = f64::from(MOD_TICK_FRAMES) / f64::from(sr);
         let table = ModPhaseTable::build(&plan, &song, sr, dt_secs * 4096.0);
-        let mark0 = PhaseMark {
-            beat: 0.0,
-            secs: 0.0,
-            bpm: f64::from(crate::automation::evaluate_song_tempo(&song, 0.0)).max(1.0),
-        };
+        let index = crate::song_index::SongIndex::build(&song);
+        let tempo = TempoSource::new(&song, index.song_store(&song));
+        let mark0 = PhaseMark { beat: 0.0, secs: 0.0, bpm: f64::from(tempo.base_at(0.0)).max(1.0) };
         // breakpoint 直後 (1025) / 途中 (1300) / 遠く (4000) の 3 点で見る。
         for target in [1025i64, 1300, 4000] {
             let mut walked = ModRuntime::default();
             walked.install(&plan);
-            walk(&plan, &mut walked, &song, dt_secs, mark0, 0..target, |_, _| {});
+            walk(&plan, &mut walked, tempo, dt_secs, mark0, 0..target, |_, _| {});
             let mut located = ModRuntime::default();
             located.install(&plan);
-            locate(&plan, &mut located, Some(&table), &song, sr, target);
+            locate(&plan, &mut located, Some(&table), tempo, sr, target);
             for slot in [0u16, 1] {
                 assert_eq!(
                     located.phase(slot),
@@ -1601,16 +1659,14 @@ mod tests {
         const T: i64 = 1300; // breakpoint (512 の倍数) をまたぐ中途半端な位置
         let mut walked = ModRuntime::default();
         walked.install(&plan);
-        let mark0 = PhaseMark {
-            beat: 0.0,
-            secs: 0.0,
-            bpm: f64::from(crate::automation::evaluate_song_tempo(&song, 0.0)).max(1.0),
-        };
-        walk(&plan, &mut walked, &song, dt_secs, mark0, 0..T, |_, _| {});
+        let index = crate::song_index::SongIndex::build(&song);
+        let tempo = TempoSource::new(&song, index.song_store(&song));
+        let mark0 = PhaseMark { beat: 0.0, secs: 0.0, bpm: f64::from(tempo.base_at(0.0)).max(1.0) };
+        walk(&plan, &mut walked, tempo, dt_secs, mark0, 0..T, |_, _| {});
         // breakpoint からの前進。
         let mut located = ModRuntime::default();
         located.install(&plan);
-        locate(&plan, &mut located, Some(&table), &song, sr, T);
+        locate(&plan, &mut located, Some(&table), tempo, sr, T);
         assert_eq!(
             located.phase(target_slot),
             walked.phase(target_slot),

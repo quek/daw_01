@@ -15,6 +15,8 @@ use std::sync::{Arc, Weak};
 use common::audio_bridge::{AudioBridgeHandle, PlaneCapacity, TelemetryPlane};
 use common::device_scope_bridge::MAX_DEVICE_SCOPES;
 use common::protocol::{AudioCommand, ProjectKey};
+use common::song_index::SongIndex;
+use common::timing::SongBounds;
 
 use crate::engine::{
     self, EngineCommand, EngineCommandSender, EngineShared, PluginEntry, ProjectDelivery, ProjectRt,
@@ -212,6 +214,19 @@ pub struct BundlePublisher {
     /// 直近 topology compile に使った `buffer_frames` (leaf 宛 sidechain tap
     /// の 1-buffer 補償量)。 実測値との drift を検知して再 compile する。
     last_compiled_frames: Option<u32>,
+    /// 直近の便の song から作った索引 / 曲の範囲 / テンポ表 ([`Self::song_derived`])。
+    derived: Option<SongDerived>,
+}
+
+/// song 1 枚から作る、RT へ song と同じ便で届ける派生物。
+#[derive(Clone)]
+struct SongDerived {
+    /// 作った元 (同じ `Arc` の再配送 = 同じ中身なので作り直さない)。
+    song: Option<Arc<common::model::Song>>,
+    sample_rate: u32,
+    index: Arc<SongIndex>,
+    bounds: SongBounds,
+    tempo_map: Arc<common::tempo_map::TempoMap>,
 }
 
 impl BundlePublisher {
@@ -230,7 +245,37 @@ impl BundlePublisher {
             parked: None,
             mod_plans: ModPlanPublisher::default(),
             last_compiled_frames: None,
+            derived: None,
         }
+    }
+
+    /// `song` の索引 / 曲の範囲 / テンポ表。直近の便と同じ song (同じ `Arc`) なら作り直さずに共有する — 再配送
+    /// (plugin の shmem を開いた / ループ範囲を変えた …) のたびに曲の大きさに比例する構築を繰り返さない。
+    fn song_derived(&mut self, song: Option<&Arc<common::model::Song>>, sample_rate: u32) -> &SongDerived {
+        let same_song = |d: &SongDerived| match (d.song.as_ref(), song) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        match &mut self.derived {
+            Some(d) if same_song(d) => {
+                if d.sample_rate != sample_rate {
+                    (d.sample_rate, d.bounds) = (sample_rate, SongBounds::of(song.map(|s| &**s), sample_rate));
+                }
+            }
+            slot => {
+                let default_song = common::model::Song::default();
+                let s = song.map_or(&default_song, |s| &**s);
+                *slot = Some(SongDerived {
+                    song: song.cloned(),
+                    sample_rate,
+                    index: Arc::new(song.map_or_else(SongIndex::default, |s| SongIndex::build(s))),
+                    bounds: SongBounds::of(song.map(|s| &**s), sample_rate),
+                    tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(s)),
+                });
+            }
+        }
+        self.derived.as_ref().expect("直前に入れた")
     }
 
     /// 成長便: per-track scratch の **追加分の行** (`RtBundle::scratch_growth`)。
@@ -398,15 +443,16 @@ impl ProjectCtl {
 
     /// 今の snapshot 一式を載せた便 (delta は全部「据え置き」)。**RT が読む snapshot を集める唯一の口** —
     /// RT は共有面の `ArcSwap` を load しないので、RT に届けるものはここに足す。
-    fn snapshot_bundle(&mut self, song: Option<Arc<common::model::Song>>) -> RtBundle {
-        let tempo_map = match song.as_deref() {
-            Some(s) => common::tempo_map::TempoMap::from_song(s),
-            None => common::tempo_map::TempoMap::from_song(&common::model::Song::default()),
-        };
+    fn snapshot_bundle(&mut self, song: Option<Arc<common::model::Song>>, sample_rate: u32) -> RtBundle {
+        // 索引と曲の範囲は song と必ず同じ便 (索引は位置で持つので、別の snapshot と組むと別の lane / device を指す)。
+        let SongDerived { index: song_index, bounds: song_bounds, tempo_map, .. } =
+            self.publisher.song_derived(song.as_ref(), sample_rate).clone();
         let audio_clip_renderer = self.shared.audio_clip_renderer.load_full(); // arch-lint: allow-arcswap-load (off-RT: RT へ送る便を組む)
         self.publisher.published_renderer = Arc::downgrade(&audio_clip_renderer);
         RtBundle {
             song,
+            song_index,
+            song_bounds,
             tempo_map,
             schedule: None,
             reset_song_scoped_state: false,
@@ -469,9 +515,7 @@ impl ProjectCtl {
         // automation lane から決まるので **値のみ更新でも変わりうる** (schedule と
         // 違って topology 限定ではない)。作るのは安いが、内容が変わっていないのに
         // 載せると RT が毎 buffer 位相を捨てて張り直すので、前回と同じなら載せない。
-        let mod_plan = song
-            .as_deref()
-            .and_then(|sg| self.publisher.mod_plans.build(sg, sample_rate));
+        let mod_plan = song.as_ref().and_then(|sg| self.publisher.mod_plans.build(sg, sample_rate));
         // 位相表は曲長ぶんの刻みループなので **必ず off-thread**。構築中は旧表 +
         // 閉形式シードで凌ぎ、完成したら housekeeping が次の便で載せる。
         if let (Some(d), Some(sg)) = (mod_plan.as_ref(), song.as_ref()) {
@@ -511,7 +555,7 @@ impl ProjectCtl {
                 }
             ),
             input_delay_replacements,
-            ..self.snapshot_bundle(song)
+            ..self.snapshot_bundle(song, sample_rate)
         };
         self.publisher.send(bundle);
     }
@@ -574,7 +618,7 @@ impl ProjectCtl {
         if let Some(table) = finished_table {
             let song = self.shared.song.load_full(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
             // 位相表だけの便。scratch は `publish_bundle` が song と同じ便で運ぶ。
-            let bundle = RtBundle { mod_phase_table: Some(table), ..self.snapshot_bundle(song) };
+            let bundle = RtBundle { mod_phase_table: Some(table), ..self.snapshot_bundle(song, sample_rate) };
             self.publisher.send(bundle);
         }
         // decode worker が renderer のミラーを差し替えていたら、同じ `Arc` を RT へ送り直す
@@ -1104,7 +1148,9 @@ mod tests {
     fn empty_bundle() -> RtBundle {
         RtBundle {
             song: None,
-            tempo_map: common::tempo_map::TempoMap::from_song(&common::model::Song::default()),
+            song_index: Arc::default(),
+            song_bounds: SongBounds::default(),
+            tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(&common::model::Song::default())),
             schedule: None,
             reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),

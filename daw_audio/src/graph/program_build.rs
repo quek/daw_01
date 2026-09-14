@@ -123,6 +123,7 @@ pub fn build_program(
         program.native_dry_l = vec![0.0; MAX_FRAMES];
         program.native_dry_r = vec![0.0; MAX_FRAMES];
     }
+    program.index_state_keys();
     BuiltProgram {
         program,
         latency: acc,

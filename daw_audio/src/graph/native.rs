@@ -12,7 +12,7 @@
 //! RT 規約: 確保・ロック・I/O なし。バッファはすべて compile 時に確保済み。
 
 use common::device_scope_bridge::{DeviceScopeBridgeHandle, MAX_DEVICE_SCOPES};
-use common::model::{NativeDevice, NativeKind, TapPoint, TapSource, native_in};
+use common::model::{NativeDevice, NativeKind, TapPoint, TapSource};
 
 use super::mix::{program_tap_owner, resolve_program_tap, resolve_scratch_tap};
 use super::program::{ChainProgram, ProgramCtx};
@@ -206,7 +206,9 @@ pub fn run_native(
     ctx: &ProgramCtx<'_>,
 ) {
     let n = n.min(bus_l.len()).min(bus_r.len());
-    let Some(dev) = native_in(ctx.owner_devices, ns.device_id).filter(|d| d.kind() == ns.dsp.kind()) else {
+    let Some(dev) =
+        ctx.song.and_then(|s| ctx.index.native_in(s, ctx.owner, ns.device_id)).filter(|d| d.kind() == ns.dsp.kind())
+    else {
         ns.gr_db = 0.0;
         return;
     };
@@ -260,14 +262,14 @@ pub fn run_native(
 
 /// この buffer で効く値。store が空なら静的な値そのまま (§8.8-5: 解決を省く)。
 fn resolve_values(ctx: &ProgramCtx<'_>, dev: &NativeDevice, owner: u32) -> NativeDevice {
-    let (lanes, routings) = ctx.owner_stores;
+    let store = ctx.owner_store();
     let Some(song) = ctx.song else { return *dev };
-    if lanes.is_empty() && routings.is_empty() {
+    if store.lanes.is_empty() && store.routings.is_empty() {
         return *dev;
     }
-    crate::automation::resolve_native_device_in(
+    crate::automation::resolve_native_device(
         &song.clip_contents,
-        ctx.owner_stores,
+        store,
         dev,
         owner,
         ctx.rows,

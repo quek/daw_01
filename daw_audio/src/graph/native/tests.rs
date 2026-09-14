@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use common::dsp::BiquadState;
 use common::mod_plane::ModTickPlaneRef;
+use common::song_index::SongIndex;
 use common::model::{
     AudioTap, AutomationLane, AutomationTarget, AuxInputRoute, CompParam, CompSettings, Device, EqBand, EqParam,
     LoopRegion, ModRouting, NativeDevice, NativeKind, NativeParamId, NativeParams, Parallel, ParallelChain,
@@ -71,7 +72,14 @@ impl Env {
     }
 }
 
-fn ctx<'a>(env: &'a Env, song: &'a Song, devices: &'a [Device], n: usize) -> ProgramCtx<'a> {
+/// `devices` をトラック 1 (id 1) の device 列に持つ Song と、その索引 (内蔵 device は索引で id から引かれる)。
+fn fixture(devices: &[Device]) -> (Song, SongIndex) {
+    let song = Song { tracks: vec![track(|t| (t.id, t.devices) = (1, devices.to_vec()))], ..Song::default() };
+    let index = SongIndex::build(&song);
+    (song, index)
+}
+
+fn ctx<'a>(env: &'a Env, song: &'a Song, index: &'a SongIndex, n: usize) -> ProgramCtx<'a> {
     ProgramCtx {
         song: Some(song),
         plugin_refs: &env.refs,
@@ -87,8 +95,9 @@ fn ctx<'a>(env: &'a Env, song: &'a Song, devices: &'a [Device], n: usize) -> Pro
         rows: TrackRows::default(),
         own_pre_fx: None,
         native: NativeIo::default(),
-        owner_devices: devices,
-        owner_stores: (&[], &[]),
+        index,
+        // `fixture` はトラック 1 (位置 0) に device を置く。
+        owner: common::model::ParamStoreAt::Track(0),
     }
 }
 
@@ -151,7 +160,6 @@ fn post_dispatch(
 #[test]
 fn state_follows_the_device_id_across_a_reordering_recompile() {
     let env = Env::new();
-    let song = Song::default();
     let n = 512;
     let slow = comp(
         10,
@@ -160,7 +168,8 @@ fn state_follows_the_device_id_across_a_reordering_recompile() {
     let block = |p: &mut ChainProgram, devices: &[Device], b: usize| {
         let mut l = sine(n, b * n, 220.0, 0.9);
         let mut r = l.clone();
-        run(p, &mut l, &mut r, &ctx(&env, &song, devices, n));
+        let (song, index) = fixture(devices);
+        run(p, &mut l, &mut r, &ctx(&env, &song, &index, n));
         (l, r)
     };
     let before = vec![Device::Native(slow)];
@@ -203,19 +212,20 @@ fn state_follows_the_device_id_across_a_reordering_recompile() {
 #[test]
 fn bypass_crossfades_then_settles_bit_exact_and_restarts_from_a_reset_dsp() {
     let env = Env::new();
-    let song = Song::default();
     let n = 64;
     let on_dev = hard_comp(10);
     let on = vec![Device::Native(on_dev)];
     let off = vec![Device::Native(NativeDevice { bypassed: true, ..on_dev })];
+    let (on_song, on_index) = fixture(&on);
+    let (off_song, off_index) = fixture(&off);
     let mut p = build(&on, 1);
     let (mut input, mut output, mut grs) = (Vec::new(), Vec::new(), Vec::new());
     // 40 block ON → 40 block OFF → 40 block ON (1 block = 64 frame、フェード 5 ms = 240 frame)。
     for b in 0..120 {
-        let devices = if (40..80).contains(&b) { &off } else { &on };
+        let (song, index) = if (40..80).contains(&b) { (&off_song, &off_index) } else { (&on_song, &on_index) };
         let x = sine(n, b * n, 100.0, 0.5);
         let (mut l, mut r) = (x.clone(), x.clone());
-        run(&mut p, &mut l, &mut r, &ctx(&env, &song, devices, n));
+        run(&mut p, &mut l, &mut r, &ctx(&env, song, index, n));
         if b == 80 {
             let mut fresh = NativeDsp::new(NativeKind::Comp);
             let (mut wl, mut wr) = (x.clone(), x.clone());
@@ -248,7 +258,7 @@ fn bypass_crossfades_then_settles_bit_exact_and_restarts_from_a_reset_dsp() {
 }
 
 /// `NativeSidechainTap` の staging だけを本番と同じ手 (`graph::step::run_step`) で 1 buffer 走らせる。確保しない。
-fn stage_native_taps(sched: &mut Schedule, scratch: &mut [TrackScratch], song: &Song, n: usize) {
+fn stage_native_taps(sched: &mut Schedule, scratch: &mut [TrackScratch], song: &Song, index: &SongIndex, n: usize) {
     let refs: PluginRefs = HashMap::new();
     let rec = HashSet::new();
     let rows = RowSourceTable::default();
@@ -267,7 +277,7 @@ fn stage_native_taps(sched: &mut Schedule, scratch: &mut [TrackScratch], song: &
         rows: &rows,
         native_io: NativeIo::default(),
     };
-    let ctx = crate::graph::step::RenderCtx::new(song, sched, scratch, &mut ml, &mut mr, &refs, None, None, params);
+    let ctx = crate::graph::step::RenderCtx::new(song, index, sched, scratch, &mut ml, &mut mr, &refs, None, None, params);
     crate::graph::step::run_nodes_for_test(&ctx, |op| matches!(op, NodeOp::NativeSidechainTap { .. }));
 }
 
@@ -348,7 +358,7 @@ fn native_sidechain_is_staged_from_scratch_the_same_program_and_other_programs()
     p1.parallels[0].in_r[..n].copy_from_slice(&ramp(n, -4.0));
     sched.master_program.chains[0].post_fx_l[..n].copy_from_slice(&ramp(n, 5.0));
     sched.master_program.chains[0].post_fx_r[..n].copy_from_slice(&ramp(n, -5.0));
-    stage_native_taps(&mut sched, &mut scratch, &song, n);
+    stage_native_taps(&mut sched, &mut scratch, &song, &SongIndex::build(&song), n);
     let staged = |p: &ChainProgram, id: u64| {
         let ns = &p.natives[slot_of(p, id)];
         assert_eq!(ns.sc_mode, ScMode::Staged, "device {id}");
@@ -488,7 +498,6 @@ fn group_builtins_and_volume_follow_modulation_lanes_and_on_automation() {
 #[test]
 fn sc_listen_replaces_the_chain_output_with_the_detection_signal_and_keeps_later_devices_running() {
     let env = Env::new();
-    let song = Song::default();
     let n = 128;
     let settings =
         CompSettings { sc_freq_hz: 1_000.0, threshold_db: -30.0, ratio: 8.0, attack_ms: 1.0, ..CompSettings::default() };
@@ -497,7 +506,8 @@ fn sc_listen_replaces_the_chain_output_with_the_detection_signal_and_keeps_later
     let block = |p: &mut ChainProgram, devices: &[Device], io: NativeIo<'_>, b: usize| {
         let x = sine(n, b * n, 700.0, 0.8);
         let (mut l, mut r) = (x.clone(), x);
-        run(p, &mut l, &mut r, &ProgramCtx { native: io, ..ctx(&env, &song, devices, n) });
+        let (song, index) = fixture(devices);
+        run(p, &mut l, &mut r, &ProgramCtx { native: io, ..ctx(&env, &song, &index, n) });
         apply_listen_override(p, &mut l, &mut r, n);
         (l, r)
     };
@@ -602,13 +612,13 @@ fn native_ops_and_sidechain_staging_do_not_allocate() {
     let rec = HashSet::new();
     let (mut l, mut r) = (vec![0.0f32; n], vec![0.0f32; n]);
     let (mut midi_a, mut midi_b) = (Vec::with_capacity(MAX_EVENTS), Vec::with_capacity(MAX_EVENTS));
-    let mut step = |b: usize, song: &Song, scratch: &mut Vec<TrackScratch>, sched: &mut Schedule| {
+    let (song_index, bypassed_index) = (SongIndex::build(&song), SongIndex::build(&bypassed));
+    let mut step = |b: usize, song: &Song, index: &SongIndex, scratch: &mut Vec<TrackScratch>, sched: &mut Schedule| {
         scratch[0].track_l[..n].copy_from_slice(&x);
         scratch[0].track_r[..n].copy_from_slice(&x);
-        stage_native_taps(sched, scratch, song, n);
+        stage_native_taps(sched, scratch, song, index, n);
         l.copy_from_slice(&x);
         r.copy_from_slice(&x);
-        let devices = &song.tracks[1].devices;
         let ctx = ProgramCtx {
             song: Some(song),
             plugin_refs: &refs,
@@ -624,8 +634,8 @@ fn native_ops_and_sidechain_staging_do_not_allocate() {
             rows: TrackRows::default(),
             own_pre_fx: Some((&x[..], &x[..])),
             native: io,
-            owner_devices: devices,
-            owner_stores: (&[], &[]),
+            index,
+            owner: common::model::ParamStoreAt::Track(1),
         };
         let p = &mut sched.track_programs[1];
         let len = p.ops.len();
@@ -633,16 +643,16 @@ fn native_ops_and_sidechain_staging_do_not_allocate() {
         apply_listen_override(p, &mut l, &mut r, n);
         // PreFx tap (自トラック Pre-FX を読む Comp 21) を持つ track の pass 1 全体。
         crate::graph::process_track_owned(
-            1, &song.tracks[1], &mut scratch[1], p, &refs, None, None, SR, n as u32, true, Some(song), false, &[], 0,
+            1, &song.tracks[1], &mut scratch[1], p, &refs, None, None, SR, n as u32, true, Some(song), index, false, false, 0,
             &rec, 120.0, b as f64, LoopRegion::default(), ModTickPlaneRef::default(), TrackRows::default(), io,
         );
     };
-    step(0, &song, &mut scratch, &mut sched); // warm-up
+    step(0, &song, &song_index, &mut scratch, &mut sched); // warm-up
     assert_no_alloc::assert_no_alloc(|| {
         for b in 1..12 {
             // 途中で bypass を切り替えて crossfade も通す。
-            let s = if (4..8).contains(&b) { &bypassed } else { &song };
-            step(b, s, &mut scratch, &mut sched);
+            let (s, index) = if (4..8).contains(&b) { (&bypassed, &bypassed_index) } else { (&song, &song_index) };
+            step(b, s, index, &mut scratch, &mut sched);
         }
     });
 }

@@ -8,6 +8,7 @@
 
 use common::model::{Clip, Note, Song};
 use common::process_data::MAX_EVENTS;
+use common::song_index::{RangeIndex, SongIndex};
 
 /// `active_notes` の RT-safe な上限。 push 前にこの値でクランプして
 /// `Vec` 再確保 (= RT 違反) を防ぐ。 `midi_bus_a` の `MAX_EVENTS` (=256)
@@ -150,6 +151,48 @@ impl BufferWindow {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         (f >= 0.0 && f < f64::from(self.frames)).then(|| f as u32 + self.time_offset)
     }
+
+    /// この窓で On / chase / Off / 読み上げを出しうる拍の範囲 (**広めに**取る。`None` = 解けないので全件を見る)。
+    ///
+    /// `offset(b) >= 0` は `b > playhead - 1 sample` を、`offset(b) < frames` は `b < playhead + frames sample` を含意する
+    /// ([`common::timing::boundary_frame`] の吸着は 1e-6 sample)。拍の丸め誤差ぶん両端に 2 sample の余白を足す。
+    fn beat_span(&self) -> Option<(f64, f64)> {
+        let spb = self.samples_per_beat;
+        if !(spb.is_finite() && spb > 0.0) {
+            return None;
+        }
+        let margin = 2.0 / spb;
+        Some((self.playhead_beats - margin, self.playhead_beats + f64::from(self.frames) / spb + margin))
+    }
+}
+
+/// 1 窓で見る clip / note の候補の上限 (スタックに置く。超えたら全件を元の並びで見る)。
+const MAX_WINDOW_CLIPS: usize = 64;
+const MAX_WINDOW_NOTES: usize = 256;
+
+/// `items` のうち拍の範囲 `window` に掛かりうるものを **元の並び順で** `f(位置, 要素)` に渡す。索引が無い / 別の
+/// snapshot の索引 / 候補が `N` を超える / 範囲が解けないときは全件を渡す (呼び出し側の判定はどちらでも同じ)。
+/// RT 安全: 候補はスタックの配列に置く。
+fn for_each_in_window<T, const N: usize>(
+    items: &[T],
+    ranges: Option<&RangeIndex>,
+    window: Option<(f64, f64)>,
+    mut f: impl FnMut(usize, &T),
+) {
+    if let (Some(ranges), Some((lo, hi))) = (ranges.filter(|r| r.built_for(items.len())), window) {
+        let mut candidates = [0u32; N];
+        if let Some(n) = ranges.overlapping(lo, hi, &mut candidates) {
+            for &i in &candidates[..n] {
+                if let Some(item) = items.get(i as usize) {
+                    f(i as usize, item);
+                }
+            }
+            return;
+        }
+    }
+    for (i, item) in items.iter().enumerate() {
+        f(i, item);
+    }
 }
 
 /// 1 つの note の On / chase / Off をこの窓で emit する ([`collect_events_for_buffer`] の本体)。
@@ -251,8 +294,12 @@ fn emit_note_events(
 #[allow(clippy::too_many_arguments)]
 pub fn collect_events_for_buffer(
     song: Option<&Song>,
+    // `song` と同じ snapshot の索引 (窓に掛かる clip / note / event だけを見るため)。
+    index: &SongIndex,
     track_idx: u32,
     clips: &[Clip],
+    // `clips` の区間索引 (アレンジ行は `SongIndex::track_clips`、ランチャーのセル 1 つは `None`)。
+    clip_ranges: Option<&RangeIndex>,
     sample_rate: u32,
     playhead_beats: f64,
     current_bpm: f32,
@@ -262,46 +309,39 @@ pub fn collect_events_for_buffer(
     active_notes: &mut Vec<(u32, u8)>,
 ) {
     let Some(song) = song else { return };
-    let Some(track) = song.tracks.get(track_idx as usize) else {
-        return;
-    };
-    if current_bpm <= 0.0 {
+    if song.tracks.get(track_idx as usize).is_none() || current_bpm <= 0.0 {
         return;
     }
 
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(current_bpm);
+    let win = BufferWindow { playhead_beats, samples_per_beat, frames, time_offset };
+    let window = win.beat_span();
 
     // note_id は `(clip.id, note.id)` からの決定論的導出
     // (`common::plugin_metadata::sing_note_id`)。daw_gui の `sync_vocal_metadata` が
     // **同じ関数**で同じ値を flush するので、clip の追加 / 削除 / 並べ替え / muted で
     // 番号がずれない (旧「track 内通し index」の欠陥、アーキ不変条件 1)。
     // 通し番号の bookkeeping はもう要らない (どの clip を skip しても影響しない)。
-    for clip in clips {
-        // v6 linked clip: notes は Song.clip_contents から取り出す。
-        // 共有 clip 群は同じ content から同じ notes を見るので、 別々の
-        // 配置位置 (clip.start_beat) で同じ内容が再生される。
-        let notes: &[Note] = song
-            .clip_contents
-            .get(&clip.content_id)
-            .and_then(|c| c.notes())
-            .unwrap_or(&[]);
-
+    for_each_in_window::<_, MAX_WINDOW_CLIPS>(clips, clip_ranges, window, |_, clip| {
         // muted clip は全 note を skip。
         if clip.muted {
-            continue;
+            return;
         }
 
         if clip.length_beats <= 0.0 {
-            continue;
+            return;
         }
         let clip_end_beats = clip.start_beat + clip.length_beats;
         // clip が窓の外なら skip。note の On / Off と **同じ frame の規則** で判定する — 拍で判定すると、窓の端
         // ちょうどで終わる clip は「この窓では Off の frame が窓の外、次の窓では拍が clip の外」になり、Off が一度も
         // 出ない (stuck note)。終端が窓の frame 0 に落ちる clip は通す (その Off はこの窓で出る)。
-        let win = BufferWindow { playhead_beats, samples_per_beat, frames, time_offset };
         if win.offset(clip_end_beats) < 0.0 || win.offset(clip.start_beat) >= f64::from(frames) {
-            continue;
+            return;
         }
+        // v6 linked clip: notes は Song.clip_contents から取り出す。
+        // 共有 clip 群は同じ content から同じ notes を見るので、 別々の
+        // 配置位置 (clip.start_beat) で同じ内容が再生される。
+        let notes: &[Note] = song.clip_contents.get(&clip.content_id).and_then(|c| c.notes()).unwrap_or(&[]);
         // r.md #44: clip は content への窓。 鳴らす note は content-local 拍で
         // `[content_offset_beats, +length_beats)` に **発音開始が入る** ものだけ
         // (= 左端 trim で隠れた note は鳴らない)。 linked clip は content を
@@ -314,32 +354,26 @@ pub fn collect_events_for_buffer(
         // 鳴らすと Off が 1 本だけ外れて早切れ / stuck になる
         // (`docs/plan_range_selection.md` §10)。 重なりを許す方向へ戻すなら、
         // ここを (pitch, clip) の多重集合にすること。
-        for note in notes {
+        let local = window.map(|(lo, hi)| (clip.song_to_content_beat(lo), clip.song_to_content_beat(hi)));
+        let note_ranges = index.content_ranges(clip.content_id);
+        for_each_in_window::<_, MAX_WINDOW_NOTES>(notes, note_ranges, local, |_, note| {
             let note_id = common::plugin_metadata::sing_note_id(clip.id, note.id);
             // muted note は On/Off を一切 emit しない (On を出さないので
             // stuck note にならない)。note_id は note.id 由来なので影響を受けない。
             if note.muted {
-                continue;
+                return;
             }
             if note.duration_beats <= 0.0 {
-                continue;
+                return;
             }
             // Skip notes whose On is outside the clip — otherwise we could
             // emit On but lose Off to clamping, leaving a stuck note.
             if note.start_beat < win_start || note.start_beat >= win_end {
-                continue;
+                return;
             }
-            emit_note_events(
-                win,
-                clip,
-                clip_end_beats,
-                note,
-                note_id,
-                out,
-                active_notes,
-            );
-        }
-    }
+            emit_note_events(win, clip, clip_end_beats, note, note_id, out, active_notes);
+        });
+    });
 
     // (talk) 読み上げトリガ (`docs/plan_voicevox_talk.md` §3.4)。VOICEVOX デバイス付き
     // トラックの `ClipContent::Text` の各 TextEvent 開始位置で、合成 note_on を発火する。
@@ -349,49 +383,42 @@ pub fn collect_events_for_buffer(
     // event_id の対応を保つ。歌唱 MIDI clip と talk Text clip が混在しても、
     // note_id (= `sing_note_id`、`[0, TALK_EVENT_ID_BASE)`) と event_id (= high band) は
     // 衝突しない。
-    if track.is_voicevox_vocal() {
-        for clip in clips {
+    if index.is_voicevox_vocal(track_idx as usize) {
+        // 発火する event は clip の窓 `[start, start + length)` の中で始まるので、窓に掛からない clip は何も出さない。
+        for_each_in_window::<_, MAX_WINDOW_CLIPS>(clips, clip_ranges, window, |_, clip| {
             // muted な Text(読み上げ) clip は talk note_on を発火しない。
             if clip.muted {
-                continue;
+                return;
             }
-            let Some(events) = song
-                .clip_contents
-                .get(&clip.content_id)
-                .and_then(|c| c.text_events())
-            else {
-                continue;
+            let Some(events) = song.clip_contents.get(&clip.content_id).and_then(|c| c.text_events()) else {
+                return;
             };
             // r.md #44: 読み上げも clip の窓の中で始まる event だけ発火する。
             let (win_start, win_end) = clip.content_window();
-            for (event_index, ev) in events.iter().enumerate() {
+            let local = window.map(|(lo, hi)| (clip.song_to_content_beat(lo), clip.song_to_content_beat(hi)));
+            let event_ranges = index.content_ranges(clip.content_id);
+            for_each_in_window::<_, MAX_WINDOW_NOTES>(events, event_ranges, local, |event_index, ev| {
                 if ev.text.is_empty() {
-                    continue;
+                    return;
                 }
-                if ev.event_start_in_clip_beats < win_start
-                    || ev.event_start_in_clip_beats >= win_end
-                {
-                    continue;
+                if ev.event_start_in_clip_beats < win_start || ev.event_start_in_clip_beats >= win_end {
+                    return;
                 }
                 let on_abs_beat = clip.content_to_song_beat(ev.event_start_in_clip_beats);
-                let win = BufferWindow { playhead_beats, samples_per_beat, frames, time_offset };
                 if let Some(time) = win.frame_in(on_abs_beat)
                     && out.len() < MAX_EVENTS
                 {
                     out.push(TimedNoteEvent {
                         time,
                         event: NoteTransition::On {
-                            note_id: common::plugin_metadata::talk_event_id(
-                                clip.id,
-                                event_index as u32,
-                            ),
+                            note_id: common::plugin_metadata::talk_event_id(clip.id, event_index as u32),
                             key: 0,
                             velocity: 1.0,
                         },
                     });
                 }
-            }
-        }
+            });
+        });
     }
 
     // CLAP requires in-events sorted by time. At equal times, Off must come
@@ -429,10 +456,13 @@ mod tests {
         let clips = song
             .and_then(|s| s.tracks.get(track_idx as usize))
             .map_or(empty, |t| t.clips.as_slice());
+        let index = song.map_or_else(SongIndex::default, SongIndex::build);
         collect_events_for_buffer(
             song,
+            &index,
             track_idx,
             clips,
+            index.track_clips(track_idx as usize),
             sample_rate,
             playhead_beats,
             current_bpm,
@@ -793,8 +823,10 @@ mod tests {
 
         // ランチャー区間 (`time_offset > 0`) では区間の開始 frame に出る。
         out.clear();
+        let index = SongIndex::build(&song);
         collect_events_for_buffer(
-            Some(&song), 0, &song.tracks[0].clips, SR, 1.5, 120.0, 512, 512, &mut out, &mut active,
+            Some(&song), &index, 0, &song.tracks[0].clips, index.track_clips(0), SR, 1.5, 120.0, 512, 512, &mut out,
+            &mut active,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].time, 512);

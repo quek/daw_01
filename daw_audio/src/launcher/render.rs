@@ -11,7 +11,8 @@
 
 use std::collections::HashMap;
 
-use common::model::{AutomationLane, Clip, ClipContent, ContentId, SessionClip, Song};
+use common::model::{ClipContent, ContentId, Song};
+use common::song_index::{LaneView, SongIndex};
 
 use super::{RowPhase, RowTimeSource, for_each_segment};
 use crate::audio_clip_renderer::{AudioClipRenderer, ClipRenderState, render_audio_events};
@@ -25,6 +26,8 @@ use crate::sequencer::{TimedNoteEvent, collect_events_for_buffer};
 #[allow(clippy::too_many_arguments)]
 pub fn collect_row_midi(
     song: Option<&Song>,
+    // `song` と同じ snapshot の索引 (セル / clip / note を引く)。
+    index: &SongIndex,
     track_idx: u32,
     src: RowTimeSource,
     sample_rate: u32,
@@ -66,17 +69,19 @@ pub fn collect_row_midi(
         }
         prev = Some((seg.beat, seg.cell_clip_id));
         covered_to = seg.end_frame.min(frames);
-        let clips = match seg.cell_clip_id {
-            0 => track.clips.as_slice(),
-            id => match cell_clip(&track.session_clips, id) {
-                Some(c) => std::slice::from_ref(c),
+        let (clips, clip_ranges) = match seg.cell_clip_id {
+            0 => (track.clips.as_slice(), index.track_clips(track_idx as usize)),
+            id => match index.track_cell(song, track_idx as usize, id) {
+                Some(cell) => (std::slice::from_ref(&cell.clip), None),
                 None => return,
             },
         };
         collect_events_for_buffer(
             Some(song),
+            index,
             track_idx,
             clips,
+            clip_ranges,
             sample_rate,
             seg.beat,
             current_bpm,
@@ -159,24 +164,29 @@ fn flush_active(out: &mut Vec<TimedNoteEvent>, active_notes: &mut Vec<(u32, u8)>
 /// - `Arranger`: 従来どおり `lane.clips` を song 拍で引く
 /// - `Silent`  : レーン既定値 (Q11 — セルの無い列を撃つとここへ戻る)
 /// - `Cell`    : そのセルの [`common::model::AutomationClip`] を実効拍で引く
+///
+/// clip / セルは lane の索引 ([`LaneView`]) で引く (毎サンプル呼ばれるので clip 列を舐めない)。
 #[must_use]
 pub fn lane_value(
-    lane: &AutomationLane,
+    view: LaneView<'_>,
     clip_contents: &HashMap<ContentId, ClipContent>,
     phase: RowPhase,
     beat: f64,
 ) -> f64 {
+    let lane = view.lane;
     if !lane.enabled {
         return lane.default_value;
     }
     match phase {
-        RowPhase::Arranger => common::automation::lane_value_at(lane, clip_contents, beat),
+        RowPhase::Arranger => {
+            common::automation::lane_value_in_clip(lane, view.arrangement_clip(beat), clip_contents, beat)
+        }
         RowPhase::Silent => lane.default_value,
         RowPhase::Cell { clip_id, .. } => {
             let Some(eff) = phase.effective_beat(beat) else {
                 return lane.default_value;
             };
-            cell_value(lane, clip_contents, clip_id, eff)
+            cell_value(view, clip_contents, clip_id, eff)
         }
     }
 }
@@ -236,12 +246,13 @@ pub fn row_transport(
 
 /// セル 1 つを実効拍で評価する。窓の外はレーン既定値。
 fn cell_value(
-    lane: &AutomationLane,
+    view: LaneView<'_>,
     clip_contents: &HashMap<ContentId, ClipContent>,
     clip_id: u32,
     eff: f64,
 ) -> f64 {
-    let Some(cell) = lane.session_clips.iter().find(|c| c.clip.id == clip_id) else {
+    let lane = view.lane;
+    let Some(cell) = view.cell(clip_id) else {
         return lane.default_value;
     };
     let clip = &cell.clip;
@@ -259,11 +270,6 @@ fn cell_value(
     common::automation::evaluate_clip(auto, clip.song_to_content_beat(eff))
 }
 
-/// トラック行のセルの中身 (`clip.id` で引く)。
-fn cell_clip(cells: &[SessionClip], clip_id: u32) -> Option<&Clip> {
-    cells.iter().find(|c| c.clip.id == clip_id).map(|c| &c.clip)
-}
-
 fn beats_per_frame(current_bpm: f32, sample_rate: u32) -> f64 {
     if sample_rate == 0 || current_bpm <= 0.0 {
         return 0.0;
@@ -276,8 +282,8 @@ mod tests {
     use super::*;
     use crate::launcher::{RowKey, RowTimeSource};
     use common::model::{
-        AutomationClip, AutomationContent, AutomationCurve, AutomationPoint, AutomationTarget,
-        LaunchSettings, MidiContent, Note, SessionAutomationClip, Track, TrackBuiltinParam,
+        AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint, AutomationTarget, Clip,
+        LaunchSettings, MidiContent, Note, SessionAutomationClip, SessionClip, Track, TrackBuiltinParam,
     };
 
     /// r.md #87: 行の供給元 → `ProcessData::row` の写像。plugin host (VOICEVOX の
@@ -379,7 +385,7 @@ mod tests {
         let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
         let mut out = Vec::with_capacity(256);
         let mut active = Vec::with_capacity(256);
-        collect_row_midi(Some(&song), 0, src, 48_000, 3.99, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 3.99, 120.0, 512, &mut out, &mut active);
 
         let ons: Vec<u32> = out
             .iter()
@@ -422,7 +428,7 @@ mod tests {
         // 撃った直後の buffer: On が出る。
         let mut out = Vec::with_capacity(256);
         let mut active = Vec::with_capacity(256);
-        collect_row_midi(Some(&song), 0, src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
         assert!(
             out.iter().any(|e| matches!(
                 e.event,
@@ -432,7 +438,7 @@ mod tests {
         );
         // ループ端を跨ぐ buffer: Off と次の周の On が両方出る。
         let mut out = Vec::with_capacity(256);
-        collect_row_midi(Some(&song), 0, src, 48_000, 3.99, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 3.99, 120.0, 512, &mut out, &mut active);
         assert!(
             out.iter().any(|e| matches!(
                 e.event,
@@ -469,6 +475,7 @@ mod tests {
         });
         // 120 BPM / 48 kHz / 512 frame = 0.0213333… 拍。
         let bpf = 512.0 * 120.0 / (60.0 * 48_000.0);
+        let index = SongIndex::build(&song);
         let mut active = Vec::with_capacity(256);
         let mut ons = 0usize;
         let mut beat = launch;
@@ -477,7 +484,7 @@ mod tests {
         while beat < launch + 11.0 {
             let mut out = Vec::with_capacity(64);
             collect_row_midi(
-                Some(&song), 0, src, 48_000, beat, 120.0, 512, &mut out, &mut active,
+                Some(&song), &index, 0, src, 48_000, beat, 120.0, 512, &mut out, &mut active,
             );
             ons += out
                 .iter()
@@ -520,7 +527,7 @@ mod tests {
 
         // 1 buffer 目: セルが鳴り出す。
         let playing = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
-        collect_row_midi(Some(&song), 0, playing, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,playing, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
         assert_eq!(active.len(), 1, "セルの note が鳴っていない: {out:?}");
         assert_eq!(active[0].1, 60, "セルの note が鳴っていない: {out:?}");
 
@@ -532,7 +539,7 @@ mod tests {
             tail: RowPhase::Arranger,
             switch_frame: 0,
         };
-        collect_row_midi(Some(&song), 0, switch, 48_000, 2.0, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,switch, 48_000, 2.0, 120.0, 512, &mut out, &mut active);
         let offs: Vec<u32> = out
             .iter()
             .filter(|e| {
@@ -551,7 +558,7 @@ mod tests {
         let src = RowTimeSource::uniform(RowKey::track(1), RowPhase::Arranger);
         let mut out = Vec::with_capacity(256);
         let mut active = Vec::with_capacity(256);
-        collect_row_midi(Some(&song), 0, src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
         assert!(out.is_empty(), "アレンジには clip が無いのに鳴った: {out:?}");
     }
 
@@ -561,7 +568,7 @@ mod tests {
         let src = RowTimeSource::uniform(RowKey::track(1), RowPhase::Silent);
         let mut out = Vec::with_capacity(256);
         let mut active = Vec::with_capacity(256);
-        collect_row_midi(Some(&song), 0, src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
         assert!(out.is_empty());
     }
 
@@ -599,7 +606,8 @@ mod tests {
             launch: LaunchSettings::default(),
         });
         song.tracks.push(Track { id: 1, automation_lanes: vec![lane], ..Track::default() });
-        let lane = &song.tracks[0].automation_lanes[0];
+        let index = SongIndex::build(&song);
+        let lane = index.track_store(&song, 0).lane(0).expect("lane 0");
 
         let phase = RowPhase::Cell {
             clip_id: 3,
@@ -658,6 +666,7 @@ mod tests {
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 5 };
         let _ = scene2;
 
+        let index = SongIndex::build(&song);
         let render_once = || {
             let mut rt = LauncherRuntime::for_song(&song);
             let mut trace: Vec<(usize, u32, u8, bool)> = Vec::new();
@@ -666,11 +675,12 @@ mod tests {
             let mut beat = 0.0_f64;
             for buf in 0..400usize {
                 let span = BufferSpan::new(beat, 120.0, 48_000, 512);
-                rt.update(&song, span, LaunchQuantize::Off, true);
+                rt.update(&song, &index, span, LaunchQuantize::Off, true);
                 out.clear();
                 active.clear();
                 collect_row_midi(
                     Some(&song),
+                    &index,
                     0,
                     rt.rows().track_row(0),
                     48_000,
@@ -795,8 +805,10 @@ mod rt_assert_tests {
         .expect("plane");
         let telemetry = &telemetry;
 
+        // 索引は live では song と同じ便で届く (off-RT で作る)。
+        let index = common::song_index::SongIndex::build(&song);
         // 1 buffer 目は行の生成 (`Vec::push`) を含むので検査の外で回す。
-        rt.update(&song, BufferSpan::new(0.0, 120.0, 48_000, 512), LaunchQuantize::Off, true);
+        rt.update(&song, &index, BufferSpan::new(0.0, 120.0, 48_000, 512), LaunchQuantize::Off, true);
 
         // 以降が定常。セル発火 / シーン発火 / フォローアクションの遷移 /
         // ループ端を何度も跨ぐ描画を、まとめて 1 つの検査に入れる。
@@ -820,12 +832,12 @@ mod rt_assert_tests {
                     beat -= 8.0;
                 }
                 let span = BufferSpan::new(beat, 120.0, 48_000, 512);
-                rt.update(&song, span, LaunchQuantize::Off, true);
+                rt.update(&song, &index, span, LaunchQuantize::Off, true);
                 rt.publish(telemetry, span.start_beat);
                 let src = rt.rows().track_row(0);
                 out.clear();
                 collect_row_midi(
-                    Some(&song), 0, src, 48_000, beat, 120.0, 512, &mut out, &mut active,
+                    Some(&song), &index, 0, src, 48_000, beat, 120.0, 512, &mut out, &mut active,
                 );
                 render_row_audio(
                     &renderer,

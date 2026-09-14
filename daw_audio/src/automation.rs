@@ -11,15 +11,21 @@
 
 #![allow(dead_code)]
 
-use common::automation::apply_modulation_with;
+use common::automation::apply_modulation_over;
 use common::mod_plane::ModTickPlaneRef;
-use common::model::{
-    AutomationLane, AutomationTarget, MasterLimiterSettings, ModRouting, NativeDevice, Song, TrackBuiltinParam,
-};
+use common::model::{AutomationTarget, MasterLimiterSettings, NativeDevice, Song, TrackBuiltinParam};
 use common::process_data::ProcessData;
+use common::song_index::{ParamStore, ParamSubject, SongIndex, TargetRoutings};
 
+use crate::engine_shared::RecordingLanes;
 use crate::launcher::TrackRows;
 use crate::launcher::render::{lane_value, phase_at_frame};
+
+/// `owner` の置き場の `target` を録音中か (録音中はカーブを評価せずノブの値を素通しする)。
+fn is_recording(recording_lanes: &RecordingLanes, owner: u32, target: &AutomationTarget) -> bool {
+    // `AutomationTarget` の clone は確保しない (中身は数値だけ)。
+    !recording_lanes.is_empty() && recording_lanes.contains(&(owner, target.clone()))
+}
 
 /// Fill `volume_per_sample` / `pan_per_sample` (each at least `frames`
 /// long, but typically `MAX_FRAMES`) for the given track and buffer.
@@ -43,6 +49,8 @@ use crate::launcher::render::{lane_value, phase_at_frame};
 #[allow(clippy::too_many_arguments)]
 pub fn fill_track_param_ramps(
     song: Option<&Song>,
+    // `song` と同じ snapshot の索引 (`RtBundle::song_index`)。
+    index: &SongIndex,
     track_idx: u32,
     // r.md #87: この track の行 (トラック行 + レーン行) の供給元。レーン行が
     // ランチャー主導ならそのセルのカーブを、停止していれば `lane.default_value` を
@@ -58,36 +66,31 @@ pub fn fill_track_param_ramps(
     frames: u32,
     volume_per_sample: &mut [f32],
     pan_per_sample: &mut [f32],
-    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    recording_lanes: &RecordingLanes,
     // docs/plan_modulation.md §5 / r.md #89: **刻みごとの**変調値面
     // (`ModSource::id` キー)。volume/pan lane の `mod_routings` がこれを引く。
     // 刻みの間は線形補間する — 64 サンプルの段 (48kHz で 750Hz) をそのまま
     // 音量に当てると段差が音として出る。空 = 変調なし。
     mod_plane: ModTickPlaneRef<'_>,
 ) {
-    let (track_volume, track_pan) = song
-        .and_then(|s| s.tracks.get(track_idx as usize))
-        .map(|t| (t.volume, t.pan))
-        .unwrap_or((1.0, 0.0));
-    let Some(track) = song.and_then(|s| s.tracks.get(track_idx as usize)) else {
+    let Some((song, track)) = song.and_then(|s| Some((s, s.tracks.get(track_idx as usize)?))) else {
         let n = (frames as usize).min(volume_per_sample.len()).min(pan_per_sample.len());
-        volume_per_sample[..n].fill(track_volume);
-        pan_per_sample[..n].fill(track_pan);
+        volume_per_sample[..n].fill(1.0);
+        pan_per_sample[..n].fill(0.0);
         return;
     };
-    let song = song.expect("track resolved from song");
+    let store = index.track_store(song, track_idx as usize);
     fill_target_ramp(
         song,
         track.id,
-        &track.automation_lanes,
-        &track.mod_routings,
+        store,
         rows,
         sample_rate,
         current_bpm,
         playhead_beats,
         frames,
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume),
-        track_volume,
+        track.volume,
         volume_per_sample,
         recording_lanes,
         mod_plane,
@@ -95,15 +98,14 @@ pub fn fill_track_param_ramps(
     fill_target_ramp(
         song,
         track.id,
-        &track.automation_lanes,
-        &track.mod_routings,
+        store,
         rows,
         sample_rate,
         current_bpm,
         playhead_beats,
         frames,
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan),
-        track_pan,
+        track.pan,
         pan_per_sample,
         recording_lanes,
         mod_plane,
@@ -119,16 +121,15 @@ pub fn fill_track_param_ramps(
 /// lane も mod_routing も無い target は constant fill のままで正しいので per-sample
 /// ループを丸ごと skip (= 無回帰)。
 ///
-/// `owner_track_id` / `lanes` / `mod_routings` は所有者の store (track なら
-/// `Track.automation_lanes` / `mod_routings`、master 所有の Parallel chain なら
-/// `Song.song_lanes` / `song_mod_routings` + `MASTER_TRACK_ID`)。
+/// `owner_track_id` / `store` は所有者の置き場 (track なら `Track.automation_lanes` / `mod_routings`、
+/// master 所有の Parallel chain なら `Song.song_lanes` / `song_mod_routings` + `MASTER_TRACK_ID`)。
+/// lane と routing は置き場の索引で引く (置き場の全件を舐めない)。
 /// RT 安全: 確保・ロックなし。
 #[allow(clippy::too_many_arguments)]
 pub fn fill_target_ramp(
     song: &Song,
     owner_track_id: u32,
-    lanes: &[common::model::AutomationLane],
-    mod_routings: &[common::model::ModRouting],
+    store: ParamStore<'_>,
     rows: TrackRows<'_>,
     sample_rate: u32,
     current_bpm: f64,
@@ -137,7 +138,7 @@ pub fn fill_target_ramp(
     target: AutomationTarget,
     constant: f32,
     buf: &mut [f32],
-    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    recording_lanes: &RecordingLanes,
     mod_plane: ModTickPlaneRef<'_>,
 ) {
     let frames = (frames as usize).min(buf.len());
@@ -150,36 +151,30 @@ pub fn fill_target_ramp(
         return;
     }
     // 当該 target を駆動する lane (enabled + 非 recording)。
-    let lane = lanes.iter().enumerate().find(|(_, l)| {
-        l.enabled
-            && l.target == target
-            && !recording_lanes
-                .iter()
-                .any(|(t, tg)| *t == owner_track_id && *tg == l.target)
-    });
-    let has_mod = mod_routings.iter().any(|r| r.target == target);
-    if lane.is_none() && !has_mod {
+    let lane = store.enabled_lane(&target).filter(|_| !is_recording(recording_lanes, owner_track_id, &target));
+    let routings = store.routings_for(&target);
+    if lane.is_none() && routings.is_empty() {
         return;
     }
     // r.md #87: このレーン行の供給元。`switch_frame` を跨ぐと途中で変わる。
-    let src = lane.map(|(li, _)| rows.lane(li)).unwrap_or_default();
+    let src = lane.map(|v| rows.lane(v.pos)).unwrap_or_default();
     for (i, slot) in buf.iter_mut().enumerate().take(frames) {
         let beat = playhead_beats + i as f64 * beats_per_frame;
         let base = match lane {
             #[allow(clippy::cast_possible_truncation)]
-            Some((_, l)) => {
+            Some(view) => {
                 let phase = phase_at_frame(src, i as u32);
-                lane_value(l, &song.clip_contents, phase, beat)
+                lane_value(view, &song.clip_contents, phase, beat)
             }
             None => f64::from(constant),
         };
         #[allow(clippy::cast_possible_truncation)]
         let f = i as u32;
         // r.md #89 Q9: 深さ自体が動く変調も刻みごとに解決する。
-        *slot = apply_modulation_with(
+        *slot = apply_modulation_over(
             &target,
             base,
-            mod_routings,
+            routings.iter(),
             |id| mod_plane.scalar_at_frame_opt(id, f),
             |r| mod_plane.depth_at_frame(r.id, f).unwrap_or(r.depth),
         ) as f32;
@@ -192,133 +187,102 @@ pub fn fill_target_ramp(
 /// カーブ値、(2) 同じ target の変調 を順に重ねる。住所 ↔ フィールドの対応は
 /// `NativeDevice::{param, set_param}` が SSoT (`On` は `bypassed`、段階式は `set` が段へ丸める)。
 ///
-/// `owner` はその device を持つトラック (master fx chain なら `MASTER_TRACK_ID`) で、store は
-/// `song.param_stores(owner)`、`rows` は owner の行。**block-rate (buffer 先頭で 1 回)**。
+/// `owner` はその device を持つトラック (master fx chain なら `MASTER_TRACK_ID`) で、`store` はその置き場、
+/// `rows` は owner の行。**block-rate (buffer 先頭で 1 回)**。lane / routing は置き場の索引で device の分だけ引く。
 ///
 /// RT 安全: 確保・ロックなし (`NativeDevice` は `Copy`)。
-pub fn resolve_native_device(
-    song: &Song,
-    device: &NativeDevice,
-    owner: u32,
-    rows: TrackRows<'_>,
-    playhead_beats: f64,
-    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
-    mod_plane: ModTickPlaneRef<'_>,
-) -> NativeDevice {
-    let Some(stores) = song.param_stores(owner) else {
-        return *device;
-    };
-    resolve_native_device_in(
-        &song.clip_contents,
-        stores,
-        device,
-        owner,
-        rows,
-        playhead_beats,
-        recording_lanes,
-        mod_plane,
-    )
-}
-
-/// [`resolve_native_device`] の store 解決済み版 (RT はプログラム実行ごとに 1 回だけ
-/// `param_stores` を引き、op ごとに track を探索しない)。
 #[allow(clippy::too_many_arguments)]
-pub fn resolve_native_device_in(
+pub fn resolve_native_device(
     clip_contents: &std::collections::HashMap<common::model::ContentId, common::model::ClipContent>,
-    stores: (&[AutomationLane], &[ModRouting]),
+    store: ParamStore<'_>,
     device: &NativeDevice,
     owner: u32,
     rows: TrackRows<'_>,
     playhead_beats: f64,
-    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    recording_lanes: &RecordingLanes,
     mod_plane: ModTickPlaneRef<'_>,
 ) -> NativeDevice {
     let mut out = *device;
-    let (lanes, routings) = stores;
+    let subject = ParamSubject::Native(device.id);
     // (1) レーン: 有効かつ録音中でないものだけがカーブ値で上書きする
     // (録音中は GUI のノブ操作を素通しさせる = fill_track_param_ramps と同じ規則)。
-    for (li, lane) in lanes.iter().enumerate() {
-        let AutomationTarget::NativeParam { device_id, param } = &lane.target else {
+    for view in store.lanes_of(subject) {
+        let lane = view.lane;
+        let AutomationTarget::NativeParam { param, .. } = lane.target else {
             continue;
         };
-        if *device_id != device.id || !lane.enabled || out.param(*param).is_none() {
+        if !lane.enabled || out.param(param).is_none() || is_recording(recording_lanes, owner, &lane.target) {
             continue;
         }
-        if recording_lanes.iter().any(|(t, tg)| *t == owner && *tg == lane.target) {
-            continue;
-        }
-        let phase = phase_at_frame(rows.lane(li), 0);
-        let v = lane_value(lane, clip_contents, phase, playhead_beats);
+        let phase = phase_at_frame(rows.lane(view.pos), 0);
+        let v = lane_value(view, clip_contents, phase, playhead_beats);
         #[allow(clippy::cast_possible_truncation)]
-        out.set_param(*param, v as f32);
+        out.set_param(param, v as f32);
     }
-    // (2) 変調: base は (1) まで解決済みの現在値。`apply_modulation_with` は同じ target の routing を
-    // 内部で全部畳むので、target ごとに 1 度だけ呼ぶ (同じ target の 2 本目以降は skip)。
-    for (i, routing) in routings.iter().enumerate() {
-        let AutomationTarget::NativeParam { device_id, param } = &routing.target else {
+    // (2) 変調: base は (1) まで解決済みの現在値。target ごとに、その target を指す routing を畳む。
+    for (target, routings) in store.targets_of(subject) {
+        let AutomationTarget::NativeParam { param, .. } = *target else {
             continue;
         };
-        if *device_id != device.id || routings[..i].iter().any(|q| q.target == routing.target) {
-            continue;
-        }
-        let Some(base) = out.param(*param) else {
+        let Some(base) = out.param(param) else {
             continue;
         };
-        let v = apply_modulation_with(
-            &routing.target,
-            f64::from(base),
-            routings,
-            |id| mod_plane.scalar_at_frame_opt(id, 0),
-            |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
-        );
         #[allow(clippy::cast_possible_truncation)]
-        out.set_param(*param, v as f32);
+        out.set_param(param, modulated_at_block_start(target, f64::from(base), routings, mod_plane) as f32);
     }
     out
 }
 
+/// block-rate (buffer 頭の値面) で `base` に変調を乗せる。
+fn modulated_at_block_start(
+    target: &AutomationTarget,
+    base: f64,
+    routings: TargetRoutings<'_>,
+    mod_plane: ModTickPlaneRef<'_>,
+) -> f64 {
+    apply_modulation_over(
+        target,
+        base,
+        routings.iter(),
+        |id| mod_plane.scalar_at_frame_opt(id, 0),
+        |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
+    )
+}
+
 /// この buffer で実際に効く **master のフェーダー後 Limiter** を解決する (r.md #129 §7.3)。
-/// store は song 側 (`song_lanes` / `song_mod_routings`)、`rows` は master の行。
+/// `store` は song 側の置き場 (`song_lanes` / `song_mod_routings`)、`rows` は master の行。
 ///
 /// RT 安全: 確保・ロックなし (`MasterLimiterSettings` は `Copy`)。
 pub fn resolve_master_limiter(
     song: &Song,
+    store: ParamStore<'_>,
     rows: TrackRows<'_>,
     playhead_beats: f64,
-    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    recording_lanes: &RecordingLanes,
     mod_plane: ModTickPlaneRef<'_>,
 ) -> MasterLimiterSettings {
     let mut out = song.master_limiter;
     let master = common::model::MASTER_TRACK_ID;
-    for (li, lane) in song.song_lanes.iter().enumerate() {
-        let AutomationTarget::MasterLimiter(param) = &lane.target else {
+    for view in store.lanes_of(ParamSubject::MasterLimiter) {
+        let lane = view.lane;
+        let AutomationTarget::MasterLimiter(param) = lane.target else {
             continue;
         };
-        if !lane.enabled || recording_lanes.iter().any(|(t, tg)| *t == master && *tg == lane.target) {
+        if !lane.enabled || is_recording(recording_lanes, master, &lane.target) {
             continue;
         }
-        let phase = phase_at_frame(rows.lane(li), 0);
-        let v = lane_value(lane, &song.clip_contents, phase, playhead_beats);
+        let phase = phase_at_frame(rows.lane(view.pos), 0);
+        let v = lane_value(view, &song.clip_contents, phase, playhead_beats);
         #[allow(clippy::cast_possible_truncation)]
-        out.set_param(*param, v as f32);
+        out.set_param(param, v as f32);
     }
-    let routings = &song.song_mod_routings;
-    for (i, routing) in routings.iter().enumerate() {
-        let AutomationTarget::MasterLimiter(param) = &routing.target else {
+    for (target, routings) in store.targets_of(ParamSubject::MasterLimiter) {
+        let AutomationTarget::MasterLimiter(param) = *target else {
             continue;
         };
-        if routings[..i].iter().any(|q| q.target == routing.target) {
-            continue;
-        }
-        let v = apply_modulation_with(
-            &routing.target,
-            f64::from(out.param(*param)),
-            routings,
-            |id| mod_plane.scalar_at_frame_opt(id, 0),
-            |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
-        );
+        let v = modulated_at_block_start(target, f64::from(out.param(param)), routings, mod_plane);
         #[allow(clippy::cast_possible_truncation)]
-        out.set_param(*param, v as f32);
+        out.set_param(param, v as f32);
     }
     out
 }
@@ -343,9 +307,9 @@ pub fn fill_pd_param_events(
     pd: &mut ProcessData,
     song: &Song,
     track_id: u32,
-    // `track_id` の lane / routing store (`Song::param_stores(track_id)`、master fx は song 側)。呼び出し側が
-    // program 実行ごとに 1 回解決したもの (plugin ごとに track を id で探さない)。
-    stores: (&[AutomationLane], &[ModRouting]),
+    // `track_id` の置き場 (master fx は song 側)。呼び出し側が program 実行ごとに 1 回解決したもの
+    // (plugin ごとに track を id で探さない)。lane / routing は索引で device の分だけ引く。
+    store: ParamStore<'_>,
     // r.md #87: この track の行の供給元 (master fx は行を持たないので
     // `TrackRows::default()` = 全部アレンジ)。
     rows: TrackRows<'_>,
@@ -358,7 +322,7 @@ pub fn fill_pd_param_events(
     current_bpm: f64,
     playhead_beats: f64,
     frames: u32,
-    recording_lanes: &std::collections::HashSet<(u32, AutomationTarget)>,
+    recording_lanes: &RecordingLanes,
     // docs/plan_modulation.md §5 / r.md #89: **刻みごとの**変調値面 (id キー)。
     // PluginParam lane の `mod_routings` がこれを引く。空 = 変調なし。
     mod_plane: ModTickPlaneRef<'_>,
@@ -368,16 +332,16 @@ pub fn fill_pd_param_events(
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
     }
-    // `song_lanes` に混在する SongTempo/TimeSig lane は下の PluginParam フィルタで skip される。
-    let (lanes, mod_routings) = stores;
     let beats_per_frame = current_bpm / (60.0 * f64::from(sample_rate));
     if beats_per_frame <= 0.0 {
         return;
     }
-    for (lane_idx, lane) in lanes.iter().enumerate() {
-        if !lane.enabled {
+    let subject = ParamSubject::Plugin(device_id);
+    for view in store.lanes_of(subject) {
+        let lane = view.lane;
+        let AutomationTarget::PluginParam { param_id, .. } = lane.target else {
             continue;
-        }
+        };
         // Phase 4 Step C-2 (plugin param 版): recording 中 (Touch/Latch/Write)
         // の lane は curve eval を skip する。 これで plugin が自身の GUI で
         // 持っている値 (= ユーザのノブ操作) を host が curve で毎バッファ
@@ -385,20 +349,9 @@ pub fn fill_pd_param_events(
         // builtin Volume/Pan の `fill_track_param_ramps` と同じ仕組みだが、
         // 旧実装は plugin param 側にこの skip が無く、 write が read のまま /
         // touch が半分しか効かないバグだった。
-        if recording_lanes
-            .iter()
-            .any(|(t, tg)| *t == track_id && *tg == lane.target)
-        {
+        if !lane.enabled || is_recording(recording_lanes, track_id, &lane.target) {
             continue;
         }
-        let param_id = match &lane.target {
-            AutomationTarget::PluginParam { device_id: d, param_id, .. }
-                if *d == device_id =>
-            {
-                *param_id
-            }
-            _ => continue,
-        };
         // automation curve 値 (絶対値)。モジュレーションは下で正規化オフセットを
         // ParamMod として別送する (`docs/plan_modulation_routing_redesign.md` §3.2)
         // ので、CLAP modulatable param では automation を破壊せず非破壊に乗る。
@@ -414,12 +367,12 @@ pub fn fill_pd_param_events(
         // (設計正本 §2.2) — 別々の 64 を持つと、片方を変えたときに黙って食い違う。
         const SUB_FRAMES: u32 = crate::mod_tick::MOD_TICK_FRAMES;
         // r.md #87: このレーン行の供給元 (ランチャー主導ならセルのカーブ)。
-        let src = rows.lane(lane_idx);
+        let src = rows.lane(view.pos);
         let mut f = 0u32;
         let mut last_v = f64::NAN;
         loop {
             let beat_at_f = playhead_beats + f64::from(f) * beats_per_frame;
-            let v = lane_value(lane, &song.clip_contents, phase_at_frame(src, f), beat_at_f);
+            let v = lane_value(view, &song.clip_contents, phase_at_frame(src, f), beat_at_f);
             if last_v.is_nan() || (v - last_v).abs() > 1e-6 {
                 pd.push_param(f, param_id, v);
                 last_v = v;
@@ -442,35 +395,22 @@ pub fn fill_pd_param_events(
     // 居座る (毎 buffer 同じ順で溢れるので永久に戻らない)。件数が枠を超えるときは
     // **刻みを間引いて解像度を落とす** — どの param にも必ず最後の刻みが届く。
     let n_ticks = mod_plane.starts(frames).count().max(1);
-    let n_params = mod_routings
-        .iter()
-        .enumerate()
-        .filter(|(i, r)| {
-            matches!(&r.target, AutomationTarget::PluginParam { device_id: d, .. } if *d == device_id)
-                && !mod_routings[..*i].iter().any(|p| p.target == r.target)
-        })
-        .count()
-        .max(1);
+    let n_params = store.targets_of(subject).count().max(1);
     // r.md #117: per-note のストリーム (per-note 対象 param × ボイス) も **同じ枠**を食うので、
     // 予算はストリーム数の合計で割る。 別枠で数えると per-note が global を押し出し、 先頭
     // param の global offset が解除されずに居座る (上の r.md #89 と同じ事故)。
     let n_pn_params = voices.map_or(0, |vt| {
-        usize::from(!vt.is_empty()) * per_note_target_count(mod_plane, mod_routings, device_id)
+        usize::from(!vt.is_empty()) * store.targets_of(subject).filter(|(_, rs)| has_per_note(mod_plane, *rs)).count()
     });
     let n_streams = n_params + n_pn_params * voices.map_or(0, |vt| vt.len());
+    // 1 ストリームあたりの件数。全ストリームが収まるので、積む順 (param の並び) で何かが落ちることは無い
+    // (ストリーム数が枠そのものを超える退化だけは、最後の刻み 1 件ずつでも溢れる)。
     let budget = (common::process_data::MAX_PARAM_MODS / n_streams.max(1)).max(1);
-    let stride = n_ticks.div_ceil(budget).max(1);
-    for (i, r) in mod_routings.iter().enumerate() {
-        let AutomationTarget::PluginParam { device_id: d, param_id, .. } = &r.target else {
+    // 同一 target は 1 度だけ (索引が target ごとに束ねてある)。
+    for (target, routings) in store.targets_of(subject) {
+        let AutomationTarget::PluginParam { param_id, .. } = *target else {
             continue;
         };
-        if *d != device_id {
-            continue;
-        }
-        // 同一 target は 1 度だけ (先行する同 target routing があれば skip)。
-        if mod_routings[..i].iter().any(|p| p.target == r.target) {
-            continue;
-        }
         // r.md #89: **刻みごとに** frame offset 付きで送る。1 buffer 1 発だと
         // 変調の解像度が buffer 長 (≒46Hz) に落ち、Hz 指定の LFO が原理的に
         // 鳴らないうえ live (device buffer 長) と書き出し (1024 固定) で段差の
@@ -478,29 +418,41 @@ pub fn fill_pd_param_events(
         // `push_param` と同じ idiom — `param_mods` の枠を無駄に食わない)。
         let mut last = f64::NAN;
         for (t, f) in mod_plane.starts(frames).enumerate() {
-            // 間引くのは中間の刻みだけ。**最後の刻みは必ず送る** (解除されない
-            // offset が居座らないように)。
-            if t % stride != 0 && t + 1 != n_ticks {
+            if !sends_tick(t, n_ticks, budget) {
                 continue;
             }
             // r.md #89 Q9: 深さ自体が動く変調は面が持つ実効値を使う。
-            let offset = f64::from(common::automation::modulation_offset_norm_with(
-                &r.target,
-                mod_routings,
+            let offset = f64::from(common::automation::modulation_offset_norm_over(
+                routings.iter(),
                 |id| mod_plane.scalar_at_frame_opt(id, f),
                 |rr| mod_plane.depth_at_frame(rr.id, f).unwrap_or(rr.depth),
             ));
             if last.is_nan() || (offset - last).abs() > 1e-6 {
-                pd.push_param_mod(f, *param_id, offset);
+                pd.push_param_mod(f, param_id, offset);
                 last = offset;
             }
         }
     }
     if let Some(voices) = voices {
         push_per_note_param_mods(
-            pd, mod_routings, device_id, sample_rate, current_bpm, playhead_beats, frames, mod_plane, voices, stride, n_ticks,
+            pd, store, device_id, sample_rate, current_bpm, playhead_beats, frames, mod_plane, voices, budget, n_ticks,
         );
     }
+}
+
+/// 1 ストリームを `budget` 件以内に収めるとき、`n_ticks` 本のうち刻み `t` を送るか。
+///
+/// 間引くのは中間の刻みだけで、**最後の刻みは必ず送る** (解除されない offset が居座らないように)。その 1 件を
+/// 含めて `budget` 件に収める — 最後の刻みを勘定の外に置くと 1 ストリームが `budget + 1` 件になり、全ストリームの
+/// 合計がリングの枠を超えて古い側 (先頭 param の刻み) が落ちる。枠に収まる間 (`budget >= n_ticks`) は全部送る。
+fn sends_tick(t: usize, n_ticks: usize, budget: usize) -> bool {
+    if t + 1 >= n_ticks {
+        return true;
+    }
+    if budget <= 1 {
+        return false;
+    }
+    t.is_multiple_of((n_ticks - 1).div_ceil(budget - 1).max(1))
 }
 
 /// r.md #117: この routing が **per-note 経路で評価される** か (source が有効な `Note` 起点)。source は値面の
@@ -509,38 +461,24 @@ fn is_per_note_routing(mod_plane: ModTickPlaneRef<'_>, r: &common::model::ModRou
     r.enabled && mod_plane.source_node(r.source_id).is_some_and(|n| n.kind.is_per_note())
 }
 
-/// r.md #117: この device の param のうち、 per-note routing が 1 本でも刺さっているものの数
-/// (target ごとに 1 = per-note ストリームの本数 / ボイス)。 予算の分母。
-fn per_note_target_count(
-    mod_plane: ModTickPlaneRef<'_>,
-    mod_routings: &[common::model::ModRouting],
-    device_id: u64,
-) -> usize {
-    mod_routings
-        .iter()
-        .enumerate()
-        .filter(|(i, r)| {
-            matches!(&r.target, AutomationTarget::PluginParam { device_id: d, .. } if *d == device_id)
-                && is_per_note_routing(mod_plane, r)
-                && !mod_routings[..*i].iter().any(|p| p.target == r.target && is_per_note_routing(mod_plane, p))
-        })
-        .count()
+/// r.md #117: この target を指す routing に per-note 経路のものが 1 本でもあるか
+/// (= この param は per-note ストリームを持つ)。
+fn has_per_note(mod_plane: ModTickPlaneRef<'_>, routings: TargetRoutings<'_>) -> bool {
+    routings.iter().any(|r| is_per_note_routing(mod_plane, r))
 }
 
 /// r.md #117: 1 ボイス・1 刻みの正規化オフセット = **その param 宛の全 routing の和**。 `Note`
 /// 起点の source はそのボイスの時刻 `time` で閉形式評価、 それ以外は面の値 (深さが動く変調は
 /// 面の実効値 — global と同じ)。
 fn per_note_offset_at(
-    mod_routings: &[common::model::ModRouting],
-    target: &AutomationTarget,
+    routings: TargetRoutings<'_>,
     mod_plane: ModTickPlaneRef<'_>,
     f: u32,
     time: common::modulators::ModTime,
 ) -> f64 {
     use common::modulators::generator_scalar;
-    f64::from(common::automation::modulation_offset_norm_with(
-        target,
-        mod_routings,
+    f64::from(common::automation::modulation_offset_norm_over(
+        routings.iter(),
         |sid| match mod_plane.source_node(sid) {
             Some(n) if n.kind.is_per_note() => Some(generator_scalar(&n.kind, time).unwrap_or(0.0).clamp(0.0, 1.0)),
             _ => mod_plane.scalar_at_frame_opt(sid, f),
@@ -560,11 +498,11 @@ fn per_note_offset_at(
 /// 同じ param の per-note routing が複数あっても 1 event (和) になる (CLAP `param_mod` は
 /// 絶対値で後勝ちなので、 別々に送ると加算されない)。
 ///
-/// `stride` / `n_ticks` は global と共通の予算 (ストリーム数で割った刻み)。
+/// `budget` / `n_ticks` は global と共通の予算 (ストリーム数で割った 1 ストリームの件数、[`sends_tick`])。
 #[allow(clippy::too_many_arguments)]
 fn push_per_note_param_mods(
     pd: &mut ProcessData,
-    mod_routings: &[common::model::ModRouting],
+    store: ParamStore<'_>,
     device_id: u64,
     sample_rate: u32,
     current_bpm: f64,
@@ -572,22 +510,19 @@ fn push_per_note_param_mods(
     frames: u32,
     mod_plane: ModTickPlaneRef<'_>,
     voices: &crate::graph::voices::VoiceTable,
-    stride: usize,
+    budget: usize,
     n_ticks: usize,
 ) {
     use common::modulators::ModTime;
     let sr = f64::from(sample_rate.max(1));
     let secs0 = mod_plane.first_sample() as f64 / sr;
     let beats_per_frame = current_bpm / (60.0 * sr);
-    for (i, r) in mod_routings.iter().enumerate() {
-        let AutomationTarget::PluginParam { device_id: d, param_id, .. } = &r.target else {
+    // 同一 target は 1 度だけ (索引が target ごとに束ねてある)。
+    for (target, routings) in store.targets_of(ParamSubject::Plugin(device_id)) {
+        let AutomationTarget::PluginParam { param_id, .. } = *target else {
             continue;
         };
-        if *d != device_id || !is_per_note_routing(mod_plane, r) {
-            continue;
-        }
-        // 同一 target は 1 度だけ (先行する同 target の per-note routing があれば skip)。
-        if mod_routings[..i].iter().any(|p| p.target == r.target && is_per_note_routing(mod_plane, p)) {
+        if !has_per_note(mod_plane, routings) {
             continue;
         }
         for v in voices.iter() {
@@ -598,7 +533,7 @@ fn push_per_note_param_mods(
             };
             let mut last = f64::NAN;
             for (t, f) in mod_plane.starts(frames).enumerate() {
-                if t % stride != 0 && t + 1 != n_ticks {
+                if !sends_tick(t, n_ticks, budget) {
                     continue;
                 }
                 let ft = f64::from(f);
@@ -609,9 +544,9 @@ fn push_per_note_param_mods(
                     v.on_secs,
                     v.off_secs,
                 );
-                let offset = per_note_offset_at(mod_routings, &r.target, mod_plane, f, time);
+                let offset = per_note_offset_at(routings, mod_plane, f, time);
                 if last.is_nan() || (offset - last).abs() > 1e-6 {
-                    pd.push_param_mod_note(f, *param_id, offset, note_id, v.key, v.channel);
+                    pd.push_param_mod_note(f, param_id, offset, note_id, v.key, v.channel);
                     last = offset;
                 }
             }
@@ -642,8 +577,10 @@ mod tests {
             .map(|s| s.mod_sources.iter().map(|m| m.id).collect())
             .unwrap_or_default();
         let mod_plane = ModTickPlaneRef::new(&ids, mod_scalars, 64);
+        let index = song.map_or_else(SongIndex::default, SongIndex::build);
         fill_track_param_ramps(
             song,
+            &index,
             track_idx,
             TrackRows::default(),
             sample_rate,
@@ -672,11 +609,12 @@ mod tests {
     ) {
         let ids: Vec<u32> = song.mod_sources.iter().map(|m| m.id).collect();
         let mod_plane = ModTickPlaneRef::new(&ids, mod_scalars, 64);
+        let index = SongIndex::build(song);
         fill_pd_param_events(
             pd,
             song,
             track_id,
-            song.param_stores(track_id).expect("owner store"),
+            owner_store(song, &index, track_id),
             TrackRows::default(),
             device_id,
             sample_rate,
@@ -688,6 +626,12 @@ mod tests {
             None,
         );
     }
+
+    /// `owner` (track id か `MASTER_TRACK_ID`) の置き場 (本番は program 実行ごとに解いたものを渡す)。
+    fn owner_store<'a>(song: &'a Song, index: &'a SongIndex, owner: u32) -> ParamStore<'a> {
+        index.store(song, song.param_store_at(owner).expect("owner store"))
+    }
+
     use common::model::{
         AutomationClip, AutomationContent, AutomationCurve, AutomationLane,
         AutomationPoint, ClipContent, Song, Track,
@@ -1037,8 +981,10 @@ mod tests {
         }));
 
         let empty = empty_recording_lanes();
+        let index = SongIndex::build(&song);
         let resolve = |dev: &NativeDevice, rec| {
-            resolve_native_device(&song, dev, 1, TrackRows::default(), 0.0, rec, ModTickPlaneRef::default())
+            let store = owner_store(&song, &index, 1);
+            resolve_native_device(&song.clip_contents, store, dev, 1, TrackRows::default(), 0.0, rec, ModTickPlaneRef::default())
         };
         let thr = |d: NativeDevice| d.param(NativeParamId::Comp(CompParam::Threshold)).unwrap();
         assert!((thr(resolve(&comp, &empty)) - -30.0).abs() < 1e-4);
@@ -1135,6 +1081,58 @@ mod tests {
         assert!(last > pd.events_in[0].value, "ramp で値が増加");
     }
 
+    /// 刻みを間引く予算は「最後の刻みは必ず送る」1 件を含めて数える。数えないと 1 ストリームが予算 + 1 件になり、
+    /// ストリームが多いと `param_mods` のリングが溢れて先頭 param の刻みが落ちる (20 param × 16 ボイスの per-note)。
+    #[test]
+    fn many_param_mod_streams_fit_the_ring_and_keep_the_last_tick() {
+        use crate::graph::voices::VoiceTable;
+        use common::model::{LfoConfig, LfoShape, ModRouting, ModSource, ModSourceKind, Polarity, RetriggerMode};
+        let mut song = Song::default();
+        song.mod_sources.push(ModSource {
+            id: 9,
+            owner_track_id: 7,
+            color: [0.0; 3],
+            kind: ModSourceKind::Lfo(LfoConfig { shape: LfoShape::SawUp, retrigger: RetriggerMode::Note, ..LfoConfig::default() }),
+            enabled: true,
+        });
+        song.tracks.push(track(|t| {
+            t.id = 7;
+            t.mod_routings = (0..20u32)
+                .map(|p| ModRouting {
+                    id: p + 1,
+                    target: AutomationTarget::PluginParam { device_id: DEVICE_ID, param_id: p, legacy_device_index: None },
+                    source_id: 9,
+                    depth: 1.0,
+                    polarity: Polarity::Unipolar,
+                    enabled: true,
+                })
+                .collect();
+        }));
+        let plan = common::mod_graph::build_plan(&song, 1, |b| b);
+        let plane = ModTickPlaneRef::new(&plan.slot_ids, &[], 64).with_nodes(&plan.nodes);
+        let mut voices = VoiceTable::new(DEVICE_ID);
+        for v in 0..16u32 {
+            voices.note_on(100 + v, 60, 0, -f64::from(v) * 0.01, 0.0, 1.0);
+        }
+        let index = SongIndex::build(&song);
+        let frames = 1024;
+        let mut pd = ProcessData::empty();
+        let store = owner_store(&song, &index, 7);
+        let empty = empty_recording_lanes();
+        fill_pd_param_events(&mut pd, &song, 7, store, TrackRows::default(), DEVICE_ID, SR, 120.0, 0.5, frames, &empty, plane, Some(&voices));
+        assert_eq!(pd.param_mods_dropped, 0, "リングが溢れた");
+        let last = plane.starts(frames).last().expect("刻みがある");
+        for p in 0..20u32 {
+            for v in 0..16i32 {
+                assert!(
+                    pd.param_mods_iter().any(|m| m.param_id == p && m.note_id == 100 + v && m.time == last),
+                    "param {p} / note {} に最後の刻みが届いていない",
+                    100 + v
+                );
+            }
+        }
+    }
+
     /// r.md #117: `Note` 起点のソースを source にする plugin param の routing は、 鳴っている
     /// ボイスごとに `ParamMod { note_id, key }` を積む (値はそのノートの note-on からの位相)。
     /// ノートが無ければ per-note は 1 件も出ない。 routing / source のバイパスは飛ばす。
@@ -1176,10 +1174,9 @@ mod tests {
         voices.note_on(100, 60, 0, 0.0, 0.0, 1.0);
         voices.note_on(101, 64, 0, 0.25, 0.125, 1.0);
         let mut pd = ProcessData::empty();
-        fn stores(song: &Song) -> (&[AutomationLane], &[ModRouting]) {
-            song.param_stores(7).expect("track 7")
-        }
-        fill_pd_param_events(&mut pd, &song, 7, stores(&song), TrackRows::default(), DEVICE_ID, SR, 120.0, 0.5, 128, &empty, plane, Some(&voices));
+        let index = SongIndex::build(&song);
+        let store = owner_store(&song, &index, 7);
+        fill_pd_param_events(&mut pd, &song, 7, store, TrackRows::default(), DEVICE_ID, SR, 120.0, 0.5, 128, &empty, plane, Some(&voices));
         // global (最新ノート = 面の値、 ここでは面が空なので 0) は従来どおり別に積まれる。
         let mods: Vec<_> = pd.param_mods_iter().copied().filter(|m| !m.is_global()).collect();
         let at0 = |nid: i32| mods.iter().find(|m| m.note_id == nid && m.time == 0).map(|m| m.value).expect("frame 0 の mod");
@@ -1191,13 +1188,15 @@ mod tests {
         // ボイス無し → per-note なし。 source バイパス → なし。
         let per_note = |pd: &ProcessData| pd.param_mods_iter().filter(|m| !m.is_global()).count();
         let mut pd = ProcessData::empty();
-        fill_pd_param_events(&mut pd, &song, 7, stores(&song), TrackRows::default(), DEVICE_ID, SR, 120.0, 0.5, 128, &empty, plane, None);
+        fill_pd_param_events(&mut pd, &song, 7, store, TrackRows::default(), DEVICE_ID, SR, 120.0, 0.5, 128, &empty, plane, None);
         assert_eq!(per_note(&pd), 0);
         song.mod_sources[0].enabled = false;
         let plan = common::mod_graph::build_plan(&song, 2, |b| b);
         let plane = ModTickPlaneRef::new(&plan.slot_ids, &[], 64).with_nodes(&plan.nodes);
+        let index = SongIndex::build(&song);
+        let store = owner_store(&song, &index, 7);
         let mut pd = ProcessData::empty();
-        fill_pd_param_events(&mut pd, &song, 7, stores(&song), TrackRows::default(), DEVICE_ID, SR, 120.0, 0.5, 128, &empty, plane, Some(&voices));
+        fill_pd_param_events(&mut pd, &song, 7, store, TrackRows::default(), DEVICE_ID, SR, 120.0, 0.5, 128, &empty, plane, Some(&voices));
         assert_eq!(per_note(&pd), 0, "バイパス中の source は per-note も出さない");
     }
 

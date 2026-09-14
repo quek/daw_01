@@ -32,15 +32,16 @@
 
 use std::ops::Range;
 
-use common::model::{AutomationLane, AutomationTarget, Device, LoopRegion, ModRouting, Song, SplitEdge, TrackBuiltinParam};
+use common::model::{AutomationTarget, Device, LoopRegion, ParamStoreAt, Song, SplitEdge, TrackBuiltinParam};
 use common::port_config::PortConfig;
 use common::process_data::EventKind;
+use common::song_index::{ParamStore, SongIndex};
 
 use crate::engine::{PairLease, PluginRefs};
 use crate::graph::DelayLine;
 use crate::graph::band_split::Splitter;
 use crate::graph::native::{NativeIo, NativeScratch};
-use crate::graph::schedule::find_near;
+use crate::graph::schedule::KeyIndex;
 use crate::graph::voices::VoiceTable;
 use crate::launcher::TrackRows;
 use crate::mixer::{MAX_EVENTS, MAX_FRAMES};
@@ -115,6 +116,8 @@ pub struct ParallelScratch {
     pub split: Option<Splitter>,
     /// 素材の音だけを描く (`RenderScope::Sources`、module doc の信号規則)。compile 時に焼く。
     pub sources: bool,
+    /// この buffer でこの Parallel のどれかの chain が solo か (`ParallelBegin` が見る)。
+    pub any_chain_solo: bool,
 }
 
 /// gain match の窓 (一次 IIR の時定数、秒)。 ポンピングが出ない程度に遅く。
@@ -143,6 +146,7 @@ impl ParallelScratch {
             in_ms: 0.0,
             out_ms: 0.0,
             match_gain: 1.0,
+            any_chain_solo: false,
         }
     }
 
@@ -209,7 +213,9 @@ pub enum Pass1Role {
     /// group / return / パラアウト先: pass 1 では何もしない (合流と device は pass 2 の `ProcessGroupFx`)。
     Bus,
     /// パラアウトの楽器兼 group: 楽器の prefix `[..pass1_end]` だけ。残りとフェーダーは pass 2。
-    GroupWithInstrument,
+    /// `main_to_child` = 楽器の main 出力も子トラックへ送る (全部子、`Track::paraout_main_to_child`)。
+    /// pass 1 は自分の scratch を空にし、pass 2 の合流は clearing `Mix` になる (compile の emit と同じ値)。
+    GroupWithInstrument { main_to_child: bool },
 }
 
 /// 1 track (または master) の device ツリーを展開した命令列 + その scratch。
@@ -248,6 +254,18 @@ pub struct ChainProgram {
     /// SC Listen: この buffer で検出信号を書いた Comp の slot。トラック出力 (PostFx 点) で消費する
     /// (`graph::native::apply_listen_override`)。
     pub listen_pending: Option<u32>,
+    /// 再 compile 跨ぎの状態移送で、この program が「旧」になったときに引く鍵の索引 ([`Self::index_state_keys`])。
+    pub state_keys: ProgramKeys,
+}
+
+/// [`ChainProgram::adopt_state_from`] の突き合わせの鍵の索引。
+#[derive(Debug, Default)]
+pub struct ProgramKeys {
+    delay: KeyIndex<u64>,
+    chains: KeyIndex<u64>,
+    parallels: KeyIndex<u64>,
+    voices: KeyIndex<u64>,
+    natives: KeyIndex<u64>,
 }
 
 impl ChainProgram {
@@ -269,26 +287,39 @@ impl ChainProgram {
             snapshot_post_fx: false,
             fader: true,
             listen_pending: None,
+            state_keys: ProgramKeys::default(),
         }
+    }
+
+    /// [`Self::adopt_state_from`] の鍵の索引を作る (off-thread、program を組み終えた後)。
+    pub fn index_state_keys(&mut self) {
+        self.state_keys = ProgramKeys {
+            delay: KeyIndex::build(self.delay_keys.iter().copied()),
+            chains: KeyIndex::build(self.chains.iter().map(|c| c.chain_id)),
+            parallels: KeyIndex::build(self.parallels.iter().map(|r| r.parallel_id)),
+            voices: KeyIndex::build(self.voices.iter().map(|v| v.device_id)),
+            natives: KeyIndex::build(self.natives.iter().map(|n| n.device_id)),
+        };
     }
 
     /// 再 compile 跨ぎの状態移送 (`Schedule::adopt_state_from` と同じ契約、RT 上で
     /// 呼ばれる = ポインタ swap と f32 コピーのみ)。delay line は chain id で、chain の
     /// tap snapshot も chain id で引き継ぐ (同 track 内 chain sidechain は前 buffer の
     /// snapshot を読むので、捨てると編集のたびに 1 buffer 無音が入る)。
-    /// 突き合わせは `find_near` (device や chain の数に上限が無いので二乗にしない — 並びは再 compile を跨いで
-    /// ほぼ保たれる)。
+    /// 突き合わせは旧 program の鍵の索引 ([`ProgramKeys`]、compile 時に作ってある) — device や chain の数に上限が
+    /// 無いので、入れ替わった / 消えた要素があっても二乗にしない。
     pub fn adopt_state_from(&mut self, old: &mut ChainProgram) {
+        let keys = &old.state_keys;
         let mut hint = 0;
         for (i, key) in self.delay_keys.iter().enumerate() {
-            if let Some(j) = find_near(&old.delay_keys, hint, |k| k == key) {
+            if let Some(j) = keys.delay.find_near(&old.delay_keys, *key, hint) {
                 self.delay_lines[i].adopt(&mut old.delay_lines[j]);
                 hint = j + 1;
             }
         }
         hint = 0;
         for cs in &mut self.chains {
-            if let Some(j) = find_near(&old.chains, hint, |o| o.chain_id == cs.chain_id) {
+            if let Some(j) = keys.chains.find_near_by(cs.chain_id, hint, |j| old.chains.get(j).map(|o| o.chain_id)) {
                 let o = &old.chains[j];
                 cs.post_fx_l.copy_from_slice(&o.post_fx_l);
                 cs.post_fx_r.copy_from_slice(&o.post_fx_r);
@@ -300,7 +331,7 @@ impl ChainProgram {
         // Parallel の走行状態 (gain match の追従値、 帯域分割のフィルタ状態) は Parallel id で。
         hint = 0;
         for rs in &mut self.parallels {
-            if let Some(j) = find_near(&old.parallels, hint, |o| o.parallel_id == rs.parallel_id) {
+            if let Some(j) = keys.parallels.find_near_by(rs.parallel_id, hint, |j| old.parallels.get(j).map(|o| o.parallel_id)) {
                 let o = &old.parallels[j];
                 rs.in_ms = o.in_ms;
                 rs.out_ms = o.out_ms;
@@ -315,7 +346,7 @@ impl ChainProgram {
         // per-note 変調が起点を失う)。
         hint = 0;
         for vt in &mut self.voices {
-            if let Some(j) = find_near(&old.voices, hint, |o| o.device_id == vt.device_id) {
+            if let Some(j) = keys.voices.find_near_by(vt.device_id, hint, |j| old.voices.get(j).map(|o| o.device_id)) {
                 vt.adopt_state_from(&old.voices[j]);
                 hint = j + 1;
             }
@@ -324,7 +355,7 @@ impl ChainProgram {
         // 編集のたびに再 compile されるので、ここで引き継がないとフィルタとコンプの平滑が毎回切れる。
         hint = 0;
         for ns in &mut self.natives {
-            if let Some(j) = find_near(&old.natives, hint, |o| o.device_id == ns.device_id) {
+            if let Some(j) = keys.natives.find_near_by(ns.device_id, hint, |j| old.natives.get(j).map(|o| o.device_id)) {
                 ns.adopt_state_from(&mut old.natives[j]);
                 hint = j + 1;
             }
@@ -352,11 +383,18 @@ pub struct ProgramCtx<'a> {
     pub own_pre_fx: Option<(&'a [f32], &'a [f32])>,
     /// r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
     pub native: NativeIo<'a>,
-    /// その program の持ち主の device 列 (内蔵 device の値を引く。op ごとに track を探索しない)。
-    pub owner_devices: &'a [Device],
-    /// その program の持ち主の lane / routing store (`Song::param_stores(track_id)` を program
-    /// 実行ごとに 1 回だけ解決したもの)。
-    pub owner_stores: (&'a [AutomationLane], &'a [ModRouting]),
+    /// `song` と同じ snapshot の索引 (内蔵 device / Parallel / chain を id で引く。op ごとに device ツリーを歩かない)。
+    pub index: &'a SongIndex,
+    /// その program の持ち主 (track の位置 / master)。device 列と lane / routing の置き場はここから引く。
+    pub owner: ParamStoreAt,
+}
+
+impl<'a> ProgramCtx<'a> {
+    /// 持ち主の lane / routing の置き場 (`song` が無ければ空)。
+    #[must_use]
+    pub fn owner_store(&self) -> ParamStore<'a> {
+        self.song.map_or_else(ParamStore::default, |s| self.index.store(s, self.owner))
+    }
 }
 
 /// `program.ops[range]` を現在のバス (`bus_l/r` + `midi_a/b`) に対して走らせる。
@@ -410,12 +448,15 @@ pub fn run_chain_program(
                 rs.sum_r[..n].fill(0.0);
                 rs.merged_midi.clear();
                 rs.any_midi_replaced = false;
+                let parallel_id = rs.parallel_id;
+                let parallel = ctx.song.and_then(|s| ctx.index.parallel(s, parallel_id));
+                // chain の solo は Parallel ごとに buffer 頭で 1 回だけ見る (`ChainEnd` ごとに全 chain を舐めない)。
+                rs.any_chain_solo = parallel.is_some_and(|p| p.chains.iter().any(|c| c.solo));
                 // r.md #112: 入力の分割。 帯域分割のクロスオーバーは automation / 変調 ramp の
                 // 終端値で係数を組む。
-                let parallel_id = rs.parallel_id;
                 match rs.split.as_mut() {
                     Some(Splitter::Frequency3(bs)) => {
-                        let (low, high) = resolve_split_freqs(ctx, parallel_id);
+                        let (low, high) = parallel.map_or(common::model::Split::DEFAULT_FREQS, |r| r.split.freqs_or_default());
                         let edge = |e| TrackBuiltinParam::ParallelSplitFreq { parallel_id, edge: e };
                         fill_parallel_ramp(ctx, track_id, edge(SplitEdge::LowMid), low, &mut bs.low_ramp);
                         fill_parallel_ramp(ctx, track_id, edge(SplitEdge::MidHigh), high, &mut bs.high_ramp);
@@ -425,7 +466,7 @@ pub fn run_chain_program(
                     // r.md #114: アクティブ chain の位置 (automation + 変調の per-sample ramp) と
                     // クロスフェード時間は Song snapshot から live-read。
                     Some(Splitter::Selector(sel)) => {
-                        let (pos, fade_ms) = resolve_selector(ctx, parallel_id);
+                        let (pos, fade_ms) = selector_state(parallel);
                         let target = TrackBuiltinParam::ParallelSelect { parallel_id };
                         fill_parallel_ramp(ctx, track_id, target, pos, &mut sel.pos_ramp);
                         sel.process(ctx.sample_rate, fade_ms, &rs.in_l, &rs.in_r, &rs.in_midi, n);
@@ -494,8 +535,7 @@ pub fn run_chain_program(
                         rs.sum_r[i] += bus_r[i];
                     }
                 } else {
-                    let (gain, pan, effective_mute) =
-                        resolve_chain_mixer(ctx, track_id, *parallel_id, *chain_id);
+                    let (gain, pan, effective_mute) = resolve_chain_mixer(ctx, *parallel_id, *chain_id, rs.any_chain_solo);
                     fill_chain_ramps(ctx, track_id, *chain_id, gain, pan, cs);
                     mix_chain_into_sum(bus_l, bus_r, n, effective_mute, *snapshot_post_fader, cs, rs);
                 }
@@ -620,51 +660,29 @@ fn append_midi(dst: &mut Vec<TimedNoteEvent>, src: &[TimedNoteEvent]) {
 
 /// chain の (gain, pan, effective_mute) を Song snapshot から live-read する
 /// (track の M/S と同じく再 compile なしで効く)。snapshot が無ければ unity。
-fn resolve_chain_mixer(
-    ctx: &ProgramCtx<'_>,
-    _track_id: u32,
-    parallel_id: u64,
-    chain_id: u64,
-) -> (f32, f32, bool) {
-    let Some(song) = ctx.song else {
+/// `any_chain_solo` は `ParallelBegin` が buffer 頭に見た「この Parallel のどれかの chain が solo」。
+fn resolve_chain_mixer(ctx: &ProgramCtx<'_>, parallel_id: u64, chain_id: u64, any_chain_solo: bool) -> (f32, f32, bool) {
+    let Some(chain) = ctx.song.and_then(|s| ctx.index.chain_in(s, parallel_id, chain_id)) else {
         return (1.0, 0.0, false);
     };
-    let Some(parallel) = song.parallel_by_id(parallel_id) else {
-        return (1.0, 0.0, false);
-    };
-    let Some(chain) = parallel.chains.iter().find(|c| c.id == chain_id) else {
-        return (1.0, 0.0, false);
-    };
-    let any_solo = parallel.chains.iter().any(|c| c.solo);
-    let effective_mute = chain.muted || (any_solo && !chain.solo);
+    let effective_mute = chain.muted || (any_chain_solo && !chain.solo);
     (chain.gain, chain.pan, effective_mute)
 }
 
 /// Parallel の (out_gain, gain_match) を Song snapshot から live-read する。無ければ unity / off。
 fn resolve_parallel_out(ctx: &ProgramCtx<'_>, parallel_id: u64) -> (f32, bool) {
     ctx.song
-        .and_then(|s| s.parallel_by_id(parallel_id))
+        .and_then(|s| ctx.index.parallel(s, parallel_id))
         .map_or((1.0, false), |r| (r.out_gain, r.gain_match))
-}
-
-/// r.md #112: Parallel のクロスオーバー (low, high) を Song snapshot から live-read する。
-/// snapshot に無い / `Frequency3` でなければ既定値 (compile 時に split が付いた Parallel だけが
-/// ここへ来る)。
-fn resolve_split_freqs(ctx: &ProgramCtx<'_>, parallel_id: u64) -> (f32, f32) {
-    ctx.song
-        .and_then(|s| s.parallel_by_id(parallel_id))
-        .map_or(common::model::Split::DEFAULT_FREQS, |r| r.split.freqs_or_default())
 }
 
 /// r.md #114: Selector の (アクティブ chain の位置, クロスフェード ms) を Song snapshot から
 /// live-read する。 snapshot に無い / `Selector` でなければ (中央, 既定)。
-fn resolve_selector(ctx: &ProgramCtx<'_>, parallel_id: u64) -> (f32, f32) {
+fn selector_state(parallel: Option<&common::model::Parallel>) -> (f32, f32) {
     use common::model::Split;
-    ctx.song
-        .and_then(|s| s.parallel_by_id(parallel_id))
-        .map_or((0.5, Split::DEFAULT_SELECTOR_FADE_MS), |r| {
-            (r.select_pos(), r.split.selector_fade_ms().unwrap_or(Split::DEFAULT_SELECTOR_FADE_MS))
-        })
+    parallel.map_or((0.5, Split::DEFAULT_SELECTOR_FADE_MS), |r| {
+        (r.select_pos(), r.split.selector_fade_ms().unwrap_or(Split::DEFAULT_SELECTOR_FADE_MS))
+    })
 }
 
 /// Parallel の builtin param (クロスオーバー周波数 / Selector の位置) の ramp を埋める
@@ -681,12 +699,10 @@ fn fill_parallel_ramp(
         buf[..n].fill(constant);
         return;
     };
-    let (lanes, routings) = ctx.owner_stores;
     crate::automation::fill_target_ramp(
         song,
         track_id,
-        lanes,
-        routings,
+        ctx.owner_store(),
         ctx.rows,
         ctx.sample_rate,
         f64::from(ctx.current_bpm),
@@ -713,12 +729,10 @@ fn fill_parallel_out_ramp(
         rs.out_gain_ramp[..n].fill(out_gain);
         return;
     };
-    let (lanes, routings) = ctx.owner_stores;
     crate::automation::fill_target_ramp(
         song,
         track_id,
-        lanes,
-        routings,
+        ctx.owner_store(),
         ctx.rows,
         ctx.sample_rate,
         f64::from(ctx.current_bpm),
@@ -748,12 +762,10 @@ fn fill_chain_ramps(
         cs.pan_ramp[..n].fill(pan);
         return;
     };
-    let (lanes, routings) = ctx.owner_stores;
     crate::automation::fill_target_ramp(
         song,
         track_id,
-        lanes,
-        routings,
+        ctx.owner_store(),
         ctx.rows,
         ctx.sample_rate,
         f64::from(ctx.current_bpm),
@@ -768,8 +780,7 @@ fn fill_chain_ramps(
     crate::automation::fill_target_ramp(
         song,
         track_id,
-        lanes,
-        routings,
+        ctx.owner_store(),
         ctx.rows,
         ctx.sample_rate,
         f64::from(ctx.current_bpm),
@@ -859,7 +870,7 @@ fn run_plugin(
             pd,
             song,
             track_id,
-            ctx.owner_stores,
+            ctx.owner_store(),
             ctx.rows,
             device_id,
             ctx.sample_rate,
@@ -1015,8 +1026,8 @@ mod tests {
             own_pre_fx: None,
             rows: TrackRows::default(),
             native: NativeIo::default(),
-            owner_devices: &song.tracks[0].devices,
-            owner_stores: (&[], &[]),
+            index: &SongIndex::build(song),
+            owner: ParamStoreAt::Track(0),
         };
         let mut midi_b = Vec::with_capacity(MAX_EVENTS);
         let len = program.ops.len();
@@ -1122,8 +1133,8 @@ mod tests {
                 own_pre_fx: None,
                 rows: TrackRows::default(),
                 native: NativeIo::default(),
-                owner_devices: &song.tracks[0].devices,
-                owner_stores: (&[], &[]),
+                index: &SongIndex::build(song),
+                owner: ParamStoreAt::Track(0),
             };
             let mut midi = Vec::with_capacity(MAX_EVENTS);
             let mut midi_b = Vec::with_capacity(MAX_EVENTS);
@@ -1181,8 +1192,10 @@ mod tests {
         let mut program = built.program;
         let refs: PluginRefs = std::collections::HashMap::new();
         let lanes = HashSet::new();
+        let index = SongIndex::build(&song);
         fn ctx<'a>(
             song: &'a Song,
+            index: &'a SongIndex,
             refs: &'a PluginRefs,
             lanes: &'a HashSet<(u32, AutomationTarget)>,
         ) -> ProgramCtx<'a> {
@@ -1201,8 +1214,8 @@ mod tests {
                 own_pre_fx: None,
                 rows: TrackRows::default(),
                 native: NativeIo::default(),
-                owner_devices: &song.tracks[0].devices,
-                owner_stores: (&[], &[]),
+                index,
+                owner: ParamStoreAt::Track(0),
             }
         }
         let mut midi = Vec::with_capacity(MAX_EVENTS);
@@ -1211,7 +1224,7 @@ mod tests {
         // 1 buffer 目: chain 11 がフェードイン (重みは 0 から)、 chain 12 は無音。
         let (mut l, mut r) = (vec![1.0f32; 16], vec![1.0f32; 16]);
         {
-            let c = ctx(&song, &refs, &lanes);
+            let c = ctx(&song, &index, &refs, &lanes);
             run_chain_program(&mut program, 0..len, &mut l, &mut r, &mut midi, &mut midi_b, &c);
         }
         assert!((l[7] - 1.0).abs() < 1e-5 && (l[15] - 1.0).abs() < 1e-5, "8 sample で入力そのまま: {l:?}");
@@ -1220,7 +1233,7 @@ mod tests {
         assert!(song.tracks[0].devices[0].as_parallel_mut().unwrap().set_active_chain(12));
         let (mut l, mut r) = (vec![1.0f32; 16], vec![1.0f32; 16]);
         {
-            let c = ctx(&song, &refs, &lanes);
+            let c = ctx(&song, &index, &refs, &lanes);
             run_chain_program(&mut program, 0..len, &mut l, &mut r, &mut midi, &mut midi_b, &c);
         }
         for (i, x) in l.iter().enumerate() {
@@ -1267,8 +1280,8 @@ mod tests {
             rows: TrackRows::default(),
             own_pre_fx: None,
             native: NativeIo::default(),
-            owner_devices: &song.tracks[0].devices,
-            owner_stores: (&[], &[]),
+            index: &SongIndex::build(&song),
+            owner: ParamStoreAt::Track(0),
         };
         let mut last = 0.0f32;
         // 3 秒ぶん (時定数 0.5 s の 6 倍) 流す。
@@ -1394,8 +1407,8 @@ mod tests {
             own_pre_fx: None,
             rows: TrackRows::default(),
             native: NativeIo::default(),
-            owner_devices: &song.tracks[0].devices,
-            owner_stores: (&[], &[]),
+            index: &SongIndex::build(&song),
+            owner: ParamStoreAt::Track(0),
         };
         let mut l = vec![0.0; 8];
         l[0] = 1.0;

@@ -60,16 +60,19 @@ ring へ入れずに畳み込んで park し直す — 先に入れると、flus
 RT は容量が足りない行だけ swap。新 schedule の便は自分の遅延線を必ず全部持つので、畳み込みで
 古い便の遅延線に頼らない。
 
-### 2.3 solo-safe 判定は compile 時の表
+### 2.3 solo-safe 判定は compile 時の辺 + buffer ごとの 1 回の伝播
 
-`ChainProgram::solo_contributors` = その track へ **流れ込む track index の推移閉包**
-(子 → group、send 元 → return)、`ChainProgram::solo_ancestors` = 祖先 group の track index (folder solo)。
-RT は表の track の `solo` を見るだけ (`mix::any_soloed`。Song の走査も固定長配列も無い)。
+`Schedule::solo` (`SoloTables`) は配線を **辺の表** で持つ: 流れ込む辺 (子 → group、send 元 → return) と
+親 group。solo の track から辺を前へ辿った先が「流れ込む track に solo がある」、親から子へ降ろしたものが
+「祖先 group に solo がある」(folder solo)。`render_master_buffer` が dispatch の前に 1 回解き
+(`SoloTables::resolve`、トラック数 + 辺数に比例)、各手は track ごとの bool を読むだけ。track ごとに推移閉包を
+持って舐める形は、入れ子の group で表も判定も track 数の二乗になるのでやめた。
 solo / mute は値のみ更新だが、`parent_group_id` / send 先の変更は topology 変更 (再 compile) なので
-表と song は同じ便で整合する。
+辺の表と song は同じ便で整合する。
 
-再 compile の走行状態の移送 (`Schedule::adopt_state_from`、RT) も delay line / follower / program を
-前回の一致位置から探す (`find_near`) — 並びは再 compile を跨いでほぼ保たれるので線形。
+再 compile の走行状態の移送 (`Schedule::adopt_state_from`、RT) は delay line / follower / program を、旧 schedule が
+compile 時に作った鍵の索引 (`KeyIndex`) で「前回の一致位置の次から」探す — 鍵が消えた / 入れ替わった要素が
+あっても二乗にしない。
 
 ### 2.4 stretch engine の配送は 1 publish = 1 便
 
@@ -82,10 +85,11 @@ solo / mute は値のみ更新だが、`parent_group_id` / send 先の変更は 
 (`LauncherGrowth`)。行数 = トラック数 + 全トラックのレーン数 + master レーン数、行群数 = トラック数 + 2。
 書き出しは off-RT なので曲から数えて確保する。
 
-毎 buffer の行の突き合わせを行数の二乗にしない: `LauncherRuntime::rows` を `for_each_launcher_row` と
-**同じ並び**に揃え (`sync_rows`、消えた行を落としてから増えた行を差し込む — 器は曲の行数ぶんなので逆順だと
-削除と追加が同じ便で届いたとき足した行が入らない)、`resync_cells` / `seed_from_song` / `sync_saved_rows` /
-`launch_scene` / `build_table` は先頭から進むカーソルで組にする (`for_each_row` / `take_row`)。
+毎 buffer の行の突き合わせを行数の二乗にしない: 行の集合と並びは song と同じ便の索引
+(`SongIndex` の launcher 行、`common/src/song_index/launcher.rs`) が持ち、`LauncherRuntime::rows` をその並びの
+先頭から器の容量ぶんに揃える (`sync_rows` — 定常は鍵の比較 1 周、並びが変わった便だけ行き先で並べ替えて
+消えた行を落とし、後ろの席から増えた行を埋める)。揃った後は位置で組にし (`for_each_row` / `take_row`)、
+鍵 → 走行状態の行 (`row_idx`)・セル (clip id / 列)・列ごとの最長のセルは索引の二分探索で引く。
 
 ### 2.6 内蔵 GR メーター
 

@@ -49,11 +49,18 @@ impl ModPlanDelivery {
 pub struct ModPlanPublisher {
     last: Option<Arc<ModPlan>>,
     generation: u64,
+    /// 直近に計画を作った song と sample rate。同じ song (同じ `Arc`) の再配送は作るまでもなく同じ計画なので作らない
+    /// (`Weak` なので中身は延命しないが、確保は残るのでアドレスが別の song に再利用されることもない)。
+    built_from: Option<(std::sync::Weak<Song>, u32)>,
 }
 
 impl ModPlanPublisher {
     /// `song` から評価計画を作る。**世代以外が前回と同じなら `None`** (据え置き)。
-    pub fn build(&mut self, song: &Song, sample_rate: u32) -> Option<ModPlanDelivery> {
+    pub fn build(&mut self, song: &Arc<Song>, sample_rate: u32) -> Option<ModPlanDelivery> {
+        if self.built_from.as_ref().is_some_and(|(s, sr)| std::ptr::eq(s.as_ptr(), Arc::as_ptr(song)) && *sr == sample_rate) {
+            return None;
+        }
+        self.built_from = Some((Arc::downgrade(song), sample_rate));
         let sr = f64::from(sample_rate.max(1));
         // `FromBeat` の anchor を秒へ換算する (テンポマップが要るので呼び側の仕事)。
         #[allow(clippy::cast_precision_loss)]

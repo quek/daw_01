@@ -73,7 +73,7 @@ impl AutomationTarget {
 /// [`Song::param_stores`] の置き場を **位置で** 持ったもの。off-RT で [`Song::param_store_at`] で解いて RT へ
 /// 渡し、RT は [`Song::lanes_at`] で引く (buffer ごとに track を id で探さない)。同じ `Song` の snapshot と組で
 /// 使うこと (track の並びが変われば位置も変わる)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParamStoreAt {
     /// `song_lanes` / `song_mod_routings` (master fx chain と song-wide param)。
     Song,

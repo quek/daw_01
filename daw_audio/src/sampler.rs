@@ -12,7 +12,8 @@
 
 use std::sync::Arc;
 
-use common::model::{Song, TapPoint};
+use common::model::TapPoint;
+use common::song_index::SongIndex;
 use common::protocol::{PreviewNote, ProjectKey, SamplerSource};
 use common::sampler_ring::{SEGMENT_RESYNC_FRAMES, SamplerRingHandle, SegmentInfo};
 
@@ -142,7 +143,8 @@ impl SamplerRt {
     pub fn arm_snapshot_flags(
         &mut self,
         rig: Option<&SamplerRig>,
-        song: Option<&Song>,
+        // 今の song の索引 (track id → 位置。`None` = song 未ロード)。
+        tracks: Option<&SongIndex>,
         scratch: &mut [TrackScratch],
     ) {
         // **毎 buffer 全部下ろしてから立て直す** (`docs/plan_project_tabs.md` §5.5)。
@@ -156,7 +158,7 @@ impl SamplerRt {
         let Some(rig) = rig else { return };
         let SamplerSource::Track { tap, .. } = rig.source else { return };
         // r.md #110: chain source は Global Sampler の対象外 (picker が track だけを出す)。
-        let Some(idx) = song.and_then(|s| tap.source_track().and_then(|t| track_index(s, t))) else { return };
+        let Some(idx) = tracks.and_then(|x| tap.source_track().and_then(|t| x.track_pos(t))) else { return };
         let Some(s) = scratch.get_mut(idx) else { return };
         match tap.tap_point {
             TapPoint::PreFx => s.force_prefx_snapshot = true,
@@ -170,7 +172,7 @@ impl SamplerRt {
     pub fn write_block(
         &mut self,
         rig: &SamplerRig,
-        song: Option<&Song>,
+        tracks: Option<&SongIndex>,
         scratch: &[TrackScratch],
         master_l: &[f32],
         master_r: &[f32],
@@ -203,8 +205,8 @@ impl SamplerRt {
         match rig.source {
             SamplerSource::Master => rig.ring.write_block(&master_l[..n], &master_r[..n]),
             SamplerSource::Track { tap, .. } => {
-                let bufs = song
-                    .and_then(|s| tap.source_track().and_then(|t| track_index(s, t)))
+                let bufs = tracks
+                    .and_then(|x| tap.source_track().and_then(|t| x.track_pos(t)))
                     .and_then(|i| scratch.get(i))
                     .map(|s| match tap.tap_point {
                         TapPoint::PostFader => (&s.track_l[..n], &s.track_r[..n]),
@@ -249,7 +251,7 @@ impl SamplerRt {
         &mut self,
         project: ProjectKey,
         seq: Option<&PreviewSequence>,
-        song: Option<&Song>,
+        tracks: Option<&SongIndex>,
         scratch: &mut [TrackScratch],
         frames_rendered: u64,
         n: usize,
@@ -259,7 +261,7 @@ impl SamplerRt {
             // **持ち主のタブの buffer でだけ畳む。** 試聴していない別タブの buffer で
             // 消すと、毎 buffer 走行状態が捨てられて頭から鳴り直す。
             if owner == Some(project) && (self.seq_cursor.is_some() || !self.seq_active.is_empty()) {
-                self.release_all(song, scratch);
+                self.release_all(tracks, scratch);
                 self.seq_cursor = None;
             }
             if let Some(slot) = self.seq_done.iter_mut().find(|s| s.is_some_and(|(p, _)| p == project)) {
@@ -278,16 +280,16 @@ impl SamplerRt {
             Some((p, g, started, next)) if p == project && g == seq.generation => (g, started, next),
             _ => {
                 // 新しいシーケンス: 鳴っている前のノートは消してから始める。
-                self.release_all(song, scratch);
+                self.release_all(tracks, scratch);
                 (seq.generation, frames_rendered, 0)
             }
         };
         let block_end = frames_rendered + n as u64;
         // まず期限の来た off を出す (同 frame の on より前に)。
-        self.release_due(song, scratch, block_end);
+        self.release_due(tracks, scratch, block_end);
         // track は毎 buffer 安定 id から解く。消えていれば鳴らさず終える。
-        let Some(track_idx) = song.and_then(|s| track_index(s, seq.track_id)) else {
-            self.release_all(song, scratch);
+        let Some(track_idx) = tracks.and_then(|x| x.track_pos(seq.track_id)) else {
+            self.release_all(tracks, scratch);
             self.seq_cursor = None;
             self.mark_seq_done(project, seq.generation);
             return;
@@ -336,12 +338,12 @@ impl SamplerRt {
         }
     }
 
-    fn release_due(&mut self, song: Option<&Song>, scratch: &mut [TrackScratch], block_end: u64) {
+    fn release_due(&mut self, tracks: Option<&SongIndex>, scratch: &mut [TrackScratch], block_end: u64) {
         let mut i = 0;
         while i < self.seq_active.len() {
             let (off_at, track_id, pitch) = self.seq_active[i];
             if off_at < block_end {
-                push_off(song, scratch, track_id, pitch);
+                push_off(tracks, scratch, track_id, pitch);
                 self.seq_active.swap_remove(i);
             } else {
                 i += 1;
@@ -349,9 +351,9 @@ impl SamplerRt {
         }
     }
 
-    fn release_all(&mut self, song: Option<&Song>, scratch: &mut [TrackScratch]) {
+    fn release_all(&mut self, tracks: Option<&SongIndex>, scratch: &mut [TrackScratch]) {
         for &(_, track_id, pitch) in &self.seq_active {
-            push_off(song, scratch, track_id, pitch);
+            push_off(tracks, scratch, track_id, pitch);
         }
         self.seq_active.clear();
     }
@@ -429,8 +431,8 @@ pub fn handle_project_command(
 /// 採番域のどちらとも衝突しない sentinel。
 const PREVIEW_SEQ_NOTE_ID: u32 = u32::MAX - 1;
 
-fn push_off(song: Option<&Song>, scratch: &mut [TrackScratch], track_id: u32, pitch: u8) {
-    let Some(idx) = song.and_then(|s| track_index(s, track_id)) else { return };
+fn push_off(tracks: Option<&SongIndex>, scratch: &mut [TrackScratch], track_id: u32, pitch: u8) {
+    let Some(idx) = tracks.and_then(|x| x.track_pos(track_id)) else { return };
     if let Some(s) = scratch.get_mut(idx) {
         let pp = &mut s.state.pending_preview;
         if pp.len() < pp.capacity() {
@@ -440,10 +442,6 @@ fn push_off(song: Option<&Song>, scratch: &mut [TrackScratch], track_id: u32, pi
             });
         }
     }
-}
-
-fn track_index(song: &Song, track_id: u32) -> Option<usize> {
-    song.tracks.iter().position(|t| t.id == track_id)
 }
 
 fn write_silence(ring: &SamplerRingHandle, n: usize) {
@@ -473,6 +471,7 @@ pub fn wall_clock_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::model::Song;
 
     fn rig(seconds: u32) -> SamplerRig {
         let id = format!("daw_01_sampler_engine_test_{}_{}", std::process::id(), wall_clock_ns());
@@ -583,26 +582,26 @@ mod tests {
             generation: 1,
         };
         // buffer 0: [0, 32) → note 60 on
-        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 0, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&SongIndex::build(&song)), &mut scratch, 0, 32);
         let ev = take_events(&mut scratch[0]);
         assert!(matches!(ev.as_slice(), [NoteTransition::On { key: 60, .. }]));
         // buffer 1: [32, 64) → 60 off (期限 25) と 62 on
-        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 32, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&SongIndex::build(&song)), &mut scratch, 32, 32);
         let ev = take_events(&mut scratch[0]);
         assert!(matches!(
             ev.as_slice(),
             [NoteTransition::Off { key: 60, .. }, NoteTransition::On { key: 62, .. }]
         ));
         // buffer 2: 62 off (期限 45) → 完了
-        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 64, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&SongIndex::build(&song)), &mut scratch, 64, 32);
         let ev = take_events(&mut scratch[0]);
         assert!(matches!(ev.as_slice(), [NoteTransition::Off { key: 62, .. }]));
         assert!(rt.seq_cursor.is_none());
         // 同じ generation が bundle に残っていても先頭からやり直さない (無限ループ防止)
-        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 96, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&SongIndex::build(&song)), &mut scratch, 96, 32);
         assert!(scratch[0].state.pending_preview.is_empty());
         // 停止要求で鳴っているものが無ければ何も出ない
-        rt.step_preview_sequence(PK, None, Some(&song), &mut scratch, 128, 32);
+        rt.step_preview_sequence(PK, None, Some(&SongIndex::build(&song)), &mut scratch, 128, 32);
         assert!(scratch[0].state.pending_preview.is_empty());
     }
 
@@ -622,14 +621,14 @@ mod tests {
             ],
             generation: 1,
         };
-        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 0, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&SongIndex::build(&song)), &mut scratch, 0, 32);
         take_events(&mut scratch[0]);
         // 別タブの buffer (試聴していない) が挟まる。
-        rt.step_preview_sequence(OTHER, None, Some(&song), &mut scratch, 0, 32);
+        rt.step_preview_sequence(OTHER, None, Some(&SongIndex::build(&song)), &mut scratch, 0, 32);
         assert!(scratch[0].state.pending_preview.is_empty(), "別タブの buffer は何も出さない");
         assert!(rt.seq_cursor.is_some(), "持ち主の走行状態が残る");
         // 持ち主の次の buffer は続きから (60 の off と 62 の on)。頭から鳴り直さない。
-        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 32, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&SongIndex::build(&song)), &mut scratch, 32, 32);
         let ev = take_events(&mut scratch[0]);
         assert!(matches!(
             ev.as_slice(),
@@ -647,9 +646,9 @@ mod tests {
             notes: vec![PreviewNote { offset_frames: 0, duration_frames: 1000, pitch: 60, velocity: 100 }],
             generation: 7,
         };
-        rt.step_preview_sequence(PK, Some(&seq), Some(&song), &mut scratch, 0, 32);
+        rt.step_preview_sequence(PK, Some(&seq), Some(&SongIndex::build(&song)), &mut scratch, 0, 32);
         scratch[0].state.pending_preview.clear();
-        rt.step_preview_sequence(PK, None, Some(&song), &mut scratch, 32, 32);
+        rt.step_preview_sequence(PK, None, Some(&SongIndex::build(&song)), &mut scratch, 32, 32);
         let ev = take_events(&mut scratch[0]);
         assert!(matches!(ev.as_slice(), [NoteTransition::Off { key: 60, .. }]));
     }

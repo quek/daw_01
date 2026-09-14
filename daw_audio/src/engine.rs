@@ -32,7 +32,8 @@ use common::audio_bridge::{AudioBridgeHandle, ProjectTelemetry, TelemetryPlane};
 use common::device_scope_bridge::{DeviceScopeBridgeHandle, MAX_DEVICE_SCOPES};
 use common::model::Song;
 use common::protocol::{ProjectKey, SamplerSource};
-use common::timing::{effective_loop_bounds, song_ended};
+use common::song_index::SongIndex;
+use common::timing::{SongBounds, effective_loop_bounds_with, ended_at};
 
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::graph::{DelayLine, DeviceScopeTap, NativeIo, Schedule, render_master_buffer};
@@ -204,7 +205,12 @@ pub enum ProjectDelivery {
 pub struct RtBundle {
     /// 現 song snapshot (`None` = song 未ロード)。
     pub song: Option<Arc<Song>>,
-    pub tempo_map: common::tempo_map::TempoMap,
+    /// `song` の索引 (**同じ便の song と組でしか使えない** — 位置で持つ)。RT が lane / routing / node を
+    /// id や target で探さないためのもの (`common::song_index`)。同じ song の再配送では同じ索引を共有する。
+    pub song_index: Arc<SongIndex>,
+    /// `song` の範囲 (曲末の自動停止 / ループ範囲未指定のループ端)。buffer ごとに全 clip を舐めないよう off-RT で求める。
+    pub song_bounds: SongBounds,
+    pub tempo_map: Arc<common::tempo_map::TempoMap>,
     /// `None` = 値のみ更新 (SetTrackVolume 等) — RT は現行 schedule を
     /// 保持する (§5 D: 値更新で `compile_schedule` を走らせない)。
     /// `Some` = topology 変更 — install 時に `adopt_state_from` で
@@ -288,6 +294,7 @@ impl RtBundle {
     /// off-thread で drop する)。RT thread から呼ばれるので、操作は move と
     /// `Vec` のポインタ swap のみ — alloc / free / lock は無い。
     pub fn supersede(&mut self, mut older: RtBundle) -> RtBundle {
+        // song / song_index は snapshot (新しい便がそのまま勝つ — 必ず同じ便の song と組)。
         if self.schedule.is_none() {
             self.schedule = older.schedule.take();
             // self 側 (値のみ更新) は常に空 Vec だが、drop を RT で走らせない
@@ -357,10 +364,9 @@ pub struct ProjectRt {
     /// (r.md #87: 「停止中に撃ったか」の判定に要る)。
     was_playing: bool,
     /// Phase 5 Step 5.2 (`docs/plan_automation.md` §10): accumulated
-    /// beat-domain playhead。 audio thread が buffer 頭で
-    /// `evaluate_song_tempo(song, playhead_beats)` を呼んで current_bpm を
-    /// 引き、 buffer 末で `playhead_beats += frames * current_bpm / (60 * SR)`
-    /// で advance する。 Play edge / SeekTo IPC では tempo map で逆算する。
+    /// beat-domain playhead。 buffer 頭の拍とテンポは変調の刻み (`ModTickRunner::run_buffer` →
+    /// `common::mod_graph::next_mark`、テンポカーブ + テンポの変調) が解く。 Play edge / SeekTo IPC では
+    /// tempo map で逆算する。
     pub playhead_beats: f64,
     /// Phase 5 Step 5.2: 前 buffer 末の sample-domain playhead。 次 buffer 頭
     /// で `shared.playhead != last_known_playhead` のとき seek が発生したと
@@ -390,11 +396,14 @@ pub struct ProjectRt {
     pub cached_schedule: Schedule,
     /// Last installed `Arc<Song>`.
     pub cached_song: Option<Arc<Song>>,
+    /// `cached_song` と同じ便で届いた索引と曲の範囲。
+    pub song_index: Arc<SongIndex>,
+    pub song_bounds: SongBounds,
     /// (A10 r.md #8) cached_song の SongTempo curve を積分した beat↔sample map。
     /// seek / loop-wrap で playhead を sample→beat に戻すとき、 constant-bpm 線形推定
     /// でなくこの map で tempo automation を honor する。 lookup は O(log n)・
     /// alloc/lock 無で RT 安全。
-    pub tempo_map: common::tempo_map::TempoMap,
+    pub tempo_map: Arc<common::tempo_map::TempoMap>,
     /// RT が使う plugin_refs snapshot (bundle 由来 Arc clone)。
     pub plugin_refs: Arc<PluginRefs>,
     /// MIDI Capture の試聴シーケンス (bundle 由来 Arc clone)。
@@ -492,8 +501,10 @@ impl ProjectRt {
             bundle_recycle_tx,
             cached_schedule: Schedule::empty(),
             cached_song: None,
+            song_index: Arc::default(),
+            song_bounds: SongBounds::default(),
             // 初期は default song (= constant 120bpm)。 seek/loop-wrap は線形に縮退。
-            tempo_map: common::tempo_map::TempoMap::from_song(&Song::default()),
+            tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(&Song::default())),
             plugin_refs: Arc::new(HashMap::new()),
             preview_sequence: None,
             loop_region: common::model::LoopRegion::default(),
@@ -540,6 +551,8 @@ impl ProjectRt {
 
         // ---- swap in the new snapshot, collecting the old for recycling ----
         let old_song = std::mem::replace(&mut self.cached_song, new.song.take());
+        let old_index = std::mem::replace(&mut self.song_index, new.song_index);
+        self.song_bounds = new.song_bounds;
         let old_tempo = std::mem::replace(&mut self.tempo_map, new.tempo_map);
         let old_refs = std::mem::replace(&mut self.plugin_refs, Arc::clone(&new.plugin_refs));
         let old_preview_sequence =
@@ -624,6 +637,8 @@ impl ProjectRt {
         // a last resort rather than leak.
         let recycled = RtBundle {
             song: old_song,
+            song_index: old_index,
+            song_bounds: SongBounds::default(),
             tempo_map: old_tempo,
             schedule: old_schedule,
             reset_song_scoped_state: false,
@@ -652,7 +667,7 @@ impl ProjectRt {
     fn locate_mod(&mut self, song: Option<&Song>, sample: u64, sample_rate: u32) {
         if let Some(s) = song {
             self.mod_tick
-                .locate(s, sample, self.playhead_beats, sample_rate);
+                .locate(s, &self.song_index, sample, self.playhead_beats, sample_rate);
         }
     }
 
@@ -727,7 +742,7 @@ impl ProjectRt {
         // まず現在位置で位相と transport を張る。
         if self.mod_tick.needs_locate() {
             self.mod_tick
-                .locate(song, playhead, self.playhead_beats, sample_rate);
+                .locate(song, &self.song_index, playhead, self.playhead_beats, sample_rate);
         }
         let sched = &self.cached_schedule;
         let env_of = &self.follower_maps.env_of_slot;
@@ -750,7 +765,7 @@ impl ProjectRt {
             scratch.get(idx as usize)?.state.latest_note
         };
         self.mod_tick
-            .run_buffer(song, playhead, frames, sample_rate, follower_env, note_anchor)
+            .run_buffer(song, &self.song_index, playhead, frames, sample_rate, follower_env, note_anchor)
     }
 
     /// r.md #40: off-thread が確保した stretch engine を `TrackScratch` へ取り込む。
@@ -1073,18 +1088,18 @@ impl ProjectRt {
                 sample_rate,
                 n as u32,
             );
-            self.launcher.update(song, span, global_launch_quantize, was_playing);
+            self.launcher.update(song, &self.song_index, span, global_launch_quantize, was_playing);
 
             // Global Sampler: 録音源が PreFx / PostFx tap なら、その track に
             // snapshot を要求する flag を render の前に立てる (この project が
             // 録音源のときだけ `ctx.sampler` が `Some`)。
-            ctx.sampler_rt.arm_snapshot_flags(ctx.sampler, Some(song), &mut self.scratch);
+            ctx.sampler_rt.arm_snapshot_flags(ctx.sampler, Some(&self.song_index), &mut self.scratch);
             // MIDI Capture の試聴: この buffer に入るノートを pending_preview へ
             // (シーケンスは bundle の snapshot field で届く = RT で ArcSwap を load しない)。
             ctx.sampler_rt.step_preview_sequence(
                 self.key,
                 self.preview_sequence.as_deref(),
-                Some(song),
+                Some(&self.song_index),
                 &mut self.scratch,
                 ctx.frames_rendered,
                 n,
@@ -1104,6 +1119,7 @@ impl ProjectRt {
             let master_gain = f32::from_bits(self.shared.master_gain.load(Ordering::Relaxed));
             render_master_buffer(
                 song,
+                &self.song_index,
                 &mut self.cached_schedule,
                 &mut self.scratch,
                 &self.plugin_refs,
@@ -1151,7 +1167,7 @@ impl ProjectRt {
             if let Some(rig) = ctx.sampler {
                 ctx.sampler_rt.write_block(
                     rig,
-                    Some(song),
+                    Some(&self.song_index),
                     &self.scratch,
                     &self.bus_l,
                     &self.bus_r,
@@ -1253,8 +1269,9 @@ impl ProjectRt {
         // Playhead advance + auto-stop / loop wrap.
         if playing {
             let mut new_ph = playhead + n as u64;
+            let song_bounds = self.song_bounds.at(song_ref, sample_rate);
             let active_end = if looping {
-                effective_loop_bounds(song_ref, loop_region, sample_rate).map(|(_, e)| e)
+                effective_loop_bounds_with(song_ref, loop_region, sample_rate, || song_bounds).map(|(_, e)| e)
             } else {
                 None
             };
@@ -1263,7 +1280,7 @@ impl ProjectRt {
                 recording_requested || self.launcher.any_cell_playing(),
                 active_end,
                 new_ph,
-                song_ended(song_ref, sample_rate, new_ph),
+                ended_at(song_bounds, new_ph),
             );
             // r.md #89: `playhead_beats` は **刻みが進める** (この buffer の頭で
             // `ModTickRunner::run_buffer` が解いた値を入れてある)。ここで
@@ -1285,7 +1302,7 @@ impl ProjectRt {
             if reached_end {
                 self.queue_all_notes_off();
                 let wrap_to = if looping {
-                    effective_loop_bounds(song_ref, loop_region, sample_rate).map(|(s, _)| s)
+                    effective_loop_bounds_with(song_ref, loop_region, sample_rate, || song_bounds).map(|(s, _)| s)
                 } else {
                     None
                 };
@@ -1774,7 +1791,9 @@ mod bundle_install_tests {
         let schedule = compile_schedule(song, &test_latencies(), 48_000, 0, common::protocol::RenderScope::Mix).unwrap();
         RtBundle {
             song: Some(Arc::clone(song)),
-            tempo_map: common::tempo_map::TempoMap::from_song(song),
+            song_index: Arc::new(SongIndex::build(song)),
+            song_bounds: SongBounds::of(Some(song), 48_000),
+            tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(song)),
             input_delay_replacements: crate::project_ctl::build_input_delay_replacements(&schedule),
             schedule: Some(schedule),
             reset_song_scoped_state: reset,
@@ -1799,7 +1818,9 @@ mod bundle_install_tests {
     fn value_only(song: &Arc<Song>) -> RtBundle {
         RtBundle {
             song: Some(Arc::clone(song)),
-            tempo_map: common::tempo_map::TempoMap::from_song(song),
+            song_index: Arc::new(SongIndex::build(song)),
+            song_bounds: SongBounds::of(Some(song), 48_000),
+            tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(song)),
             schedule: None,
             reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),
@@ -2435,7 +2456,9 @@ mod multi_project_tests {
     fn bundle(song: &Arc<Song>) -> RtBundle {
         RtBundle {
             song: Some(Arc::clone(song)),
-            tempo_map: common::tempo_map::TempoMap::from_song(song),
+            song_index: Arc::new(SongIndex::build(song)),
+            song_bounds: SongBounds::of(Some(song), 48_000),
+            tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(song)),
             schedule: Some(
                 crate::graph::compile_schedule(song, &HashMap::new(), 48_000, 256, common::protocol::RenderScope::Mix)
                     .unwrap(),

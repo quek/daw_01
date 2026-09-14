@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 
 use common::model::{AutomationTarget, LoopRegion, Song};
 use common::mod_plane::ModTickPlaneRef;
+use common::song_index::SongIndex;
 
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::engine::{PairLease, PluginRefs, WorkerRig};
@@ -48,6 +49,8 @@ pub struct BufferParams<'a> {
 /// pool の worker へポインタで渡す)。可変な資源は生ポインタで持ち、手ごとに `unsafe` 引き口で借りる。
 pub struct RenderCtx<'a> {
     pub song: &'a Song,
+    /// `song` と同じ snapshot の索引。
+    pub index: &'a SongIndex,
     scratch: *mut TrackScratch,
     n_scratch: usize,
     programs: *mut ChainProgram,
@@ -81,6 +84,7 @@ impl<'a> RenderCtx<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         song: &'a Song,
+        index: &'a SongIndex,
         schedule: &'a mut Schedule,
         scratch: &'a mut [TrackScratch],
         master_l: &'a mut [f32],
@@ -96,6 +100,7 @@ impl<'a> RenderCtx<'a> {
         } = schedule;
         Self {
             song,
+            index,
             n_scratch: scratch.len(),
             scratch: scratch.as_mut_ptr(),
             n_programs: track_programs.len(),
@@ -192,6 +197,7 @@ pub fn run_step(ctx: &RenderCtx<'_>, step: Step, slot: usize) {
                     p.frames,
                     p.playing,
                     Some(ctx.song),
+                    ctx.index,
                     p.any_solo,
                     ctx.solo.of(i).1,
                     input_delay,
@@ -246,6 +252,7 @@ unsafe fn run_node(ctx: &RenderCtx<'_>, op: &NodeOp, sync: Option<PairLease<'_>>
                     *track_idx,
                     track,
                     song,
+                    ctx.index,
                     target,
                     program,
                     ctx.plugin_refs,
@@ -336,13 +343,14 @@ unsafe fn run_node(ctx: &RenderCtx<'_>, op: &NodeOp, sync: Option<PairLease<'_>>
                 let (Some(dst), Some(src_s)) = (ctx.scratch_mut(*dst_idx), ctx.scratch(src_idx)) else {
                     return;
                 };
-                let contributors = ctx.solo.of(*src_track_idx).0;
+                let contributor_soloed = ctx.solo.of(*src_track_idx).0;
                 mix_send_into(
                     dst,
                     *dst_idx,
                     src_s,
                     pre_fader,
                     song,
+                    ctx.index,
                     *src_track_idx,
                     *send_id,
                     p.sample_rate,
@@ -352,7 +360,7 @@ unsafe fn run_node(ctx: &RenderCtx<'_>, op: &NodeOp, sync: Option<PairLease<'_>>
                     p.recording_lanes,
                     n,
                     p.rows.track_rows(*src_track_idx as usize),
-                    contributors,
+                    contributor_soloed,
                 );
             }
             NodeOp::MixSend { .. } => {}

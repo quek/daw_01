@@ -74,9 +74,36 @@ pub fn content_bounds_beats(song: &Song) -> Option<(f64, f64)> {
 /// True when `playhead` has advanced past the last clip's end (or there is
 /// nothing playable across the whole song).
 pub fn song_ended(song: Option<&Song>, sample_rate: u32, playhead: u64) -> bool {
-    match song_bounds_samples(song, sample_rate) {
-        Some((_, end)) => playhead >= end,
-        None => false,
+    ended_at(song_bounds_samples(song, sample_rate), playhead)
+}
+
+/// [`song_ended`] の、曲の範囲 ([`song_bounds_samples`]) を求め済みの形 (RT は song と同じ便で届いた値を使い、
+/// buffer ごとに全 clip を舐めない)。
+#[must_use]
+pub fn ended_at(bounds: Option<(u64, u64)>, playhead: u64) -> bool {
+    bounds.is_some_and(|(_, end)| playhead >= end)
+}
+
+/// 曲の範囲 ([`song_bounds_samples`]) を求めたときの sample rate とその値 (song と同じ便で RT へ届ける)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SongBounds {
+    pub sample_rate: u32,
+    pub samples: Option<(u64, u64)>,
+}
+
+impl SongBounds {
+    #[must_use]
+    pub fn of(song: Option<&Song>, sample_rate: u32) -> Self {
+        Self { sample_rate, samples: song_bounds_samples(song, sample_rate) }
+    }
+
+    /// `sample_rate` での曲の範囲。求めたときと rate が違えば (device の rate が session と食い違う間) その rate で
+    /// 求め直して持ち替える — 次の buffer からは求め直さない。`song` は求めたときと同じ snapshot。
+    pub fn at(&mut self, song: Option<&Song>, sample_rate: u32) -> Option<(u64, u64)> {
+        if self.sample_rate != sample_rate {
+            *self = Self::of(song, sample_rate);
+        }
+        self.samples
     }
 }
 
@@ -153,6 +180,16 @@ pub fn effective_loop_bounds(
     loop_region: LoopRegion,
     sample_rate: u32,
 ) -> Option<(u64, u64)> {
+    effective_loop_bounds_with(song, loop_region, sample_rate, || song_bounds_samples(song, sample_rate))
+}
+
+/// [`effective_loop_bounds`] の、曲の範囲を求める手段を渡す形 (RT は song と同じ便で届いた値を返す)。
+pub fn effective_loop_bounds_with(
+    song: Option<&Song>,
+    loop_region: LoopRegion,
+    sample_rate: u32,
+    song_bounds: impl FnOnce() -> Option<(u64, u64)>,
+) -> Option<(u64, u64)> {
     let song_ref = song?;
     if song_ref.bpm > 0.0 && loop_region.has_range() {
         let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song_ref.bpm);
@@ -162,7 +199,7 @@ pub fn effective_loop_bounds(
             return Some((start, end));
         }
     }
-    song_bounds_samples(song, sample_rate)
+    song_bounds()
 }
 
 #[cfg(test)]

@@ -1,50 +1,41 @@
 //! 行のセル列 ([`RowCells`]) と、発火の判断に要る値だけを抜いたセル ([`CellRef`])。
 //! トラック行とレーン行で型が違うだけで規則は同じ (Q4) なので、判定は 1 本にまとめる。
 
-use common::model::{
-    FollowAction, LaunchMode, LaunchQuantize, LaunchSettings, SessionAutomationClip, SessionClip,
-};
+use common::model::{FollowAction, LaunchMode, LaunchQuantize, LaunchSettings};
+use common::song_index::{CellSlice, SessionCells};
 
 use crate::launcher::{RowPhase, is_positive};
 
-/// 行のセル列。トラック行とレーン行で型が違うだけで規則は同じ (Q4) なので、
-/// 判定は 1 本にまとめる。
+/// 行のセル列 ([`SessionCells`] = `Song` のセル列と、同じ snapshot の索引の組)。
 #[derive(Debug, Clone, Copy)]
-pub enum RowCells<'a> {
-    Track(&'a [SessionClip]),
-    Lane(&'a [SessionAutomationClip]),
+pub struct RowCells<'a>(SessionCells<'a>);
+
+impl<'a> From<SessionCells<'a>> for RowCells<'a> {
+    fn from(cells: SessionCells<'a>) -> Self {
+        Self(cells)
+    }
 }
 
 impl RowCells<'_> {
     /// `clip.id` でセルを引く (行の中で一意)。
     #[must_use]
     pub fn find_by_clip(&self, clip_id: u32) -> Option<CellRef> {
-        self.find(|id, _| id == clip_id)
+        self.at(self.0.clip_pos(clip_id)?)
     }
 
-    /// 列 (`scene_id`) でセルを引く。
+    /// 列 (`scene_id`) でセルを引く (その列に複数あれば並びの先頭)。
     #[must_use]
     pub fn find_by_scene(&self, scene_id: u32) -> Option<CellRef> {
-        self.find(|_, sid| sid == scene_id)
+        self.at(self.0.scene_pos(scene_id)?)
     }
 
-    /// この行のセルが使っている列 id を全部見る (列の占有判定用)。
-    pub fn for_each_scene_id(&self, mut f: impl FnMut(u32)) {
-        match self {
-            Self::Track(v) => v.iter().for_each(|c| f(c.scene_id)),
-            Self::Lane(v) => v.iter().for_each(|c| f(c.scene_id)),
-        }
-    }
-
-    fn find(&self, pred: impl Fn(u32, u32) -> bool) -> Option<CellRef> {
-        match self {
-            Self::Track(v) => v
-                .iter()
-                .find(|c| pred(c.clip.id, c.scene_id))
+    fn at(&self, pos: usize) -> Option<CellRef> {
+        match self.0.cells {
+            CellSlice::Track(v) => v
+                .get(pos)
                 .map(|c| CellRef::of(c.scene_id, &c.launch, &c.clip.id, c.clip.start_beat, c.clip.length_beats)),
-            Self::Lane(v) => v
-                .iter()
-                .find(|c| pred(c.clip.id, c.scene_id))
+            CellSlice::Lane(v) => v
+                .get(pos)
                 .map(|c| CellRef::of(c.scene_id, &c.launch, &c.clip.id, c.clip.start_beat, c.clip.length_beats)),
         }
     }

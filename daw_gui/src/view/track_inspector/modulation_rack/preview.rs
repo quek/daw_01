@@ -6,8 +6,8 @@
 //! 形 — 再生位置中心の時間窓をスクロールさせる — に倒し、 変調前の形を薄く重ねて
 //! 「どれだけ振られているか」 を見せる。
 
+use common::automation::SongTempoCurve;
 use common::mod_graph::{MOD_TICK_FRAMES, ModPlan, ModRuntime, TickCtx};
-use common::model::Song;
 use common::modulators::ModTime;
 
 use crate::app::AppData;
@@ -65,13 +65,13 @@ fn window_of(app: &AppData, node: &common::mod_graph::ModNode, secs: f64) -> Opt
 /// (`samples_to_beats` は O(再生位置) の積分なので、 毎フレーム呼ぶと再生位置が
 /// 進むほど描画が重くなる。 後退積分は窓の刻み数ぶんで、 走行そのものと同じ order)。
 /// テンポは各刻みでその拍のテンポを引くので、 前進積分と同じ写像を辿る。
-fn beat_at_window_start(song: &Song, playhead_beat: f64, back_ticks: i64, dt_secs: f64) -> f64 {
+fn beat_at_window_start(tempo: &SongTempoCurve<'_>, playhead_beat: f64, back_ticks: i64, dt_secs: f64) -> f64 {
     let mut beat = playhead_beat;
     for _ in 0..back_ticks {
         if beat <= 0.0 {
             return 0.0;
         }
-        let bpm = f64::from(common::automation::evaluate_song_tempo(song, beat));
+        let bpm = f64::from(tempo.at(beat));
         beat -= bpm * dt_secs / 60.0;
     }
     beat.max(0.0)
@@ -106,12 +106,14 @@ fn walk_window(
     }
     #[allow(clippy::cast_precision_loss)]
     let start_secs = w.start_tick as f64 * w.dt_secs;
-    let mut beat = beat_at_window_start(song, playhead_beat, w.center_tick - w.start_tick, w.dt_secs);
+    // テンポカーブは窓 1 回ぶん 1 度だけ引く (刻みごとに lane と clip 列を探さない)。
+    let tempo = SongTempoCurve::of(song);
+    let mut beat = beat_at_window_start(&tempo, playhead_beat, w.center_tick - w.start_tick, w.dt_secs);
     for k in 0..=w.ticks {
         #[allow(clippy::cast_precision_loss)]
         let secs = start_secs + k as f64 * w.dt_secs;
         // engine と同じく bpm はその時点のテンポカーブから引いて積分する。
-        let bpm = f64::from(common::automation::evaluate_song_tempo(song, beat));
+        let bpm = f64::from(tempo.at(beat));
         let dt_beats = bpm * w.dt_secs / 60.0;
         common::mod_graph::tick(
             plan,

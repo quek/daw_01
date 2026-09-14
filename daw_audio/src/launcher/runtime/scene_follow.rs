@@ -56,16 +56,16 @@ impl LauncherRuntime {
     /// 1 周とみなす — 列そのものは長さを持たないので、鳴っている中身から導く。
     pub(super) fn arm_scene_follow(
         &mut self,
-        song: &Song,
+        song: SongRef<'_>,
         scene_id: u32,
         fire: f64,
         longest: f64,
         now: f64,
     ) {
         let follow = song
-            .scenes
-            .iter()
-            .find(|s| s.id == scene_id)
+            .index
+            .scene_pos(scene_id)
+            .and_then(|pos| song.scenes.get(pos))
             .map(|s| s.follow.clone())
             .unwrap_or_default();
         let base = if fire.is_finite() { fire } else { now };
@@ -81,11 +81,11 @@ impl LauncherRuntime {
     /// 走行中に列のフォローアクションの設定が変わったら張り直す (行の
     /// [`Self::resync_cells`] と同じ規則、SSoT は `Song`)。起点 `base` から周期を刻んで
     /// `now` 以降で最初の発火へ。
-    pub(super) fn resync_scene_follow(&mut self, song: &Song, now: f64) {
+    pub(super) fn resync_scene_follow(&mut self, song: SongRef<'_>, now: f64) {
         if self.scene.scene_id == 0 {
             return;
         }
-        let Some(scene) = song.scenes.iter().find(|s| s.id == self.scene.scene_id) else {
+        let Some(scene) = song.index.scene_pos(self.scene.scene_id).and_then(|pos| song.scenes.get(pos)) else {
             return;
         };
         if scene.follow == self.scene.armed {
@@ -102,20 +102,22 @@ impl LauncherRuntime {
     ///
     /// **グローバル量子化は受け取らない** — 列のフォローアクションはそれを
     /// 迂回する (計画書 §2.3) ので、発火拍の解決に使う値が無い。
-    pub(super) fn tick_scene_follow(&mut self, song: &Song, span: BufferSpan) {
+    pub(super) fn tick_scene_follow(&mut self, song: SongRef<'_>, span: BufferSpan) {
         if !self.scene.at.is_finite() || self.scene.at >= span.end_beat() {
             return;
         }
         let fire = self.scene.at.max(span.start_beat);
-        let Some(pos) = song.scenes.iter().position(|s| s.id == self.scene.scene_id) else {
+        let Some((pos, scene)) =
+            song.index.scene_pos(self.scene.scene_id).and_then(|pos| Some((pos, song.scenes.get(pos)?)))
+        else {
             self.disarm_scene();
             return;
         };
-        let follow = song.scenes[pos].follow.clone();
+        let follow = scene.follow.clone();
         let n = self.fill_scene_occupancy(song);
         let seed = follow::row_seed(SCENE_SEED_SALT, self.scene.scene_id);
-        let outcome =
-            follow::resolve(&follow, &self.occupied[..n], pos, &song.scenes, seed, fire);
+        let scene_pos = |id| song.index.scene_pos(id);
+        let outcome = follow::resolve(&follow, &self.occupied[..n], pos, scene_pos, seed, fire);
         match outcome {
             FollowOutcome::Keep => {
                 // 再武装は **初回と同じ長さ** (その列の最長セル) で張る。
@@ -135,39 +137,24 @@ impl LauncherRuntime {
 
     /// 「その列にどれかの行のセルがあるか」を作業領域へ埋め、有効長を返す。
     ///
-    /// 数える行は [`for_each_launcher_row`] が定義する集合そのもの — マスター行
+    /// 数える行はランチャーの行の集合そのもの ([`SongIndex::scene_longest`]) — マスター行
     /// (`Song.song_lanes`) を落とすと、そこにしかセルの無い列が「空列」と判定され、
     /// Q13 の「空セルに区切られた塊」が誤って途切れる (`Next` がその列を飛ばす /
-    /// その列自身のフォローアクションが一度も発火しない)。
-    ///
-    /// 呼ばれるのは列のフォローアクションが発火する buffer だけなので、走査量は
-    /// 「行 × セル × 列」で足りる (毎 buffer のコストではない)。
-    fn fill_scene_occupancy(&mut self, song: &Song) -> usize {
+    /// その列自身のフォローアクションが一度も発火しない)。同じ id の列が複数あれば先頭だけが埋まる。
+    fn fill_scene_occupancy(&mut self, song: SongRef<'_>) -> usize {
         let n = song.scenes.len().min(MAX_SCENES);
-        let occ = &mut self.occupied[..n];
-        occ.fill(false);
-        for_each_launcher_row(song, |_, cells, _| {
-            cells.for_each_scene_id(|id| {
-                if let Some(i) = song.scenes[..n].iter().position(|sc| sc.id == id) {
-                    occ[i] = true;
-                }
-            });
-        });
+        for (i, (slot, scene)) in self.occupied[..n].iter_mut().zip(&song.scenes).enumerate() {
+            *slot = song.index.scene_pos(scene.id) == Some(i) && song.index.scene_longest(scene.id).is_some();
+        }
         n
     }
 }
 
-/// その列で最も長いセルの長さ (拍)。
+/// その列で最も長いセルの長さ (拍、セルが無ければ 0)。
 ///
 /// 列そのものは長さを持たないので、Linked の列のフォローアクションは鳴っている
 /// 中身から 1 周を導く。`launch_scene` が発火時に数えるのと**同じ規則**を
 /// 再生開始 (reseed) でも使うために切り出してある。
-pub(super) fn scene_longest(song: &Song, scene_id: u32) -> f64 {
-    let mut longest = 0.0_f64;
-    for_each_launcher_row(song, |_, cells, _| {
-        if let Some(c) = cells.find_by_scene(scene_id) {
-            longest = longest.max(c.length_beats);
-        }
-    });
-    longest
+pub(super) fn scene_longest(song: SongRef<'_>, scene_id: u32) -> f64 {
+    song.index.scene_longest(scene_id).unwrap_or(0.0)
 }

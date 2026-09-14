@@ -125,8 +125,17 @@ fn render(s: &Scenario) -> Vec<WindowStats> {
     // 遅延を焼くか = `Song::master_limiter_latency_active` (レーンも変調も無いので静的な on)。
     let mut song = Song { master_limiter: limiter, ..Song::default() };
     let latency_active = song.master_limiter_latency_active();
-    song.master_fx_chain = Vec::new();
+    // 内蔵 device は描画中に song の索引で id から引かれるので、置き場 (master / トラック 1) に置く。
     let track_id = if master { MASTER_TRACK_ID } else { 1 };
+    if master {
+        song.master_fx_chain = devices.clone();
+    } else {
+        let mut track = common::model::Track::default();
+        (track.id, track.devices) = (1, devices.clone());
+        song.master_fx_chain = Vec::new();
+        song.tracks = vec![track];
+    }
+    let index = common::song_index::SongIndex::build(&song);
     let mut program =
         build_program(&devices, track_id, None, &DeviceLatencies::new(), &HashSet::new(), common::protocol::RenderScope::Mix)
             .program;
@@ -151,8 +160,8 @@ fn render(s: &Scenario) -> Vec<WindowStats> {
             rows: TrackRows::default(),
             own_pre_fx: None,
             native: NativeIo::default(),
-            owner_devices: &devices,
-            owner_stores: (&[], &[]),
+            index: &index,
+            owner: if master { common::model::ParamStoreAt::Song } else { common::model::ParamStoreAt::Track(0) },
         };
         let len = program.ops.len();
         run_chain_program(&mut program, 0..len, l, r, &mut midi_a, &mut midi_b, &ctx);

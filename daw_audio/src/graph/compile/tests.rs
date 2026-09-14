@@ -2409,7 +2409,7 @@ fn v38_fixture_compiles_builtins_where_the_old_strip_ran() {
     }
     let gwi = song.tracks.iter().position(|t| t.name == "GWI").expect("GWI track");
     let p = &sched.track_programs[gwi];
-    assert_eq!(p.pass1_role, crate::graph::program::Pass1Role::GroupWithInstrument);
+    assert!(matches!(p.pass1_role, crate::graph::program::Pass1Role::GroupWithInstrument { .. }));
     let first_native = p.ops.iter().position(|op| matches!(op, crate::graph::ChainOp::Native { .. })).unwrap();
     assert!(p.pass1_end <= first_native, "GWI の組み込みは pass 2: pass1_end={} ops={:?}", p.pass1_end, op_labels(p));
     let master = op_labels(&sched.master_program);
@@ -2509,7 +2509,7 @@ fn a_group_with_instrument_prefix_consumer_takes_the_pass_one_lag() {
         ..Song::default()
     };
     let sched = compile_schedule(&song, &lat, 48_000, BUF, RenderScope::Mix).unwrap();
-    assert_eq!(sched.track_programs[1].pass1_role, crate::graph::program::Pass1Role::GroupWithInstrument);
+    assert!(matches!(sched.track_programs[1].pass1_role, crate::graph::program::Pass1Role::GroupWithInstrument { .. }));
     assert_eq!(sched.input_delay_per_track[1], L + BUF);
     assert!(!sched.delay_keys.iter().any(|k| matches!(k, DelayKey::BusScAlign { .. })), "{:?}", sched.delay_keys);
 }
@@ -2581,8 +2581,8 @@ fn sched_free_eq_output(song: &Song, x: &[f32]) -> Vec<f32> {
         rows: crate::launcher::TrackRows::default(),
         own_pre_fx: None,
         native: crate::graph::NativeIo::default(),
-        owner_devices: devices,
-        owner_stores: (&[], &[]),
+        index: &common::song_index::SongIndex::build(song),
+        owner: common::model::ParamStoreAt::Track(0),
     };
     let (mut a, mut b) = (Vec::with_capacity(8), Vec::with_capacity(8));
     let len = alone.ops.len();

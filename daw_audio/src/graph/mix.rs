@@ -8,7 +8,7 @@
 //!
 //! RT 規約: 全関数が audio callback / worker / export freewheel から呼ばれる。
 //! ヒープ確保・ロック・I/O を行わない。Song の配線を歩く判定は RT には置かず、compile 時に
-//! program へ焼く (`ChainProgram::snapshot_*` r.md #129 §18-B / `ChainProgram::solo_contributors`)。
+//! program / schedule へ焼く (`ChainProgram::snapshot_*` r.md #129 §18-B / `SoloTables`)。
 
 use common::model::{Song, Track};
 
@@ -190,6 +190,8 @@ pub(super) fn mix_send_into(
     src_scratch: &TrackScratch,
     pre_fader: bool,
     song: &Song,
+    // `song` と同じ snapshot の索引 (send と SendGain の lane を引く)。
+    index: &common::song_index::SongIndex,
     src_track_idx: u32,
     send_id: u32,
     sample_rate: u32,
@@ -204,17 +206,17 @@ pub(super) fn mix_send_into(
     // 撃っていたら、アレンジのカーブではなく **セルのカーブ**を使う
     // (Volume / Pan / PluginParam は既にそうなっていて、ここだけ抜けていた)。
     rows: crate::launcher::TrackRows<'_>,
-    // 送り元トラックへ流れ込む track の表 (`ChainProgram::solo_contributors`)。
-    src_contributors: &[u32],
+    // 送り元トラックへ流れ込む track に solo があるか (`SoloTables::of`)。
+    src_contributor_soloed: bool,
 ) {
     use common::model::{AutomationTarget, TrackBuiltinParam};
 
     let Some(track) = song.tracks.get(src_track_idx as usize) else {
         return;
     };
-    // v29: stable `Send::id` で live lookup (sends は高々数本 — 線形走査で
-    // RT-safe)。 positional index は schedule に焼き込まれない。
-    let Some(send) = track.sends.iter().find(|s| s.id == send_id) else {
+    // v29: stable `Send::id` で live lookup (song と同じ便の索引で引く)。 positional index は schedule に
+    // 焼き込まれない。
+    let Some(send) = index.send(song, src_track_idx as usize, send_id) else {
         return;
     };
     if !send.enabled {
@@ -233,7 +235,7 @@ pub(super) fn mix_send_into(
     // process_track_owned), so the soloed-return audition still works.
     if any_solo {
         let dest_soloed = song.tracks.get(dst_idx as usize).is_some_and(|d| d.solo);
-        if !dest_soloed && !track.solo && !any_soloed(song, src_contributors) {
+        if !dest_soloed && !track.solo && !src_contributor_soloed {
             return;
         }
     }
@@ -249,10 +251,7 @@ pub(super) fn mix_send_into(
     let lane = if recording_lanes.contains(&(track.id, target.clone())) {
         None
     } else {
-        track
-            .automation_lanes
-            .iter()
-            .find(|l| l.enabled && l.target == target)
+        index.track_store(song, src_track_idx as usize).enabled_lane(&target)
     };
     let beats_per_frame = if bpm > 0.0 && sample_rate > 0 {
         f64::from(bpm) / (60.0 * f64::from(sample_rate))
@@ -273,12 +272,11 @@ pub(super) fn mix_send_into(
         .min(dst_scratch.track_r.len());
 
     if let (Some(lane), true) = (lane, beats_per_frame > 0.0) {
-        // この行の供給元 (アレンジ / セル / 停止) を 1 度だけ解く。
-        let lane_row = song
-            .tracks
-            .get(src_track_idx as usize)
-            .and_then(|t| t.automation_lanes.iter().position(|l| l.id == lane.id))
-            .map_or(crate::launcher::RowTimeSource::default(), |i| rows.lane(i));
+        // この行の供給元 (アレンジ / セル / 停止) を 1 度だけ解く。行はその lane id の (並びで先頭の) lane の席。
+        let lane_row = index
+            .track_store(song, src_track_idx as usize)
+            .lane_by_id(lane.lane.id)
+            .map_or(crate::launcher::RowTimeSource::default(), |view| rows.lane(view.pos));
         for i in 0..n {
             // `fill_track_param_ramps` / `fill_pd_param_events` と同じ積分済み
             // anchor + per-frame 増分 (M5 の beat-domain 統一)。
@@ -300,18 +298,4 @@ pub(super) fn mix_send_into(
             dst_scratch.track_r[i] += src_r[i] * const_gain;
         }
     }
-}
-
-/// `tracks` (song-track index) のいずれかが `solo == true` なら true。表は compile 時に焼いた配線の閉包で、
-/// solo の透過規則の 2 つがこれを引く:
-///
-/// - [`ChainProgram::solo_contributors`] — その track に流れ込む track (子 → group、send 元 → return)。
-///   「あるトラックを solo すると、そのトラックが送っている reverb / delay の **リターン** も生かす」
-///   Ableton 準拠の挙動 (リターンを solo-safe にしないと、ソロ中はセンドエフェクトが聞こえない)。
-/// - [`ChainProgram::solo_ancestors`] — 祖先 group (folder solo: group を solo したら子も鳴る)。
-///
-/// 配線は topology なので再 compile と同じ便で変わり、solo は値のみ更新なので song から毎 buffer 読む。
-/// RT-safe: 表の走査のみ (確保なし、トラック数に上限なし、RT で Song の配線を歩かない)。
-pub(super) fn any_soloed(song: &Song, tracks: &[u32]) -> bool {
-    tracks.iter().any(|&i| song.tracks.get(i as usize).is_some_and(|t| t.solo))
 }

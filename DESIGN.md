@@ -125,9 +125,14 @@ event 名は **generation** 込みで、旧世代の依頼や signal が新 pool
   チェーン op、[plan_rack_native_devices.md](docs/plan_rack_native_devices.md) §8) / `mixer.rs`
   (track scratch と volume / pan) / `metronome.rs` / `sequencer.rs` / `export.rs` / `audio_worker.rs` /
   `audio_clip_renderer.rs`。
-- Song は `RtBundle` (song + tempo_map + schedule) として単一経路で publish され、
+- Song は `RtBundle` (song + song_index + tempo_map + schedule) として単一経路で publish され、
   RT は schedule と同一の song snapshot を読む。playhead は audio thread 単独 writer。
   WAV decode は専用 `audio-decode` スレッド (RT はディスクに触れない)。
+- **RT は Song を id / target で探さず、全件を舐めない**: `common::song_index::SongIndex` を snapshot ごとに
+  off-thread で作り、song と同じ便で届ける (位置で持つので別の snapshot と組まない)。lane / routing は束ねる単位
+  (device / chain / send …) で、device / chain / track / scene は id → 位置で、アレンジ clip と note は窓に掛かるものを、
+  ランチャーの行とセルは鍵で引く。答えは従来の線形探索と同じ (同じ id が複数あれば線形探索が先に見つける方) なので、
+  音は変わらない。
 
 ### daw_plugin_host
 

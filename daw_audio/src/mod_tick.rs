@@ -29,14 +29,15 @@
 
 use std::sync::Arc;
 
-use common::mod_graph::{LaneParam, ModPhaseTable, ModPlan, ModRuntime, PhaseMark, TickCtx};
+use common::mod_graph::{LaneParam, ModPhaseTable, ModPlan, ModRuntime, PhaseMark, TempoSource, TickCtx};
+use common::song_index::{ParamStore, SongIndex};
 
 /// 制御グリッドの刻み幅 (サンプル)。定義の SSoT は `common::mod_graph` で、
 /// ここは daw_audio 側の再公開 (`crate::automation` の automation サブバッファ刻みが
 /// これを引く — automation の段と変調の段は **同じ格子でなければならない**)。
 pub use common::mod_graph::MOD_TICK_FRAMES;
 use common::mod_plane::{ModPlane, ModTickPlane, ModTickPlaneRef};
-use common::model::{AutomationTarget, ModParam, ParamStoreAt, Song};
+use common::model::{AutomationTarget, ModParam, Song};
 
 use crate::mod_plan_publish::ModPlanDelivery;
 
@@ -302,11 +303,12 @@ impl ModTickRunner {
     ///
     /// `beat` は tempo map が逆算した `sample` 位置の拍。刻み境界へ丸めた位置で
     /// 張り直すので、以降の前進は位相表と同じ格子に乗る。
-    pub fn locate(&mut self, song: &Song, sample: u64, beat: f64, sample_rate: u32) {
+    pub fn locate(&mut self, song: &Song, index: &SongIndex, sample: u64, beat: f64, sample_rate: u32) {
+        let tempo = TempoSource::new(song, index.song_store(song));
         let k = tick_of(sample);
         let dt = dt_secs(sample_rate);
         let rem = sample % u64::from(MOD_TICK_FRAMES);
-        let bpm0 = f64::from(common::automation::evaluate_song_tempo(song, beat)).max(1.0);
+        let bpm0 = f64::from(tempo.base_at(beat)).max(1.0);
         // 刻み境界の拍 (sample が境界の途中なら手前の境界へ戻す)。刻み内は
         // bpm 一定 (= `next_mark` と同じ規則) なので線形に戻せる。
         let boundary_beat =
@@ -315,11 +317,11 @@ impl ModTickRunner {
             &self.plan,
             &mut self.rt,
             self.table.as_deref(),
-            song,
+            tempo,
             sample_rate,
             k,
         );
-        let bpm = f64::from(common::automation::evaluate_song_tempo(song, boundary_beat)).max(1.0);
+        let bpm = f64::from(tempo.base_at(boundary_beat)).max(1.0);
         self.first_tick = k;
         self.marks.clear();
         let n = self.n_slots();
@@ -338,9 +340,12 @@ impl ModTickRunner {
     /// 戻り値は **buffer 頭**の transport (`beat` / `bpm`) — 以降の描画はこれを使う。
     ///
     /// RT 安全: 事前確保済みの器への書き込みのみ。
+    #[allow(clippy::too_many_arguments)]
     pub fn run_buffer(
         &mut self,
         song: &Song,
+        // `song` と同じ snapshot の索引 (刻みごとに lane / routing を探さない)。
+        index: &SongIndex,
         start_sample: u64,
         frames: u32,
         sample_rate: u32,
@@ -373,6 +378,7 @@ impl ModTickRunner {
         }
 
         let dt = dt_secs(sample_rate);
+        let tempo = TempoSource::new(song, index.song_store(song));
         // buffer 末の frame が乗る刻み **+1** まで評価する。最後の区間も両端の値が
         // 揃うので、buffer の切り方に依らず同じ補間になる (末尾だけ保持に落ちると
         // live と書き出しで音が変わる)。
@@ -382,7 +388,7 @@ impl ModTickRunner {
             && self.marks.len() < MAX_TICKS_PER_BUFFER
         {
             let k = self.first_tick + self.marks.len() as i64;
-            self.eval_tick(song, k, dt, &mut follower_env, &mut note_anchor);
+            self.eval_tick(song, index, tempo, k, dt, &mut follower_env, &mut note_anchor);
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -400,9 +406,12 @@ impl ModTickRunner {
     }
 
     /// 1 刻み評価して行を積む。
+    #[allow(clippy::too_many_arguments)]
     fn eval_tick(
         &mut self,
         song: &Song,
+        index: &SongIndex,
+        tempo: TempoSource<'_>,
         k: i64,
         dt: f64,
         follower_env: &mut impl FnMut(u16, i64) -> f32,
@@ -427,7 +436,7 @@ impl ModTickRunner {
         // automation lane が base を上書きする param を解決する (r.md #89 Q4)。
         for i in 0..self.plan.lane_params.len() {
             let lp = self.plan.lane_params[i];
-            let plain = lane_base(song, &self.plan, lp, self.next_mark.beat);
+            let plain = lane_base(song, index, &self.plan, lp, self.next_mark.beat);
             self.rt.set_base(lp.slot, lp.param, plain);
         }
         // r.md #89 Q9: 深さの automation lane も同じ刻みで解決する。
@@ -436,7 +445,7 @@ impl ModTickRunner {
             let Some(store) = g.lane else {
                 continue;
             };
-            let plain = depth_lane_base(song, store, g.routing_id, g.base_depth, self.next_mark.beat);
+            let plain = depth_lane_base(song, index.store(song, store), g.routing_id, g.base_depth, self.next_mark.beat);
             self.rt.set_depth_base(i, plain);
         }
         let mark = self.next_mark;
@@ -476,7 +485,7 @@ impl ModTickRunner {
             });
         }
         self.marks.push(mark);
-        self.next_mark = common::mod_graph::next_mark(song, &self.plan, &self.rt, mark, k, dt);
+        self.next_mark = common::mod_graph::next_mark(tempo, &self.plan, &self.rt, mark, k, dt);
     }
 
     fn drop_leading_eff(&mut self, rows: usize) {
@@ -606,25 +615,25 @@ pub fn dt_secs(sample_rate: u32) -> f64 {
 ///
 /// 置き場は「そのソースの帰属トラック」(`MASTER_TRACK_ID` なら `song_lanes`) で、plan の構築時 (off-RT) に
 /// 位置へ解いてある ([`common::mod_graph::LaneParam::store`]、刻みごとに track を id で探さない)。
-fn lane_base(song: &Song, plan: &ModPlan, lp: LaneParam, beat: f64) -> f64 {
+fn lane_base(song: &Song, index: &SongIndex, plan: &ModPlan, lp: LaneParam, beat: f64) -> f64 {
     let LaneParam { slot, param, store } = lp;
     let Some(&source_id) = plan.slot_ids.get(usize::from(slot)) else {
         return 0.0;
     };
     let target = AutomationTarget::ModSourceParam { source_id, param };
-    match song.lanes_at(store).iter().find(|l| l.enabled && l.target == target) {
-        Some(lane) => common::automation::lane_value_at(lane, &song.clip_contents, beat),
+    match index.store(song, store).enabled_lane(&target) {
+        Some(v) => common::automation::lane_value_in_clip(v.lane, v.arrangement_clip(beat), &song.clip_contents, beat),
         None => fallback_base(plan, slot, param),
     }
 }
 
 /// `ModRoutingDepth` の automation lane を解決する (r.md #89 Q9)。
 /// 置き場は **その変調が置かれている所** (`Song::mod_routing_owner`) を plan が位置へ解いたもの。
-fn depth_lane_base(song: &Song, store: ParamStoreAt, routing_id: u32, base: f32, beat: f64) -> f32 {
+fn depth_lane_base(song: &Song, store: ParamStore<'_>, routing_id: u32, base: f32, beat: f64) -> f32 {
     let target = AutomationTarget::ModRoutingDepth { routing_id };
-    match song.lanes_at(store).iter().find(|l| l.enabled && l.target == target) {
+    match store.enabled_lane(&target) {
         #[allow(clippy::cast_possible_truncation)]
-        Some(lane) => common::automation::lane_value_at(lane, &song.clip_contents, beat) as f32,
+        Some(v) => common::automation::lane_value_in_clip(v.lane, v.arrangement_clip(beat), &song.clip_contents, beat) as f32,
         None => base,
     }
 }
@@ -710,17 +719,18 @@ mod tests {
         };
 
         let sr = 48_000u32;
+        let index = SongIndex::build(&song);
         let run = |chunks: &[u32]| -> Vec<(u64, f32)> {
             let plan = Arc::new(common::mod_graph::build_plan(&song, 1, |_| 0.0));
             let table = Arc::new(common::mod_graph::ModPhaseTable::build(&plan, &song, sr, 4.0));
             let mut r = ModTickRunner::new();
             r.install(ModPlanDelivery::new(plan));
             r.set_table(Some(table));
-            r.locate(&song, 0, 0.0, sr);
+            r.locate(&song, &index, 0, 0.0, sr);
             let mut out = Vec::new();
             let mut at = 0u64;
             for &n in chunks {
-                r.run_buffer(&song, at, n, sr, |_, _| 0.0, |_| None);
+                r.run_buffer(&song, &index, at, n, sr, |_, _| 0.0, |_| None);
                 // buffer 内の各 frame の値を絶対サンプル位置つきで記録する。
                 let plane = r.plane();
                 for f in 0..n {
@@ -740,16 +750,16 @@ mod tests {
             let plan = Arc::new(common::mod_graph::build_plan(&song, 1, |_| 0.0));
             let mut r = ModTickRunner::new();
             r.install(ModPlanDelivery::new(Arc::clone(&plan)));
-            r.locate(&song, 0, 0.0, sr);
-            let _ = r.run_buffer(&song, 0, 480, sr, |_, _| 0.0, |_| None);
+            r.locate(&song, &index, 0, 0.0, sr);
+            let _ = r.run_buffer(&song, &index, 0, 480, sr, |_, _| 0.0, |_| None);
             let end_beat = r.beat_at_sample(480, sr).expect("buffer 末は評価済み");
-            let head2 = r.run_buffer(&song, 480, 544, sr, |_, _| 0.0, |_| None);
+            let head2 = r.run_buffer(&song, &index, 480, 544, sr, |_, _| 0.0, |_| None);
             assert!((end_beat - head2.beat).abs() < 1e-9, "{end_beat} vs {}", head2.beat);
             // plan 差し替え → buffer 末の拍で locate → 次の頭も同じ拍。
             r.install(ModPlanDelivery::new(plan));
             let end2 = end_beat + 544.0 / f64::from(sr) * 120.0 / 60.0;
-            r.locate(&song, 1024, end2, sr);
-            let head3 = r.run_buffer(&song, 1024, 512, sr, |_, _| 0.0, |_| None);
+            r.locate(&song, &index, 1024, end2, sr);
+            let head3 = r.run_buffer(&song, &index, 1024, 512, sr, |_, _| 0.0, |_| None);
             assert!((head3.beat - end2).abs() < 1e-9, "{} vs {end2}", head3.beat);
         }
         assert_eq!(export.len(), live.len());

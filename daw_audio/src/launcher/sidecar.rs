@@ -13,6 +13,8 @@
 //! `export.rs` の走査ループで、`LauncherRuntime::update` の直後 (= この buffer の
 //! 供給元テーブルが確定した直後)。off-RT なので確保してよい。
 
+use std::collections::HashMap;
+
 use common::launcher_sidecar::{LauncherRowState, LauncherSidecar};
 
 use super::runtime::BufferSpan;
@@ -21,9 +23,8 @@ use super::{RowPhase, RowSourceTable};
 /// 行ごとの「最後に記録した供給元」を持ち、変わった瞬間だけ sidecar へ積む。
 #[derive(Debug, Default)]
 pub struct SidecarRecorder {
-    /// `(row_key, 最後に記録した供給元)`。行数ぶんの線形走査で足りる
-    /// (行は数十〜数百、遷移の頻度は buffer あたり高々 1 回)。
-    last: Vec<(u64, RowPhase)>,
+    /// `row_key.packed()` → 最後に記録した供給元 (毎 buffer 全行を引くので、行数の二乗にしない)。
+    last: HashMap<u64, RowPhase>,
     out: LauncherSidecar,
 }
 
@@ -57,10 +58,8 @@ impl SidecarRecorder {
     }
 
     fn emit(&mut self, key: u64, phase: RowPhase, beat: f64) {
-        match self.last.iter().position(|(k, _)| *k == key) {
-            Some(i) if self.last[i].1 == phase => return,
-            Some(i) => self.last[i].1 = phase,
-            None => self.last.push((key, phase)),
+        if self.last.insert(key, phase) == Some(phase) {
+            return;
         }
         #[allow(clippy::cast_possible_truncation)]
         let row = LauncherRowState {

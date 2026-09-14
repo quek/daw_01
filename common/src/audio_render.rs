@@ -179,8 +179,8 @@ pub struct WaveSpan {
 
 /// 拍 ↔ tempo の写像。 描画が engine と同じ tempo 追従を得るための唯一の口。
 ///
-/// engine は buffer ごとに `evaluate_song_tempo(song, playhead_beats)` で
-/// `current_bpm` を評価し、 `samples_per_beat` を作り直す
+/// engine は buffer ごとにテンポカーブ ([`crate::automation::evaluate_song_tempo`] と同じ規則) から
+/// `current_bpm` を解き、 `samples_per_beat` を作り直す
 /// (`daw_audio::engine` / `audio_clip_renderer::render_audio_events`)。
 /// このため **native rate 再生** (`Raw` 全体と `Slice` の slice 本体) は
 /// 「1 拍あたりの source 消費量」 が `current_bpm` に反比例して変わる。
@@ -195,32 +195,27 @@ pub struct WaveSpan {
 /// **既知の限界**: engine は automation の上に song modulation
 /// (LFO / MSEG → `SongTempo`) を重ねるが、 modulator の位相は audio thread が
 /// 持つので GUI からは再現できない。 変調中の tempo は automation 値で近似する。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TempoMap<'a> {
     /// compile 時 (`song.bpm`) 基準の nominal bpm。 `stretch_ratio` / trigger 配置に使う。
     nominal_bpm: f64,
-    /// SongTempo automation を持つ song (`None` = 定数 tempo)。
-    song: Option<&'a crate::model::Song>,
+    /// SongTempo automation を持つ song のテンポカーブ (`None` = 定数 tempo)。
+    curve: Option<crate::automation::SongTempoCurve<'a>>,
 }
 
 impl<'a> TempoMap<'a> {
     /// 定数 tempo (SongTempo lane 無し / テスト用)。
     #[must_use]
     pub fn constant(bpm: f32) -> Self {
-        Self { nominal_bpm: f64::from(bpm), song: None }
+        Self { nominal_bpm: f64::from(bpm), curve: None }
     }
 
     /// song から構築する。 有効な `SongTempo` lane がある場合だけ曲線評価を有効にする
-    /// (無い曲では `evaluate_song_tempo` を 1 度も呼ばない)。
+    /// (無い曲では曲線を 1 度も評価しない。lane と clip の索引は構築時に 1 度だけ作る)。
     #[must_use]
     pub fn from_song(song: &'a crate::model::Song) -> Self {
-        let has_curve = song.song_lanes.iter().any(|l| {
-            l.enabled && matches!(l.target, crate::model::AutomationTarget::SongTempo)
-        });
-        Self {
-            nominal_bpm: f64::from(song.bpm),
-            song: has_curve.then_some(song),
-        }
+        let curve = crate::automation::SongTempoCurve::of(song);
+        Self { nominal_bpm: f64::from(song.bpm), curve: curve.is_automated().then_some(curve) }
     }
 
     /// compile 時基準の bpm (= `RenderedEvent.nominal_bpm`)。
@@ -233,14 +228,14 @@ impl<'a> TempoMap<'a> {
     /// 区分線形化せず閉形式 1 span で済む。
     #[must_use]
     pub fn is_constant(&self) -> bool {
-        self.song.is_none()
+        self.curve.is_none()
     }
 
     /// song 絶対拍 `beat` での実効 bpm (= engine の `current_bpm`)。
     #[must_use]
     pub fn bpm_at(&self, beat: f64) -> f64 {
-        match self.song {
-            Some(s) => f64::from(crate::automation::evaluate_song_tempo(s, beat)),
+        match &self.curve {
+            Some(curve) => f64::from(curve.at(beat)),
             None => self.nominal_bpm,
         }
     }

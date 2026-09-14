@@ -42,7 +42,7 @@ use common::protocol::RenderScope;
 use super::program::Pass1Role;
 use super::program_build::{BuiltProgram, ChainLatency, build_program};
 use super::render_graph::RenderGraph;
-use super::schedule::{BufRef, MASTER_OWNER, NodeOp, Schedule, SoloTables};
+use super::schedule::{BufRef, MASTER_OWNER, NodeOp, Schedule};
 use deps::Topology;
 use pdc::master_output_latency;
 use sidechain::{TapCtx, bake_snapshot_needs, collect_chain_taps, compute_sc_delays};
@@ -180,15 +180,15 @@ pub fn compile_schedule(
     // ---- 配線トポロジ: 親参照の検査 → group / send / パラアウトの入力表 → bus 判定 ----
     let topo = Topology::build(song)?;
     // pass 1 の役割を program に焼く (RT の `process_track_owned` が Song を歩かない)。
-    for (b, (&bus, gwi)) in built.iter_mut().zip(topo.bus_flags.iter().zip(&topo.gwi_split)) {
+    for ((b, track), (&bus, gwi)) in built.iter_mut().zip(&song.tracks).zip(topo.bus_flags.iter().zip(&topo.gwi_split)) {
         b.program.pass1_role = match (gwi, bus) {
-            (Some(_), _) => Pass1Role::GroupWithInstrument,
+            (Some(_), _) => Pass1Role::GroupWithInstrument { main_to_child: track.paraout_main_to_child() },
             (None, true) => Pass1Role::Bus,
             (None, false) => Pass1Role::Leaf,
         };
     }
     // solo の透過規則の表 (「子 / send 元が solo なら bus も透過」と folder solo。RT で配線を歩かない)。
-    let solo = SoloTables { contributors: topo.solo_contributors(song), ancestors: topo.solo_ancestors(song) };
+    let solo = topo.solo_tables(song);
     let taps = TapCtx {
         id_to_idx: &topo.id_to_idx,
         chains: &chain_map,
@@ -215,7 +215,7 @@ pub fn compile_schedule(
     let (follower_slots, follower_keys, mod_kinds) =
         emit::emit_followers(song, sample_rate, &topo.id_to_idx, &chain_map, &mut compensated.nodes);
 
-    Ok(Schedule {
+    let mut schedule = Schedule {
         graph: RenderGraph::build(song, &compensated.nodes),
         solo,
         nodes: compensated.nodes,
@@ -237,7 +237,10 @@ pub fn compile_schedule(
         master_latency_samples: master_latency(compensated.master_mix_latency),
         master_limiter_latency,
         master_stage: scope.master(),
-    })
+        state_keys: Default::default(),
+    };
+    schedule.index_state_keys();
+    Ok(schedule)
 }
 
 /// compile する master の fx chain: scope が master を通さないなら空 (op も latency も出さない)。

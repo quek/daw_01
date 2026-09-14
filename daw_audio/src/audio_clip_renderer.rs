@@ -25,7 +25,7 @@ use common::audio_render::{
     fade_envelope, pitch_factor, sample_rate_ratio, stretch_ratio_for, tempo_follow_ratio,
 };
 use common::model::{
-    AudioSourceId, AudioSourcePath, ClipContent, FadeCurve, Song, StretchMode,
+    AudioSourceId, AudioSourcePath, Clip, ClipContent, FadeCurve, Song, StretchMode,
     clamp_semitones, FORMANT_SEMITONES_LIMIT, PITCH_SEMITONES_LIMIT,
 };
 
@@ -178,8 +178,7 @@ pub struct RenderedEvent {
 /// audio thread `load()`s a snapshot and reads it for the duration of
 /// one buffer; new edits land via `store()` on the next callback.
 pub struct AudioClipRenderer {
-    /// Sorted by `start_frame` ascending. PR6's render loop bisects
-    /// here to find events overlapping the current buffer.
+    /// `start_beat` の昇順 (安定ソート)。
     pub schedule: Vec<RenderedEvent>,
     /// `AudioSourceId → decoded buffer`. The render loop clones the
     /// `Arc` once per active event — no hashmap lookup beyond that.
@@ -190,6 +189,20 @@ pub struct AudioClipRenderer {
     /// **RT では確保できない**ので、off-thread の publish 側がこれを見て不足分の
     /// エンジンを作り `TrackScratch::stretch_engines` へ配送する。
     pub engines_per_track: Vec<u16>,
+    /// track index → その track の event (schedule 順)。描画は自分の track の event だけを、playhead より前に
+    /// 終わった event を二分探索で飛ばして見る (schedule 全体を track ごと・buffer ごとに舐めない)。
+    track_events: Vec<TrackEvents>,
+}
+
+/// 1 track の event の並び (schedule 順 = `start_beat` 昇順)。
+#[derive(Default)]
+struct TrackEvents {
+    /// schedule 上の位置。
+    order: Vec<u32>,
+    /// 各 event の `start_beat` (有限、schedule 順なので昇順)。
+    starts: Vec<f64>,
+    /// 各 event の `end_beat` の木 (NaN は +∞ = 飛ばさない側)。
+    ends: common::song_index::EndTree,
 }
 
 impl AudioClipRenderer {
@@ -198,7 +211,29 @@ impl AudioClipRenderer {
             schedule: Vec::new(),
             sources: HashMap::new(),
             engines_per_track: Vec::new(),
+            track_events: Vec::new(),
         }
+    }
+
+    /// `schedule` (`start_beat` 昇順) から描画の器を組む (off-thread)。stretch engine の必要数と track ごとの並びを求める。
+    pub fn new(mut schedule: Vec<RenderedEvent>, sources: HashMap<AudioSourceId, Arc<AudioSourceBuffer>>) -> Self {
+        let engines_per_track = count_engines_per_track(&mut schedule);
+        let mut track_events: Vec<TrackEvents> = Vec::new();
+        let mut ends: Vec<Vec<f64>> = Vec::new();
+        for (i, ev) in schedule.iter().enumerate() {
+            if track_events.len() <= ev.track_idx {
+                track_events.resize_with(ev.track_idx + 1, TrackEvents::default);
+                ends.resize_with(ev.track_idx + 1, Vec::new);
+            }
+            let t = &mut track_events[ev.track_idx];
+            t.order.push(u32::try_from(i).unwrap_or(u32::MAX));
+            t.starts.push(ev.start_beat);
+            ends[ev.track_idx].push(ev.end_beat);
+        }
+        for (t, ends) in track_events.iter_mut().zip(&ends) {
+            t.ends = common::song_index::EndTree::build(ends);
+        }
+        Self { schedule, sources, engines_per_track, track_events }
     }
 }
 
@@ -334,24 +369,21 @@ pub fn compile_audio_schedule(
     // -- Flatten every audio clip's events into RenderedEvent ----------------
     let mut schedule: Vec<RenderedEvent> = Vec::new();
     for (track_idx, track) in song.tracks.iter().enumerate() {
+        // 隣接の突き合わせ表は張り出しを要求するクリップがあるトラックだけ作る (要求ゼロが普通)。
+        let neighbors = track
+            .clips
+            .iter()
+            .any(|c| c.xfade_lead_beats > 0.0 || c.xfade_tail_beats > 0.0)
+            .then(|| ClipNeighbors::of(&track.clips));
         for clip in &track.clips {
             // 隣接クリップとのクロスフェード: **隣が実在するときだけ**窓を外へ緩める。
             // これで、クリップを動かして隣が居なくなったら `xfade_*` が残っていても
             // 無視され、stale な音漏れが起きない (`Clip::xfade_lead_beats` の doc)。
-            // 隣接走査は **張り出しを要求しているクリップだけ** に絞る
-            // (要求ゼロが普通なので、クリップ数の 2 乗走査を実質 O(N) にする)。
             let want_lead = clip.xfade_lead_beats > 0.0;
             let want_tail = clip.xfade_tail_beats > 0.0;
             let (s0, e0) = clip.song_window();
-            let has_prev = want_lead
-                && track.clips.iter().any(|o| {
-                    o.id != clip.id && (o.start_beat + o.length_beats - s0).abs() < 1e-6
-                });
-            let has_next = want_tail
-                && track
-                    .clips
-                    .iter()
-                    .any(|o| o.id != clip.id && (o.start_beat - e0).abs() < 1e-6);
+            let has_prev = want_lead && neighbors.as_ref().is_some_and(|n| ClipNeighbors::touches(&n.ends, s0, clip.id));
+            let has_next = want_tail && neighbors.as_ref().is_some_and(|n| ClipNeighbors::touches(&n.starts, e0, clip.id));
             let lead = if has_prev { clip.xfade_lead_beats.max(0.0) } else { 0.0 };
             let tail = if has_next { clip.xfade_tail_beats.max(0.0) } else { 0.0 };
             push_clip_events(
@@ -382,20 +414,16 @@ pub fn compile_audio_schedule(
         }
     }
     schedule.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
-    let engines_per_track = count_engines_per_track(&mut schedule);
+    let renderer = AudioClipRenderer::new(schedule, sources);
     tracing::info!(
-        n_events = schedule.len(),
-        n_sources = sources.len(),
+        n_events = renderer.schedule.len(),
+        n_sources = renderer.sources.len(),
         engine_sr = engine_sample_rate,
         bpm = song.bpm,
-        n_engines = engines_per_track.iter().map(|&n| usize::from(n)).sum::<usize>(),
+        n_engines = renderer.engines_per_track.iter().map(|&n| usize::from(n)).sum::<usize>(),
         "compiled audio schedule"
     );
-    AudioClipRenderer {
-        schedule,
-        sources,
-        engines_per_track,
-    }
+    renderer
 }
 
 /// 1 クリップ (アレンジのクリップ or ランチャーのセル) の audio event を
@@ -418,6 +446,31 @@ pub fn compile_audio_schedule(
 struct ClipPlacement {
     cell_clip_id: u32,
     xfade: (f64, f64),
+}
+
+/// トラック 1 本のアレンジのクリップの境界 `(拍, clip id)` を拍の昇順に (NaN は載せない)。隣接の突き合わせを
+/// クリップ数の二乗にしない。
+struct ClipNeighbors {
+    /// 終端 `start_beat + length_beats`。
+    ends: Vec<(f64, u32)>,
+    starts: Vec<(f64, u32)>,
+}
+
+impl ClipNeighbors {
+    fn of(clips: &[Clip]) -> Self {
+        let sorted = |edge: fn(&Clip) -> f64| {
+            let mut v: Vec<(f64, u32)> = clips.iter().map(|c| (edge(c), c.id)).filter(|(b, _)| !b.is_nan()).collect();
+            v.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            v
+        };
+        Self { ends: sorted(|c| c.start_beat + c.length_beats), starts: sorted(|c| c.start_beat) }
+    }
+
+    /// `edges` に `own_id` 以外で `|境界 - beat| < 1e-6` のものがあるか。
+    fn touches(edges: &[(f64, u32)], beat: f64, own_id: u32) -> bool {
+        let lo = edges.partition_point(|&(b, _)| b - beat <= -1e-6);
+        edges[lo..].iter().take_while(|&&(b, _)| b - beat < 1e-6).any(|&(_, id)| id != own_id)
+    }
 }
 
 fn push_clip_events(
@@ -460,7 +513,8 @@ fn push_clip_events(
         let event_start_beat =
             clip.content_to_song_beat(event.event_start_in_clip_beats);
         let event_end_beat = event_start_beat + event.event_length_beats;
-        if event_end_beat <= event_start_beat {
+        // 始点が有限で長さが正の event だけ (NaN の始点・長さは比較を素通りして、描画で位置の無い音になっていた)。
+        if !event_start_beat.is_finite() || event_end_beat.partial_cmp(&event_start_beat) != Some(std::cmp::Ordering::Greater) {
             continue;
         }
         // 窓と交差しない event は schedule に載せない。
@@ -731,21 +785,18 @@ pub fn render_audio_events(
     let buf_end_beats =
         playhead_beats + f64::from(frames) / samples_per_beat;
 
+    let Some(events) = renderer.track_events.get(track_idx) else {
+        return;
+    };
+    // この buffer の終端より前に始まり (`start_beat` 昇順の二分探索)、playhead より後に終わる event だけを並び順に
+    // 辿る (終点の木。この buffer より前に終わった event は、早い長い event があっても舐めない)。
+    let before_end = events.starts.partition_point(|s| *s < buf_end_beats);
     // E5 (r.md #8): track 内 event を schedule 順に数える安定 index (repitch
-    // accumulator の添字)。 track_idx filter 後・overlap skip 前に増やすので、
-    // 同じ event は buffer を跨いで同じ index になる。
-    let mut track_event_seq = 0usize;
-    for event in &renderer.schedule {
-        if event.track_idx != track_idx {
+    // accumulator の添字) = `order` の位置。同じ event は buffer を跨いで同じ index になる。
+    for accum_idx in events.ends.reaching(before_end, |end| end > playhead_beats) {
+        let Some(event) = events.order.get(accum_idx).and_then(|&i| renderer.schedule.get(i as usize)) else {
             continue;
-        }
-        let accum_idx = track_event_seq;
-        track_event_seq += 1;
-        // schedule is sorted by start_beat ascending; early-out once we
-        // pass the buffer end.
-        if event.start_beat >= buf_end_beats {
-            break;
-        }
+        };
         // r.md #87: 行の供給元と違う出どころの event は描かない。判定は
         // `accum_idx` を進めた **後**なので、アレンジ ↔ ランチャーを行き来しても
         // `repitch_accum` の添字は同じ event に張り付いたままになる。
@@ -1343,6 +1394,29 @@ fn slice_sample_at(
 mod render_tests {
     use super::*;
 
+    /// 隣接の突き合わせ表は、全クリップを舐めて `|境界 - 拍| < 1e-6` を探すのと同じ答えを返す
+    /// (自分自身は数えない / 誤差の内外 / NaN の境界)。
+    #[test]
+    fn 隣接の突き合わせは全クリップを舐めた答えと同じ() {
+        let clip = |id: u32, start_beat: f64, length_beats: f64| Clip { id, start_beat, length_beats, ..Clip::default() };
+        let clips = vec![
+            clip(1, 4.0, 4.0),
+            clip(2, 0.0, 4.0),
+            clip(3, 8.0 + 5e-7, 2.0),
+            clip(4, 8.0 - 2e-6, 1.0),
+            clip(5, f64::NAN, 1.0),
+            clip(6, 12.0, 0.0),
+        ];
+        let n = ClipNeighbors::of(&clips);
+        for c in &clips {
+            let (s0, e0) = c.song_window();
+            let prev = clips.iter().any(|o| o.id != c.id && (o.start_beat + o.length_beats - s0).abs() < 1e-6);
+            let next = clips.iter().any(|o| o.id != c.id && (o.start_beat - e0).abs() < 1e-6);
+            assert_eq!(ClipNeighbors::touches(&n.ends, s0, c.id), prev, "prev of {}", c.id);
+            assert_eq!(ClipNeighbors::touches(&n.starts, e0, c.id), next, "next of {}", c.id);
+        }
+    }
+
     const ENGINE_SR: u32 = 48_000;
     const BPM: f32 = 120.0;
     /// 4 拍 @ 120 BPM = 2 秒 (= 1 秒素材の 2 倍に stretch)。
@@ -1448,7 +1522,7 @@ mod render_tests {
     ) -> (Vec<f32>, Vec<f32>) {
         let source_sr = buffer.sample_rate;
         let source_frames = buffer.frames;
-        let mut schedule = vec![RenderedEvent {
+        let schedule = vec![RenderedEvent {
             track_idx: 0,
             cell_clip_id: 0,
             start_beat: 0.0,
@@ -1477,14 +1551,9 @@ mod render_tests {
             onsets,
             beat_markers: Vec::new(),
         }];
-        let engines_per_track = count_engines_per_track(&mut schedule);
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));
-        let renderer = AudioClipRenderer {
-            schedule,
-            sources,
-            engines_per_track,
-        };
+        let renderer = AudioClipRenderer::new(schedule, sources);
 
         let n_engines = renderer.engines_per_track.first().copied().unwrap_or(0);
         let mut engines: Vec<StretchEngine> = (0..n_engines)
@@ -1541,7 +1610,7 @@ mod render_tests {
         let source_frames = source.frames;
         let samples_per_beat = f64::from(ENGINE_SR) * 60.0 / f64::from(BPM);
         let render = |gate: (f64, f64)| -> Vec<f32> {
-            let mut schedule = vec![RenderedEvent {
+            let schedule = vec![RenderedEvent {
                 track_idx: 0,
                 cell_clip_id: 0,
                 start_beat: 0.0,
@@ -1570,10 +1639,9 @@ mod render_tests {
                 onsets: Vec::new(),
                 beat_markers: Vec::new(),
             }];
-            let engines_per_track = count_engines_per_track(&mut schedule);
             let mut sources = HashMap::new();
             sources.insert(1u32, Arc::clone(&source));
-            let renderer = AudioClipRenderer { schedule, sources, engines_per_track };
+            let renderer = AudioClipRenderer::new(schedule, sources);
             let total = (LEN_BEATS * samples_per_beat) as usize;
             let mut accum = vec![(u64::MAX, 0.0f64); 4];
             let mut engines: Vec<StretchEngine> = Vec::new();
@@ -1645,7 +1713,7 @@ mod render_tests {
         let samples_per_beat = f64::from(ENGINE_SR) * 60.0 / f64::from(BPM);
         let (start, len) = (4.0, frames_src as f64 / f64::from(SOURCE_SR) * f64::from(BPM) / 60.0);
         for buffer in [256u32, 441, 480, 512, 1024] {
-            let mut schedule = vec![RenderedEvent {
+            let schedule = vec![RenderedEvent {
                 track_idx: 0,
                 cell_clip_id: 0,
                 start_beat: start,
@@ -1674,10 +1742,9 @@ mod render_tests {
                 onsets: Vec::new(),
                 beat_markers: Vec::new(),
             }];
-            let engines_per_track = count_engines_per_track(&mut schedule);
             let mut sources = HashMap::new();
             sources.insert(1u32, Arc::clone(&source));
-            let renderer = AudioClipRenderer { schedule, sources, engines_per_track };
+            let renderer = AudioClipRenderer::new(schedule, sources);
             let (mut accum, mut engines) = (vec![(u64::MAX, 0.0f64); 4], Vec::<StretchEngine>::new());
             let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
             let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
@@ -2225,7 +2292,7 @@ mod render_tests {
     fn spectral_render_does_not_allocate_on_the_audio_thread() {
         let buffer = ramped_sine_source(48_000);
         let source_frames = buffer.frames;
-        let mut schedule = vec![RenderedEvent {
+        let schedule = vec![RenderedEvent {
             track_idx: 0,
             cell_clip_id: 0,
             start_beat: 0.0,
@@ -2254,14 +2321,9 @@ mod render_tests {
             onsets: Vec::new(),
             beat_markers: Vec::new(),
         }];
-        let engines_per_track = count_engines_per_track(&mut schedule);
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));
-        let renderer = AudioClipRenderer {
-            schedule,
-            sources,
-            engines_per_track,
-        };
+        let renderer = AudioClipRenderer::new(schedule, sources);
 
         // エンジンと scratch は off-RT で用意する (= live では publish 側が作って
         // ring で配送、export では walk の頭で積む)。
@@ -2478,7 +2540,7 @@ mod wave_span_binding_tests {
         let mut beat_markers = event.beat_markers.clone();
         beat_markers.sort_by(|a, b| a.locked_beat.total_cmp(&b.locked_beat));
         beat_markers.dedup_by(|a, b| (a.locked_beat - b.locked_beat).abs() < 1e-9);
-        let mut schedule = vec![RenderedEvent {
+        let schedule = vec![RenderedEvent {
             track_idx: 0,
             cell_clip_id: 0,
             start_beat: 0.0,
@@ -2512,10 +2574,9 @@ mod wave_span_binding_tests {
             onsets,
             beat_markers,
         }];
-        let engines_per_track = count_engines_per_track(&mut schedule);
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));
-        let renderer = AudioClipRenderer { schedule, sources, engines_per_track };
+        let renderer = AudioClipRenderer::new(schedule, sources);
         let n_engines = renderer.engines_per_track.first().copied().unwrap_or(0);
         let mut engines: Vec<StretchEngine> = (0..n_engines)
             .map(|_| StretchEngine::new(ENGINE_SR).expect("stretch engine"))
@@ -2527,9 +2588,10 @@ mod wave_span_binding_tests {
         let mut render_seq = 0u64;
         let mut r = Rendered { out: Vec::new(), marks: Vec::new() };
         let mut playhead_beats = 0.0_f64;
+        let tempo_curve = tempo_song.map(common::automation::SongTempoCurve::of);
         while playhead_beats < event.event_length_beats {
-            let current_bpm = match tempo_song {
-                Some(s) => common::automation::evaluate_song_tempo(s, playhead_beats),
+            let current_bpm = match &tempo_curve {
+                Some(curve) => curve.at(playhead_beats),
                 None => BPM,
             };
             let frames = 512usize;
@@ -3094,11 +3156,7 @@ mod source_identity_tests {
                 samples: vec![vec![0.5; 8]],
             }),
         );
-        AudioClipRenderer {
-            schedule: Vec::new(),
-            sources,
-            engines_per_track: Vec::new(),
-        }
+        AudioClipRenderer::new(Vec::new(), sources)
     }
 
     /// 同一 project 内の再 compile (BPM 変更 / 編集 / scrub) は従来どおり

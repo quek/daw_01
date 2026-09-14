@@ -33,6 +33,7 @@ pub mod sampler_ring;
 pub mod scope_bridge;
 pub mod shmem;
 pub mod snap;
+pub mod song_index;
 pub mod tempo_map;
 pub mod time;
 pub mod timing;

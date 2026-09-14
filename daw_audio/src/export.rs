@@ -620,6 +620,8 @@ fn render_loop(
     // フォローアクションがどこで次の列へ移ったかを知らないので、焼かないと
     // 「音は Scene2 へ移ったのに絵は Scene1 を延々ループ」になる。
     let mut launcher_sidecar = crate::launcher::sidecar::SidecarRecorder::new();
+    // live と同じく、描画は song の索引で lane / routing / node を引く (書き出し中 song は変わらないので 1 回)。
+    let song_index = common::song_index::SongIndex::build(song);
     // r.md #89: 変調の制御グリッド。**live engine と同じ 1 本** (`crate::mod_tick`、
     // アーキ不変条件 6) を通すので、刻みの割り方も transport の進め方も
     // buffer 長 (export 1024 固定 / live は device 実測長) に依存しない。
@@ -674,7 +676,7 @@ fn render_loop(
     // r.md #89: 変調の位相と transport を走査開始位置で張る (範囲書き出しは曲頭
     // から始まらない)。live の seek と同じ `locate` を通すので、同じ位置から
     // 再生したときと位相が一致する。
-    mod_tick.locate(song, walk_start, playhead_beats, sample_rate);
+    mod_tick.locate(song, &song_index, walk_start, playhead_beats, sample_rate);
 
     // r.md #87 (Q9 / §2.5): 書き出しは **今のランチャーの状態を反映する**。
     // 走査の先頭で `Track.launcher` / `AutomationLane.launcher` を一斉に撃った
@@ -758,7 +760,7 @@ fn render_loop(
                 let idx = plan.nodes.get(usize::from(plan_slot))?.owner_track_index?;
                 scratch_ref.get(idx as usize)?.state.latest_note
             };
-            mod_tick.run_buffer(song, playhead, frames as u32, sample_rate, follower_env, note_anchor)
+            mod_tick.run_buffer(song, &song_index, playhead, frames as u32, sample_rate, follower_env, note_anchor)
         };
         playhead_beats = head_mark.beat;
         let smoothed_current_bpm_freewheel = head_mark.bpm;
@@ -774,12 +776,13 @@ fn render_loop(
             sample_rate,
             frames as u32,
         );
-        launcher.update(song, span, global_launch_quantize, playing);
+        launcher.update(song, &song_index, span, global_launch_quantize, playing);
         if write_video_sidecars {
             launcher_sidecar.record(launcher.rows(), span);
         }
         render_master_buffer(
             song,
+            &song_index,
             &mut schedule,
             scratch,
             &plugin_refs_g,

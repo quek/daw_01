@@ -172,7 +172,7 @@ pub enum NodeOp {
 /// schedule 再 compile を跨いだ状態移送のキー)。track は Song 上の安定
 /// `Track::id`。1 track は高々 1 つの clearing `Mix` (親 bus か master) に
 /// しか流れ込まないので、src 側補償は track id 単独で一意。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DelayKey {
     /// Mix 合流点で低 latency 側 src に入る補償 (`emit_mix_src_alignment`)。
     MixSrc { track_id: u32 },
@@ -273,27 +273,108 @@ pub struct Schedule {
     /// solo の透過規則の表 (track index 順)。**render の間は読むだけ** — program (走行状態) とは別に持つので、
     /// 並列実行で ある program を書いている手と、表を読む手 (`MixSend`) が同じ資源を奪い合わない。
     pub solo: SoloTables,
+    /// 再 compile 跨ぎの状態移送で、この schedule が「旧」になったときに引く鍵の索引 ([`Self::index_state_keys`])。
+    pub state_keys: ScheduleKeys,
 }
 
-/// solo の透過規則の表 (compile 時に焼いた配線の閉包、index = song-track index、`mix::any_soloed` が引く)。
-/// RT で Song の配線を歩かない (`docs/plan_unbounded_tracks.md` §2.3)。
+/// solo の透過規則 (index = song-track index)。配線は compile 時に辺の表へ焼き、どの track が透過するかは
+/// **buffer ごとに** その buffer の `solo` から 1 回だけ解く ([`Self::resolve`]、トラック数 + 辺数に比例)。RT で Song の
+/// 配線を歩かず、track ごとに推移閉包を舐めもしない (`docs/plan_unbounded_tracks.md` §2.3)。
+///
+/// 規則は 2 つ:
+/// - その track へ **流れ込む** track (子 → group、send 元 → return、send の有効 / 無効を問わない) のどれかが solo なら、
+///   solo でない bus も透過する — 「あるトラックを solo すると、そのトラックが送っている reverb / delay の **リターン** も
+///   生かす」Ableton 準拠の挙動。
+/// - 祖先 group (`parent_group_id` を辿る) のどれかが solo なら透過する — folder solo。
 #[derive(Debug, Default)]
 pub struct SoloTables {
-    /// その track へ **流れ込む** track (子 → group、send 元 → return) の推移閉包 — 「子 / send 元が solo なら
-    /// bus 自身も透過」。
-    pub contributors: Vec<Vec<u32>>,
-    /// その track の祖先 group (`parent_group_id` を辿った順) — folder solo (「group を solo したら子も鳴る」)。
-    pub ancestors: Vec<Vec<u32>>,
+    /// 辺 (流れ込む側 → 受け取る側) を流れ込む側の順に: `flows_to[flows_start[i]..flows_start[i + 1]]`。
+    flows_start: Vec<u32>,
+    flows_to: Vec<u32>,
+    /// 親 group (`u32::MAX` = 無し)。
+    parent: Vec<u32>,
+    /// 親が子より先に来る並び (祖先の solo を 1 周で子へ降ろす)。
+    parent_first: Vec<u32>,
+    /// 直近の [`Self::resolve`] の解 (流れ込む track に solo がある / 祖先 group に solo がある)。
+    contributor_soloed: Vec<bool>,
+    ancestor_soloed: Vec<bool>,
+    /// [`Self::resolve`] の作業領域 (容量 2 × トラック数)。
+    stack: Vec<u32>,
 }
 
 impl SoloTables {
-    /// track `i` の (流れ込む track, 祖先 group)。範囲外は空。
+    /// `flows` = 辺 (流れ込む側, 受け取る側)、`parent[i]` = track `i` の親 group (off-thread)。
     #[must_use]
-    pub fn of(&self, i: u32) -> (&[u32], &[u32]) {
-        fn get(v: &[Vec<u32>], i: u32) -> &[u32] {
-            v.get(i as usize).map_or(&[][..], Vec::as_slice)
+    pub fn build(flows: impl Iterator<Item = (u32, u32)>, parent: Vec<Option<u32>>) -> Self {
+        let n = parent.len();
+        let mut edges: Vec<(u32, u32)> = flows.filter(|&(from, to)| (from as usize) < n && (to as usize) < n).collect();
+        edges.sort_unstable();
+        edges.dedup();
+        let mut flows_start = vec![0u32; n + 1];
+        for &(from, _) in &edges {
+            flows_start[from as usize + 1] += 1;
         }
-        (get(&self.contributors, i), get(&self.ancestors, i))
+        for i in 0..n {
+            flows_start[i + 1] += flows_start[i];
+        }
+        let parent: Vec<u32> = parent.into_iter().map(|p| p.filter(|&p| (p as usize) < n).unwrap_or(u32::MAX)).collect();
+        let mut kids: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (i, &p) in parent.iter().enumerate() {
+            if p != u32::MAX {
+                kids[p as usize].push(i as u32);
+            }
+        }
+        // 根から幅優先 (親の循環は compile が弾くので、全 track が並ぶ)。
+        let mut parent_first: Vec<u32> = (0..n as u32).filter(|&i| parent[i as usize] == u32::MAX).collect();
+        let mut at = 0;
+        while at < parent_first.len() {
+            let p = parent_first[at] as usize;
+            parent_first.extend_from_slice(&kids[p]);
+            at += 1;
+        }
+        Self {
+            flows_start,
+            flows_to: edges.into_iter().map(|(_, to)| to).collect(),
+            parent,
+            parent_first,
+            contributor_soloed: vec![false; n],
+            ancestor_soloed: vec![false; n],
+            stack: Vec::with_capacity(2 * n),
+        }
+    }
+
+    /// この buffer の `solo` から透過を解く。dispatch の前 (callback スレッド、表を読む手が走る前) に呼ぶ。
+    /// RT 安全: 確保済みの表の書き換えのみ。
+    pub fn resolve(&mut self, song: &common::model::Song) {
+        let Self { flows_start, flows_to, parent, parent_first, contributor_soloed, ancestor_soloed, stack } = self;
+        let soloed = |i: usize| song.tracks.get(i).is_some_and(|t| t.solo);
+        // 流れ込む側: solo の track から辺を前へ辿って届く track に印を付ける。
+        contributor_soloed.fill(false);
+        stack.clear();
+        stack.extend((0..contributor_soloed.len() as u32).filter(|&i| soloed(i as usize)));
+        while let Some(from) = stack.pop() {
+            let (a, b) = (flows_start[from as usize] as usize, flows_start[from as usize + 1] as usize);
+            for &to in &flows_to[a..b] {
+                if !std::mem::replace(&mut contributor_soloed[to as usize], true) {
+                    stack.push(to);
+                }
+            }
+        }
+        // 祖先: 親が先に解けている並びで、親の solo か親の祖先の solo を子へ降ろす。
+        ancestor_soloed.fill(false);
+        for &i in parent_first.iter() {
+            let p = parent[i as usize];
+            if p != u32::MAX {
+                ancestor_soloed[i as usize] = soloed(p as usize) || ancestor_soloed[p as usize];
+            }
+        }
+    }
+
+    /// track `i` の (流れ込む track に solo がある, 祖先 group に solo がある) — 直近の [`Self::resolve`] の解。範囲外は無し。
+    #[must_use]
+    pub fn of(&self, i: u32) -> (bool, bool) {
+        let i = i as usize;
+        (self.contributor_soloed.get(i).copied().unwrap_or(false), self.ancestor_soloed.get(i).copied().unwrap_or(false))
     }
 }
 
@@ -329,6 +410,7 @@ impl Schedule {
             master_midi_b: Vec::with_capacity(crate::mixer::MAX_EVENTS),
             graph: super::render_graph::RenderGraph::default(),
             solo: SoloTables::default(),
+            state_keys: ScheduleKeys::default(),
         }
     }
 
@@ -341,11 +423,12 @@ impl Schedule {
     /// 時)。live の走行状態 (ring の音声履歴 / env) は RT だけが持つので、
     /// off-thread では移送できない — ここで行う操作は `Vec` の `mem::swap`
     /// (ポインタ交換) と f32 コピーだけで、alloc / free / lock は無い。
-    /// 突き合わせは [`find_near`] (本数に上限が無いので二乗にしない — 並びは再 compile を跨いでほぼ保たれる)。
+    /// 突き合わせは旧 schedule の鍵の索引 ([`KeyIndex`]、compile 時に作ってある) — 本数に上限が無いので、鍵が
+    /// 入れ替わった / 消えた要素があっても二乗にしない。
     pub fn adopt_state_from(&mut self, old: &mut Schedule) {
         let mut hint = 0;
         for (i, key) in self.delay_keys.iter().enumerate() {
-            if let Some(j) = find_near(&old.delay_keys, hint, |k| k == key) {
+            if let Some(j) = old.state_keys.delay.find_near(&old.delay_keys, *key, hint) {
                 // 補償 delay 長が変わっていても手元の過去は引き継ぐ (`DelayLine::adopt`)。
                 self.delay_lines[i].adopt(&mut old.delay_lines[j]);
                 hint = j + 1;
@@ -356,7 +439,7 @@ impl Schedule {
             if *key == 0 {
                 continue; // 未採番 sentinel は identity にならない
             }
-            if let Some(j) = find_near(&old.follower_keys, hint, |k| k == key) {
+            if let Some(j) = old.state_keys.followers.find_near(&old.follower_keys, *key, hint) {
                 self.follower_slots[i].adopt_state_from(&old.follower_slots[j]);
                 hint = j + 1;
             }
@@ -365,25 +448,103 @@ impl Schedule {
         // chain id で移送する (`ChainProgram::adopt_state_from`)。
         hint = 0;
         for p in &mut self.track_programs {
-            if let Some(j) = find_near(&old.track_programs, hint, |o| o.track_id == p.track_id) {
+            let found = old.state_keys.programs.find_near_by(p.track_id, hint, |j| old.track_programs.get(j).map(|o| o.track_id));
+            if let Some(j) = found {
                 p.adopt_state_from(&mut old.track_programs[j]);
                 hint = j + 1;
             }
         }
         self.master_program.adopt_state_from(&mut old.master_program);
     }
+
+    /// [`Self::adopt_state_from`] の鍵の索引を作る (off-thread、schedule を組み終えた後。program の分は
+    /// `build_program` が作っている)。
+    pub fn index_state_keys(&mut self) {
+        self.state_keys = ScheduleKeys {
+            delay: KeyIndex::build(self.delay_keys.iter().copied()),
+            followers: KeyIndex::build(self.follower_keys.iter().copied()),
+            programs: KeyIndex::build(self.track_programs.iter().map(|p| p.track_id)),
+        };
+    }
 }
 
-/// `items` から `pred` に合う最初の要素を、`hint` から後ろ → 先頭から `hint` の手前の順に探す。
-/// 新旧の並びがほぼ同じ突き合わせ (前回の一致位置の次を `hint` に渡す) は、並びが保たれている間
-/// 要素ごとに 1 回の比較で済む。確保なし (RT 安全)。
-pub(crate) fn find_near<T>(items: &[T], hint: usize, pred: impl Fn(&T) -> bool) -> Option<usize> {
-    let hint = hint.min(items.len());
-    items[hint..].iter().position(&pred).map(|p| hint + p).or_else(|| items[..hint].iter().position(pred))
+/// [`Schedule::adopt_state_from`] の突き合わせの鍵の索引。
+#[derive(Debug, Default)]
+pub struct ScheduleKeys {
+    delay: KeyIndex<DelayKey>,
+    followers: KeyIndex<u32>,
+    programs: KeyIndex<u32>,
+}
+
+/// 再 compile を跨ぐ状態移送の、鍵 → 要素の位置の索引 (off-thread で作る)。
+#[derive(Debug)]
+pub struct KeyIndex<K> {
+    /// `(鍵, 位置)` を鍵 → 位置の順に。
+    sorted: Vec<(K, u32)>,
+}
+
+impl<K> Default for KeyIndex<K> {
+    fn default() -> Self {
+        Self { sorted: Vec::new() }
+    }
+}
+
+impl<K: Ord + Copy> KeyIndex<K> {
+    #[must_use]
+    pub fn build(keys: impl Iterator<Item = K>) -> Self {
+        let mut sorted: Vec<(K, u32)> = keys.enumerate().map(|(i, k)| (k, u32::try_from(i).unwrap_or(u32::MAX))).collect();
+        sorted.sort_unstable();
+        Self { sorted }
+    }
+
+    /// 鍵 `key` の要素 (`keys[j] == key`) のうち、位置が `hint` 以上で最初のもの、無ければ最初のもの。新旧の並びが
+    /// ほぼ同じ突き合わせで前回の一致位置の次を `hint` に渡すと、同じ鍵が複数あっても並び順に対になる。
+    /// `keys` は索引を作った列 (答えは必ず `keys` で照合するので、別の列の索引から外れた位置は返らない)。
+    /// 確保なし (RT 安全)。
+    pub fn find_near(&self, keys: &[K], key: K, hint: usize) -> Option<usize> {
+        self.find_near_by(key, hint, |j| keys.get(j).copied())
+    }
+
+    /// [`Self::find_near`] の、位置 → 鍵を関数で引く版。
+    pub fn find_near_by(&self, key: K, hint: usize, key_at: impl Fn(usize) -> Option<K>) -> Option<usize> {
+        let lo = self.sorted.partition_point(|(k, _)| *k < key);
+        let run = &self.sorted[lo..];
+        let run = &run[..run.partition_point(|(k, _)| *k == key)];
+        let at = run.partition_point(|&(_, pos)| (pos as usize) < hint);
+        let j = run.get(at).or_else(|| run.first())?.1 as usize;
+        (key_at(j) == Some(key)).then_some(j)
+    }
 }
 
 impl Default for Schedule {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeyIndex;
+
+    /// 鍵の索引は「`hint` から後ろで最初 → 無ければ先頭から最初」の線形探索と同じ位置を返す
+    /// (同じ鍵が複数ある / 鍵が無い / `hint` が末尾を越える)。
+    #[test]
+    fn 鍵の索引は_hint_から探す線形探索と同じ位置を返す() {
+        let keys = [5u32, 3, 5, 9, 3, 5];
+        let index = KeyIndex::build(keys.iter().copied());
+        let linear = |key: u32, hint: usize| {
+            let hint = hint.min(keys.len());
+            keys[hint..]
+                .iter()
+                .position(|k| *k == key)
+                .map(|p| hint + p)
+                .or_else(|| keys[..hint].iter().position(|k| *k == key))
+        };
+        for key in [3, 5, 9, 7] {
+            for hint in 0..=keys.len() + 1 {
+                assert_eq!(index.find_near(&keys, key, hint), linear(key, hint), "key={key} hint={hint}");
+            }
+        }
+        assert_eq!(index.find_near(&[5, 3], 9, 0), None, "別の列の索引から外れた位置は返さない");
     }
 }

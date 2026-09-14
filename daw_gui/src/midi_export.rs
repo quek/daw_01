@@ -103,10 +103,8 @@ fn build_meta_track(song: &Song) -> Vec<TrackEvent<'static>> {
 /// 曲頭 `song.bpm` の 1 点。 SMF は step tempo のみなので、 ramp/bezier は 1/8 拍
 /// 解像度でサンプルし bpm が 0.05 超変わるたびに breakpoint を置く (= 階段近似)。
 fn tempo_breakpoints(song: &Song) -> Vec<(u32, f32)> {
-    let has_tempo_lane = song.song_lanes.iter().any(|l| {
-        l.enabled && matches!(l.target, common::model::AutomationTarget::SongTempo)
-    });
-    if !has_tempo_lane {
+    let curve = common::automation::SongTempoCurve::of(song);
+    if !curve.is_automated() {
         return vec![(0, song.bpm)];
     }
     let mut out: Vec<(u32, f32)> = Vec::new();
@@ -117,7 +115,7 @@ fn tempo_breakpoints(song: &Song) -> Vec<(u32, f32)> {
     let mut beat = 0.0_f64;
     let mut prev_bpm = f32::NAN;
     while beat < end_beat {
-        let bpm = common::automation::evaluate_song_tempo(song, beat);
+        let bpm = curve.at(beat);
         if prev_bpm.is_nan() || (bpm - prev_bpm).abs() > 0.05 {
             out.push((beat_to_tick(beat), bpm));
             prev_bpm = bpm;

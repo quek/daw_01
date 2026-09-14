@@ -19,13 +19,13 @@
 
 use std::sync::atomic::Ordering;
 
-use common::model::{LoopRegion, Song, Track};
+use common::model::{LoopRegion, ParamStoreAt, Song, Track};
 use common::plugin_ref::{DISPATCH_TIMEOUT_MS, DispatchOutcome};
 use common::process_data::EventKind;
+use common::song_index::SongIndex;
 
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::engine::{PairLease, PluginEntry, PluginRefs, SyncSlot, WorkerRig};
-use crate::graph::mix::any_soloed;
 use crate::graph::native::{NativeIo, apply_listen_override};
 use crate::graph::program::Pass1Role;
 use crate::graph::step::{BufferParams, RenderCtx, run_step};
@@ -148,9 +148,11 @@ pub fn process_track_owned(
     frames: u32,
     playing: bool,
     song: Option<&Song>,
+    // `song` と同じ snapshot の索引 (`RtBundle::song_index`)。
+    index: &SongIndex,
     any_solo: bool,
-    // この track の祖先 group (`SoloTables::ancestors`、folder solo)。
-    solo_ancestors: &[u32],
+    // この track の祖先 group に solo があるか (`SoloTables::of`、folder solo)。
+    ancestor_soloed: bool,
     input_delay_samples: u32,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     // Phase 5 Step 5.2: 当該 buffer の effective bpm (= SongTempo lane 評価
@@ -206,9 +208,9 @@ pub fn process_track_owned(
     // (`program.pass1_end`) まで、leaf は全部。
     // r.md #129: 役割は compile 時に焼いた値 (旧実装は毎 buffer Song を歩き、パラアウト先の判定が
     // plugin を列挙する iterator の確保を RT で起こしていた)。
-    let skip_strip = match program.pass1_role {
-        Pass1Role::Leaf => false,
-        Pass1Role::GroupWithInstrument => true,
+    let (skip_strip, main_to_child) = match program.pass1_role {
+        Pass1Role::Leaf => (false, false),
+        Pass1Role::GroupWithInstrument { main_to_child } => (true, main_to_child),
         Pass1Role::Bus => {
             scratch.track_l[..n].fill(0.0);
             scratch.track_r[..n].fill(0.0);
@@ -247,6 +249,7 @@ pub fn process_track_owned(
     if playing {
         crate::launcher::render::collect_row_midi(
             song,
+            index,
             track_idx,
             rows.track(),
             sample_rate,
@@ -344,8 +347,8 @@ pub fn process_track_owned(
         rows,
         own_pre_fx: captured_prefx.then_some((&scratch.pre_fx_l[..], &scratch.pre_fx_r[..])),
         native: native_io,
-        owner_devices: &song_track.devices,
-        owner_stores: (&song_track.automation_lanes, &song_track.mod_routings),
+        index,
+        owner: ParamStoreAt::Track(track_idx),
     };
     run_chain_program(
         program,
@@ -367,7 +370,7 @@ pub fn process_track_owned(
         // its OWN child track (port 0 → `buffer_aux_out[0]`), so clear it from
         // the parent's scratch — the parent's clearing `Mix` then sums only the
         // children. 楽器兼バス mode (port 0 unrouted) keeps main for `MixAdditive`.
-        if song_track.paraout_main_to_child() {
+        if main_to_child {
             scratch.track_l[..n].fill(0.0);
             scratch.track_r[..n].fill(0.0);
             scratch.peak_l = 0.0;
@@ -401,15 +404,15 @@ pub fn process_track_owned(
     let muted = song_track.muted;
     let solo = song_track.solo;
     // Folder solo: グループを solo したらその子も鳴る (Ableton / Reaper 準拠)。
-    // 祖先 group のいずれかが solo なら、 この track 自身が非 solo でも透過させる (祖先は compile 時に焼いた表)。
-    let effective_mute =
-        muted || (any_solo && !solo && !song.is_some_and(|s| any_soloed(s, solo_ancestors)));
+    // 祖先 group のいずれかが solo なら、 この track 自身が非 solo でも透過させる (buffer の頭で解いた `SoloTables`)。
+    let effective_mute = muted || (any_solo && !solo && !(song.is_some() && ancestor_soloed));
 
     // strip は常に適用する — excluded track でも `track_l/r` に post-fader
     // signal を残す (solo された return への send / sidechain tap が読める、
     // Ableton 準拠)。 mute の意味論は `apply_strip` の doc 参照。
     crate::automation::fill_track_param_ramps(
         song,
+        index,
         track_idx,
         rows,
         sample_rate,
@@ -448,6 +451,7 @@ pub fn process_master_fx_chain(
     frames: u32,
     playing: bool,
     song: Option<&Song>,
+    index: &SongIndex,
     current_bpm: f32,
     playhead_beats: f64,
     loop_region: LoopRegion,
@@ -462,11 +466,6 @@ pub fn process_master_fx_chain(
     // master は note を持たない = 空の MIDI バスで走らせる。
     midi_a.clear();
     program.listen_pending = None;
-    // r.md #129: master fx chain の device (組み込み Bus Comp / Tone EQ を含む) の store は song 側。
-    let (owner_devices, owner_stores) = match song {
-        Some(s) => (s.master_fx_chain.as_slice(), (s.song_lanes.as_slice(), s.song_mod_routings.as_slice())),
-        None => (&[][..], (&[][..], &[][..])),
-    };
     let ctx = ProgramCtx {
         song,
         plugin_refs,
@@ -482,8 +481,9 @@ pub fn process_master_fx_chain(
         rows: master_rows,
         own_pre_fx: None,
         native: native_io,
-        owner_devices,
-        owner_stores,
+        index,
+        // r.md #129: master fx chain の device (組み込み Bus Comp / Tone EQ を含む) と store は song 側。
+        owner: ParamStoreAt::Song,
     };
     let len = program.ops.len();
     run_chain_program(program, 0..len, master_l, master_r, midi_a, midi_b, &ctx);
@@ -515,6 +515,10 @@ pub fn execute_schedule_post_dispatch(
     rows: &RowSourceTable,
     native_io: NativeIo<'_>,
 ) {
+    // solo の透過は本番 (`render_master_buffer`) と同じく表を読む手が走る前に解く。
+    if any_solo {
+        schedule.solo.resolve(song);
+    }
     let params = BufferParams {
         sample_rate,
         frames: frames.min(n as u32),
@@ -529,7 +533,8 @@ pub fn execute_schedule_post_dispatch(
         rows,
         native_io,
     };
-    let ctx = RenderCtx::new(song, schedule, scratch, master_l, master_r, plugin_refs, None, None, params);
+    let index = SongIndex::build(song);
+    let ctx = RenderCtx::new(song, &index, schedule, scratch, master_l, master_r, plugin_refs, None, None, params);
     crate::graph::step::run_nodes_for_test(&ctx, |_| true);
 }
 
@@ -543,6 +548,7 @@ pub(super) fn run_group_fx_chain(
     track_idx: u32,
     song_track: &Track,
     song: &Song,
+    index: &SongIndex,
     scratch: &mut TrackScratch,
     program: &mut ChainProgram,
     plugin_refs: &PluginRefs,
@@ -551,8 +557,8 @@ pub(super) fn run_group_fx_chain(
     frames: u32,
     playing: bool,
     any_solo: bool,
-    // この bus の (流れ込む track, 祖先 group) (`SoloTables::of`)。
-    (solo_contributors, solo_ancestors): (&[u32], &[u32]),
+    // この bus の (流れ込む track に solo がある, 祖先 group に solo がある) (`SoloTables::of`)。
+    (contributor_soloed, ancestor_soloed): (bool, bool),
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     current_bpm: f32,
     // group fx の transport snapshot (= 積分済み拍位置 + 実 loop トグル)。
@@ -609,8 +615,8 @@ pub(super) fn run_group_fx_chain(
         rows,
         own_pre_fx: captured_prefx.then_some((&scratch.pre_fx_l[..], &scratch.pre_fx_r[..])),
         native: native_io,
-        owner_devices: &song_track.devices,
-        owner_stores: (&song_track.automation_lanes, &song_track.mod_routings),
+        index,
+        owner: ParamStoreAt::Track(track_idx),
     };
     let len = program.ops.len();
     run_chain_program(
@@ -642,18 +648,15 @@ pub(super) fn run_group_fx_chain(
     let muted = song_track.muted;
     let solo = song_track.solo;
     // Live 互換: 子 / send 元のいずれかが solo されていれば、 この bus 自身は
-    // solo フラグが無くても透過させる (`solo_contributors`)。 さらに folder
-    // solo: 祖先 group が solo なら、 このネストした group bus 自身も透過させる (`solo_ancestors`)。
-    let effective_mute = muted
-        || (any_solo
-            && !solo
-            && !any_soloed(song, solo_ancestors)
-            && !any_soloed(song, solo_contributors));
+    // solo フラグが無くても透過させる (`contributor_soloed`)。 さらに folder
+    // solo: 祖先 group が solo なら、 このネストした group bus 自身も透過させる (`ancestor_soloed`)。
+    let effective_mute = muted || (any_solo && !solo && !ancestor_soloed && !contributor_soloed);
 
     // strip は常に適用 (mirrors process_track_owned) — mute 意味論は
     // `apply_strip` の doc 参照。
     crate::automation::fill_track_param_ramps(
         Some(song),
+        index,
         track_idx,
         rows,
         sample_rate,
@@ -726,6 +729,8 @@ pub(super) fn advance_follower(
 #[allow(clippy::too_many_arguments)]
 pub fn render_master_buffer(
     song: &Song,
+    // `song` と同じ snapshot の索引 (RT が lane / routing / node を id や target で探さないため)。
+    index: &SongIndex,
     schedule: &mut Schedule,
     scratch: &mut [TrackScratch],
     plugin_refs: &PluginRefs,
@@ -758,6 +763,10 @@ pub fn render_master_buffer(
     master_r[..n].fill(0.0);
 
     let any_solo = song.tracks.iter().any(|t| t.solo);
+    // solo の透過はこの buffer の solo から 1 回だけ解く (表を読む手が走る前)。solo が無ければ誰も読まない。
+    if any_solo {
+        schedule.solo.resolve(song);
+    }
     let params = BufferParams {
         sample_rate,
         frames,
@@ -784,6 +793,7 @@ pub fn render_master_buffer(
     let ran = {
         let ctx = RenderCtx::new(
             song,
+            index,
             schedule,
             scratch,
             &mut master_l[..n],
@@ -837,6 +847,7 @@ pub fn render_master_buffer(
         frames,
         playing,
         Some(song),
+        index,
         current_bpm,
         playhead_beats,
         loop_region,
@@ -863,7 +874,14 @@ pub fn render_master_buffer(
     // 「出力を超えさせない」保証が破れる。値 (On / Ceiling) はオートメーション / 変調を
     // buffer 頭で解決する。先読み遅延を通すかは compile 時に焼いた値 (PDC の会計と同じ) で決まり、
     // 遅延を焼いてある間は解決値が OFF でも遅延だけを通す。
-    let limiter = crate::automation::resolve_master_limiter(song, rows.master_rows(), playhead_beats, recording_lanes, mod_plane);
+    let limiter = crate::automation::resolve_master_limiter(
+        song,
+        index.song_store(song),
+        rows.master_rows(),
+        playhead_beats,
+        recording_lanes,
+        mod_plane,
+    );
     #[allow(clippy::cast_precision_loss)]
     let sr_f32 = sample_rate as f32;
     master_limiter.process(&limiter, schedule.master_limiter_latency, &mut master_l[..n], &mut master_r[..n], n, sr_f32);
@@ -1144,6 +1162,7 @@ mod send_tests {
             src,
             pre_fader,
             song,
+            &SongIndex::build(song),
             0,
             send_id,
             48_000,
@@ -1153,7 +1172,7 @@ mod send_tests {
             &empty_lanes(),
             FRAMES,
             crate::launcher::TrackRows::default(),
-            &[],
+            false,
         );
     }
 
@@ -1292,19 +1311,15 @@ mod send_tests {
     fn soloed_send_source_keeps_return_solo_safe() {
         // song_with_send: Vocal (id 1) post-fader sends to Reverb (id 2).
         let mut song = song_with_send(1.0, SendMode::PostFader, true);
-        let sched = crate::graph::compile_schedule_for_test(&song, 48_000, 0).expect("compile");
-        let reverb = sched.solo.of(1).0;
+        let mut sched = crate::graph::compile_schedule_for_test(&song, 48_000, 0).expect("compile");
         song.tracks[0].solo = true; // solo the send SOURCE (Vocal)
-        assert!(
-            any_soloed(&song, reverb),
-            "Reverb return must be solo-safe when its send source is soloed"
-        );
+        sched.solo.resolve(&song);
+        assert!(sched.solo.of(1).0, "Reverb return must be solo-safe when its send source is soloed");
+        assert!(!sched.solo.of(0).0, "the source itself has no soloed contributor");
         // Nothing soloed → the return has no soloed contributor.
         song.tracks[0].solo = false;
-        assert!(
-            !any_soloed(&song, reverb),
-            "with nothing soloed, the return has no soloed contributor"
-        );
+        sched.solo.resolve(&song);
+        assert!(!sched.solo.of(1).0, "with nothing soloed, the return has no soloed contributor");
     }
 
     /// Folder solo: soloing a GROUP must keep its children audible (Ableton /
@@ -1330,15 +1345,54 @@ mod send_tests {
             ..Default::default()
         };
 
-        let sched = crate::graph::compile_schedule_for_test(&song, 48_000, 0).expect("compile");
-        let ancestors = |i: u32| sched.solo.of(i).1;
-        assert_eq!(ancestors(1), [0], "child の祖先は group (song-track index)");
+        let mut sched = crate::graph::compile_schedule_for_test(&song, 48_000, 0).expect("compile");
+        sched.solo.resolve(&song);
         // child: not soloed itself, but its ancestor group is → audible.
-        assert!(any_soloed(&song, ancestors(1)), "child sees the soloed ancestor group");
+        assert!(sched.solo.of(1).1, "child sees the soloed ancestor group");
         // unrelated track: no soloed ancestor → excluded (silent) under solo.
-        assert!(!any_soloed(&song, ancestors(2)), "unrelated track is silenced while a group is soloed");
+        assert!(!sched.solo.of(2).1, "unrelated track is silenced while a group is soloed");
         song.tracks[0].solo = false;
-        assert!(!any_soloed(&song, ancestors(1)), "group の solo を外せば child は透過しない");
+        sched.solo.resolve(&song);
+        assert!(!sched.solo.of(1).1, "group の solo を外せば child は透過しない");
+    }
+
+    /// 入れ子の group と send が混ざっても、透過の解は「流れ込む track / 祖先を全部舐めて solo を探す」のと同じ。
+    /// 孫 → 子 group → 親 group、孫 → return への send、無関係な track。
+    #[test]
+    fn solo_の透過は入れ子の_group_と_send_を辿った解と同じ() {
+        let child = |id: u32, parent: u32| {
+            track(|t| {
+                t.id = id;
+                t.parent_group_id = Some(parent);
+            })
+        };
+        // 0: 親 group / 1: 子 group / 2: 孫 / 3: return / 4: 無関係
+        let mut song = Song {
+            tracks: vec![track(|t| t.id = 1), child(2, 1), child(3, 2), track(|t| t.id = 4), track(|t| t.id = 5)],
+            ..Default::default()
+        };
+        song.tracks[2].sends.push(common::model::Send {
+            id: 1,
+            dest_track_id: 4,
+            gain: 1.0,
+            mode: SendMode::PostFader,
+            enabled: false,
+        });
+        let mut sched = crate::graph::compile_schedule_for_test(&song, 48_000, 0).expect("compile");
+        // (solo にする track, 透過の解 [(流れ込む側に solo, 祖先に solo)] × 5)
+        let cases: [(usize, [(bool, bool); 5]); 3] = [
+            (2, [(true, false), (true, false), (false, false), (true, false), (false, false)]),
+            (0, [(false, false), (false, true), (false, true), (false, false), (false, false)]),
+            (1, [(true, false), (false, false), (false, true), (false, false), (false, false)]),
+        ];
+        for (soloed, want) in cases {
+            for (i, t) in song.tracks.iter_mut().enumerate() {
+                t.solo = i == soloed;
+            }
+            sched.solo.resolve(&song);
+            let got: Vec<(bool, bool)> = (0..5).map(|i| sched.solo.of(i)).collect();
+            assert_eq!(got, want, "solo = track {soloed}");
+        }
     }
 }
 
@@ -1378,6 +1432,7 @@ mod render_master_tests {
         let renderer = crate::audio_clip_renderer::AudioClipRenderer::empty();
         render_master_buffer(
             &song,
+            &SongIndex::build(&song),
             &mut schedule,
             &mut scratch,
             &plugin_refs,

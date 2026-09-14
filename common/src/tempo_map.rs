@@ -8,7 +8,7 @@
 //! The lookups (`beat_to_seconds` / `seconds_to_beat` and the sample variants)
 //! are alloc/lock-free and RT-safe.
 
-use crate::automation::evaluate_song_tempo;
+use crate::automation::SongTempoCurve;
 use crate::model::Song;
 
 /// Integration / table resolution. 1/16 beat keeps a 600-beat song to ~9600
@@ -24,9 +24,7 @@ const MAX_TABLE_BEATS: f64 = 1_000_000.0;
 /// 構築に落ちるか)。 呼び出し側が `TempoMap` を世代キャッシュする判断に使う。
 #[must_use]
 pub fn has_tempo_automation(song: &Song) -> bool {
-    song.song_lanes
-        .iter()
-        .any(|l| l.enabled && matches!(l.target, crate::model::AutomationTarget::SongTempo))
+    crate::automation::has_song_tempo_automation(song)
 }
 
 /// Song beat → song 秒の便宜関数。 `SongTempo` automation lane があれば
@@ -67,15 +65,17 @@ impl TempoMap {
         secs.push(0.0);
         let mut s = 0.0_f64;
         let mut beat = 0.0_f64;
+        // 刻みごとに song_lanes と clip 列を探さない (1 度引いて使い回す)。
+        let curve = SongTempoCurve::of(song);
         for _ in 0..steps {
             // 中点則 (segment 中央の bpm) で積分精度を上げる (左 Riemann は ramp で
-            // 系統誤差が出る)。 evaluate_song_tempo は [1, 1000] clamp 済 → 0 除算なし。
-            let bpm = f64::from(evaluate_song_tempo(song, beat + STEP_BEATS * 0.5));
+            // 系統誤差が出る)。 テンポは [1, 1000] clamp 済 → 0 除算なし。
+            let bpm = f64::from(curve.at(beat + STEP_BEATS * 0.5));
             s += STEP_BEATS * 60.0 / bpm;
             secs.push(s);
             beat += STEP_BEATS;
         }
-        let tail_bpm = f64::from(evaluate_song_tempo(song, end_beat));
+        let tail_bpm = f64::from(curve.at(end_beat));
         Self { secs, tail_bpm }
     }
 

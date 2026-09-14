@@ -17,7 +17,7 @@
 //! **同じ行の中で空セルに区切られた連続した塊** (Q13)。判定は
 //! [`common::model::launch_group`] が SSoT で、ここでは再実装しない。
 
-use common::model::{FollowAction, FollowActionKind, Scene, launch_group};
+use common::model::{FollowAction, FollowActionKind, launch_group};
 use common::modulators::random_unit;
 
 /// フォローアクションの結果。列は `Song.scenes` の表示順 index で返す
@@ -60,15 +60,16 @@ pub fn row_seed(row_key: u64, clip_id: u32) -> u64 {
 ///
 /// - `occupied[i]` = 「表示順 `i` の列にこの行のセルがあるか」
 /// - `from` = 今鳴っているセルの列 index
-/// - `scenes` = `Song.scenes` (`Jump { scene_id }` の解決にだけ使う)
+/// - `scene_pos` = 列 id → `Song.scenes` の表示順 index (`Jump { scene_id }` の解決にだけ使う。同じ id が
+///   複数あれば先頭)
 ///
-/// RT 安全: 確保もロックも無い純関数 (`scenes` の線形走査のみ)。
+/// RT 安全: 確保もロックも無い純関数。
 #[must_use]
 pub fn resolve(
     action: &FollowAction,
     occupied: &[bool],
     from: usize,
-    scenes: &[Scene],
+    scene_pos: impl Fn(u32) -> Option<usize>,
     seed: u64,
     fire_beat: f64,
 ) -> FollowOutcome {
@@ -81,10 +82,10 @@ pub fn resolve(
     // 端は抽選しない — `random_unit` は `[0,1)` だが f32 化で 1.0 に丸まりうるので、
     // 「100% なのに稀に b」「0% なのに稀に a」が起きる (UI の表示と食い違う)。
     if chance == 100 {
-        return apply(action.a, occupied, from, scenes, seed, step);
+        return apply(action.a, occupied, from, scene_pos, seed, step);
     }
     if chance == 0 {
-        return apply(action.b, occupied, from, scenes, seed, step);
+        return apply(action.b, occupied, from, scene_pos, seed, step);
     }
     let roll = random_unit(seed ^ SALT_LOTTERY, step);
     let kind = if roll * 100.0 < f32::from(chance) {
@@ -92,7 +93,7 @@ pub fn resolve(
     } else {
         action.b
     };
-    apply(kind, occupied, from, scenes, seed, step)
+    apply(kind, occupied, from, scene_pos, seed, step)
 }
 
 /// 選ばれた 1 種を列 index へ落とす。
@@ -100,7 +101,7 @@ fn apply(
     kind: FollowActionKind,
     occupied: &[bool],
     from: usize,
-    scenes: &[Scene],
+    scene_pos: impl Fn(u32) -> Option<usize>,
     seed: u64,
     step: i64,
 ) -> FollowOutcome {
@@ -108,10 +109,7 @@ fn apply(
         FollowActionKind::NoAction => FollowOutcome::Keep,
         FollowActionKind::Stop => FollowOutcome::Stop,
         FollowActionKind::PlayAgain => FollowOutcome::Go(from),
-        FollowActionKind::Jump { scene_id } => scenes
-            .iter()
-            .position(|s| s.id == scene_id)
-            .map_or(FollowOutcome::Keep, FollowOutcome::Go),
+        FollowActionKind::Jump { scene_id } => scene_pos(scene_id).map_or(FollowOutcome::Keep, FollowOutcome::Go),
         // 以下は「空セルで区切られた塊」の中で解く (Q13)。塊が引けない
         // (= 今のセルが空、通常あり得ない) なら何もしない。
         other => match launch_group(occupied, from) {
@@ -204,10 +202,15 @@ pub fn next_due_beat(action: &FollowAction, launch_beat: f64, loop_len: f64, now
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::model::Scene;
 
     fn scenes(n: usize) -> Vec<Scene> {
         #[allow(clippy::cast_possible_truncation)]
         (0..n).map(|i| Scene::new(i as u32 + 1)).collect()
+    }
+
+    fn pos(scenes: &[Scene]) -> impl Fn(u32) -> Option<usize> + '_ {
+        |id| scenes.iter().position(|s| s.id == id)
     }
 
     fn act(a: FollowActionKind) -> FollowAction {
@@ -245,7 +248,7 @@ mod tests {
             (FollowActionKind::Jump { scene_id: 99 }, 0, FollowOutcome::Keep),
         ];
         for (kind, from, want) in cases {
-            let got = resolve(&act(*kind), &OCC, *from, &sc, 12345, 8.0);
+            let got = resolve(&act(*kind), &OCC, *from, pos(&sc), 12345, 8.0);
             assert_eq!(got, *want, "kind={kind:?} from={from}");
         }
     }
@@ -255,7 +258,7 @@ mod tests {
         let sc = scenes(5);
         let a = FollowAction { a: FollowActionKind::Stop, ..FollowAction::default() };
         assert!(!a.enabled);
-        assert_eq!(resolve(&a, &OCC, 1, &sc, 1, 4.0), FollowOutcome::Keep);
+        assert_eq!(resolve(&a, &OCC, 1, pos(&sc), 1, 4.0), FollowOutcome::Keep);
     }
 
     #[test]
@@ -272,8 +275,8 @@ mod tests {
         // 拍を動かしても (= 乱数が変わっても) 選ばれる側は変わらない。
         for i in 0..64 {
             let beat = f64::from(i) * 0.37;
-            assert_eq!(resolve(&a, &OCC, 1, &sc, 7, beat), FollowOutcome::Stop);
-            assert_eq!(resolve(&b, &OCC, 1, &sc, 7, beat), FollowOutcome::Go(1));
+            assert_eq!(resolve(&a, &OCC, 1, pos(&sc), 7, beat), FollowOutcome::Stop);
+            assert_eq!(resolve(&b, &OCC, 1, pos(&sc), 7, beat), FollowOutcome::Go(1));
         }
     }
 
@@ -292,8 +295,8 @@ mod tests {
         let mut seen_go = 0;
         for i in 0..200 {
             let beat = f64::from(i) * 1.25;
-            let first = resolve(&a, &OCC, 1, &sc, 42, beat);
-            assert_eq!(first, resolve(&a, &OCC, 1, &sc, 42, beat), "beat={beat}");
+            let first = resolve(&a, &OCC, 1, pos(&sc), 42, beat);
+            assert_eq!(first, resolve(&a, &OCC, 1, pos(&sc), 42, beat), "beat={beat}");
             match first {
                 FollowOutcome::Stop => seen_stop += 1,
                 FollowOutcome::Go(i) => {
@@ -307,9 +310,9 @@ mod tests {
         assert!(seen_stop > 40 && seen_go > 40, "偏りすぎ: stop={seen_stop} go={seen_go}");
         // seed が違えば別の並びになる。
         let other: Vec<_> =
-            (0..200).map(|i| resolve(&a, &OCC, 1, &sc, 43, f64::from(i) * 1.25)).collect();
+            (0..200).map(|i| resolve(&a, &OCC, 1, pos(&sc), 43, f64::from(i) * 1.25)).collect();
         let base: Vec<_> =
-            (0..200).map(|i| resolve(&a, &OCC, 1, &sc, 42, f64::from(i) * 1.25)).collect();
+            (0..200).map(|i| resolve(&a, &OCC, 1, pos(&sc), 42, f64::from(i) * 1.25)).collect();
         assert_ne!(other, base, "seed を変えても同じ並び = seed が効いていない");
     }
 
@@ -319,7 +322,7 @@ mod tests {
         let a = act(FollowActionKind::Other);
         for from in 0..3 {
             for i in 0..200 {
-                let got = resolve(&a, &OCC, from, &sc, 9, f64::from(i) * 0.5);
+                let got = resolve(&a, &OCC, from, pos(&sc), 9, f64::from(i) * 0.5);
                 let FollowOutcome::Go(idx) = got else {
                     panic!("Other が Go を返さない: {got:?}");
                 };

@@ -14,6 +14,7 @@
 //!   disabled.
 
 use crate::mod_plane::ModPlaneRef;
+use crate::song_index::CoverIndex;
 use crate::model::{
     AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationTarget,
     ClipContent, ContentId, ModParam, ModRouting, ParamRange, Polarity, Song, TrackBuiltinParam,
@@ -402,7 +403,21 @@ pub fn lane_value_over(
     if !lane.enabled {
         return lane.default_value;
     }
-    let Some(clip) = clip_covering(clips, beat) else {
+    lane_value_in_clip(lane, clip_covering(clips, beat), clip_contents, beat)
+}
+
+/// [`lane_value_over`] の **`beat` を覆う clip を引き済み**の形 (値の決め方の本体)。RT は lane の clip 索引
+/// ([`crate::song_index::LaneView::arrangement_clip`]) で引いた clip を渡し、clip 列を毎サンプル舐めない。
+pub fn lane_value_in_clip(
+    lane: &AutomationLane,
+    clip: Option<&AutomationClip>,
+    clip_contents: &HashMap<ContentId, ClipContent>,
+    beat: f64,
+) -> f64 {
+    if !lane.enabled {
+        return lane.default_value;
+    }
+    let Some(clip) = clip else {
         return lane.default_value;
     };
     let Some(content) = clip_contents.get(&clip.content_id) else {
@@ -467,9 +482,19 @@ pub fn modulation_offset_norm_with(
     scalar: impl Fn(u32) -> Option<f32>,
     depth: impl Fn(&ModRouting) -> f32,
 ) -> f32 {
+    modulation_offset_norm_over(routings.iter().filter(|r| &r.target == target), scalar, depth)
+}
+
+/// [`modulation_offset_norm_with`] の **target で絞り済みの routing** を受け取る形 (合成の本体)。
+/// RT は置き場の索引 ([`crate::song_index::ParamStore::routings_for`]) で絞った列を渡し、置き場の全件を舐めない。
+pub fn modulation_offset_norm_over<'r>(
+    routings: impl IntoIterator<Item = &'r ModRouting>,
+    scalar: impl Fn(u32) -> Option<f32>,
+    depth: impl Fn(&ModRouting) -> f32,
+) -> f32 {
     let mut sum = 0.0f32;
     for r in routings {
-        if &r.target != target || !r.enabled {
+        if !r.enabled {
             continue;
         }
         let Some(s) = scalar(r.source_id) else {
@@ -516,10 +541,27 @@ pub fn apply_modulation_with(
     scalar: impl Fn(u32) -> Option<f32>,
     depth: impl Fn(&ModRouting) -> f32,
 ) -> f64 {
-    let offset = modulation_offset_norm_with(target, routings, scalar, depth);
-    if offset == 0.0 && !routings.iter().any(|r| &r.target == target) {
+    apply_modulation_over(target, base, routings.iter().filter(|r| &r.target == target), scalar, depth)
+}
+
+/// [`apply_modulation_with`] の **`target` を指す routing だけ** を受け取る形 (本体)。
+pub fn apply_modulation_over<'r, I>(
+    target: &AutomationTarget,
+    base: f64,
+    routings: I,
+    scalar: impl Fn(u32) -> Option<f32>,
+    depth: impl Fn(&ModRouting) -> f32,
+) -> f64
+where
+    I: IntoIterator<Item = &'r ModRouting>,
+    I::IntoIter: Clone,
+{
+    let routings = routings.into_iter();
+    // routing が 1 本も無い target は正規化の往復もしない (未変調の値を bit 単位で変えない)。
+    if routings.clone().next().is_none() {
         return base;
     }
+    let offset = modulation_offset_norm_over(routings, scalar, depth);
     let norm_eff = (plain_to_norm(target, base) + offset).clamp(0.0, 1.0);
     norm_to_plain(target, norm_eff)
 }
@@ -538,12 +580,10 @@ pub fn apply_modulation_with_plane(
     routings: &[ModRouting],
     plane: ModPlaneRef<'_>,
 ) -> f64 {
-    let offset = modulation_offset_norm_with_plane(target, routings, plane);
-    if offset == 0.0 && !routings.iter().any(|r| &r.target == target) {
-        return base;
-    }
-    let norm_eff = (plain_to_norm(target, base) + offset).clamp(0.0, 1.0);
-    norm_to_plain(target, norm_eff)
+    // r.md #89 Q9: 深さが動く変調は面が持つ実効値を使う (動かない変調はモデル値)。
+    apply_modulation_with(target, base, routings, |source_id| plane.scalar_opt(source_id), |r| {
+        plane.depth(r.id).unwrap_or(r.depth)
+    })
 }
 
 /// [`modulation_offset_norm`] の値面版 ([`apply_modulation_with_plane`] と対)。
@@ -644,26 +684,60 @@ pub fn thin_collinear_and_insert(
 /// テンポ / 拍子レーンにセルは置けないので、見るべきものが無い — 判定の SSoT は
 /// [`AutomationTarget::accepts_launcher_cells`]。
 pub fn evaluate_song_tempo(song: &Song, beat: f64) -> f32 {
-    if !has_song_tempo_automation(song) {
+    song_tempo_in_clip(song, song_tempo_lane(song).map(|l| (l, clip_covering(&l.clips, beat))), beat)
+}
+
+/// テンポを決める lane (`song_lanes` の並び順で最初の有効な `SongTempo`)。
+#[must_use]
+pub fn song_tempo_lane(song: &Song) -> Option<&AutomationLane> {
+    song.song_lanes.iter().find(|l| l.enabled && matches!(l.target, AutomationTarget::SongTempo))
+}
+
+/// テンポカーブの読み口: テンポを決める lane と、その clip の索引を 1 度だけ作る。刻みで積分するループや、描画で
+/// 拍ごとに何度も引く呼び出し元が、評価のたびに `song_lanes` と clip 列を舐めないための形 (1 回だけ引くなら
+/// [`evaluate_song_tempo`]、RT は置き場の索引 [`crate::song_index::LaneView`] で引く)。
+#[derive(Debug, Clone)]
+pub struct SongTempoCurve<'a> {
+    song: &'a Song,
+    lane: Option<(&'a AutomationLane, CoverIndex)>,
+}
+
+impl<'a> SongTempoCurve<'a> {
+    #[must_use]
+    pub fn of(song: &'a Song) -> Self {
+        let lane = song_tempo_lane(song)
+            .map(|l| (l, CoverIndex::build(l.clips.iter().map(|c| (c.start_beat, c.start_beat + c.length_beats)))));
+        Self { song, lane }
+    }
+
+    /// 有効なテンポ lane を持つか (無ければ全拍 `song.bpm`)。
+    #[must_use]
+    pub fn is_automated(&self) -> bool {
+        self.lane.is_some()
+    }
+
+    /// `beat` のテンポ ([`evaluate_song_tempo`] と同じ値)。
+    #[must_use]
+    pub fn at(&self, beat: f64) -> f32 {
+        let lane = self.lane.as_ref().map(|(l, cover)| (*l, cover.first_covering(beat).and_then(|i| l.clips.get(i))));
+        song_tempo_in_clip(self.song, lane, beat)
+    }
+}
+
+/// [`song_tempo_at`] の **`beat` を覆う clip を引き済み**の形 (RT は lane の clip 索引で引く)。
+pub fn song_tempo_in_clip(song: &Song, lane: Option<(&AutomationLane, Option<&AutomationClip>)>, beat: f64) -> f32 {
+    let Some((lane, clip)) = lane else {
+        return song.bpm;
+    };
+    let v = lane_value_in_clip(lane, clip, &song.clip_contents, beat) as f32;
+    // SongTempo の plain value は BPM (= song.bpm と同単位)。 sanity
+    // clamp: 1 BPM 未満は不正 (divide by zero リスク)、 上限 1000 BPM
+    // で防御 (= 通常 user は 20..=300 程度)。 NaN/Inf は clamp を
+    // 素通りするので finite チェックを先に行い、 song.bpm へ fallback。
+    if !v.is_finite() {
         return song.bpm;
     }
-    for lane in &song.song_lanes {
-        if !lane.enabled {
-            continue;
-        }
-        if matches!(lane.target, AutomationTarget::SongTempo) {
-            let v = lane_value_at(lane, &song.clip_contents, beat) as f32;
-            // SongTempo の plain value は BPM (= song.bpm と同単位)。 sanity
-            // clamp: 1 BPM 未満は不正 (divide by zero リスク)、 上限 1000 BPM
-            // で防御 (= 通常 user は 20..=300 程度)。 NaN/Inf は clamp を
-            // 素通りするので finite チェックを先に行い、 song.bpm へ fallback。
-            if !v.is_finite() {
-                return song.bpm;
-            }
-            return v.clamp(1.0, 1000.0);
-        }
-    }
-    song.bpm
+    v.clamp(1.0, 1000.0)
 }
 
 /// 有効な SongTempo オートメーションレーンを持つか。
@@ -674,9 +748,7 @@ pub fn evaluate_song_tempo(song: &Song, beat: f64) -> f32 {
 /// この早期パスは実用上必須 (長い曲では 1 回あたり数万反復になる)。
 #[must_use]
 pub fn has_song_tempo_automation(song: &Song) -> bool {
-    song.song_lanes
-        .iter()
-        .any(|l| l.enabled && matches!(l.target, AutomationTarget::SongTempo))
+    song_tempo_lane(song).is_some()
 }
 
 /// SongTempo カーブを積分して、 song の beat 位置 `target_beat` が出力 sample
@@ -692,7 +764,8 @@ pub fn beats_to_samples(song: &Song, sample_rate: u32, target_beat: f64) -> u64 
     }
     let sr = f64::from(sample_rate);
     // テンポカーブが無ければ線形 (積分と厳密に一致する閉形式)。
-    if !has_song_tempo_automation(song) {
+    let curve = SongTempoCurve::of(song);
+    if !curve.is_automated() {
         let bpm = f64::from(song.bpm.clamp(1.0, 1000.0));
         return (target_beat * 60.0 * sr / bpm).round() as u64;
     }
@@ -700,8 +773,8 @@ pub fn beats_to_samples(song: &Song, sample_rate: u32, target_beat: f64) -> u64 
     let mut samples = 0.0_f64;
     const STEP: f64 = 1.0 / 64.0;
     while beat < target_beat {
-        // evaluate_song_tempo は [1, 1000] に clamp 済 (0 除算なし)。
-        let bpm = f64::from(evaluate_song_tempo(song, beat));
+        // テンポは [1, 1000] に clamp 済 (0 除算なし)。
+        let bpm = f64::from(curve.at(beat));
         let dbeat = STEP.min(target_beat - beat);
         samples += dbeat * 60.0 * sr / bpm;
         beat += dbeat;
@@ -720,7 +793,8 @@ pub fn samples_to_beats(song: &Song, sample_rate: u32, target_sample: u64) -> f6
     let sr = f64::from(sample_rate);
     let target = target_sample as f64;
     // テンポカーブが無ければ線形 ([`beats_to_samples`] と同じ早期パス)。
-    if !has_song_tempo_automation(song) {
+    let curve = SongTempoCurve::of(song);
+    if !curve.is_automated() {
         let bpm = f64::from(song.bpm.clamp(1.0, 1000.0));
         return target * bpm / (60.0 * sr);
     }
@@ -728,7 +802,7 @@ pub fn samples_to_beats(song: &Song, sample_rate: u32, target_sample: u64) -> f6
     let mut samples = 0.0_f64;
     let chunk = (sr / 64.0).max(1.0);
     while samples < target {
-        let bpm = f64::from(evaluate_song_tempo(song, beat));
+        let bpm = f64::from(curve.at(beat));
         let dsamp = chunk.min(target - samples);
         beat += dsamp * bpm / (60.0 * sr);
         samples += dsamp;
