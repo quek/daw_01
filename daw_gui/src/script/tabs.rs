@@ -9,11 +9,7 @@ use super::{js_native, with_host};
 
 /// `daw.newTab()` — 空の Untitled を新しいタブに開いてアクティブにする。
 pub(super) fn daw_new_tab(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
-    let ok = with_host(|h| {
-        let ok = h.app.new_tab().is_some();
-        h.app.flush_all_song_sync();
-        ok
-    });
+    let ok = with_host(|h| h.app.new_tab().is_some());
     if !ok {
         return Err(js_native("newTab: tab limit reached"));
     }
@@ -25,7 +21,6 @@ pub(super) fn daw_close_tab(_this: &JsValue, _args: &[JsValue], _ctx: &mut Conte
     with_host(|h| {
         let key = h.app.pk();
         h.app.close_tab_now(key);
-        h.app.flush_all_song_sync();
     });
     Ok(JsValue::undefined())
 }

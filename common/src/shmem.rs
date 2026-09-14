@@ -10,9 +10,11 @@
 //!   named section + `MapViewOfFile`。view は 64 KiB (システム割り当て粒度) 境界に
 //!   align される (各 bridge 構造体の align 要件を自明に満たす)。全プロセスがハンドルを
 //!   閉じるとカーネルが自動回収する。
-//! - Unix (設計のみ・実機未検証): POSIX `shm_open` + `mmap`。Windows と違い名前が
-//!   ファイルシステム (`/dev/shm`) に永続するため、プロセス異常終了で stale エントリが
-//!   残ると次回 `create` が失敗しうる (Linux を実働対象にする際に unlink 戦略を再検討)。
+//! - Unix (実機未検証): POSIX `shm_open` + `mmap`。名前は `/dev/shm` に残り続けるので、**作成者が drop で
+//!   `shm_unlink` する** — Windows の「作成者が閉じたら (他に握り手が居なければ) 名前が消える」と同じ寿命に
+//!   なり、map 済みの領域は握り手が munmap するまで生きる。名前は世代入りで作り直しごとに変わるので、unlink
+//!   しないと作り直すたびに `/dev/shm` にエントリ (とその実メモリ) が溜まる。プロセスが異常終了した場合だけは
+//!   エントリが残る (名前に pid が入るので次のセッションとは衝突しない)。
 //!
 //! `create` は「新規作成のみ、既存名なら失敗」(旧 `ShmemConf::create` と同じ invariant)。
 //! `open` は既存 region への attach + 実サイズが `min_size` 以上であることの検証まで行う
@@ -175,6 +177,8 @@ mod imp {
     pub struct NamedShmem {
         ptr: *mut u8,
         len: usize,
+        /// 作成者だけが持つ名前 (drop で `shm_unlink` する)。open 側は `None`。
+        owned_name: Option<CString>,
     }
 
     /// POSIX shm 名は先頭 `/` 必須 (shm_open(3))。Windows 側の呼び出し規約
@@ -215,7 +219,7 @@ mod imp {
             let ptr = Self::map(fd, size, name);
             unsafe { libc::close(fd) };
             match ptr {
-                Ok(ptr) => Ok(Self { ptr, len: size }),
+                Ok(ptr) => Ok(Self { ptr, len: size, owned_name: Some(cname) }),
                 Err(e) => {
                     unsafe { libc::shm_unlink(cname.as_ptr()) };
                     Err(e)
@@ -242,7 +246,7 @@ mod imp {
             }
             let ptr = Self::map(fd, len, name);
             unsafe { libc::close(fd) };
-            Ok(Self { ptr: ptr?, len })
+            Ok(Self { ptr: ptr?, len, owned_name: None })
         }
 
         fn map(fd: libc::c_int, len: usize, name: &str) -> Result<*mut u8> {
@@ -279,6 +283,9 @@ mod imp {
         fn drop(&mut self) {
             unsafe {
                 libc::munmap(self.ptr.cast(), self.len);
+                if let Some(name) = &self.owned_name {
+                    libc::shm_unlink(name.as_ptr());
+                }
             }
         }
     }
@@ -328,6 +335,20 @@ mod tests {
         // 1 page (4096B) 確保 → page 丸めを超える min_size 要求は失敗する
         let _held = NamedShmem::create(&name, 1024).unwrap();
         assert!(NamedShmem::open(&name, 1024 * 1024).is_err());
+    }
+
+    /// 作成者が落ちた後の名前は引けない (Unix でも `/dev/shm` に残さない)。先に open していた側の領域は生きている。
+    #[test]
+    fn 作成者が_drop_すると名前が消え_open_済みの領域は残る() {
+        let name = unique_name("drop");
+        let created = NamedShmem::create(&name, 4096).unwrap();
+        let opened = NamedShmem::open(&name, 4096).unwrap();
+        unsafe { created.as_ptr().write(0x5A) };
+        drop(created);
+        assert_eq!(unsafe { opened.as_ptr().read() }, 0x5A);
+        drop(opened);
+        assert!(NamedShmem::open(&name, 16).is_err());
+        assert!(NamedShmem::create(&name, 16).is_ok(), "同じ名前をもう一度作れる");
     }
 
     #[test]

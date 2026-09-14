@@ -16,7 +16,7 @@ use common::model::{AutomationTarget, LoopRegion, Song};
 use common::mod_plane::ModTickPlaneRef;
 
 use crate::audio_clip_renderer::AudioClipRenderer;
-use crate::engine::{PluginRefs, SyncSlot};
+use crate::engine::{PairLease, PluginRefs, WorkerRig};
 use crate::graph::execute::{advance_follower, process_track_owned, run_group_fx_chain};
 use crate::graph::mix::{mix_into, mix_into_master, mix_send_into, program_tap_owner, resolve_program_tap, resolve_tap};
 use crate::graph::native::{NativeIo, stage_into};
@@ -64,7 +64,8 @@ pub struct RenderCtx<'a> {
     input_delays: &'a [u32],
     solo: &'a SoloTables,
     pub graph: &'a RenderGraph,
-    pub slots: &'a [SyncSlot],
+    /// plugin を依頼する pair の束 (runner ごとの借り口、`WorkerRig::lease`)。無ければ plugin は素通し。
+    pub rig: Option<&'a WorkerRig>,
     plugin_refs: &'a PluginRefs,
     audio_renderer: Option<&'a AudioClipRenderer>,
     pub params: BufferParams<'a>,
@@ -86,7 +87,7 @@ impl<'a> RenderCtx<'a> {
         master_r: &'a mut [f32],
         plugin_refs: &'a PluginRefs,
         audio_renderer: Option<&'a AudioClipRenderer>,
-        slots: &'a [SyncSlot],
+        rig: Option<&'a WorkerRig>,
         params: BufferParams<'a>,
     ) -> Self {
         let n = (params.frames as usize).min(master_l.len()).min(master_r.len());
@@ -111,7 +112,7 @@ impl<'a> RenderCtx<'a> {
             input_delays: input_delay_per_track,
             solo,
             graph,
-            slots,
+            rig,
             plugin_refs,
             audio_renderer,
             params: BufferParams { frames: n as u32, ..params },
@@ -167,7 +168,7 @@ impl<'a> RenderCtx<'a> {
 
 /// 手 `step` を runner `slot` (callback スレッド = 0、worker i = i + 1) で実行する。
 pub fn run_step(ctx: &RenderCtx<'_>, step: Step, slot: usize) {
-    let sync = ctx.slots.get(slot);
+    let sync = ctx.rig.map(|rig| rig.lease(slot));
     let p = ctx.params;
     // SAFETY: 各分岐は `Resources::access` の表どおりの資源だけを引く (module doc)。
     unsafe {
@@ -215,7 +216,7 @@ pub fn run_step(ctx: &RenderCtx<'_>, step: Step, slot: usize) {
 /// `Schedule::nodes` の 1 op (旧 `execute_schedule_post_dispatch` の 1 arm)。
 ///
 /// SAFETY: [`run_step`] と同じ (op ごとの資源は `Resources::access` の表)。
-unsafe fn run_node(ctx: &RenderCtx<'_>, op: &NodeOp, sync: Option<&SyncSlot>) {
+unsafe fn run_node(ctx: &RenderCtx<'_>, op: &NodeOp, sync: Option<PairLease<'_>>) {
     let (n, p, song) = (ctx.n, ctx.params, ctx.song);
     unsafe {
         match op {

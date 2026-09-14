@@ -32,6 +32,70 @@ struct Job {
 /// ready queue の未書き込みの席。
 const EMPTY: u32 = u32::MAX;
 
+/// 走れるようになった job の待ち行列 (容量 = 積まれうる job の数の配列 + `tail` 予約 + `head` CAS)。1 buffer で各 job は
+/// 高々 1 回しか積まれないので、席は予約してから書く。
+#[derive(Debug, Default)]
+struct ReadyQueue {
+    slots: Vec<AtomicU32>,
+    head: AtomicU32,
+    tail: AtomicU32,
+}
+
+impl ReadyQueue {
+    fn with_capacity(n: usize) -> Self {
+        Self { slots: (0..n).map(|_| AtomicU32::new(EMPTY)).collect(), ..Self::default() }
+    }
+
+    /// 1 つのスレッドだけが呼ぶ (buffer の頭)。
+    fn reset(&self) {
+        let used = self.tail.load(Ordering::Relaxed) as usize;
+        for s in &self.slots[..used.min(self.slots.len())] {
+            s.store(EMPTY, Ordering::Relaxed);
+        }
+        self.head.store(0, Ordering::Relaxed);
+        self.tail.store(0, Ordering::Relaxed);
+    }
+
+    fn push(&self, job: u32) {
+        let at = self.tail.fetch_add(1, Ordering::SeqCst);
+        if let Some(slot) = self.slots.get(at as usize) {
+            slot.store(job, Ordering::SeqCst);
+        }
+    }
+
+    /// 予約済みで未書き込みの席に当たったら `None` (書き手がすぐ書く — [`Self::has_work`] は真)。
+    fn pop(&self) -> Option<u32> {
+        loop {
+            let h = self.head.load(Ordering::SeqCst);
+            if h >= self.tail.load(Ordering::SeqCst) {
+                return None;
+            }
+            let job = self.slots.get(h as usize)?.load(Ordering::SeqCst);
+            if job == EMPTY {
+                return None;
+            }
+            if self.head.compare_exchange(h, h + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Some(job);
+            }
+        }
+    }
+
+    fn has_work(&self) -> bool {
+        self.head.load(Ordering::SeqCst) < self.tail.load(Ordering::SeqCst)
+    }
+}
+
+/// [`RenderGraph::finish`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Finished {
+    /// 待ちが無くなった job のうち、呼び側がそのまま続けて実行する 1 つ。
+    pub next: Option<u32>,
+    /// 共有の待ち行列に積んだ数 (起こす runner の数)。
+    pub pushed: u32,
+    /// callback スレッド専用の待ち行列に積んだ ([`RenderGraph`] の `on_master`)。
+    pub for_master: bool,
+}
+
 /// 1 buffer の処理の依存グラフ。構造は compile 時に固まり、RT は作業領域 (atomic) だけを書く。
 #[derive(Debug, Default)]
 pub struct RenderGraph {
@@ -41,12 +105,19 @@ pub struct RenderGraph {
     steps: Vec<Step>,
     jobs: Vec<Job>,
     succs: Vec<u32>,
+    /// 最初から走れる job のうち、どの runner が取ってもよいもの。
     roots: Vec<u32>,
+    /// **master バスへ書く job** は callback スレッドだけが実行する。master バスはグラフの後で callback スレッドが
+    /// master の段 (fx chain / 音量 / Limiter / 出力への書き出し) で読むので、合流もそこで行えば書いた値が冷えない。
+    /// 最後の track を終えた worker に続けて合流させると、合流 (曲の出力全部を読む重い直列の手) が起きたばかりで
+    /// 冷えた core に回り、手そのものが遅くなる (leaf 64 本 / 1024 frame で 48 µs → 67〜80 µs 実測)。
+    on_master: Vec<bool>,
+    /// 最初から走れる `on_master` の job。
+    master_roots: Vec<u32>,
     // ---- RT の作業領域 (1 buffer ごとに [`Self::begin`] で戻す) ----
     pending: Vec<AtomicU32>,
-    ready: Vec<AtomicU32>,
-    head: AtomicU32,
-    tail: AtomicU32,
+    ready: ReadyQueue,
+    master_ready: ReadyQueue,
     /// 最初から走れる job (`roots`) の次に取る位置。roots は数も並びも compile 時に決まっているので、queue に
     /// 積まずに `fetch_add` で取らせる (失敗しない = 取り合いで再試行しない。track 本体の大半がこれ)。
     next_root: AtomicU32,
@@ -252,10 +323,20 @@ impl RenderGraph {
             .collect();
         edges.sort_unstable();
         edges.dedup();
-        Self::from_jobs(trace, job_steps, &edges)
+        let (mut reads, mut writes) = (Vec::new(), Vec::new());
+        let on_master = job_steps
+            .iter()
+            .map(|js| {
+                js.iter().any(|&s| {
+                    res.access(s, nodes, &mut reads, &mut writes);
+                    writes.contains(&res.master_bus())
+                })
+            })
+            .collect();
+        Self::from_jobs(trace, job_steps, &edges, on_master)
     }
 
-    fn from_jobs(trace: Vec<Step>, job_steps: Vec<Vec<Step>>, edges: &[(u32, u32)]) -> Self {
+    fn from_jobs(trace: Vec<Step>, job_steps: Vec<Vec<Step>>, edges: &[(u32, u32)], on_master: Vec<bool>) -> Self {
         let n_jobs = job_steps.len();
         let mut preds = vec![0u32; n_jobs];
         for &(_, b) in edges {
@@ -275,18 +356,22 @@ impl RenderGraph {
             }
             jobs.push(Job { steps: (s0, steps.len() as u32), succs: (e0, succs.len() as u32), preds: preds[j] });
         }
-        let roots = (0..n_jobs as u32).filter(|&j| preds[j as usize] == 0).collect();
+        let (master_roots, roots): (Vec<u32>, Vec<u32>) =
+            (0..n_jobs as u32).filter(|&j| preds[j as usize] == 0).partition(|&j| on_master[j as usize]);
         let sink_count = jobs.iter().filter(|job: &&Job| job.succs.0 == job.succs.1).count() as u32;
+        let master_jobs = on_master.iter().filter(|&&m| m).count();
         Self {
             trace,
             steps,
-            jobs,
             succs,
-            roots,
             pending: (0..n_jobs).map(|_| AtomicU32::new(0)).collect(),
-            ready: (0..n_jobs).map(|_| AtomicU32::new(EMPTY)).collect(),
-            head: AtomicU32::new(0),
-            tail: AtomicU32::new(0),
+            // 積まれるのは前駆のある job だけ。
+            ready: ReadyQueue::with_capacity(n_jobs - roots.len() - master_roots.len()),
+            master_ready: ReadyQueue::with_capacity(master_jobs),
+            jobs,
+            roots,
+            on_master,
+            master_roots,
             next_root: AtomicU32::new(0),
             sinks_left: AtomicU32::new(0),
             sink_count,
@@ -298,7 +383,7 @@ impl RenderGraph {
         self.jobs.len()
     }
 
-    /// 最初から走れる job の数 ([`Self::begin`] が積む数 = buffer の頭で起こす runner の数の上限)。
+    /// どの runner が取ってもよい、最初から走れる job の数 (buffer の頭で起こす worker の数の上限)。
     #[must_use]
     pub fn root_count(&self) -> u32 {
         self.roots.len() as u32
@@ -325,28 +410,22 @@ impl RenderGraph {
         for (p, job) in self.pending.iter().zip(&self.jobs) {
             p.store(job.preds, Ordering::Relaxed);
         }
-        // queue に積まれるのは前駆のある job だけ (高々 job 数 − roots 数)。
-        let pushed_max = self.jobs.len() - self.roots.len();
-        for r in &self.ready[..pushed_max] {
-            r.store(EMPTY, Ordering::Relaxed);
+        self.ready.reset();
+        self.master_ready.reset();
+        for &j in &self.master_roots {
+            self.master_ready.push(j);
         }
-        self.head.store(0, Ordering::Relaxed);
-        self.tail.store(0, Ordering::Relaxed);
         self.next_root.store(0, Ordering::Relaxed);
         self.sinks_left.store(self.sink_count, Ordering::SeqCst);
     }
 
-    /// 1 buffer で各 job は高々 1 回しか積まれないので、席は予約 (`tail`) してから書く。
-    fn push(&self, job: u32) {
-        let at = self.tail.fetch_add(1, Ordering::SeqCst);
-        if let Some(slot) = self.ready.get(at as usize) {
-            slot.store(job, Ordering::SeqCst);
+    /// 走れる job を 1 つ取る: (callback スレッドなら専用の待ち行列、) まだ取られていない root、積まれている job の
+    /// 順。予約済みで未書き込みの席に当たったら `None` (書き手がすぐ書く — [`Self::has_work`] は真なので呼び側は
+    /// 寝ずに見直す)。
+    pub fn pop(&self, master: bool) -> Option<u32> {
+        if master && let Some(job) = self.master_ready.pop() {
+            return Some(job);
         }
-    }
-
-    /// 走れる job を 1 つ取る: まだ取られていない root、無ければ積まれている job。予約済みで未書き込みの席に
-    /// 当たったら `None` (書き手がすぐ書く — [`Self::has_work`] は真なので呼び側は寝ずに見直す)。
-    pub fn pop(&self) -> Option<u32> {
         // root は数が決まっているので fetch_add で取る (取り過ぎた分は範囲外なので捨てるだけ)。
         if self.next_root.load(Ordering::SeqCst) < self.roots.len() as u32 {
             let r = self.next_root.fetch_add(1, Ordering::SeqCst);
@@ -354,26 +433,16 @@ impl RenderGraph {
                 return Some(job);
             }
         }
-        loop {
-            let h = self.head.load(Ordering::SeqCst);
-            if h >= self.tail.load(Ordering::SeqCst) {
-                return None;
-            }
-            let job = self.ready.get(h as usize)?.load(Ordering::SeqCst);
-            if job == EMPTY {
-                return None;
-            }
-            if self.head.compare_exchange(h, h + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                return Some(job);
-            }
-        }
+        self.ready.pop()
     }
 
-    /// 未取得の job がある (root の残り / 積まれた job、未書き込みの席を含む)。
+    /// 未取得の job がある (root の残り / 積まれた job、未書き込みの席を含む)。`master` = callback スレッド専用の
+    /// 待ち行列も数える。
     #[must_use]
-    pub fn has_work(&self) -> bool {
-        self.next_root.load(Ordering::SeqCst) < self.roots.len() as u32
-            || self.head.load(Ordering::SeqCst) < self.tail.load(Ordering::SeqCst)
+    pub fn has_work(&self, master: bool) -> bool {
+        (master && self.master_ready.has_work())
+            || self.next_root.load(Ordering::SeqCst) < self.roots.len() as u32
+            || self.ready.has_work()
     }
 
     /// 全 job が終わった。
@@ -382,34 +451,42 @@ impl RenderGraph {
         self.sinks_left.load(Ordering::SeqCst) == 0
     }
 
-    /// job `j` を終えた: 後続の待ちを減らし、待ちが無くなった job のうち 1 つは積まずに返し (呼び側が
-    /// そのまま続けて実行する)、残りを積む。戻り値の 2 つ目 = 積んだ数 (起こす runner の数)。
-    pub fn finish(&self, j: u32) -> (Option<u32>, u32) {
+    /// job `j` を終えた (`master` = 呼び側が callback スレッド): 後続の待ちを減らし、待ちが無くなった job のうち
+    /// 呼び側が実行してよい 1 つは積まずに返し (そのまま続けて実行する)、残りを積む。
+    pub fn finish(&self, j: u32, master: bool) -> Finished {
+        let mut out = Finished { next: None, pushed: 0, for_master: false };
         let (a, b) = self.jobs[j as usize].succs;
         if a == b {
             self.sinks_left.fetch_sub(1, Ordering::SeqCst);
-            return (None, 0);
+            return out;
         }
-        let mut next = None;
-        let mut pushed = 0;
         for &s in &self.succs[a as usize..b as usize] {
-            if self.pending[s as usize].fetch_sub(1, Ordering::SeqCst) == 1 {
-                if next.is_none() {
-                    next = Some(s);
-                } else {
-                    self.push(s);
-                    pushed += 1;
-                }
+            if self.pending[s as usize].fetch_sub(1, Ordering::SeqCst) != 1 {
+                continue;
+            }
+            let on_master = self.on_master[s as usize];
+            if out.next.is_none() && (master || !on_master) {
+                out.next = Some(s);
+            } else if on_master {
+                self.master_ready.push(s);
+                out.for_master = true;
+            } else {
+                self.ready.push(s);
+                out.pushed += 1;
             }
         }
-        (next, pushed)
+        out
     }
 }
 
 /// runner (pool の worker / callback スレッド) の寝起き。
 pub trait Park {
+    /// この runner が callback スレッド (`on_master` の job を実行する側) か。
+    fn is_master(&self) -> bool;
     /// 寝ている runner を最大 `n` 人起こす (job を `n` 個積んだ)。
     fn wake(&self, n: u32);
+    /// callback スレッド専用の待ち行列に積んだ (寝ていれば起こす)。
+    fn wake_master(&self);
     /// グラフが終わった (待っている callback スレッドへ知らせる)。
     fn finished(&self);
     /// 仕事が積まれるかグラフが終わるまで寝る。寝る前に「寝る」ことを登録してから `graph` を見直す
@@ -420,17 +497,21 @@ pub trait Park {
 /// 積まれている job が無くなるまで取って `run` する (Ardour `Graph::run_one` と同型)。終えた job の後続のうち
 /// 1 つはそのまま続けて実行し、残りは積んでその数だけ寝ている runner を起こす。
 pub fn drain(graph: &RenderGraph, park: &impl Park, run: &mut impl FnMut(u32)) {
-    while let Some(mut job) = graph.pop() {
+    let master = park.is_master();
+    while let Some(mut job) = graph.pop(master) {
         loop {
             run(job);
-            let (next, pushed) = graph.finish(job);
-            if pushed > 0 {
-                park.wake(pushed);
+            let f = graph.finish(job, master);
+            if f.pushed > 0 {
+                park.wake(f.pushed);
+            }
+            if f.for_master {
+                park.wake_master();
             }
             if graph.is_done() {
                 park.finished();
             }
-            match next {
+            match f.next {
                 Some(n) => job = n,
                 None => break,
             }

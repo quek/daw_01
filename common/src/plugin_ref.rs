@@ -8,34 +8,32 @@
 //! to outputs; the plugin host does the inverse.
 //!
 //! daw_audio also owns N `WorkerSyncRef`, one per audio-engine worker
-//! thread. `worker[i]` uses `worker_sync[i]` to wake `plugin_host worker[i]`
-//! (a 1:1 pair) and tell it which instance to process via the shared
-//! `WorkerBridge::worker_task[i]` atomic ([`InstanceToken`] — device_id は
+//! thread. `worker[i]` uses `worker_sync[i]` to hand `plugin_host worker[i]`
+//! (a 1:1 pair) the instance to process over the shared
+//! `WorkerBridge::channels[i]` ([`InstanceToken`] — device_id は
 //! project をまたいで衝突するので使わない、`docs/plan_project_tabs.md` §1.3)。
+//! 受け渡しの手順 (回って待ち、間に合わなければ寝る) は [`crate::worker_bridge`] の module doc。
 //! Because the audio engine dispatches per **track** (and a track's chain
 //! runs serially in one audio worker), the same plugin instance is never
 //! asked to process concurrently — CLAP spec is upheld without per-plugin
 //! locking.
 //!
-//! The events are auto-reset, so a single waiter consumes the signal and
-//! the event is immediately ready for the next dispatch.
-//!
 //! # 有界 dispatch と poisoning contract (`docs/plan_arch_refactor.md` §4)
 //!
-//! [`WorkerSyncRef::dispatch`] は done event を **有界** (`timeout_ms`) で
+//! [`WorkerSyncRef::dispatch`] は完了を **有界** (`timeout_ms`) で
 //! 待つ。RT スレッドが他プロセスを無限待ちすると、プラグインの SEH crash /
 //! `process()` 内ハングで CPAL コールバックが永久凍結し (named event は
 //! 所有プロセスが死んでも signal されない)、respawn しても復旧不能になる —
 //! 3 プロセス分離の目的そのものが崩れるため、無限待ちは禁止。
 //!
-//! **timeout 後の worker pair は poisoned**: 後から plugin_host 側が
-//! `process()` を終えて done を signal すると、auto-reset event が待ち手
-//! なしで signaled のまま残る。この状態で次の dispatch をすると「まだ
-//! 走っている process と並行に入力を書く」ことになる。よって timeout を
-//! 観測した worker は以後 dispatch してはならず、pool 再構築 (=
-//! `OpenWorkerPool` の再送) まで該当 pair を停止する。pool 再構築時は
-//! event 名に **generation** を含めて mint し (`worker_wake_event_name`)、
-//! 旧世代の stale signal が新 pool に漏れないようにする。
+//! **timeout 後の worker pair は poisoned**: plugin_host 側の worker はまだ
+//! その `process()` の中に居る。この状態で次の依頼をすると「まだ走っている
+//! process と並行に入力を書く」ことになる。よって poisoned な pair には依頼しない。
+//! その pair を借りていた runner は予備の pair に借り替え (たまたまその runner に回った
+//! 無関係な plugin を素通しにしない)、host がその依頼を終えたら pair は空きに戻る
+//! (daw_audio の `WorkerRig`)。予備も尽きた状態が続けば pool を作り直す
+//! (= `OpenWorkerPool` の再送)。pool 再構築時は依頼番号と event 名に **generation** を含めて
+//! (`worker_wake_event_name`)、旧世代の依頼や signal が新 pool に漏れないようにする。
 //!
 //! # OS リソース名の命名契約 (load-bearing)
 //!
@@ -68,13 +66,8 @@
 //!   create され作り直されないので pid だけで一意。作り直す設計に変えるなら
 //!   同時に世代を足すこと。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 #[cfg(windows)]
-use windows::Win32::{
-    Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-    System::Threading::{SetEvent, WaitForSingleObject},
-};
+use windows::Win32::Foundation::HANDLE;
 
 use crate::process_data::ProcessData;
 use crate::protocol::InstanceToken;
@@ -114,24 +107,17 @@ impl PluginRef {
     }
 }
 
-/// [`WorkerSyncRef::dispatch`] の結果。
 #[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DispatchOutcome {
-    /// plugin_host worker が process() を完了した (通常経路)。
-    Done,
-    /// `timeout_ms` 内に done が来なかった。**この worker pair は poisoned**
-    /// — 呼び出し側は該当 device を quarantine し、pool 再構築までこの
-    /// pair で dispatch しないこと (module doc の contract 参照)。
-    TimedOut,
-}
+pub use crate::worker_bridge::DispatchOutcome;
 
-/// Owned by an audio-engine worker. The `worker_task` pointer references
-/// the matching slot in the shared `WorkerBridge` shmem.
+/// Owned by an audio-engine worker. The `channel` pointer references
+/// the matching pair's slot in the shared `WorkerBridge` shmem.
 #[cfg(windows)]
 pub struct WorkerSyncRef {
     pub worker_idx: u32,
-    pub worker_task: *const AtomicU64,
+    pub channel: *const crate::worker_bridge::WorkerChannel,
+    /// この pool の世代 (依頼番号に焼き込む — [`crate::worker_bridge`] の module doc)。
+    pub generation: u32,
     pub event_wake: HANDLE,
     pub event_done: HANDLE,
 }
@@ -139,10 +125,8 @@ pub struct WorkerSyncRef {
 #[cfg(windows)]
 unsafe impl Send for WorkerSyncRef {}
 
-// Safe: the audio engine and the export thread only read `worker_task`
-// (atomic), `event_wake`, and `event_done`. The handles themselves are
-// kernel objects with their own internal sync; Rust's `*const AtomicU64`
-// carries the actual atomicity for `worker_task`.
+// Safe: the channel holds only atomics, and the handles are kernel objects with their own internal sync.
+// A slot is driven by exactly one runner at a time (`AudioWorkerPool::new`).
 #[cfg(windows)]
 unsafe impl Sync for WorkerSyncRef {}
 
@@ -151,30 +135,24 @@ impl WorkerSyncRef {
     /// Hand an instance to the matching plugin-host worker and wait (bounded)
     /// until `process()` finishes. The caller must have already populated
     /// the `ProcessData` for that instance (frames / events_in / buffer_in).
+    /// `spin` = 寝る前に回って待つ時間 ([`crate::worker_bridge::spin_budget`])。See the module-level poisoning
+    /// contract for what `TimedOut` obliges the caller to do.
     ///
-    /// Order of operations is load-bearing:
-    ///   1. Publish `token` so the host worker can read it after the
-    ///      wake fires (`Release`).
-    ///   2. Signal the wake event.
-    ///   3. Wait on the done event (auto-reset; one return = one signal),
-    ///      **bounded by `timeout_ms`** — see the module-level poisoning
-    ///      contract for what `TimedOut` obliges the caller to do.
-    pub fn dispatch(&self, token: InstanceToken, timeout_ms: u32) -> anyhow::Result<DispatchOutcome> {
-        unsafe {
-            (*self.worker_task).store(token.0, Ordering::Release);
-            SetEvent(self.event_wake)?;
-            match WaitForSingleObject(self.event_done, timeout_ms) {
-                WAIT_OBJECT_0 => Ok(DispatchOutcome::Done),
-                WAIT_TIMEOUT => Ok(DispatchOutcome::TimedOut),
-                WAIT_FAILED => Err(anyhow::anyhow!(
-                    "WaitForSingleObject(done) failed: {:?}",
-                    windows::core::Error::from_thread()
-                )),
-                other => Err(anyhow::anyhow!(
-                    "WaitForSingleObject(done) unexpected result: {other:?}"
-                )),
-            }
-        }
+    /// RT から呼ぶので失敗も値で返す (エラー文字列を組まない = 確保しない)。
+    pub fn dispatch(&self, token: InstanceToken, spin: std::time::Duration, timeout_ms: u32) -> DispatchOutcome {
+        self.channel().dispatch(self.generation, token, self.event_wake, self.event_done, spin, timeout_ms)
+    }
+
+    /// host の worker が最後の依頼を終えている (timeout した依頼の中にもう居ない)。
+    #[must_use]
+    pub fn idle(&self) -> bool {
+        let channel = self.channel();
+        channel.completed.load(std::sync::atomic::Ordering::SeqCst) == channel.request.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn channel(&self) -> &crate::worker_bridge::WorkerChannel {
+        // SAFETY: `channel` は rig が持つ `WorkerBridgeHandle` の mapping を指し、rig より長く生きない。
+        unsafe { &*self.channel }
     }
 }
 
@@ -207,7 +185,7 @@ pub fn process_data_shmem_id(pid: u32, device_id: u64, incarnation: u64) -> Stri
 }
 
 /// Build the shared-memory id for the worker bridge (`WorkerBridge`,
-/// containing the `worker_task` array). daw_gui の bootstrap で 1 度だけ
+/// containing the per-pair `channels`). daw_gui の bootstrap で 1 度だけ
 /// create され、プロセス生存中は作り直されないので世代を持たない
 /// (module doc の命名契約を参照)。
 pub fn worker_bridge_shmem_id(pid: u32) -> String {

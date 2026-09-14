@@ -578,17 +578,9 @@ impl ProjectRt {
                 // スコープの名前なので、引き継ぐと **別物同士が一致**して前
                 // project の PDC リング音声 / follower envelope が新 project の
                 // 頭に混ざる。新 schedule は compile 直後でゼロ初期化済みなので、
-                // 移送を **やらない** ことがそのままリセットになる。
+                // 移送を **やらない** ことがそのままリセットになる。schedule 外で生き続ける
+                // per-track の input delay line は下の `install_input_delay_lines` が扱う。
                 //
-                // schedule 外で生き続ける per-track の input delay line は
-                // 明示的にゼロ化する。遅延線を持つ全 track を舐めると無駄な memset に
-                // なるので、実際に補償が効く (= 遅延サンプルを読み出す) track
-                // だけに絞る。alloc / free は無い。
-                for (i, &d) in sched.input_delay_per_track.iter().enumerate() {
-                    if d > 0 && let Some(s) = self.scratch.get_mut(i) {
-                        s.input_delay_line.reset();
-                    }
-                }
                 // r.md #40: stretch engine の走行ストリームも Song スコープ。
                 // `stream_key = clip.id << 32 | audio event id` は project ごとに
                 // 1 から再採番される名前なので、別 project の event が同じキーで
@@ -610,21 +602,16 @@ impl ProjectRt {
                 // §5 D: 走行状態 (PDC ring / follower env) を stable key で移送。
                 sched.adopt_state_from(&mut self.cached_schedule);
             }
-            old_schedule = Some(std::mem::replace(&mut self.cached_schedule, sched));
-
-            // per-track input delay line: 遅延が要る track には off-thread で確保した line が
-            // 載っている。容量が足りない行だけ swap して旧 line を bundle 側に残す (off-thread drop)。
-            // 足りている行は走行中のリングをそのまま使う。
-            for (i, repl) in new.input_delay_replacements.iter_mut().enumerate() {
-                if i >= self.scratch.len() {
-                    break;
-                }
-                if let Some(line) = repl.as_mut()
-                    && self.scratch[i].input_delay_line.capacity() < line.capacity()
-                {
-                    std::mem::swap(&mut self.scratch[i].input_delay_line, line);
-                }
-            }
+            let old = std::mem::replace(&mut self.cached_schedule, sched);
+            // 別 project のリングは、この曲にとって「走っていなかった」リング。
+            let old_delays: &[u32] = if new.reset_song_scoped_state { &[] } else { &old.input_delay_per_track };
+            crate::mixer::install_input_delay_lines(
+                &mut self.scratch,
+                old_delays,
+                &self.cached_schedule.input_delay_per_track,
+                &mut new.input_delay_replacements,
+            );
+            old_schedule = Some(old);
             retired_lines = std::mem::take(&mut new.input_delay_replacements);
         }
 
@@ -1575,6 +1562,9 @@ impl DeviceRt {
 
     /// Render `frames` of device output into `master_l/r` = 全 project の bus の加算
     /// (`docs/plan_project_tabs.md` §3.2)。
+    ///
+    /// buffer の間は `EngineShared::live_rendering` を立てておく (書き出しとの Dekker handshake。
+    /// 予約 `export_running` は立てた **後** に読む)。
     pub fn process_buffer(
         &mut self,
         shared: &SharedState,
@@ -1585,6 +1575,19 @@ impl DeviceRt {
         frames: usize,
     ) {
         let _ = shared;
+        self.shared.live_rendering.store(true, Ordering::SeqCst);
+        self.process_buffer_body(bridge, scope, device_scope, sample_rate, frames);
+        self.shared.live_rendering.store(false, Ordering::SeqCst);
+    }
+
+    fn process_buffer_body(
+        &mut self,
+        bridge: &AudioBridgeHandle,
+        scope: &common::scope_bridge::ScopeBridgeHandle,
+        device_scope: &DeviceScopeBridgeHandle,
+        sample_rate: u32,
+        frames: usize,
+    ) {
         self.refresh_projects();
         self.refresh_device_bundle();
         self.pump_commands();
@@ -1602,7 +1605,7 @@ impl DeviceRt {
         self.master_l[..n].fill(0.0);
         self.master_r[..n].fill(0.0);
 
-        let export_running = self.shared.export_running.load(Ordering::Acquire);
+        let export_running = self.shared.export_running.load(Ordering::SeqCst);
         let scope_project = self.shared.scope_project();
         // Global Sampler の録音源が縛られている project: `Master` はアクティブなタブ
         // (= scope と同じ)、`Track` はその tap の project。
@@ -1627,11 +1630,8 @@ impl DeviceRt {
         // freewheel export: while the export thread holds the audio
         // resources, write silence and skip dispatch so the worker pool
         // and plugin instances are exclusively driven by the export
-        // render loop. Publish `live_parked` so the export thread knows the
-        // live callback has stopped dispatching before it starts its own (no
-        // collision on the shared plugin-host worker slots). **全 project が止まる**。
+        // render loop. **全 project が止まる**。
         if export_running {
-            self.shared.live_parked.store(true, Ordering::Release);
             for p in &mut self.projects {
                 // r.md #87: 書き出し中に届いたローンチ操作は捨てる。溜めておくと
                 // 書き出し明けに **全部同時に**発火し、64 件で溢れた分は無言で消える。
@@ -1643,7 +1643,6 @@ impl DeviceRt {
             }
             return;
         }
-        self.shared.live_parked.store(false, Ordering::Release);
 
         let frames_rendered = self.frames_rendered;
         for p in &mut self.projects {
@@ -2559,7 +2558,10 @@ mod multi_project_tests {
         r.engine.export_running.store(true, Ordering::Release);
         run(&mut r, 3);
         assert_eq!(a.playhead.load(Ordering::Acquire), 512, "書き出し中は進まない");
-        assert!(r.engine.live_parked.load(Ordering::Acquire));
+        assert!(
+            !r.engine.live_rendering.load(Ordering::SeqCst),
+            "無音で抜けた buffer も印を下ろす (でないと書き出しが live の終わりを待ち続ける)"
+        );
         r.engine.export_running.store(false, Ordering::Release);
         run(&mut r, 2);
         assert_eq!(a.playhead.load(Ordering::Acquire), 1024, "続きから進む");

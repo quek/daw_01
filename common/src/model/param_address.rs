@@ -70,18 +70,51 @@ impl AutomationTarget {
     }
 }
 
+/// [`Song::param_stores`] の置き場を **位置で** 持ったもの。off-RT で [`Song::param_store_at`] で解いて RT へ
+/// 渡し、RT は [`Song::lanes_at`] で引く (buffer ごとに track を id で探さない)。同じ `Song` の snapshot と組で
+/// 使うこと (track の並びが変われば位置も変わる)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamStoreAt {
+    /// `song_lanes` / `song_mod_routings` (master fx chain と song-wide param)。
+    Song,
+    /// `tracks[i]` の `automation_lanes` / `mod_routings`。
+    Track(u32),
+}
+
 impl Song {
     /// `owner` (track id か `MASTER_TRACK_ID`) の lane / routing store。置き場規則の唯一の実装。
     /// 確保なし (RT 可)。`0` は解釈しない (legacy の 0 → master は `mod_source_owner` の責務)。
     #[must_use]
     pub fn param_stores(&self, owner: u32) -> Option<(&[AutomationLane], &[ModRouting])> {
+        match self.param_store_at(owner)? {
+            ParamStoreAt::Song => Some((&self.song_lanes, &self.song_mod_routings)),
+            ParamStoreAt::Track(i) => self
+                .tracks
+                .get(i as usize)
+                .map(|t| (t.automation_lanes.as_slice(), t.mod_routings.as_slice())),
+        }
+    }
+
+    /// `owner` の置き場の位置 ([`Self::param_stores`] と同じ規則。track を id で探すので off-RT で解く)。
+    #[must_use]
+    pub fn param_store_at(&self, owner: u32) -> Option<ParamStoreAt> {
         if owner == MASTER_TRACK_ID {
-            return Some((&self.song_lanes, &self.song_mod_routings));
+            return Some(ParamStoreAt::Song);
         }
         self.tracks
             .iter()
-            .find(|t| t.id == owner && owner != 0)
-            .map(|t| (t.automation_lanes.as_slice(), t.mod_routings.as_slice()))
+            .position(|t| t.id == owner && owner != 0)
+            .and_then(|i| u32::try_from(i).ok())
+            .map(ParamStoreAt::Track)
+    }
+
+    /// 解決済みの置き場の lane (位置が外れていれば空)。確保なし (RT 可)。
+    #[must_use]
+    pub fn lanes_at(&self, at: ParamStoreAt) -> &[AutomationLane] {
+        match at {
+            ParamStoreAt::Song => &self.song_lanes,
+            ParamStoreAt::Track(i) => self.tracks.get(i as usize).map_or(&[], |t| &t.automation_lanes),
+        }
     }
 
     /// [`Self::param_stores`] の可変版。

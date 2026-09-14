@@ -29,14 +29,14 @@
 
 use std::sync::Arc;
 
-use common::mod_graph::{ModPhaseTable, ModPlan, ModRuntime, PhaseMark, TickCtx};
+use common::mod_graph::{LaneParam, ModPhaseTable, ModPlan, ModRuntime, PhaseMark, TickCtx};
 
 /// 制御グリッドの刻み幅 (サンプル)。定義の SSoT は `common::mod_graph` で、
 /// ここは daw_audio 側の再公開 (`crate::automation` の automation サブバッファ刻みが
 /// これを引く — automation の段と変調の段は **同じ格子でなければならない**)。
 pub use common::mod_graph::MOD_TICK_FRAMES;
 use common::mod_plane::{ModPlane, ModTickPlane, ModTickPlaneRef};
-use common::model::{AutomationTarget, MASTER_TRACK_ID, ModParam, Song};
+use common::model::{AutomationTarget, ModParam, ParamStoreAt, Song};
 
 use crate::mod_plan_publish::ModPlanDelivery;
 
@@ -117,7 +117,7 @@ fn moving_followers(plan: &ModPlan) -> impl Iterator<Item = u16> + '_ {
     plan.nodes.iter().enumerate().filter_map(|(slot, node)| {
         let s = u16::try_from(slot).ok()?;
         let by_edge = node.in_edges.iter().any(|e| FOLLOWER_PARAMS.contains(&e.param));
-        let by_lane = plan.lane_params.iter().any(|(ls, p)| *ls == s && FOLLOWER_PARAMS.contains(p));
+        let by_lane = plan.lane_params.iter().any(|l| l.slot == s && FOLLOWER_PARAMS.contains(&l.param));
         (by_edge || by_lane).then_some(s)
     })
 }
@@ -426,19 +426,18 @@ impl ModTickRunner {
         }
         // automation lane が base を上書きする param を解決する (r.md #89 Q4)。
         for i in 0..self.plan.lane_params.len() {
-            let (slot, param) = self.plan.lane_params[i];
-            let plain = lane_base(song, &self.plan, slot, param, self.next_mark.beat);
-            self.rt.set_base(slot, param, plain);
+            let lp = self.plan.lane_params[i];
+            let plain = lane_base(song, &self.plan, lp, self.next_mark.beat);
+            self.rt.set_base(lp.slot, lp.param, plain);
         }
         // r.md #89 Q9: 深さの automation lane も同じ刻みで解決する。
         for i in 0..self.plan.depth_groups.len() {
-            if !self.plan.depth_groups[i].has_lane {
+            let g = &self.plan.depth_groups[i];
+            let Some(store) = g.lane else {
                 continue;
-            }
-            let rid = self.plan.depth_groups[i].routing_id;
-            let base = self.plan.depth_groups[i].base_depth;
-            let plain = depth_lane_base(song, rid, base, self.next_mark.beat);
-            self.rt.set_depth_base(&self.plan, rid, plain);
+            };
+            let plain = depth_lane_base(song, store, g.routing_id, g.base_depth, self.next_mark.beat);
+            self.rt.set_depth_base(i, plain);
         }
         let mark = self.next_mark;
         common::mod_graph::tick(
@@ -461,9 +460,8 @@ impl ModTickRunner {
         }
         // r.md #89 Q9: 深さも刻みごとに動く (深さを動かしていなければ空 = ゼロコスト)。
         self.depth_row.clear();
-        for g in &self.plan.depth_groups {
-            self.depth_row
-                .push(self.rt.depth_for(&self.plan, g.routing_id).unwrap_or(g.base_depth));
+        for (i, g) in self.plan.depth_groups.iter().enumerate() {
+            self.depth_row.push(self.rt.depth_at(i).unwrap_or(g.base_depth));
         }
         self.plane.push_row(&self.row, &self.depth_row);
         for i in 0..self.follower_cols.len() {
@@ -509,10 +507,10 @@ impl ModTickRunner {
         }
     }
 
-    /// この buffer の刻みごとの値面 (描画経路へ渡す)。
+    /// この buffer の刻みごとの値面 (描画経路へ渡す)。列は plan の slot なので、ソースの種類も一緒に引ける。
     #[must_use]
     pub fn plane(&self) -> ModTickPlaneRef<'_> {
-        self.plane.as_ref()
+        self.plane.as_ref().with_nodes(&self.plan.nodes)
     }
 
     /// **まだ着地していない** (= `locate` を呼ばずに走らせてはいけない)。
@@ -606,41 +604,25 @@ pub fn dt_secs(sample_rate: u32) -> f64 {
 
 /// `ModPlan::lane_params` の 1 件を automation lane から解決する。
 ///
-/// 置き場は「そのソースの帰属トラック」— `MASTER_TRACK_ID` なら `song_lanes`、
-/// それ以外はそのトラックの `automation_lanes`。`AutomationTarget` だけから
-/// 置き場を決める全域関数は作らない (設計正本 §3.2)。
-fn lane_base(song: &Song, plan: &ModPlan, slot: u16, param: ModParam, beat: f64) -> f64 {
+/// 置き場は「そのソースの帰属トラック」(`MASTER_TRACK_ID` なら `song_lanes`) で、plan の構築時 (off-RT) に
+/// 位置へ解いてある ([`common::mod_graph::LaneParam::store`]、刻みごとに track を id で探さない)。
+fn lane_base(song: &Song, plan: &ModPlan, lp: LaneParam, beat: f64) -> f64 {
+    let LaneParam { slot, param, store } = lp;
     let Some(&source_id) = plan.slot_ids.get(usize::from(slot)) else {
         return 0.0;
     };
     let target = AutomationTarget::ModSourceParam { source_id, param };
-    let lanes = match song.mod_source_owner(source_id) {
-        Some(MASTER_TRACK_ID) => song.song_lanes.as_slice(),
-        Some(track_id) => match song.tracks.iter().find(|t| t.id == track_id) {
-            Some(t) => t.automation_lanes.as_slice(),
-            None => return fallback_base(plan, slot, param),
-        },
-        None => return fallback_base(plan, slot, param),
-    };
-    match lanes.iter().find(|l| l.enabled && l.target == target) {
+    match song.lanes_at(store).iter().find(|l| l.enabled && l.target == target) {
         Some(lane) => common::automation::lane_value_at(lane, &song.clip_contents, beat),
         None => fallback_base(plan, slot, param),
     }
 }
 
 /// `ModRoutingDepth` の automation lane を解決する (r.md #89 Q9)。
-/// 置き場は **その変調が置かれている所** (`Song::mod_routing_owner`)。
-fn depth_lane_base(song: &Song, routing_id: u32, base: f32, beat: f64) -> f32 {
+/// 置き場は **その変調が置かれている所** (`Song::mod_routing_owner`) を plan が位置へ解いたもの。
+fn depth_lane_base(song: &Song, store: ParamStoreAt, routing_id: u32, base: f32, beat: f64) -> f32 {
     let target = AutomationTarget::ModRoutingDepth { routing_id };
-    let lanes = match song.mod_routing_owner(routing_id) {
-        Some(MASTER_TRACK_ID) => song.song_lanes.as_slice(),
-        Some(track_id) => match song.tracks.iter().find(|t| t.id == track_id) {
-            Some(t) => t.automation_lanes.as_slice(),
-            None => return base,
-        },
-        None => return base,
-    };
-    match lanes.iter().find(|l| l.enabled && l.target == target) {
+    match song.lanes_at(store).iter().find(|l| l.enabled && l.target == target) {
         #[allow(clippy::cast_possible_truncation)]
         Some(lane) => common::automation::lane_value_at(lane, &song.clip_contents, beat) as f32,
         None => base,

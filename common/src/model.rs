@@ -50,6 +50,7 @@ pub use midi_bind::*;
 pub use modulation::*;
 pub use native::*;
 pub use native_param::*;
+pub use param_address::ParamStoreAt;
 pub use param_range::*;
 pub use plugin_instance::*;
 pub use section_ops::*;

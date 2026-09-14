@@ -346,9 +346,8 @@ impl Schedule {
         let mut hint = 0;
         for (i, key) in self.delay_keys.iter().enumerate() {
             if let Some(j) = find_near(&old.delay_keys, hint, |k| k == key) {
-                // capacity 不一致 (= 補償 delay 長が変わった) なら false =
-                // リセットのまま。
-                let _ = self.delay_lines[i].try_adopt(&mut old.delay_lines[j]);
+                // 補償 delay 長が変わっていても手元の過去は引き継ぐ (`DelayLine::adopt`)。
+                self.delay_lines[i].adopt(&mut old.delay_lines[j]);
                 hint = j + 1;
             }
         }
@@ -378,7 +377,7 @@ impl Schedule {
 /// `items` から `pred` に合う最初の要素を、`hint` から後ろ → 先頭から `hint` の手前の順に探す。
 /// 新旧の並びがほぼ同じ突き合わせ (前回の一致位置の次を `hint` に渡す) は、並びが保たれている間
 /// 要素ごとに 1 回の比較で済む。確保なし (RT 安全)。
-fn find_near<T>(items: &[T], hint: usize, pred: impl Fn(&T) -> bool) -> Option<usize> {
+pub(crate) fn find_near<T>(items: &[T], hint: usize, pred: impl Fn(&T) -> bool) -> Option<usize> {
     let hint = hint.min(items.len());
     items[hint..].iter().position(&pred).map(|p| hint + p).or_else(|| items[..hint].iter().position(pred))
 }

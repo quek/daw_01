@@ -175,8 +175,9 @@ build / clippy + clip_rename/video smoke)。**S8 実機 sign-off 完了 = arch-r
 
 ## 4. RT 境界の有界化 [A1+A8]
 
-- `WorkerSyncRef::dispatch(device_id) -> DispatchOutcome { Done | TimedOut }`。
-  `WaitForSingleObject(done, DISPATCH_TIMEOUT_MS)` (定数、初期値 500ms)。
+- `WorkerSyncRef::dispatch(token) -> DispatchOutcome { Done | TimedOut | WaitFailed }`。
+  完了待ちは `DISPATCH_TIMEOUT_MS` (定数、初期値 500ms) で有界 (受け渡しの手順は `common::worker_bridge`)。
+  `WaitFailed` は `TimedOut` と同じ扱い (host が走っているか分からない)。
 - TimedOut → 該当 device を **quarantine** (per-entry AtomicBool、以後 skip して無音バイパス)、
   AudioEvent で GUI へ通知 (トースト + 該当デバイス赤表示は GUI 側既存 status 経路)。
   plugin_host respawn / SetSlotPlugin 再ロードで解除。

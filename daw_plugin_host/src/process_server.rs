@@ -4,13 +4,11 @@
 //! # buffer 毎の dispatch
 //!
 //! 各 worker:
-//!   1. 自分専用の `wake` event を待つ (`SetEvent` は audio engine 側)。
-//!   2. audio 側が `WorkerBridge::worker_task` の対応 slot に書いた
-//!      **安定 device id (u64)** を読む (v29 — session-unique plugin_id は
-//!      廃止)。
-//!   3. 自分の受け口 ([`RegistryInbox`]) に届いている最新の registry snapshot を採用し、
-//!      その id を resolve して live な entry に対応していれば audio half の `process()` を呼ぶ。
-//!   4. `done` event を signal して audio worker を再開させる。
+//!   1. 自分の pair の `WorkerBridge::channels[i]` に、この世代の次の依頼 (instance token) が置かれるのを待つ
+//!      (少し回ってから `wake` event で寝る — 手順は `common::worker_bridge` の module doc)。
+//!   2. 自分の受け口 ([`RegistryInbox`]) に届いている最新の registry snapshot を採用し、
+//!      その token を resolve して live な entry に対応していれば audio half の `process()` を呼ぶ。
+//!   3. 完了を書く (audio worker が寝ていれば `done` event で起こす)。
 //!
 //! # registry snapshot の受け渡し (worker が旧 snapshot の最終参照にならない)
 //!
@@ -36,13 +34,17 @@
 //!     時点で increment する。
 //!
 //! plugin-main thread の [`WorkerPool::quiesce`] は `enter` を snapshot し、
-//! 全 worker で `exit` が追いつくのを待つ。 registry から entry を外して
+//! 外す plugin を処理中の worker で `exit` が追いつくのを待つ。 registry から entry を外して
 //! (`registry_remove` = 外した snapshot を全 worker の受け口に置く) から `quiesce` を呼べば、
 //! 以後に critical section に入る worker は必ずその snapshot 以降を採用する (置く `swap` と
 //! `enter` / 採用の `swap` がすべて `SeqCst`) ので、その audio half に触れない — そこで初めて
 //! main half (と FFI plugin) を安全に deactivate / drop できる。
 //!
-//! IDLE wake / missing-entry でも counter は bump する (SeqCst 全順序の
+//! 1 つの critical section が触れる audio half は依頼の token の 1 つだけなので、section に入る前に書く
+//! `current[i]` が外す plugin でなければ、その worker は待たない (別の plugin で固まった worker に巻き込まれない)。
+//! 待ちは有界で、上限までに抜けない plugin は token で返す (呼び出し側はその plugin に触れない — `crate::quiesce`)。
+//!
+//! missing-entry でも counter は bump する (SeqCst 全順序の
 //! 論証を分岐 free に保つため)。
 
 #![allow(dead_code)]
@@ -57,12 +59,11 @@ use common::metrics_bridge::{MetricsBridgeHandle, PluginMetricsPlane, PluginSlot
 use common::protocol::{DeviceAddr, InstanceToken};
 use common::plugin_ref::open_named_event;
 use common::process_data::{Event, EventKind};
-use common::protocol::PluginEvent;
-use common::worker_bridge::{MAX_WORKERS, WorkerBridge, WorkerBridgeHandle};
+use common::protocol::{PluginEvent, WorkerPoolSpec};
+use common::worker_bridge::{MAX_WORKERS, WorkerBridgeHandle, WorkerChannel};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{
-    GetCurrentThread, INFINITE, SetEvent, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
-    WaitForSingleObject,
+    GetCurrentThread, SetEvent, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
 
 use crate::plugin_instance::{AudioHalf, NoteTransition, TimedNoteEvent};
@@ -427,6 +428,9 @@ unsafe impl Send for SendableHandle {}
 struct DispatchCounter {
     enter: [AtomicU64; MAX_WORKERS],
     exit: [AtomicU64; MAX_WORKERS],
+    /// worker ごとの、いま (最後に) dispatch-critical section に入った依頼の token。`enter` を上げる **前** に書くので、
+    /// `exit < enter` (処理中) の間に読めばその処理中の依頼の token。
+    current: [AtomicU64; MAX_WORKERS],
 }
 
 impl DispatchCounter {
@@ -434,12 +438,14 @@ impl DispatchCounter {
         Self {
             enter: [const { AtomicU64::new(0) }; MAX_WORKERS],
             exit: [const { AtomicU64::new(0) }; MAX_WORKERS],
+            current: [const { AtomicU64::new(0) }; MAX_WORKERS],
         }
     }
 
-    /// worker が dispatch-critical section に入る直前に呼ぶ。
+    /// worker が `token` の依頼で dispatch-critical section に入る直前に呼ぶ。
     #[inline]
-    fn enter(&self, idx: usize) {
+    fn enter(&self, idx: usize, token: InstanceToken) {
+        self.current[idx].store(token.0, Ordering::SeqCst);
         self.enter[idx].fetch_add(1, Ordering::SeqCst);
     }
 
@@ -453,6 +459,11 @@ impl DispatchCounter {
 
 /// per-worker param-event ring の容量。
 const PARAM_RING_CAP: usize = 1024;
+
+/// [`WorkerPool::quiesce`] が処理中の `process()` を待つ上限。audio 側は依頼を `DISPATCH_TIMEOUT_MS` で見切り、
+/// 予備の pair も尽きた状態が `DISPATCH_TIMEOUT_MS * 4` 続けば plugin_host を立て直すので、それと同じ長さ。
+const QUIESCE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(common::plugin_ref::DISPATCH_TIMEOUT_MS as u64 * 4);
 
 /// plugin-GUI 発の param event の種別 (RT 経路で alloc しない flat tag)。
 #[derive(Clone, Copy)]
@@ -540,6 +551,31 @@ impl ParamEventRing {
     }
 }
 
+/// 登録の無い token への依頼の数 (RT worker が数え、drain thread が集計してログに出す)。
+///
+/// plugin の再初期化中 (書き出しの準備 / panic) や削除の直後は、audio 側がまだその token を依頼してくる。
+/// 1 worker は 1 buffer に何本もの plugin を順に処理するので、「同じ token が続く間は 1 回だけ」ではログが
+/// 止まらず、TIME_CRITICAL の worker から大量に出ていた (実機で 1 回の書き出し準備に 309 行)。RT では数えるだけ。
+#[derive(Default)]
+struct MissingTokens {
+    /// 書き手は worker 1 本だけ。
+    count: AtomicU64,
+    last: AtomicU64,
+}
+
+/// worker 1 本から非RT (drain thread) へ渡すもの。
+#[derive(Default)]
+struct WorkerOutbox {
+    params: ParamEventRing,
+    missing: MissingTokens,
+}
+
+impl Default for ParamEventRing {
+    fn default() -> Self {
+        Self::new(PARAM_RING_CAP)
+    }
+}
+
 /// `RtParamEvent` を wire 用 [`PluginEvent`] へ変換 (drain thread = 非RT)。
 fn rt_param_to_event(ev: RtParamEvent) -> PluginEvent {
     match ev.kind {
@@ -574,30 +610,54 @@ fn rt_param_to_event(ev: RtParamEvent) -> PluginEvent {
 /// イベントを 1 つでも拾ったら即座に最小間隔へ戻すので、 ノブを回している間の
 /// 追従は従来どおり。 静止状態から動かし始めた最初の 1 イベントだけ最大
 /// `PARAM_DRAIN_MAX_MS` 遅れるが、 これは GUI の数値表示更新であって音ではない。
+///
+/// 登録の無い token への依頼 ([`MissingTokens`]) も、ここで worker ごとに増えた分を 1 秒に 1 回まとめてログに出す。
 fn run_param_drain(
-    rings: Vec<Arc<ParamEventRing>>,
+    outboxes: Vec<Arc<WorkerOutbox>>,
     evt_tx: tokio::sync::mpsc::UnboundedSender<PluginEvent>,
     drain_quit: Arc<AtomicBool>,
 ) {
     const PARAM_DRAIN_MIN_MS: u64 = 2;
     const PARAM_DRAIN_MAX_MS: u64 = 32;
+    const MISSING_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
     let mut idle_sleep_ms = PARAM_DRAIN_MIN_MS;
+    let mut reported = vec![0u64; outboxes.len()];
+    let mut last_report = std::time::Instant::now();
+    let report_missing = |reported: &mut [u64]| {
+        for (i, (out, seen)) in outboxes.iter().zip(reported.iter_mut()).enumerate() {
+            let count = out.missing.count.load(Ordering::Relaxed);
+            if count != *seen {
+                tracing::warn!(
+                    worker_idx = i,
+                    dispatches = count.wrapping_sub(*seen),
+                    last_token = out.missing.last.load(Ordering::Relaxed),
+                    "dispatches to tokens with no registered plugin (reinitialising / removed); skipped"
+                );
+                *seen = count;
+            }
+        }
+    };
     loop {
         let mut any = false;
-        for ring in &rings {
-            while let Some(ev) = ring.pop() {
+        for out in &outboxes {
+            while let Some(ev) = out.params.pop() {
                 any = true;
                 let _ = evt_tx.send(rt_param_to_event(ev));
             }
         }
+        if last_report.elapsed() >= MISSING_REPORT_INTERVAL {
+            report_missing(&mut reported);
+            last_report = std::time::Instant::now();
+        }
         if drain_quit.load(Ordering::Acquire) {
-            // `drain_quit` は teardown が全 worker join 後に立てるので、
-            // break 時点で新規 push は起き得ない。 最終 drain で拾い切る。
-            for ring in &rings {
-                while let Some(ev) = ring.pop() {
+            // `drain_quit` は teardown が worker を join (止まらないものは手放し) した後に立てるので、
+            // join した worker の push はここで拾い切る。
+            for out in &outboxes {
+                while let Some(ev) = out.params.pop() {
                     let _ = evt_tx.send(rt_param_to_event(ev));
                 }
             }
+            report_missing(&mut reported);
             break;
         }
         if any {
@@ -610,12 +670,13 @@ fn run_param_drain(
 }
 
 /// dispatch-critical section の teardown を `Drop` に集約する guard。
-/// `process()` が panic しても `exit` / slot IDLE 化 / `SetEvent(done)` が
-/// 必ず実行され、 quiesce の永久 wait を防ぐ。
+/// `process()` が panic しても `exit` / 完了の書き込みが
+/// 必ず実行され、 quiesce の永久 wait と audio 側の timeout を防ぐ。
 struct DispatchGuard<'a> {
     dispatch: &'a DispatchCounter,
-    bridge: &'a WorkerBridgeHandle,
+    channel: &'a WorkerChannel,
     idx: usize,
+    request: u64,
     done: SendableHandle,
 }
 
@@ -624,11 +685,7 @@ impl Drop for DispatchGuard<'_> {
         // dispatch-critical section を閉じる。 ここから先 audio half に
         // 触れないので、 plugin-main が entry を drop しても safe。
         self.dispatch.exit(self.idx);
-        // 次の stale wake がよからぬ device を起こさないよう IDLE に戻す。
-        self.bridge.bridge().worker_task[self.idx].store(WorkerBridge::IDLE, Ordering::Release);
-        unsafe {
-            let _ = SetEvent(self.done.0);
-        }
+        self.channel.complete(self.request, self.done.0);
     }
 }
 
@@ -644,135 +701,158 @@ pub struct WorkerPool {
     dispatch: Arc<DispatchCounter>,
     /// 実際に起動した worker 数。
     n_workers: u32,
-    /// plugin GUI 発の param event を RT → 非RT に運ぶ per-worker SPSC ring。
-    param_rings: Vec<Arc<ParamEventRing>>,
-    /// param ring を poll して `evt_tx` へ流す非RT thread。
+    /// RT → 非RT に運ぶ per-worker の受け渡し (plugin GUI 発の param event の SPSC ring と、登録の無い token の数)。
+    outboxes: Vec<Arc<WorkerOutbox>>,
+    /// outbox を poll して `evt_tx` へ流す非RT thread。
     drain_thread: Option<JoinHandle<()>>,
 }
 
 impl WorkerPool {
     pub fn open(
-        n_workers: u32,
-        worker_bridge_shmem_id: &str,
+        spec: &WorkerPoolSpec,
         metrics_shmem_id: &str,
-        wake_event_names: &[String],
-        done_event_names: &[String],
         registry: &PluginRegistry,
         evt_tx: tokio::sync::mpsc::UnboundedSender<PluginEvent>,
     ) -> Result<Self> {
-        anyhow::ensure!(
-            wake_event_names.len() == n_workers as usize,
-            "wake_event_names len {} != n_workers {}",
-            wake_event_names.len(),
-            n_workers
-        );
-        anyhow::ensure!(
-            done_event_names.len() == n_workers as usize,
-            "done_event_names len {} != n_workers {}",
-            done_event_names.len(),
-            n_workers
-        );
-        anyhow::ensure!(
-            (n_workers as usize) <= common::worker_bridge::MAX_WORKERS,
-            "n_workers {} exceeds MAX_WORKERS {}",
-            n_workers,
-            common::worker_bridge::MAX_WORKERS
-        );
+        spec.validate()?;
+        // host の worker は pair ごとに 1 本 (audio 側の runner の数 + 予備)。
+        let (n_workers, generation) = (spec.n_pairs, spec.generation);
 
-        let bridge = Arc::new(WorkerBridgeHandle::open(worker_bridge_shmem_id)?);
+        let bridge = Arc::new(WorkerBridgeHandle::open(&spec.worker_bridge_shmem_id)?);
         // resource monitor: per-plugin の process() 時間を載せる計測面に繋ぐ (worker は registry の
         // snapshot 経由で面を受け取る)。
         registry.attach_metrics(metrics_shmem_id)?;
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let dispatch = Arc::new(DispatchCounter::new());
-        let mut workers = Vec::with_capacity(n_workers as usize);
-        let mut wake_events = Vec::with_capacity(n_workers as usize);
-        let mut param_rings = Vec::with_capacity(n_workers as usize);
+        // 途中で失敗したら `Drop` がそこまでに起こした worker を止める (手放すと、どの pool にも数えられない worker が
+        // 依頼を受け続け、quiesce から見えない dispatch になる)。
+        let mut pool = Self {
+            workers: Vec::with_capacity(n_workers as usize),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            drain_quit: Arc::new(AtomicBool::new(false)),
+            wake_events: Vec::with_capacity(n_workers as usize),
+            dispatch: Arc::new(DispatchCounter::new()),
+            n_workers,
+            outboxes: Vec::with_capacity(n_workers as usize),
+            drain_thread: None,
+        };
         // worker ごとの registry の受け口 (以前の pool の送り口はここで置き換わる)。
         let inboxes = registry.attach_workers(n_workers as usize);
 
         for (i, inbox) in inboxes.into_iter().enumerate() {
-            let wake = open_named_event(&wake_event_names[i])?;
-            let done = open_named_event(&done_event_names[i])?;
-            wake_events.push(wake);
+            let wake = open_named_event(&spec.wake_event_names[i])?;
+            let done = open_named_event(&spec.done_event_names[i])?;
+            pool.wake_events.push(wake);
 
             let bridge_w = Arc::clone(&bridge);
-            let shutdown_w = Arc::clone(&shutdown);
-            let dispatch_w = Arc::clone(&dispatch);
+            let shutdown_w = Arc::clone(&pool.shutdown);
+            let dispatch_w = Arc::clone(&pool.dispatch);
             let idx = i as u32;
             let wake_s = SendableHandle(wake);
             let done_s = SendableHandle(done);
-            let ring = Arc::new(ParamEventRing::new(PARAM_RING_CAP));
-            param_rings.push(Arc::clone(&ring));
+            let outbox = Arc::new(WorkerOutbox::default());
+            pool.outboxes.push(Arc::clone(&outbox));
             let handle = std::thread::Builder::new()
                 .name(format!("plugin-worker-{i}"))
                 .spawn(move || {
-                    run_worker(idx, bridge_w, shutdown_w, inbox, dispatch_w, wake_s, done_s, ring)
+                    run_worker(idx, generation, bridge_w, shutdown_w, inbox, dispatch_w, wake_s, done_s, outbox)
                 })?;
-            workers.push(handle);
+            pool.workers.push(handle);
         }
 
-        // drain thread: RT worker が ring に書いた param event を非RT で
-        // `evt_tx` へ流す。
-        let drain_rings: Vec<Arc<ParamEventRing>> =
-            param_rings.iter().map(Arc::clone).collect();
-        let drain_quit = Arc::new(AtomicBool::new(false));
-        let drain_quit_w = Arc::clone(&drain_quit);
-        let drain_thread = std::thread::Builder::new()
-            .name("plugin-param-drain".into())
-            .spawn(move || run_param_drain(drain_rings, evt_tx, drain_quit_w))?;
+        // drain thread: RT worker が outbox に書いたものを非RT で `evt_tx` / ログへ流す。
+        let drain_outboxes: Vec<Arc<WorkerOutbox>> = pool.outboxes.iter().map(Arc::clone).collect();
+        let drain_quit_w = Arc::clone(&pool.drain_quit);
+        pool.drain_thread = Some(
+            std::thread::Builder::new()
+                .name("plugin-param-drain".into())
+                .spawn(move || run_param_drain(drain_outboxes, evt_tx, drain_quit_w))?,
+        );
 
         tracing::info!(n_workers, "plugin worker pool started");
-        Ok(Self {
-            workers,
-            shutdown,
-            drain_quit,
-            wake_events,
-            dispatch,
-            n_workers,
-            param_rings,
-            drain_thread: Some(drain_thread),
-        })
+        Ok(pool)
     }
 
-    /// 全 worker が in-flight な `process()` を完了するまで待つ。
+    /// `tokens` の plugin の `process()` を処理中の worker が抜けるまで待つ (上限 [`QUIESCE_TIMEOUT`])。
     /// **plugin-main thread からのみ呼ぶ — RT thread からは呼ばない。**
     ///
     /// 呼び出し側は drop / mutate 予定の device 全てについて、 この method
     /// を呼ぶ **前に** registry から entry を外しておく必要がある
-    /// ([`registry_remove`])。 return した時点で、 旧 snapshot を hold した
-    /// まま audio half に触れている worker は存在しない。
-    pub fn quiesce(&self) {
-        for i in 0..self.n_workers as usize {
-            let snap = self.dispatch.enter[i].load(Ordering::SeqCst);
-            while self.dispatch.exit[i].load(Ordering::SeqCst) < snap {
+    /// ([`registry_remove`])。 空の戻り値で return した時点で、 `tokens` の audio half に触れている worker は
+    /// 存在しない (処理中の依頼が別の plugin の worker は、旧 snapshot を持っていても外した plugin には触れないので
+    /// 待たない)。
+    ///
+    /// 戻り値 = 上限までに抜けなかった (その plugin の `process()` の中で固まっている) token。呼び出し側はその
+    /// plugin に触ってはならない — 以前は無期限に待ったので、固まった plugin を 1 つ外そうとするだけで plugin-main
+    /// が止まったままになった (audio 側は予備の pair に借り替えて動き続けるので、この状態が普通に起こる)。
+    pub fn quiesce(&self, tokens: &[InstanceToken]) -> Vec<InstanceToken> {
+        let d = &self.dispatch;
+        let n = self.n_workers as usize;
+        let snaps: Vec<u64> = (0..n).map(|i| d.enter[i].load(Ordering::SeqCst)).collect();
+        let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
+        let mut stuck = Vec::new();
+        for (i, &snap) in snaps.iter().enumerate() {
+            loop {
+                // `current` を先に読む: その後で `exit < snap` なら、読んだ値は snapshot 時点で処理中だった依頼の
+                // token (worker は `exit` を上げてから次の依頼の `current` を書く)。
+                let current = InstanceToken(d.current[i].load(Ordering::SeqCst));
+                if d.exit[i].load(Ordering::SeqCst) >= snap || !tokens.contains(&current) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    if !stuck.contains(&current) {
+                        stuck.push(current);
+                    }
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
+        stuck
     }
 
-    pub fn shutdown(mut self) {
-        self.teardown();
+    /// 全 worker と drain thread を止める。戻り値は [`Self::teardown`]。
+    pub fn shutdown(mut self) -> Vec<InstanceToken> {
+        self.teardown()
     }
 
     /// 全 worker と drain thread を停止・join する (冪等)。
-    fn teardown(&mut self) {
+    ///
+    /// 戻り値 = [`QUIESCE_TIMEOUT`] までに止まらなかった worker が処理中の plugin の token。その worker は join せずに
+    /// 手放す (plugin の `process()` から戻らない thread を待つと plugin-main が止まったままになる) ので、呼び出し側は
+    /// その plugin を壊してはならず、別の pool で使ってもならない (まだ `process()` の中にいる)。
+    fn teardown(&mut self) -> Vec<InstanceToken> {
         if self.drain_thread.is_none() && self.workers.is_empty() {
-            return;
+            return Vec::new();
         }
-        self.shutdown.store(true, Ordering::Release);
+        self.shutdown.store(true, Ordering::SeqCst);
         // Wake every worker so it sees the flag and exits its loop.
         for &wake in &self.wake_events {
             unsafe {
                 let _ = SetEvent(wake);
             }
         }
-        for h in self.workers.drain(..) {
-            if h.join().is_err() {
-                tracing::error!("plugin worker thread panicked");
+        let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
+        while self.workers.iter().any(|h| !h.is_finished()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let d = &self.dispatch;
+        let mut wedged = Vec::new();
+        for (i, h) in self.workers.drain(..).enumerate() {
+            if h.is_finished() {
+                if h.join().is_err() {
+                    tracing::error!("plugin worker thread panicked");
+                }
+                continue;
+            }
+            // quiesce と同じ読み順: `exit < enter` なら、その間に読んだ `current` は処理中の依頼の token。
+            let enter = d.enter[i].load(Ordering::SeqCst);
+            let token = InstanceToken(d.current[i].load(Ordering::SeqCst));
+            let in_process = d.exit[i].load(Ordering::SeqCst) < enter;
+            tracing::error!(worker_idx = i, in_process, ?token, "plugin worker did not stop in time; detached");
+            if in_process {
+                wedged.push(token);
             }
         }
-        // 全 worker join 済 ⇒ ring への新規 push は起き得ない。
+        // join した worker はもう ring へ push しない (手放した worker が後で push した分は捨てられる)。
         self.drain_quit.store(true, Ordering::Release);
         if let Some(d) = self.drain_thread.take()
             && d.join().is_err()
@@ -780,12 +860,13 @@ impl WorkerPool {
             tracing::error!("plugin param drain thread panicked");
         }
         tracing::info!("plugin worker pool stopped");
+        wedged
     }
 }
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        // 正常系は `shutdown()` 済で no-op。 panic unwind 等の異常系のみ
+        // 正常系は `shutdown()` 済で no-op。 `open` の途中失敗 / panic unwind 等の異常系のみ
         // ここで停止・join する。
         self.teardown();
     }
@@ -794,13 +875,14 @@ impl Drop for WorkerPool {
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     idx: u32,
+    generation: u32,
     bridge: Arc<WorkerBridgeHandle>,
     shutdown: Arc<AtomicBool>,
     mut registry: RegistryInbox,
     dispatch: Arc<DispatchCounter>,
     wake: SendableHandle,
     done: SendableHandle,
-    param_ring: Arc<ParamEventRing>,
+    outbox: Arc<WorkerOutbox>,
 ) {
     // Best-effort priority boost so we don't lose the CPAL buffer deadline.
     unsafe {
@@ -828,62 +910,39 @@ fn run_worker(
     let mut out_param_touches: Vec<u32> = Vec::with_capacity(64);
     let mut out_param_values: Vec<(u32, f64)> = Vec::with_capacity(common::process_data::MAX_EVENTS);
     let mut out_param_releases: Vec<u32> = Vec::with_capacity(64);
-    // per-worker one-shot: 「registry に居ない device」への dispatch 警告は
-    // 同じ id が続く限り 1 回だけ (TIME_CRITICAL thread での毎 buffer log を
-    // 排除 — respawn 待ちの間 audio 側は毎 buffer dispatch し続ける)。
-    let mut warned_missing: Option<InstanceToken> = None;
+    let Some(channel) = bridge.bridge().channels.get(idx as usize) else { return };
+    // 直前に終えた依頼と、次の依頼を回って待つ時間 (直前の buffer 周期から)。
+    let mut last = channel.host_start(generation);
+    let mut spin = std::time::Duration::ZERO;
 
-    loop {
-        // 仕事が来るまでの park。不変条件 4 が禁じているのは「**他プロセスの完了待ち**を
-        // 無限にすること」で、この wake は同一プロセス内の dispatch 側が起こす。
-        // RT deadline を握らない (起きなければ何も走らないだけ)。audio 側から見た
-        // この worker の完了待ちは daw_audio が DISPATCH_TIMEOUT_MS で bounded にしている。
-        unsafe {
-            WaitForSingleObject(wake.0, INFINITE); // arch-lint: allow-infinite
-        }
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
+    // 次の依頼を待つ (`None` = shutdown)。
+    while let Some((request, token)) = channel.wait_request(generation, last, wake.0, spin, &shutdown) {
+        last = request;
 
         // dispatch-critical section を、 観測可能な操作の **前** に開く
         // (happens-before の論証は module docs)。
-        dispatch.enter(idx as usize);
+        dispatch.enter(idx as usize, token);
 
-        let raw = bridge.bridge().worker_task[idx as usize].load(Ordering::Acquire);
-        if raw == WorkerBridge::IDLE {
-            dispatch.exit(idx as usize);
-            unsafe {
-                let _ = SetEvent(done.0);
-            }
-            continue;
-        }
-
-        let token = InstanceToken(raw);
         // `enter` の後に採用する (quiesce の論証、module doc)。旧 snapshot は plugin-main へ返る。
         let snapshot = registry.adopt_latest();
         let entry_opt = snapshot.get(&token);
         let Some(entry) = entry_opt else {
-            // one-shot per distinct id (旧実装は毎 buffer warn = RT 違反)。
-            if warned_missing != Some(token) {
-                warned_missing = Some(token);
-                tracing::warn!(?token, "no plugin registered for token (suppressing repeats)");
-            }
-            bridge.bridge().worker_task[idx as usize]
-                .store(WorkerBridge::IDLE, Ordering::Release);
+            // RT ではログを出さず数えるだけ (drain thread がまとめて出す — `MissingTokens`)。
+            let missing = &outbox.missing;
+            missing.count.store(missing.count.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+            missing.last.store(token.0, Ordering::Relaxed);
             dispatch.exit(idx as usize);
-            unsafe {
-                let _ = SetEvent(done.0);
-            }
+            channel.complete(request, done.0);
             continue;
         };
-        warned_missing = None;
         let device = entry.device;
 
-        // teardown (exit / slot IDLE 化 / SetEvent(done)) を `Drop` に集約。
+        // teardown (exit / 完了の書き込み) を `Drop` に集約。
         let _guard = DispatchGuard {
             dispatch: &dispatch,
-            bridge: &bridge,
+            channel,
             idx: idx as usize,
+            request,
             done,
         };
 
@@ -895,6 +954,7 @@ fn run_worker(
         // shmem 由来の `frames` を clamp (信頼境界の外なので防御)。
         let n = (pd.frames as usize).min(common::process_data::MAX_FRAMES);
         let frames = n as u32;
+        spin = common::worker_bridge::spin_budget(frames, pd.sample_rate);
 
         // Decode events_in → TimedNoteEvent / TimedParamEvent。
         events_in.clear();
@@ -1053,7 +1113,7 @@ fn run_worker(
                 || !out_param_releases.is_empty()
             {
                 for param_id in out_param_touches.drain(..) {
-                    param_ring.push(RtParamEvent {
+                    outbox.params.push(RtParamEvent {
                         kind: RtParamKind::Touch,
                         device,
                         param_id,
@@ -1061,7 +1121,7 @@ fn run_worker(
                     });
                 }
                 for (param_id, value) in out_param_values.drain(..) {
-                    param_ring.push(RtParamEvent {
+                    outbox.params.push(RtParamEvent {
                         kind: RtParamKind::Value,
                         device,
                         param_id,
@@ -1069,7 +1129,7 @@ fn run_worker(
                     });
                 }
                 for param_id in out_param_releases.drain(..) {
-                    param_ring.push(RtParamEvent {
+                    outbox.params.push(RtParamEvent {
                         kind: RtParamKind::Release,
                         device,
                         param_id,
@@ -1211,18 +1271,9 @@ mod tests {
     #[test]
     fn quiesce_returns_immediately_when_idle() {
         let dispatch = Arc::new(DispatchCounter::new());
-        let pool = WorkerPool {
-            workers: Vec::new(),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            drain_quit: Arc::new(AtomicBool::new(false)),
-            wake_events: Vec::new(),
-            dispatch: Arc::clone(&dispatch),
-            n_workers: 4,
-            param_rings: Vec::new(),
-            drain_thread: None,
-        };
+        let pool = pool_over(&dispatch, 4);
         let start = Instant::now();
-        pool.quiesce();
+        assert!(pool.quiesce(&[InstanceToken(1)]).is_empty());
         assert!(start.elapsed() < Duration::from_millis(5));
     }
 
@@ -1231,19 +1282,9 @@ mod tests {
     #[test]
     fn quiesce_waits_for_inflight_dispatch() {
         let dispatch = Arc::new(DispatchCounter::new());
-        // slot 2 で in-flight な状態を作る。
-        dispatch.enter(2);
-
-        let pool = WorkerPool {
-            workers: Vec::new(),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            drain_quit: Arc::new(AtomicBool::new(false)),
-            wake_events: Vec::new(),
-            dispatch: Arc::clone(&dispatch),
-            n_workers: 4,
-            param_rings: Vec::new(),
-            drain_thread: None,
-        };
+        // slot 2 で token 7 を in-flight な状態を作る。
+        dispatch.enter(2, InstanceToken(7));
+        let pool = pool_over(&dispatch, 4);
 
         let dispatch_for_releaser = Arc::clone(&dispatch);
         let release_after = Duration::from_millis(50);
@@ -1253,7 +1294,7 @@ mod tests {
         });
 
         let start = Instant::now();
-        pool.quiesce();
+        assert!(pool.quiesce(&[InstanceToken(7)]).is_empty());
         let elapsed = start.elapsed();
         releaser.join().unwrap();
 
@@ -1273,16 +1314,7 @@ mod tests {
     #[test]
     fn quiesce_ignores_new_enters_after_snapshot() {
         let dispatch = Arc::new(DispatchCounter::new());
-        let pool = WorkerPool {
-            workers: Vec::new(),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            drain_quit: Arc::new(AtomicBool::new(false)),
-            wake_events: Vec::new(),
-            dispatch: Arc::clone(&dispatch),
-            n_workers: 2,
-            param_rings: Vec::new(),
-            drain_thread: None,
-        };
+        let pool = pool_over(&dispatch, 2);
 
         // background thread で enter/exit pair を高速に回す。
         let stop = Arc::new(AtomicBool::new(false));
@@ -1290,15 +1322,15 @@ mod tests {
         let dispatch_w = Arc::clone(&dispatch);
         let busy = std::thread::spawn(move || {
             while !stop_w.load(Ordering::Relaxed) {
-                dispatch_w.enter(0);
+                dispatch_w.enter(0, InstanceToken(3));
                 dispatch_w.exit(0);
-                dispatch_w.enter(1);
+                dispatch_w.enter(1, InstanceToken(3));
                 dispatch_w.exit(1);
             }
         });
 
         let start = Instant::now();
-        pool.quiesce();
+        pool.quiesce(&[InstanceToken(3)]);
         let elapsed = start.elapsed();
         stop.store(true, Ordering::Relaxed);
         busy.join().unwrap();
@@ -1307,6 +1339,78 @@ mod tests {
             elapsed < Duration::from_millis(50),
             "quiesce が継続中の dispatch に starve された (elapsed={elapsed:?})"
         );
+    }
+
+    /// 別の plugin の `process()` で固まっている worker は、外す plugin に触れないので待たない。
+    #[test]
+    fn quiesce_does_not_wait_for_other_plugins() {
+        let dispatch = Arc::new(DispatchCounter::new());
+        dispatch.enter(1, InstanceToken(9));
+        let pool = pool_over(&dispatch, 2);
+
+        let start = Instant::now();
+        assert!(pool.quiesce(&[InstanceToken(4)]).is_empty());
+        assert!(start.elapsed() < Duration::from_millis(5));
+    }
+
+    /// 外す plugin の `process()` から上限までに抜けなければ、その token を返して戻る (plugin-main を止めない)。
+    #[test]
+    fn quiesce_reports_plugins_stuck_past_the_limit() {
+        let dispatch = Arc::new(DispatchCounter::new());
+        dispatch.enter(0, InstanceToken(5));
+        dispatch.enter(1, InstanceToken(6));
+        let pool = pool_over(&dispatch, 2);
+
+        let start = Instant::now();
+        let stuck = pool.quiesce(&[InstanceToken(5), InstanceToken(6)]);
+        let elapsed = start.elapsed();
+
+        assert_eq!(stuck, vec![InstanceToken(5), InstanceToken(6)]);
+        assert!(elapsed >= QUIESCE_TIMEOUT, "上限より前に見切った ({elapsed:?})");
+        assert!(elapsed < QUIESCE_TIMEOUT * 2, "worker ごとに上限を数え直している ({elapsed:?})");
+    }
+
+    /// plugin の `process()` から戻らない worker を待ち続けず、手放してその plugin の token を返す。
+    #[test]
+    fn shutdown_detaches_workers_stuck_in_process() {
+        let dispatch = Arc::new(DispatchCounter::new());
+        let mut pool = pool_over(&dispatch, 2);
+        let (release, stuck_until) = std::sync::mpsc::channel::<()>();
+        let d = Arc::clone(&dispatch);
+        pool.workers.push(std::thread::spawn(move || {
+            d.enter(0, InstanceToken(8));
+            let _ = stuck_until.recv();
+            d.exit(0);
+        }));
+        let d = Arc::clone(&dispatch);
+        pool.workers.push(std::thread::spawn(move || {
+            d.enter(1, InstanceToken(9));
+            d.exit(1);
+        }));
+        while dispatch.enter[0].load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+
+        let start = Instant::now();
+        let wedged = pool.shutdown();
+        let elapsed = start.elapsed();
+        let _ = release.send(());
+
+        assert_eq!(wedged, vec![InstanceToken(8)], "処理を終えた worker の token は返さない");
+        assert!(elapsed < QUIESCE_TIMEOUT * 2, "止まらない worker を待ち続けた ({elapsed:?})");
+    }
+
+    fn pool_over(dispatch: &Arc<DispatchCounter>, n_workers: u32) -> WorkerPool {
+        WorkerPool {
+            workers: Vec::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            drain_quit: Arc::new(AtomicBool::new(false)),
+            wake_events: Vec::new(),
+            dispatch: Arc::clone(dispatch),
+            n_workers,
+            outboxes: Vec::new(),
+            drain_thread: None,
+        }
     }
 
     struct NullHalf;

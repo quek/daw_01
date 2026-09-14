@@ -73,21 +73,22 @@ automation point (per-content 要素 id) も同様に安定 id。
 
 | 経路 | 用途 |
 |---|---|
-| `WorkerBridge` + wake/done named event 対 | audio worker ↔ plugin_host worker の 1:1 dispatch。`worker_task[i]` (AtomicU64) が device_id を運ぶ |
+| `WorkerBridge` + wake/done named event 対 | audio worker ↔ plugin_host worker の 1:1 dispatch。`channels[i]` の依頼番号 (世代入り) と instance token を共有メモリで受け渡し、相手を少し回って待ってから event で寝る (`common::worker_bridge`) |
 | per-device `ProcessData` shmem | 音声バッファ・イベント・transport (per-buffer) |
 | `AudioBridge` shmem | telemetry: playhead / peaks / mod scalars / preroll (writer = daw_audio、GUI 30Hz poll) |
 | `MetricsBridge` shmem | DSP load / xrun / per-plugin process() μs |
 
 #### RT dispatch の有界性 (poisoning contract)
 
-`WorkerSyncRef::dispatch(device_id, DISPATCH_TIMEOUT_MS)` は done を**有界**で待つ
-(`common/src/plugin_ref.rs`)。timeout = その worker pair は **poisoned** (auto-reset
-event に待ち手なし signal が残留し得るため、pool 再構築まで dispatch 禁止)。
+`WorkerSyncRef::dispatch(token, spin, DISPATCH_TIMEOUT_MS)` は完了を**有界**で待つ
+(`common/src/plugin_ref.rs` / `common/src/worker_bridge.rs`)。timeout = その worker pair は **poisoned**
+(host の worker がまだその `process()` の中に居るので、終えるまで dispatch 禁止)。その pair を借りていた runner は
+予備の pair (`SPARE_PAIRS`) に借り替え、host が依頼を終えた pair は空きに戻る (`WorkerRig::heal`)。
 該当 device は **quarantine** (AtomicBool、以後 mix から無音バイパス、shmem にも
 触らない) され、専用 notify スレッドが `AudioEvent::PluginUnresponsive` を 1 回だけ
-GUI へ通知する。pool 全体の完了待ち (`all_done`) も有界で、timeout は
-`WorkerPoolStalled` → GUI が plugin_host respawn → `OpenWorkerPool` 再送 (worker
-event 名は **generation** 込みで mint され、旧世代の stale signal が新 pool に漏れない)。
+GUI へ通知する。pool 全体の完了待ちも有界で、timeout (または予備も尽きた状態の持続) は
+`WorkerPoolStalled` → GUI が plugin_host respawn → `OpenWorkerPool` 再送 (依頼番号と worker
+event 名は **generation** 込みで、旧世代の依頼や signal が新 pool に漏れない)。
 
 プラグインの SEH crash / `process()` ハングが CPAL コールバックを永久凍結させる
 経路は存在しない — 3 プロセス分離の目的 (crash 隔離) が異常系でも成立する。
@@ -136,7 +137,9 @@ event 名は **generation** 込みで mint され、旧世代の stale signal �
   param) と `AudioProcessorHalf` (process バッファ・event scratch を所有) を型で分離。
   worker registry には audio half のみ渡り、main の `&mut` と worker の `&mut` が
   同一オブジェクトに並存する aliasing は構造的に消滅。quiesce
-  (detach → DispatchCounter 待ち → mutate → republish) は維持。
+  (detach → DispatchCounter 待ち → mutate → republish) は維持。待つのは外す plugin を処理中の
+  worker だけで、上限 (`DISPATCH_TIMEOUT_MS` × 4) までに `process()` から抜けない plugin には触れず
+  手放す。pool を閉じても止まらない worker が残れば plugin_host を終えて respawn に任せる (`quiesce.rs`)。
 - **ProcessScaffold** (`process_scaffold.rs`): 入力/aux copy・bus assembly・
   transport 導出 (非有限 sanitize 込み)・modulation folding を CLAP/VST3 で共有。
   backend は「scaffold → FFI 型への写像 + 呼び出し」だけ。ARA lifecycle

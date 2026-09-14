@@ -24,7 +24,7 @@ use common::plugin_ref::{DISPATCH_TIMEOUT_MS, DispatchOutcome};
 use common::process_data::EventKind;
 
 use crate::audio_clip_renderer::AudioClipRenderer;
-use crate::engine::{PluginEntry, PluginRefs, SyncSlot, WorkerRig};
+use crate::engine::{PairLease, PluginEntry, PluginRefs, SyncSlot, WorkerRig};
 use crate::graph::mix::any_soloed;
 use crate::graph::native::{NativeIo, apply_listen_override};
 use crate::graph::program::Pass1Role;
@@ -46,23 +46,23 @@ pub(super) fn pair_usable(slot: &SyncSlot, entry: &PluginEntry) -> bool {
     !entry.quarantined.load(Ordering::Acquire) && !slot.poisoned.load(Ordering::Acquire)
 }
 
-/// 1 device を worker pair へ **有界** dispatch する (plan §4)。 timeout は
-/// (a) この pair を poison (pool 再構築まで dispatch 禁止 — contract)、
-/// (b) この device を quarantine (以後 skip して bypass) して `false` を返す。
+/// 1 device を worker pair へ **有界** dispatch する (plan §4)。 timeout と待ちの失敗は
+/// (a) この pair を poison (host がその依頼を終えるまで dispatch 禁止 — contract。runner は予備の pair に借り替える)、
+/// (b) この device を quarantine (以後 skip して bypass) して `false` を返す — host 側で `process()` が
+/// まだ走っているかもしれず、別の slot から同じ device を叩くと並行 process になる。
 /// 通知は RT からは行わない — flag を notify スレッド (`main.rs`) が poll して
 /// `AudioEvent::PluginUnresponsive` を 1 回だけ送る。 RT-safe: atomic store のみ。
+/// `frames` / `sample_rate` は完了を回って待つ時間 (buffer 周期に比例) を決める。
 #[inline]
-pub(super) fn dispatch_bounded(slot: &SyncSlot, entry: &PluginEntry) -> bool {
-    match slot.sync.dispatch(entry.plugin_ref.token, DISPATCH_TIMEOUT_MS) {
-        Ok(DispatchOutcome::Done) => true,
-        Ok(DispatchOutcome::TimedOut) => {
+pub(super) fn dispatch_bounded(slot: &SyncSlot, entry: &PluginEntry, frames: u32, sample_rate: u32) -> bool {
+    let spin = common::worker_bridge::spin_budget(frames, sample_rate);
+    match slot.sync.dispatch(entry.plugin_ref.token, spin, DISPATCH_TIMEOUT_MS) {
+        DispatchOutcome::Done => true,
+        DispatchOutcome::TimedOut | DispatchOutcome::WaitFailed => {
             slot.poisoned.store(true, Ordering::Release);
             entry.quarantined.store(true, Ordering::Release);
             false
         }
-        // WAIT_FAILED 等 (handle 破棄直後など)。 この buffer は skip する
-        // だけで poison しない (次 pool 再構築で自然回復する一時状態)。
-        Err(_) => false,
     }
 }
 
@@ -143,7 +143,7 @@ pub fn process_track_owned(
     program: &mut ChainProgram,
     plugin_refs: &PluginRefs,
     audio_renderer: Option<&AudioClipRenderer>,
-    worker_sync: Option<&SyncSlot>,
+    worker_sync: Option<PairLease<'_>>,
     sample_rate: u32,
     frames: u32,
     playing: bool,
@@ -443,7 +443,7 @@ pub fn process_master_fx_chain(
     master_l: &mut [f32],
     master_r: &mut [f32],
     plugin_refs: &PluginRefs,
-    worker_sync: Option<&SyncSlot>,
+    worker_sync: Option<PairLease<'_>>,
     sample_rate: u32,
     frames: u32,
     playing: bool,
@@ -490,7 +490,8 @@ pub fn process_master_fx_chain(
 }
 
 /// 旧 pass 2 (`Schedule::nodes` の op) だけを直列トレースの順に 1 buffer 走らせる (テスト用)。pass 1 の出力は
-/// 呼び側が scratch に置く。本番は [`render_master_buffer`] が pass 1 と合わせたグラフで流す。
+/// 呼び側が scratch に置く。本番は [`render_master_buffer`] が pass 1 と合わせたグラフで流す。plugin host は居ない
+/// (plugin の依頼口を持たない)。
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn execute_schedule_post_dispatch(
@@ -501,7 +502,6 @@ pub fn execute_schedule_post_dispatch(
     n: usize,
     song: &Song,
     plugin_refs: &PluginRefs,
-    worker_sync: Option<&SyncSlot>,
     sample_rate: u32,
     frames: u32,
     playing: bool,
@@ -529,8 +529,7 @@ pub fn execute_schedule_post_dispatch(
         rows,
         native_io,
     };
-    let slots = worker_sync.map(std::slice::from_ref).unwrap_or(&[]);
-    let ctx = RenderCtx::new(song, schedule, scratch, master_l, master_r, plugin_refs, None, slots, params);
+    let ctx = RenderCtx::new(song, schedule, scratch, master_l, master_r, plugin_refs, None, None, params);
     crate::graph::step::run_nodes_for_test(&ctx, |_| true);
 }
 
@@ -547,7 +546,7 @@ pub(super) fn run_group_fx_chain(
     scratch: &mut TrackScratch,
     program: &mut ChainProgram,
     plugin_refs: &PluginRefs,
-    worker_sync: Option<&SyncSlot>,
+    worker_sync: Option<PairLease<'_>>,
     sample_rate: u32,
     frames: u32,
     playing: bool,
@@ -778,7 +777,10 @@ pub fn render_master_buffer(
     // (`docs/plan_parallel_graph.md`)。worker pool があればグラフで並列に、無ければ直列トレースの順に流す
     // (どちらも同じ `run_step`、結果は bit 一致)。
     let pool = worker.and_then(|rig| rig.pool.as_ref());
-    let slots: &[SyncSlot] = worker.map(|rig| rig.slots.as_slice()).unwrap_or(&[]);
+    // timeout した依頼を host が終えた pair を空きに戻す (runner が走る前 = 1 スレッドだけ)。
+    if let Some(rig) = worker {
+        rig.heal();
+    }
     let ran = {
         let ctx = RenderCtx::new(
             song,
@@ -788,7 +790,7 @@ pub fn render_master_buffer(
             &mut master_r[..n],
             plugin_refs,
             Some(audio_renderer),
-            slots,
+            worker,
             params,
         );
         match pool {
@@ -830,7 +832,7 @@ pub fn render_master_buffer(
         &mut master_l[..n],
         &mut master_r[..n],
         plugin_refs,
-        slots.first(),
+        worker.map(|rig| rig.lease(0)),
         sample_rate,
         frames,
         playing,
@@ -994,7 +996,6 @@ mod sidechain_tests {
             FRAMES,
             &song,
             &plugin_refs,
-            None,
             48_000,
             FRAMES as u32,
             true,
@@ -1070,7 +1071,6 @@ mod sidechain_tests {
             FRAMES,
             &song,
             &plugin_refs,
-            None,
             48_000,
             FRAMES as u32,
             true,

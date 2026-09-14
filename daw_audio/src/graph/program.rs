@@ -36,10 +36,11 @@ use common::model::{AutomationLane, AutomationTarget, Device, LoopRegion, ModRou
 use common::port_config::PortConfig;
 use common::process_data::EventKind;
 
-use crate::engine::{PluginRefs, SyncSlot};
+use crate::engine::{PairLease, PluginRefs};
 use crate::graph::DelayLine;
 use crate::graph::band_split::Splitter;
 use crate::graph::native::{NativeIo, NativeScratch};
+use crate::graph::schedule::find_near;
 use crate::graph::voices::VoiceTable;
 use crate::launcher::TrackRows;
 use crate::mixer::{MAX_EVENTS, MAX_FRAMES};
@@ -275,43 +276,57 @@ impl ChainProgram {
     /// 呼ばれる = ポインタ swap と f32 コピーのみ)。delay line は chain id で、chain の
     /// tap snapshot も chain id で引き継ぐ (同 track 内 chain sidechain は前 buffer の
     /// snapshot を読むので、捨てると編集のたびに 1 buffer 無音が入る)。
+    /// 突き合わせは `find_near` (device や chain の数に上限が無いので二乗にしない — 並びは再 compile を跨いで
+    /// ほぼ保たれる)。
     pub fn adopt_state_from(&mut self, old: &mut ChainProgram) {
+        let mut hint = 0;
         for (i, key) in self.delay_keys.iter().enumerate() {
-            if let Some(j) = old.delay_keys.iter().position(|k| k == key) {
-                let _ = self.delay_lines[i].try_adopt(&mut old.delay_lines[j]);
+            if let Some(j) = find_near(&old.delay_keys, hint, |k| k == key) {
+                self.delay_lines[i].adopt(&mut old.delay_lines[j]);
+                hint = j + 1;
             }
         }
+        hint = 0;
         for cs in &mut self.chains {
-            if let Some(o) = old.chains.iter().find(|o| o.chain_id == cs.chain_id) {
+            if let Some(j) = find_near(&old.chains, hint, |o| o.chain_id == cs.chain_id) {
+                let o = &old.chains[j];
                 cs.post_fx_l.copy_from_slice(&o.post_fx_l);
                 cs.post_fx_r.copy_from_slice(&o.post_fx_r);
                 cs.post_fader_l.copy_from_slice(&o.post_fader_l);
                 cs.post_fader_r.copy_from_slice(&o.post_fader_r);
+                hint = j + 1;
             }
         }
         // Parallel の走行状態 (gain match の追従値、 帯域分割のフィルタ状態) は Parallel id で。
+        hint = 0;
         for rs in &mut self.parallels {
-            if let Some(o) = old.parallels.iter().find(|o| o.parallel_id == rs.parallel_id) {
+            if let Some(j) = find_near(&old.parallels, hint, |o| o.parallel_id == rs.parallel_id) {
+                let o = &old.parallels[j];
                 rs.in_ms = o.in_ms;
                 rs.out_ms = o.out_ms;
                 rs.match_gain = o.match_gain;
                 if let (Some(s), Some(os)) = (rs.split.as_mut(), o.split.as_ref()) {
                     s.adopt_state_from(os);
                 }
+                hint = j + 1;
             }
         }
         // r.md #117: 鳴っているノートは plugin id で引き継ぐ (捨てると編集のたびに
         // per-note 変調が起点を失う)。
+        hint = 0;
         for vt in &mut self.voices {
-            if let Some(o) = old.voices.iter().find(|o| o.device_id == vt.device_id) {
-                vt.adopt_state_from(o);
+            if let Some(j) = find_near(&old.voices, hint, |o| o.device_id == vt.device_id) {
+                vt.adopt_state_from(&old.voices[j]);
+                hint = j + 1;
             }
         }
         // r.md #129: 内蔵 device の DSP 状態は device id で (同じ種類のときだけ)。つまみのドラッグ中は
         // 編集のたびに再 compile されるので、ここで引き継がないとフィルタとコンプの平滑が毎回切れる。
+        hint = 0;
         for ns in &mut self.natives {
-            if let Some(o) = old.natives.iter_mut().find(|o| o.device_id == ns.device_id) {
-                ns.adopt_state_from(o);
+            if let Some(j) = find_near(&old.natives, hint, |o| o.device_id == ns.device_id) {
+                ns.adopt_state_from(&mut old.natives[j]);
+                hint = j + 1;
             }
         }
     }
@@ -321,7 +336,8 @@ impl ChainProgram {
 pub struct ProgramCtx<'a> {
     pub song: Option<&'a Song>,
     pub plugin_refs: &'a PluginRefs,
-    pub worker_sync: Option<&'a SyncSlot>,
+    /// この runner の plugin の依頼口 (op ごとに `slot()` で引く — 途中で pair が poison されたら借り替える)。
+    pub worker_sync: Option<PairLease<'a>>,
     pub sample_rate: u32,
     pub frames: u32,
     pub playing: bool,
@@ -786,7 +802,7 @@ fn run_plugin(
     let Some(entry) = ctx.plugin_refs.get(&device_id) else {
         return false;
     };
-    let Some(ws) = ctx.worker_sync else {
+    let Some(ws) = ctx.worker_sync.and_then(|lease| lease.slot()) else {
         return false;
     };
     // quarantine / poison gate — 通らない device は pd にも触らない
@@ -843,6 +859,7 @@ fn run_plugin(
             pd,
             song,
             track_id,
+            ctx.owner_stores,
             ctx.rows,
             device_id,
             ctx.sample_rate,
@@ -870,7 +887,7 @@ fn run_plugin(
             pd.aux_in_active[port] = 1;
         }
     }
-    if !super::execute::dispatch_bounded(ws, entry) {
+    if !super::execute::dispatch_bounded(ws, entry, ctx.frames, ctx.sample_rate) {
         return false;
     }
     // ---- outputs ----

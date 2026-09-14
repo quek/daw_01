@@ -84,9 +84,6 @@ struct ScriptHost {
     bootstrap: Bootstrap,
     /// `--output` etc. を script に渡すための args bag。
     script_args: ScriptArgs,
-    /// 直前の `loadSongFromObject` で送った Song を keep。 `setGeneratedAudio`
-    /// など差分更新が必要な API のために。
-    last_loaded_song: Option<Song>,
     /// PR7 follow-up (JS test infra): GUI mode の `AppData` と同じ役割を
     /// script mode でも持つ。 AppEvent を script から発火できるように
     /// するため、 production の `AppData::handle_event` を直接呼ぶ
@@ -188,22 +185,15 @@ impl ScriptHost {
         Self {
             bootstrap,
             script_args: ScriptArgs { output, extra },
-            last_loaded_song: None,
             next_raw_load_generation: 0,
             plugin_load_events: PluginLoadEvents::default(),
             app,
         }
     }
 
-    /// v29: `(track_id, device_index)` → 安定 device id。 app の song
-    /// (loadSongFile 経路) → `last_loaded_song` (loadSongFromObject 経路) の
-    /// 順で解決する。
+    /// v29: `(track_id, device_index)` → 安定 device id (app の song から)。
     fn resolve_device_id(&self, track_id: u32, index: u32) -> Option<u64> {
-        crate::app::device_id_at(self.app.cur.song_doc.song(), track_id, index).or_else(|| {
-            self.last_loaded_song
-                .as_ref()
-                .and_then(|s| crate::app::device_id_at(s, track_id, index))
-        })
+        crate::app::device_id_at(self.app.cur.song_doc.song(), track_id, index)
     }
 
     /// `incoming_rx` から条件 `pred` を満たす event が来るまで pump。
@@ -251,7 +241,14 @@ impl ScriptHost {
         }
     }
 
+    /// 届いた event を production と同じ経路で処理し、GUI の frame 末と同じ子プロセス sync を回す (event の処理が
+    /// Song を編集していれば、次に送る命令より先に engine へ届く)。
     fn handle_incoming(&mut self, msg: &ChildEvent) {
+        self.dispatch_incoming(msg);
+        self.app.flush_all_song_sync();
+    }
+
+    fn dispatch_incoming(&mut self, msg: &ChildEvent) {
         let msg = match msg {
             // production (GUI runner) と同じく app へ dispatch する。 audio 側の
             // 完了通知で song を書き換える非同期フロー (bounce / `J` Glue の焼き込み)
@@ -433,7 +430,19 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
 fn register_daw_globals(ctx: &mut Context) -> Result<()> {
     let mut init = boa_engine::object::ObjectInitializer::new(ctx);
     for &(name, function, length) in DAW_API {
-        init.function(NativeFunction::from_fn_ptr(function), JsString::from(name), length);
+        // `daw.*` の 1 呼び出しを GUI の 1 frame とみなし、抜けたところで frame 末と同じ子プロセス sync を回す
+        // (`runner.rs` の `flush_all_song_sync`)。headless には frame loop が無いので、ここで回さないと
+        // handler が Song を編集しても daw_audio / plugin host に届かない。epoch が進んでいなければ no-op。
+        let frame = move |this: &JsValue, args: &[JsValue], ctx: &mut Context| {
+            let result = function(this, args, ctx);
+            HOST.with_borrow_mut(|h| {
+                if let Some(host) = h.as_mut() {
+                    host.app.flush_all_song_sync();
+                }
+            });
+            result
+        };
+        init.function(NativeFunction::from_copy_closure(frame), JsString::from(name), length);
     }
     let daw = init.build();
 
@@ -510,9 +519,10 @@ fn daw_load_song_from_object(
     // device_id addressing (`daw.setSlotPlugin` 等) がこの id を引く。
     song.ensure_ids();
     with_host(|h| {
-        let project = h.app.pk();
-        let _ = h.bootstrap.audio_tx.send(AudioCommand::LoadSong { project, song: song.clone() });
-        h.last_loaded_song = Some(song);
+        // 曲の持ち主は app の `song_doc` 1 つ (GUI の Open と同じ)。engine へは呼び出しを抜けたところの frame 境界で
+        // 送られる — ここで LoadSong を直接送ると、次の frame 境界が app 側の (古い) 曲で上書きする。
+        h.app.cur.song_doc.replace_song(song);
+        h.app.after_song_replaced();
     });
     Ok(JsValue::undefined())
 }
@@ -627,8 +637,8 @@ fn daw_export_wav(
 
     let pump_result = with_host(|h| {
         // PR3.3: 直前に発火された IPC events (PluginLatencyChanged 等) を
-        // exportWav の前に drain して、 latency が `last_loaded_song` →
-        // `LoadSong` 再送経路で `compile_schedule` まで反映されるのを待つ。
+        // exportWav の前に drain して、 latency が `compile_schedule` まで反映されるのを待つ
+        // (drain した event による Song の編集は `handle_incoming` が flush する)。
         // export thread は ExportWav arrival 時点で `shared.song` を snapshot
         // するので、 event drain して LoadSong を先に届けないと PDC が
         // 適用されない song で render が始まる。
@@ -688,12 +698,9 @@ fn daw_load_song_file(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
         // the song + project_dir + LoadSong to the audio engine.
         h.app.restore_plugin_from_song(&song);
         h.app.cur.song_doc.replace_song(song.clone());
-        // Song スコープの派生状態を破棄する唯一の口 (GUI 経路と同じ)。
+        // Song スコープの派生状態を破棄する唯一の口 (GUI 経路と同じ)。LoadSong は呼び出しを抜けたところで
+        // 送られる (frame 境界、replace_song が epoch を bump している)。
         h.app.after_song_replaced();
-        // headless (frame loop 無し) なので明示的に flush する。 replace_song が epoch を
-        // bump しているので flush_song_sync は必ず choreography を実行する。
-        h.app.flush_song_sync();
-        h.last_loaded_song = Some(song);
     });
     Ok(JsValue::undefined())
 }
@@ -1002,11 +1009,7 @@ fn daw_app_load_song_json(
     song.ensure_ids();
     song.ensure_clip_contents();
     song.ensure_audio_source_ids();
-    with_host(|host| {
-        host.app.cur.song_doc.replace_song(song);
-        // headless: frame flush が無いので明示 flush (replace_song の epoch bump を拾う)。
-        host.app.flush_song_sync();
-    });
+    with_host(|host| host.app.cur.song_doc.replace_song(song));
     Ok(JsValue::undefined())
 }
 

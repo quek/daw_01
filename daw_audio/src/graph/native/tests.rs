@@ -131,7 +131,6 @@ fn post_dispatch(
         n,
         song,
         &refs,
-        None,
         SR,
         n as u32,
         true,
@@ -268,7 +267,7 @@ fn stage_native_taps(sched: &mut Schedule, scratch: &mut [TrackScratch], song: &
         rows: &rows,
         native_io: NativeIo::default(),
     };
-    let ctx = crate::graph::step::RenderCtx::new(song, sched, scratch, &mut ml, &mut mr, &refs, None, &[], params);
+    let ctx = crate::graph::step::RenderCtx::new(song, sched, scratch, &mut ml, &mut mr, &refs, None, None, params);
     crate::graph::step::run_nodes_for_test(&ctx, |op| matches!(op, NodeOp::NativeSidechainTap { .. }));
 }
 

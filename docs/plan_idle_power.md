@@ -44,8 +44,8 @@ plugin_host 側の worker は `WaitForSingleObject(INFINITE)` (`common/src/plugi
 
 ### 1.3 park の前例が既にある
 
-export freewheel 中は callback が `live_parked` を立てて即 return し、export thread が
-それを待ってから plugin を駆動する (`engine.rs:844-862`)。**「止めて後で再開する」構造は
+export freewheel 中は callback が `export_running` を見て即 return し、export thread は live の
+buffer が抜けたこと (`EngineShared::live_rendering` が下りた) を見てから plugin を駆動する。**「止めて後で再開する」構造は
 既に存在する**ので、#49 はその一般化。
 
 ### 1.4 アクティブ判定の材料は未配線
@@ -131,8 +131,8 @@ mod scalars は**ゼロにしない** — メーターではなくパラメー�
 不変条件 1 の言う「補償コード」になるので列挙しない。resume 後は callback が park 条件を
 再評価し、まだ idle ならまた 5 秒かけて park する (無害)。
 
-park 中は `live_parked = true` を立てる (dispatch していないのは事実)。これが無いと
-`export.rs:184-191` の 2 秒待ちを毎回踏む。
+park 中の書き出しに待ちは生じない: 書き出しが見るのは「今 buffer を処理しているか」
+(`live_rendering`、buffer の間だけ立つ) なので、callback が呼ばれていない park 中は最初から下りている。
 
 ### 2.3 描画: 「画面が変わるときだけ描く」
 

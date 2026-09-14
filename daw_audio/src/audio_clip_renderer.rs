@@ -777,12 +777,13 @@ pub fn render_audio_events(
         if render_end_beat <= render_start_beat {
             continue;
         }
+        // 範囲の両端も event の起点も同じ規則 (`boundary_frame`) で frame に写す。切り捨てると buffer 末尾まで続く
+        // 音の最後の 1 sample が書かれずに残り (buffer 周期のクリック)、起点は誤差の符号で 1 sample 前後する。
+        let frame = |beat: f64| common::timing::boundary_frame(beat - playhead_beats, samples_per_beat);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let buf_off_start =
-            ((render_start_beat - playhead_beats) * samples_per_beat).max(0.0) as usize;
+        let buf_off_start = frame(render_start_beat).max(0.0) as usize;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let buf_off_end_raw =
-            ((render_end_beat - playhead_beats) * samples_per_beat).max(0.0) as usize;
+        let buf_off_end_raw = frame(render_end_beat).max(0.0) as usize;
         let buf_off_end = buf_off_end_raw.min(n);
         if buf_off_end <= buf_off_start {
             continue;
@@ -844,10 +845,7 @@ pub fn render_audio_events(
         // 念のため `clamp` で i64 全範囲に収める (= 異常な beat 値で NaN /
         // Inf になる事故を防ぐ defensive)。
         #[allow(clippy::cast_possible_truncation)]
-        let event_start_offset_in_buf = ((event.start_beat - playhead_beats)
-            * samples_per_beat)
-            .clamp(i64::MIN as f64, i64::MAX as f64)
-            as i64;
+        let event_start_offset_in_buf = frame(event.start_beat).clamp(i64::MIN as f64, i64::MAX as f64) as i64;
         let source_len = event
             .source_end_frames
             .saturating_sub(event.source_start_frames);
@@ -1627,6 +1625,96 @@ mod render_tests {
             &full[one..2 * one],
             "窓の内側は gate 無しと 1 sample も違わない (= source 窓を動かしていない証拠)"
         );
+    }
+
+    /// 44.1 kHz の素材を 48 kHz の engine で、engine と同じく buffer ごとに拍を足して (`+=`) 進めながら鳴らしても、
+    /// 音の途中に 1 sample も穴が空かない。拍から buffer 内の frame を切り捨てで出していた頃は、buffer 末尾まで
+    /// 続く音の最後の 1 sample が 0 のまま残り、buffer 周期のクリック (48 kHz / 480 frame で 100 Hz のブザー) になっていた
+    /// (実例: 振幅 1 の 808 を鳴らした曲)。
+    #[test]
+    fn buffer_の境界で音に穴が空かない() {
+        const SOURCE_SR: u32 = 44_100;
+        let frames_src = 75_853u64;
+        let source = Arc::new(AudioSourceBuffer {
+            origin: std::path::PathBuf::from("test://dc"),
+            sample_rate: SOURCE_SR,
+            channels: 1,
+            frames: frames_src,
+            samples: vec![vec![0.5f32; frames_src as usize]],
+        });
+        let samples_per_beat = f64::from(ENGINE_SR) * 60.0 / f64::from(BPM);
+        let (start, len) = (4.0, frames_src as f64 / f64::from(SOURCE_SR) * f64::from(BPM) / 60.0);
+        for buffer in [256u32, 441, 480, 512, 1024] {
+            let mut schedule = vec![RenderedEvent {
+                track_idx: 0,
+                cell_clip_id: 0,
+                start_beat: start,
+                end_beat: start + len,
+                gate_start_beat: f64::NEG_INFINITY,
+                gate_end_beat: f64::INFINITY,
+                source_id: 1,
+                source_start_frames: 0,
+                source_end_frames: frames_src,
+                gain_lin: 1.0,
+                pan: 0.0,
+                sr_ratio: sample_rate_ratio(SOURCE_SR, ENGINE_SR),
+                pitch_factor: 1.0,
+                pitch_semitones: 0.0,
+                formant_semitones: 0.0,
+                stream_key: 1,
+                needs_engine: false,
+                stretch_ratio: 1.0,
+                nominal_bpm: BPM,
+                fade_in_beats: 0.0,
+                fade_out_beats: 0.0,
+                fade_in_curve: FadeCurve::Linear,
+                fade_out_curve: FadeCurve::Linear,
+                reversed: false,
+                stretch_mode: StretchMode::Raw,
+                onsets: Vec::new(),
+                beat_markers: Vec::new(),
+            }];
+            let engines_per_track = count_engines_per_track(&mut schedule);
+            let mut sources = HashMap::new();
+            sources.insert(1u32, Arc::clone(&source));
+            let renderer = AudioClipRenderer { schedule, sources, engines_per_track };
+            let (mut accum, mut engines) = (vec![(u64::MAX, 0.0f64); 4], Vec::<StretchEngine>::new());
+            let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
+            let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
+            let mut render_seq = 0u64;
+            let mut out: Vec<f32> = Vec::new();
+            let mut playhead = 0.0f64;
+            let total = ((start + len + 0.5) * samples_per_beat) as usize;
+            while out.len() < total {
+                let mut l = vec![0.0f32; buffer as usize];
+                let mut r = vec![0.0f32; buffer as usize];
+                render_audio_events(
+                    &renderer,
+                    0,
+                    0,
+                    &mut l,
+                    &mut r,
+                    playhead,
+                    BPM,
+                    ENGINE_SR,
+                    buffer,
+                    &mut ClipRenderState {
+                        repitch_accum: &mut accum,
+                        engines: &mut engines,
+                        event_l: &mut event_l,
+                        event_r: &mut event_r,
+                        render_seq: &mut render_seq,
+                    },
+                );
+                out.extend_from_slice(&l);
+                playhead += f64::from(buffer) / samples_per_beat;
+            }
+            // 音の頭と終わりの 1 sample (補間の端) を除いた本体は全部 0.5。
+            let body = (start * samples_per_beat) as usize + 1..((start + len) * samples_per_beat) as usize - 1;
+            let hole = out[body.clone()].iter().position(|s| (s - 0.5).abs() > 1e-4).map(|i| i + body.start);
+            assert_eq!(hole, None, "buffer {buffer} frame: 音の途中に穴 (frame {hole:?})");
+            assert!(out[..body.start - 1].iter().all(|s| *s == 0.0), "buffer {buffer}: 頭より前は無音");
+        }
     }
 
     /// Goertzel: `freq` 成分の振幅。

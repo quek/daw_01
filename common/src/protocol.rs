@@ -88,7 +88,7 @@ impl DeviceAddr {
 /// plugin_host が `SetSlotPlugin` ごとに採番する **プロセス生存中に一意な** インスタンス番号
 /// (`docs/plan_project_tabs.md` §1.3)。`ProcessData` shmem 名の incarnation と同じ値。
 ///
-/// **worker dispatch (`WorkerBridge.worker_task[i]`) と `MetricsBridge` の per-plugin slot は
+/// **worker dispatch (`WorkerBridge.channels[i].task`) と `MetricsBridge` の per-plugin slot は
 /// これで引く** — どちらも「1 ワードで instance を名指しする」必要があり、`DeviceAddr`
 /// (2 ワード) をそのまま atomic に載せられない。再利用されないので、閉じたタブの
 /// instance を新しい instance と取り違えることも無い。`0` = 未割当。
@@ -326,6 +326,44 @@ pub struct AraRegionUpdate {
 /// **`project` を持つ variant はその project (= タブ) の engine slot に効く**
 /// (`docs/plan_project_tabs.md` §3)。持たない variant はデバイス全体
 /// (Panic / park / worker pool / Global Sampler の試聴 / 終了)。
+/// worker pool 1 世代分の仕様 (`AudioCommand::OpenWorkerPool` / `PluginCommand::OpenWorkerPool` の payload)。
+///
+/// plugin-host worker は `n_pairs` 本で、audio 側の依頼口と `worker_bridge_shmem_id` の `channels[i]` と named event の
+/// 対 (`wake_event_names[i]` / `done_event_names[i]`) で組む。audio 側で plugin を依頼する runner (callback スレッド +
+/// audio worker) は `n_runners` 本で、pair を 1 本ずつ借りる。残りの pair は予備 — timeout した依頼の中に host の
+/// worker が居る pair を借りていた runner が借り替える (`daw_audio` の `WorkerRig`)。event 名も依頼番号も世代
+/// (`generation`、daw_gui が pool を作り直すたびに進める) 込みなので、旧世代の依頼や signal が新しい pool に漏れない
+/// (`plugin_ref` の poisoning contract / `worker_bridge` の module doc)。
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct WorkerPoolSpec {
+    pub n_pairs: u32,
+    pub n_runners: u32,
+    pub generation: u32,
+    pub worker_bridge_shmem_id: String,
+    pub wake_event_names: Vec<String>,
+    pub done_event_names: Vec<String>,
+}
+
+impl WorkerPoolSpec {
+    /// 受け取った側が `channels[i]` / event 名を数で引く前の検証 (IPC 由来の数を信じない)。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let n = self.n_pairs as usize;
+        anyhow::ensure!(
+            self.wake_event_names.len() == n && self.done_event_names.len() == n,
+            "worker pool: {} wake / {} done event names for {n} pairs",
+            self.wake_event_names.len(),
+            self.done_event_names.len()
+        );
+        anyhow::ensure!(n <= crate::worker_bridge::MAX_WORKERS, "n_pairs {n} exceeds MAX_WORKERS");
+        anyhow::ensure!(
+            (1..=self.n_pairs).contains(&self.n_runners),
+            "n_runners {} must be within 1..={n}",
+            self.n_runners
+        );
+        Ok(())
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum AudioCommand {
@@ -556,18 +594,9 @@ pub enum AudioCommand {
     /// engine は preroll を捨て、auto-stop の抑止と `recording_live` を解除する。
     /// transport は **止めない** — 停止は `Stop` の仕事 (パンチアウトは再生継続)。
     StopRecording { project: ProjectKey },
-    /// Stand up the per-buffer plugin process worker pool. `n_workers`
-    /// audio-engine workers pair 1:1 with plugin-host workers via the named
-    /// events listed. イベント名は世代 (generation) 込みで daw_gui が mint
-    /// する — pool 再構築時に stale な auto-reset signal を旧世代へ隔離する
-    /// (`plugin_ref` の poisoning contract 参照)。pool はデバイス全体で 1 つ
-    /// (全 project が共有)。
-    OpenWorkerPool {
-        n_workers: u32,
-        worker_bridge_shmem_id: String,
-        wake_event_names: Vec<String>,
-        done_event_names: Vec<String>,
-    },
+    /// Stand up the per-buffer plugin process worker pool ([`WorkerPoolSpec`]、plugin host にも同じものを送る)。
+    /// pool はデバイス全体で 1 つ (全 project が共有)。
+    OpenWorkerPool(WorkerPoolSpec),
     /// Tear down the worker pool started by `OpenWorkerPool`.
     CloseWorkerPool,
     /// Map a `ProcessData` shmem region into the audio engine. 配置
@@ -740,7 +769,7 @@ impl AudioCommand {
             | PanicRelease
             | CancelExport
             | SetAppActive(_)
-            | OpenWorkerPool { .. }
+            | OpenWorkerPool(_)
             | CloseWorkerPool
             | SamplerPreview { .. }
             | SamplerPreviewStop
@@ -842,8 +871,8 @@ pub enum AudioEvent {
     /// (以後 mix から外して無音バイパス)。 GUI は該当デバイスを可視化し、
     /// plugin_host respawn / 再ロードで解除する。
     PluginUnresponsive { device: DeviceAddr },
-    /// (v29) worker pool 全体の完了待ちが timeout した = plugin_host が
-    /// 応答不能 (ハード crash / ハング)。 GUI は plugin_host を respawn する。
+    /// (v29) worker pool 全体の完了待ちが timeout した、または plugin_host の worker が詰まったまま予備の pair も
+    /// 尽きた状態が続いた = plugin_host が応答不能 (ハード crash / ハング)。 GUI は plugin_host を respawn する。
     WorkerPoolStalled,
 }
 
@@ -1033,13 +1062,8 @@ pub enum PluginCommand {
     /// 「Send all keyboard input to plug-in」)。 Dear ImGui / 自前 OpenGL 系のように
     /// 「今テキスト入力中か」 を外から知る手段が原理的に無い GUI 用の逃げ道。
     SetEditorSendAllKeys { device: DeviceAddr, enabled: bool },
-    /// Worker pool の plugin_host 側 open (audio 側と対で送られる)。
-    OpenWorkerPool {
-        n_workers: u32,
-        worker_bridge_shmem_id: String,
-        wake_event_names: Vec<String>,
-        done_event_names: Vec<String>,
-    },
+    /// Worker pool の plugin_host 側 open (audio 側と対で、同じ [`WorkerPoolSpec`] が送られる)。
+    OpenWorkerPool(WorkerPoolSpec),
     CloseWorkerPool,
     /// (r.md #5 ARA2) Build/replace the ARA document for the ARA-capable
     /// device: expose `clips` as ARA audio sources + playback regions and

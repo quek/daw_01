@@ -60,10 +60,13 @@ impl ModPlanPublisher {
         let plan = build_plan(song, self.generation + 1, |beat| {
             common::automation::beats_to_samples(song, sample_rate, beat) as f64 / sr
         });
+        // 世代以外の全部を比べる (深さの群が変わっただけの編集 — 深さを動かす変調やレーンの追加 — も載せる。
+        // lane の置き場は位置で持つので、track の並べ替えで位置が変わった plan も載せ直す)。
         if let Some(prev) = self.last.as_deref()
             && prev.nodes == plan.nodes
             && prev.slot_ids == plan.slot_ids
             && prev.lane_params == plan.lane_params
+            && prev.depth_groups == plan.depth_groups
         {
             return None;
         }

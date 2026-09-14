@@ -30,7 +30,7 @@ use common::pipe::pipe_path;
 use common::plugin_db::PluginDatabase;
 use common::protocol::{
     AudioCommand, AudioEvent, AudioSession, ChildKind, PROTOCOL_FINGERPRINT, PluginCommand,
-    PluginEvent,
+    PluginEvent, WorkerPoolSpec,
 };
 use common::wire::{read_msg, write_msg};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -127,44 +127,14 @@ pub struct Bootstrap {
     _worker_bridge: common::worker_bridge::WorkerBridgeHandle,
 }
 
-/// 1 世代分の worker pool spec (= `OpenWorkerPool` の payload)。 respawn 後、
-/// 生存している側の子プロセスにも同じ世代を re-open させるために
-/// [`RespawnedAudio`] / [`RespawnedPlugin`] へ複製して返す。
-#[derive(Debug, Clone)]
-pub struct WorkerPoolSpec {
-    pub n_workers: u32,
-    pub worker_bridge_shmem_id: String,
-    pub wake_event_names: Vec<String>,
-    pub done_event_names: Vec<String>,
-}
-
-impl WorkerPoolSpec {
-    pub fn to_audio_cmd(&self) -> AudioCommand {
-        AudioCommand::OpenWorkerPool {
-            n_workers: self.n_workers,
-            worker_bridge_shmem_id: self.worker_bridge_shmem_id.clone(),
-            wake_event_names: self.wake_event_names.clone(),
-            done_event_names: self.done_event_names.clone(),
-        }
-    }
-
-    pub fn to_plugin_cmd(&self) -> PluginCommand {
-        PluginCommand::OpenWorkerPool {
-            n_workers: self.n_workers,
-            worker_bridge_shmem_id: self.worker_bridge_shmem_id.clone(),
-            wake_event_names: self.wake_event_names.clone(),
-            done_event_names: self.done_event_names.clone(),
-        }
-    }
-}
-
 /// worker pool の現世代 state。 event 名は
 /// `worker_wake_event_name(pid, generation, idx)` で mint され、 pool
 /// 再構築 (= `OpenWorkerPool` 再送) のたびに generation を bump する —
-/// poisoned pair (dispatch timeout 後) が残した stale auto-reset signal を
-/// 旧世代の名前空間へ隔離するため (`common::plugin_ref` の contract 参照)。
+/// poisoned pair (dispatch timeout 後) が残した stale な依頼と signal を
+/// 旧世代へ隔離するため (`common::plugin_ref` の contract 参照)。 respawn 後、
+/// 生存している側の子プロセスにも同じ世代を re-open させるために `spec` を
+/// [`RespawnedAudio`] / [`RespawnedPlugin`] へ複製して返す。
 struct WorkerPoolState {
-    generation: u32,
     spec: WorkerPoolSpec,
     /// 親プロセスが create した named event の keep-alive。 子はどちらも
     /// create-or-open するが、 親が先に握ることで「両子の open 順序 race」
@@ -200,7 +170,7 @@ impl Drop for PoolEventHandles {
 
 /// `respawn_audio` の結果。 呼び出し側 (AppData) は `tx` を差し替え、
 /// `sample_rate` の複製を更新し、 生存側 plugin_host へ
-/// `CloseWorkerPool` + `pool.to_plugin_cmd()` を送って新世代 pool に
+/// `CloseWorkerPool` + `OpenWorkerPool(pool)` を送って新世代 pool に
 /// 載せ替える。
 pub struct RespawnedAudio {
     pub tx: UnboundedSender<AudioCommand>,
@@ -211,7 +181,7 @@ pub struct RespawnedAudio {
 }
 
 /// `respawn_plugin` の結果。 呼び出し側 (AppData) は `tx` を差し替え、
-/// 生存側 daw_audio へ `CloseWorkerPool` + `pool.to_audio_cmd()` を送る。
+/// 生存側 daw_audio へ `CloseWorkerPool` + `OpenWorkerPool(pool)` を送る。
 pub struct RespawnedPlugin {
     pub tx: UnboundedSender<PluginCommand>,
     pub pool: WorkerPoolSpec,
@@ -247,7 +217,7 @@ pub struct ChildSupervisor {
     /// 採用して更新される (= 以後の plugin respawn も新レートで Session を
     /// 受ける)。
     session: std::sync::Mutex<AudioSession>,
-    n_workers: u32,
+    n_runners: u32,
     worker_bridge_shmem_id: String,
     /// worker pool の現世代 (event 名 + HANDLE keep-alive)。
     pool: std::sync::Mutex<WorkerPoolState>,
@@ -351,11 +321,11 @@ impl ChildSupervisor {
     /// 現世代として保持する。 戻り値は新世代の `OpenWorkerPool` payload。
     fn rotate_worker_pool(&self) -> Result<WorkerPoolSpec> {
         let mut guard = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-        let generation = guard.generation.wrapping_add(1).max(1);
+        let generation = guard.spec.generation.wrapping_add(1).max(1);
         let state = build_worker_pool_state(
             self.pid,
             generation,
-            self.n_workers,
+            self.n_runners,
             &self.worker_bridge_shmem_id,
         )?;
         let spec = state.spec.clone();
@@ -384,7 +354,7 @@ impl ChildSupervisor {
 
         let mut server = server;
         let session_msg = AudioCommand::Session(session.clone());
-        let open_pool = pool.to_audio_cmd();
+        let open_pool = AudioCommand::OpenWorkerPool(pool.clone());
         self.rt_handle.block_on(async {
             write_msg(&mut server, &session_msg).await?;
             write_msg(&mut server, &open_pool).await?;
@@ -420,7 +390,7 @@ impl ChildSupervisor {
 
         let mut server = server;
         let session_msg = PluginCommand::Session(session);
-        let open_pool = pool.to_plugin_cmd();
+        let open_pool = PluginCommand::OpenWorkerPool(pool.clone());
         // r.md #36: 「エディタ窓で拾ってよいキー」 も Session / worker pool と同じ
         // **子起動ごとに必ず送る初期状態**。 respawn で送り忘れると plugin-host の
         // forwarded_keys が空のままになり、 プラグインエディタ上の Space が黙って
@@ -609,13 +579,13 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
     );
     tracing::info!(?session, "created audio session handles");
 
-    let n_workers = pick_worker_count();
+    let n_runners = pick_worker_count();
     let worker_bridge_shmem_id = common::plugin_ref::worker_bridge_shmem_id(pid);
     let worker_bridge = common::worker_bridge::WorkerBridgeHandle::create(&worker_bridge_shmem_id)
         .context("failed to create worker_bridge shmem")?;
     // 初回 pool は generation 1 (respawn ごとに rotate_worker_pool が bump)。
-    let pool_state = build_worker_pool_state(pid, 1, n_workers, &worker_bridge_shmem_id)?;
-    tracing::info!(n_workers, "created plugin worker pool handles (generation 1)");
+    let pool_state = build_worker_pool_state(pid, 1, n_runners, &worker_bridge_shmem_id)?;
+    tracing::info!(n_runners, n_pairs = pool_state.spec.n_pairs, "created plugin worker pool handles (generation 1)");
 
     let (audio_child, plugin_child, mut audio_server, mut plugin_server, audio_device_sr) =
         rt.block_on(spawn_and_handshake(&job))?;
@@ -626,8 +596,8 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
     }
     tracing::info!(sample_rate = session.sample_rate, "resolved audio session sample rate");
 
-    let open_pool_audio = pool_state.spec.to_audio_cmd();
-    let open_pool_plugin = pool_state.spec.to_plugin_cmd();
+    let open_pool_audio = AudioCommand::OpenWorkerPool(pool_state.spec.clone());
+    let open_pool_plugin = PluginCommand::OpenWorkerPool(pool_state.spec.clone());
     let forwarded_keys = forwarded_editor_keys_cmd();
     rt.block_on(async {
         write_msg(&mut audio_server, &AudioCommand::Session(session.clone())).await?;
@@ -665,7 +635,7 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         rt_handle: rt.handle().clone(),
         job: job.clone(),
         session: std::sync::Mutex::new(session.clone()),
-        n_workers,
+        n_runners,
         worker_bridge_shmem_id: worker_bridge_shmem_id.clone(),
         pool: std::sync::Mutex::new(pool_state),
         incoming_tx,
@@ -781,8 +751,8 @@ impl Bootstrap {
     }
 }
 
-const MAX_WORKER_COUNT_DEFAULT: u32 = 64;
-
+/// audio 側で plugin を依頼する runner (callback スレッド + audio worker) の数。pair は予備
+/// (`common::worker_bridge::SPARE_PAIRS`) を足した数なので、合計が `MAX_WORKERS` に収まるようにする。
 fn pick_worker_count() -> u32 {
     let n = std::env::var("DAW_AUDIO_WORKERS")
         .ok()
@@ -792,26 +762,26 @@ fn pick_worker_count() -> u32 {
                 .map(|n| n.get().saturating_sub(1).max(1) as u32)
                 .unwrap_or(2)
         });
-    n.min(common::worker_bridge::MAX_WORKERS as u32)
-        .clamp(1, MAX_WORKER_COUNT_DEFAULT)
+    n.clamp(1, common::worker_bridge::MAX_WORKERS as u32 - common::worker_bridge::SPARE_PAIRS)
 }
 
 /// 指定世代の worker pool state (event 名 + 親 keep-alive HANDLE) を作る。
 /// 名前は `worker_wake_event_name(pid, generation, idx)` — 世代を名前に
 /// 含めることで、 旧世代 pair の stale auto-reset signal が新 pool に
-/// 漏れない (`common::plugin_ref` の poisoning contract)。
+/// 漏れない (`common::plugin_ref` の poisoning contract)。pair は runner の数 + 予備。
 fn build_worker_pool_state(
     pid: u32,
     generation: u32,
-    n_workers: u32,
+    n_runners: u32,
     worker_bridge_shmem_id: &str,
 ) -> Result<WorkerPoolState> {
-    let mut wake_names = Vec::with_capacity(n_workers as usize);
-    let mut done_names = Vec::with_capacity(n_workers as usize);
+    let n_pairs = n_runners + common::worker_bridge::SPARE_PAIRS;
+    let mut wake_names = Vec::with_capacity(n_pairs as usize);
+    let mut done_names = Vec::with_capacity(n_pairs as usize);
     #[cfg(windows)]
     let mut handles: Vec<windows::Win32::Foundation::HANDLE> =
-        Vec::with_capacity(2 * n_workers as usize);
-    for i in 0..n_workers {
+        Vec::with_capacity(2 * n_pairs as usize);
+    for i in 0..n_pairs {
         let wn = common::plugin_ref::worker_wake_event_name(pid, generation, i);
         let dn = common::plugin_ref::worker_done_event_name(pid, generation, i);
         #[cfg(windows)]
@@ -827,9 +797,10 @@ fn build_worker_pool_state(
         done_names.push(dn);
     }
     Ok(WorkerPoolState {
-        generation,
         spec: WorkerPoolSpec {
-            n_workers,
+            n_pairs,
+            n_runners,
+            generation,
             worker_bridge_shmem_id: worker_bridge_shmem_id.to_string(),
             wake_event_names: wake_names,
             done_event_names: done_names,

@@ -2364,7 +2364,6 @@ fn run_post_dispatch(
         n,
         song,
         &refs,
-        None,
         48_000,
         n as u32,
         true,

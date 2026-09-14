@@ -228,14 +228,31 @@ impl PluginEntry {
 /// map は v29 で廃止)。project ごとに 1 つ ([`ProjectShared::plugin_refs`])。
 pub type PluginRefs = HashMap<u64, Arc<PluginEntry>>;
 
-/// 1 worker handshake pair (audio worker i ↔ plugin_host worker i)。
+/// 1 worker handshake pair (audio 側の依頼口 ↔ plugin_host worker i)。
 pub struct SyncSlot {
     pub sync: WorkerSyncRef,
     /// plan §4 poisoning contract: dispatch timeout を観測した pair は
-    /// 以後 dispatch 禁止 (auto-reset done event に待ち手なし signal が
-    /// 残留し、次 dispatch が「走行中の process と並行に入力を書く」事故に
-    /// なるため)。pool 再構築 (= 新 `WorkerRig`) まで立ちっぱなし。
+    /// dispatch 禁止 (host の worker はまだその `process()` の中に居て、
+    /// 次 dispatch が「走行中の process と並行に入力を書く」事故に
+    /// なるため)。host がその依頼を終えたら [`WorkerRig::heal`] が下ろす。
     pub poisoned: AtomicBool,
+}
+
+/// runner 1 本の plugin の依頼口 ([`WorkerRig::lease`])。
+#[derive(Clone, Copy)]
+pub struct PairLease<'a> {
+    rig: &'a WorkerRig,
+    runner: usize,
+}
+
+impl<'a> PairLease<'a> {
+    /// この buffer でこの runner が使う pair。buffer の途中で poison されたら、残りの plugin は呼び側の gate が弾く
+    /// (借り替えは次の buffer の頭の [`WorkerRig::heal`] — 1 buffer の中で 1 runner が timeout まで待つのは高々 1 回
+    /// なので、pool の stall 判定の前提 (`audio_worker::POOL_WAIT_TIMEOUT_MS`) が崩れない)。
+    pub fn slot(&self) -> Option<&'a SyncSlot> {
+        let lease = self.rig.leases.get(self.runner)?;
+        self.rig.slots.get(lease.load(Ordering::Relaxed) as usize)
+    }
 }
 
 /// worker pool 一式 (plugin_host との handshake 面 + audio 側 worker threads)。
@@ -246,15 +263,91 @@ pub struct SyncSlot {
 ///
 /// **フィールド順序が drop 順序**: `pool` (worker threads join — slots の
 /// raw pointer を deref し得る) → `slots` → `bridge` (slots の
-/// `worker_task` ptr の backing shmem) の順で落とすこと。
+/// `channel` ptr の backing shmem) の順で落とすこと。
 pub struct WorkerRig {
-    /// `None` = `AudioWorkerPool::new` 失敗 (serial fallback で slot 0 のみ使用)。
+    /// `None` = `AudioWorkerPool::new` 失敗 (serial fallback で runner 0 のみ使用)。
     pub pool: Option<AudioWorkerPool>,
+    /// pair の全部 (runner の数 + 予備 `common::worker_bridge::SPARE_PAIRS`)。
     pub slots: Vec<SyncSlot>,
-    /// shmem mapping を保持 (`slots[*].sync.worker_task` の backing)。
+    /// runner ごとに今借りている pair (`slots` の添字)。書き手は [`Self::heal`] だけ (runner が走っていない間)。
+    leases: Vec<AtomicU32>,
+    /// どの runner も借りていない、使える pair の bit (`slots` の添字)。書き手は [`Self::heal`] だけ。
+    free_pairs: AtomicU64,
+    /// poison された pair を借りたまま、空きが無くて借り替えられなかった runner がいる。
+    degraded: AtomicBool,
+    /// shmem mapping を保持 (`slots[*].sync.channel` の backing)。
     pub bridge: WorkerBridgeHandle,
     /// `AudioEvent::WorkerPoolStalled` を送ったか (notify thread の dedup)。
     pub stall_notified: AtomicBool,
+}
+
+impl WorkerRig {
+    /// `runners` 本の runner (callback スレッド + audio worker) が `slots` の先頭から 1 本ずつ借り、残りを予備にする。
+    #[must_use]
+    pub fn new(pool: Option<AudioWorkerPool>, slots: Vec<SyncSlot>, runners: usize, bridge: WorkerBridgeHandle) -> Self {
+        let runners = runners.min(slots.len());
+        let free_pairs = (runners..slots.len().min(64)).fold(0u64, |bits, p| bits | (1u64 << p));
+        Self {
+            pool,
+            slots,
+            leases: (0..runners).map(|r| AtomicU32::new(r as u32)).collect(),
+            free_pairs: AtomicU64::new(free_pairs),
+            degraded: AtomicBool::new(false),
+            bridge,
+            stall_notified: AtomicBool::new(false),
+        }
+    }
+
+    /// runner `runner` (callback スレッド = 0、audio worker i = i + 1) の依頼口。
+    #[must_use]
+    pub fn lease(&self, runner: usize) -> PairLease<'_> {
+        PairLease { rig: self, runner }
+    }
+
+    /// buffer の頭 (runner が走っていない間に 1 スレッドだけ) で呼ぶ:
+    /// 1. timeout した依頼を host が終えた pair の poison を下ろし、どの runner も借りていなければ空きに戻す。
+    /// 2. poison された pair (host の worker がまだ timeout した依頼の中に居る) を借りている runner を、空いている
+    ///    pair に借り替える — そうしないと、たまたまその runner に回った **無関係な** plugin まで通知なしで素通しになる。
+    /// 3. 空きが無くて借り替えられなかった runner が居るかを [`Self::is_degraded`] に書く。
+    ///
+    /// poison された pair が無ければ atomic の読みだけ。RT: 確保・ロックなし。
+    pub fn heal(&self) {
+        let mut free = self.free_pairs.load(Ordering::Relaxed);
+        for (p, slot) in self.slots.iter().enumerate() {
+            if slot.poisoned.load(Ordering::Acquire) && slot.sync.idle() {
+                slot.poisoned.store(false, Ordering::Release);
+                if p < 64 && !self.leases.iter().any(|l| l.load(Ordering::Relaxed) as usize == p) {
+                    free |= 1u64 << p;
+                }
+            }
+        }
+        let mut stuck = false;
+        for lease in &self.leases {
+            let poisoned = self
+                .slots
+                .get(lease.load(Ordering::Relaxed) as usize)
+                .is_some_and(|s| s.poisoned.load(Ordering::Acquire));
+            if !poisoned {
+                continue;
+            }
+            if free == 0 {
+                stuck = true;
+                continue;
+            }
+            let pair = free.trailing_zeros();
+            free &= !(1u64 << pair);
+            lease.store(pair, Ordering::Relaxed);
+        }
+        self.free_pairs.store(free, Ordering::Relaxed);
+        self.degraded.store(stuck, Ordering::Release);
+    }
+
+    /// poison された pair を借りたまま借り替えられない runner が居る (その runner に回った plugin は素通し)。
+    /// notify thread が持続を見て plugin_host の立て直しへ上げる。
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Acquire)
+    }
 }
 
 /// r.md #40: off-thread で確保した stretch engine を RT の `TrackScratch` へ
@@ -487,15 +580,14 @@ pub struct EngineShared {
     /// `run_export` / the freewheel loop only **read** it (every buffer)
     /// and abort (deleting the partial WAV) when set.
     pub export_cancel: AtomicBool,
-    /// set `true` by the CPAL callback once it observes
-    /// `export_running` and parks (writes silence, skips dispatch); set `false`
-    /// on any normal (non-parked) buffer. The export thread sets
-    /// `export_running` then waits for this to go `true` before it dispatches,
-    /// guaranteeing the live callback's *in-flight* buffer has fully drained —
-    /// otherwise two drivers would race on the shared plugin-host worker slots
-    /// ("プラグインで処理がぶつかる"). It is the single-producer (CPAL callback)
-    /// flag the single-consumer (export thread) polls.
-    pub live_parked: AtomicBool,
+    /// CPAL callback が buffer を処理している間 `true` (`EngineRt::process_buffer` の頭で立て、抜けるときに下ろす)。
+    ///
+    /// 書き出しとの排他は Dekker 型: callback は **これを立ててから** `export_running` を読み、書き出しは
+    /// `export_running` を立ててから **これが下りているのを見る**。どちらかが必ず相手を見るので、書き出しが下りて
+    /// いるのを見た後に始まる buffer は必ず予約を見て無音で抜ける — 共有の plugin-host worker slot / plugin
+    /// instance を 2 本の描画が同時に叩かない ("プラグインで処理がぶつかる")。park 中 (callback が呼ばれない) は
+    /// 最初から下りているので、書き出しは待たない。
+    pub live_rendering: AtomicBool,
     /// 直近の CPAL callback が処理した frames (= device period)。 audio
     /// thread が毎 buffer store し、recv loop が schedule compile の
     /// `buffer_frames` (leaf 宛 sidechain tap の 1-buffer 補償量) に使う。
@@ -521,7 +613,7 @@ impl EngineShared {
             sampler: ArcSwapOption::empty(),
             export_running: AtomicBool::new(false),
             export_cancel: AtomicBool::new(false),
-            live_parked: AtomicBool::new(false),
+            live_rendering: AtomicBool::new(false),
             last_buffer_frames: AtomicU32::new(0),
             mmcss_join_failed: AtomicBool::new(false),
             mmcss_warned: AtomicBool::new(false),
@@ -636,5 +728,69 @@ mod idle_park_tests {
         let n = advance_idle_counter(&counter, true, frames);
         assert_eq!(n, frames, "リセット前の値へ戻ってはいけない");
         assert!(n < threshold, "起こした直後に park し直してはいけない");
+    }
+}
+
+#[cfg(test)]
+mod pair_lease_tests {
+    use super::*;
+
+    /// runner 2 本 + 予備 1 本の rig (plugin host は居ない。pair の依頼番号は直接書く)。
+    fn rig(tag: &str) -> WorkerRig {
+        let bridge = WorkerBridgeHandle::create(&format!("daw01_lease_test_{}_{tag}", std::process::id())).expect("bridge");
+        let slots = (0..3)
+            .map(|i| SyncSlot {
+                sync: WorkerSyncRef {
+                    worker_idx: i as u32,
+                    channel: &bridge.bridge().channels[i] as *const _,
+                    generation: 1,
+                    event_wake: windows::Win32::Foundation::HANDLE::default(),
+                    event_done: windows::Win32::Foundation::HANDLE::default(),
+                },
+                poisoned: AtomicBool::new(false),
+            })
+            .collect();
+        WorkerRig::new(None, slots, 2, bridge)
+    }
+
+    /// pair `p` の host が timeout した依頼の中に居る状態にする (依頼番号が完了より先)。
+    fn hang(rig: &WorkerRig, p: usize) {
+        rig.slots[p].poisoned.store(true, Ordering::Release);
+        rig.bridge.bridge().channels[p].request.store((1u64 << 32) | 7, Ordering::SeqCst);
+    }
+
+    fn finish(rig: &WorkerRig, p: usize) {
+        rig.bridge.bridge().channels[p].completed.store((1u64 << 32) | 7, Ordering::SeqCst);
+    }
+
+    fn pair_of(rig: &WorkerRig, runner: usize) -> usize {
+        let slot = rig.lease(runner).slot().expect("slot");
+        rig.slots.iter().position(|s| std::ptr::eq(s, slot)).expect("pair")
+    }
+
+    /// 詰まった pair を借りていた runner は次の buffer の頭で予備に借り替え (無関係な plugin を素通しにしない)、
+    /// buffer の途中では借り替えない (1 buffer に timeout 待ちは 1 回)。予備が尽きたら degraded になる。host が依頼を
+    /// 終えた pair は空きに戻り、次に詰まった runner が使える。
+    #[test]
+    fn 詰まった_pair_は予備に借り替え_終われば空きに戻る() {
+        let rig = rig("swap");
+        assert_eq!((pair_of(&rig, 0), pair_of(&rig, 1)), (0, 1));
+
+        hang(&rig, 0);
+        assert_eq!(pair_of(&rig, 0), 0, "buffer の途中では借り替えない");
+        rig.heal();
+        assert_eq!(pair_of(&rig, 0), 2, "buffer の頭で予備に借り替える");
+        assert!(!rig.is_degraded());
+
+        hang(&rig, 1);
+        rig.heal();
+        assert_eq!(pair_of(&rig, 1), 1, "予備が無ければ詰まった pair のまま (呼び側の gate が弾く)");
+        assert!(rig.is_degraded(), "借り替えられない runner が居る");
+
+        finish(&rig, 0);
+        rig.heal();
+        assert!(!rig.slots[0].poisoned.load(Ordering::Acquire), "host が終えた pair の poison を下ろす");
+        assert_eq!(pair_of(&rig, 1), 0, "空きに戻った pair へ借り替える");
+        assert!(!rig.is_degraded());
     }
 }

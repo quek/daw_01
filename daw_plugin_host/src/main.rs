@@ -25,6 +25,7 @@ mod editor_window;
 mod plugin_instance;
 mod process_scaffold;
 mod process_server;
+mod quiesce;
 mod vst3_events;
 mod vst3_host;
 mod vst3_params;
@@ -685,6 +686,9 @@ struct PluginHost {
     /// worker pool が dispatch 中に読む registry の正本 (worker へは snapshot の受け渡しで届く)。
     registry: PluginRegistry,
     worker_pool: Option<process_server::WorkerPool>,
+    /// pool を閉じても止まらなかった worker が `process()` の中にいる plugin の token。空でなくなったら plugin_host は
+    /// pool を作り直せない (その plugin を別の worker が並行に呼ぶことになる) ので終わり、daw_gui の respawn に任せる。
+    wedged: Vec<InstanceToken>,
     /// 開いているプロジェクト (= タブ) の帳簿。instance は `DeviceAddr.project` で
     /// 帰属するので、ここには project 単位の情報だけ。
     projects: HashMap<ProjectKey, ProjectCtx>,
@@ -705,6 +709,7 @@ impl PluginHost {
             instances: HashMap::new(),
             registry: PluginRegistry::default(),
             worker_pool: None,
+            wedged: Vec::new(),
             projects: HashMap::new(),
         }
     }
@@ -821,28 +826,6 @@ impl PluginHost {
         let _ = self.evt_tx.send(evt);
     }
 
-    /// registry から `device` の entry を外し、worker の in-flight
-    /// dispatch を排出する。戻り値 = 外した entry (republish 用)。
-    /// entry が未 publish なら quiesce も不要 (worker は触れない)。
-    fn detach_and_quiesce(&self, device: DeviceAddr) -> Option<PluginEntry> {
-        let token = self.instances.get(&device)?.token;
-        let saved = registry_remove(&self.registry, token);
-        if saved.is_some()
-            && let Some(pool) = self.worker_pool.as_ref()
-        {
-            pool.quiesce();
-        }
-        saved
-    }
-
-    /// [`Self::detach_and_quiesce`] で外した entry を同じ instance の token で戻す。
-    /// (device が消えていれば捨てる = 戻し先が無い)
-    fn republish(&self, device: DeviceAddr, entry: PluginEntry) {
-        if let Some(rec) = self.instances.get(&device) {
-            registry_insert(&self.registry, rec.token, entry);
-        }
-    }
-
     /// `device` の plugin latency を再 query して `PluginLatencyChanged`
     /// を emit する (activate 直後 / restart / reinit / CLAP latency.changed
     /// の共通関数 — `docs/plan_arch_refactor.md` §6 の非対称是正)。
@@ -886,21 +869,13 @@ impl PluginHost {
                 tracing::info!(?project, ?dir, "project dir updated");
                 self.projects.entry(project).or_default().project_dir = dir;
             }
-            PluginCommand::OpenWorkerPool {
-                n_workers,
-                worker_bridge_shmem_id,
-                wake_event_names,
-                done_event_names,
-            } => {
-                if let Some(pool) = self.worker_pool.take() {
-                    pool.shutdown();
+            PluginCommand::OpenWorkerPool(spec) => {
+                if !self.close_worker_pool() {
+                    return;
                 }
                 match process_server::WorkerPool::open(
-                    n_workers,
-                    &worker_bridge_shmem_id,
+                    &spec,
                     &self.session.metrics_shmem_id,
-                    &wake_event_names,
-                    &done_event_names,
                     &self.registry,
                     self.evt_tx.clone(),
                 ) {
@@ -911,9 +886,7 @@ impl PluginHost {
                 }
             }
             PluginCommand::CloseWorkerPool => {
-                if let Some(pool) = self.worker_pool.take() {
-                    pool.shutdown();
-                }
+                self.close_worker_pool();
             }
             PluginCommand::SetRenderMode(mode) => {
                 // Forward the render hint to every loaded plugin
@@ -1064,7 +1037,7 @@ impl PluginHost {
             }
             PluginCommand::SetupAraDocument { device, clips, bpm, time_sig, archive } => {
                 // setup_ara は内部で deactivate→activate するので quiesce 契約。
-                let saved = self.detach_and_quiesce(device);
+                let Ok(saved) = self.detach_and_quiesce(device) else { return };
                 let published = saved.is_some();
                 match self.instances.get_mut(&device) {
                     Some(rec) => {
@@ -1101,7 +1074,7 @@ impl PluginHost {
             }
             PluginCommand::ClearAraDocument { device } => {
                 // clear_ara も deactivate→activate を伴うので同じ quiesce 契約。
-                let saved = self.detach_and_quiesce(device);
+                let Ok(saved) = self.detach_and_quiesce(device) else { return };
                 let published = saved.is_some();
                 if let Some(rec) = self.instances.get_mut(&device) {
                     if published {
@@ -1366,10 +1339,9 @@ impl PluginHost {
         self.emit(PluginEvent::SlotPluginShmemReleased { device });
         // (1) registry から外す → (2) in-flight dispatch 排出。record は既に帳簿から
         //     外してあるので `detach_and_quiesce` (帳簿で token を引く) ではなく token 直。
-        if registry_remove(&self.registry, rec.token).is_some()
-            && let Some(pool) = self.worker_pool.as_ref()
-        {
-            pool.quiesce();
+        if registry_remove(&self.registry, rec.token).is_some() && !self.quiesce(&[rec.token]).is_empty() {
+            self.abandon_stuck_device(device, rec, emit_unloaded);
+            return;
         }
         // worker が触れなくなった後で per-plugin 計測の枠を空ける (detach 中に壊された instance も含む)。
         registry_release_metric_slot(&self.registry, rec.token);
@@ -1437,9 +1409,7 @@ impl PluginHost {
                 })
                 .collect(),
         };
-        if let Some(pool) = self.worker_pool.as_ref() {
-            pool.quiesce();
-        }
+        let stuck = self.quiesce(&saved.keys().copied().collect::<Vec<_>>());
         let sr = f64::from(self.session.sample_rate);
         let mf = self.session.max_frames;
         let mut restored: HashMap<InstanceToken, PluginEntry> = HashMap::new();
@@ -1449,6 +1419,13 @@ impl PluginHost {
                 continue;
             };
             let token = rec.token;
+            if stuck.contains(&token) {
+                // `process()` から抜けないので触れずにそのまま戻す。
+                if let Some(entry) = saved.get(&token) {
+                    restored.insert(token, entry.clone());
+                }
+                continue;
+            }
             rec.plugin.stop_processing();
             rec.plugin.deactivate();
             let ok = match rec
@@ -1532,7 +1509,7 @@ impl PluginHost {
             );
             return;
         }
-        let saved = self.detach_and_quiesce(device);
+        let Ok(saved) = self.detach_and_quiesce(device) else { return };
         let published = saved.is_some();
         let sr = f64::from(self.session.sample_rate);
         let mf = self.session.max_frames;
@@ -2058,9 +2035,8 @@ impl PluginHost {
         // (1) worker pool を先に止める。`shutdown` は全 worker thread を join
         //     するので、以後 registry を触る RT スレッドは存在しない
         //     (= teardown_device の `detach_and_quiesce` より強い保証)。
-        if let Some(pool) = self.worker_pool.take() {
-            pool.shutdown();
-        }
+        //     止まらなかった worker が `process()` の中にいる plugin は、teardown_device が壊さずに手放す。
+        self.close_worker_pool();
         // (2) 全 device を正規経路で畳む。`emit_unloaded` は false — device が
         //     「Song から外れた」のではなくプロセスが終わるだけで、受け手の
         //     daw_gui も同時に畳まれている。
@@ -2173,6 +2149,9 @@ fn plugin_main_loop(
             match msg {
                 HostMsg::Shutdown => break 'main "Shutdown",
                 HostMsg::Cmd(cmd) => host.handle_command(cmd),
+            }
+            if !host.wedged.is_empty() {
+                break 'main "worker wedged in plugin process()";
             }
         }
 

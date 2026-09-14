@@ -9,6 +9,8 @@
 //! callback and serialize against a second export), resets `export_cancel`,
 //! then spawns `run_export` on a dedicated `std::thread`. The export thread:
 //!
+//! 0. Waits for the live callback to leave its in-flight buffer
+//!    (`EngineShared::live_rendering`); every later buffer sees the reservation.
 //! 1. Allocates its own `scratch` / `master_l` / `master_r` (heap is fine
 //!    here; this thread is RT-irrelevant once the realtime callback is
 //!    parked).
@@ -211,10 +213,9 @@ pub fn run_export(
         bits_per_sample: 32,
         sample_format: SampleFormat::Float,
     };
+    wait_for_live_exit(&engine_shared)?;
     let mut writer = WavWriter::create(&path, spec)
         .with_context(|| format!("failed to create WAV {}", path.display()))?;
-
-    wait_for_live_park(&engine_shared);
 
     // Plugins are reinitialised (deactivate→activate) by the GUI's
     // `begin_wav_export` → `ReinitAllPlugins` handshake *before* this
@@ -350,21 +351,28 @@ impl RenderWindow {
     }
 }
 
-/// `export_running` は既に recv loop が立てているので、live CPAL コールバックが
-/// 実際に park するのを待ってから共有 plugin-host worker slot に触る。待たないと
-/// フラグを立てた瞬間に `process_buffer` の途中だったバッファが、この走査と同じ
-/// slot へ同時 dispatch する ("plugin processing collides")。`live_parked` が
-/// true を返した時点で live 側はゲートを通っており、in-flight のバッファは
-/// 完全に抜けている (CPAL は直列に呼ぶ)。
-fn wait_for_live_park(engine_shared: &EngineShared) {
-    let park_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !engine_shared.live_parked.load(Ordering::Acquire) {
-        if std::time::Instant::now() >= park_deadline {
-            tracing::warn!("live callback did not report parked within 2s; proceeding anyway");
-            break;
+/// live の buffer が抜けきるのを待つ上限。live の 1 buffer の中で timeout まで待つ dispatch は pair ごとに高々
+/// 1 回 (timeout した pair は poison されて以後叩かない) で、pool の完了待ちの打ち切りは進みが
+/// `DISPATCH_TIMEOUT_MS * 2` 止まったとき。その合計を越えて抜けないのは詰まった callback。
+const LIVE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
+    common::plugin_ref::DISPATCH_TIMEOUT_MS as u64 * (common::worker_bridge::MAX_WORKERS as u64 + 2),
+);
+
+/// 予約 (`export_running`、recv loop が立て済み) の後、live の callback が今の buffer を抜けるのを待つ
+/// (`EngineShared::live_rendering` の Dekker handshake)。下りているのを見た後に始まる buffer は予約を見て
+/// 無音で抜けるので、ここから先の描画は共有の plugin-host worker slot / plugin instance を独占する。
+/// 抜けなければ描画しない (live と並んで同じ plugin を叩くくらいなら書き出しを失敗させる)。
+fn wait_for_live_exit(engine_shared: &EngineShared) -> Result<()> {
+    let deadline = std::time::Instant::now() + LIVE_EXIT_TIMEOUT;
+    while engine_shared.live_rendering.load(Ordering::SeqCst) {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "live audio callback did not finish its buffer within {LIVE_EXIT_TIMEOUT:?}"
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    Ok(())
 }
 
 /// r.md #54: 範囲のラウドネスをオフラインで解析する。
@@ -400,7 +408,7 @@ pub fn run_loudness_analysis(
         "starting offline loudness analysis"
     );
 
-    wait_for_live_park(&engine_shared);
+    wait_for_live_exit(&engine_shared)?;
 
     let mut sink = LoudnessSink {
         collector: LoudnessCollector::new(
@@ -1163,7 +1171,6 @@ mod tests {
         let window = (clip.start_beat, clip.start_beat + clip.length_beats);
         let baked_path = dir.join("baked.wav");
         let engine = Arc::new(EngineShared::new());
-        engine.live_parked.store(true, Ordering::Release);
         let project = Arc::new(ProjectShared::new(common::protocol::ProjectKey(1), 0));
         let isolated = song.isolated_track(source.track_id).expect("isolated");
         let span = RenderSpan::RangeWarm { start_beat: window.0, end_beat: window.1 };
@@ -1446,13 +1453,13 @@ mod tests {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let engine = EngineShared::new();
-        engine.worker.store(Some(Arc::new(crate::engine_shared::WorkerRig {
-            pool: Some(crate::audio_worker::AudioWorkerPool::new(sync_slots).expect("pool")),
-            slots: Vec::new(),
-            bridge: common::worker_bridge::WorkerBridgeHandle::create(&format!("daw01_test_wb_{}_{seq}", std::process::id()))
+        engine.worker.store(Some(Arc::new(crate::engine_shared::WorkerRig::new(
+            Some(crate::audio_worker::AudioWorkerPool::new(sync_slots).expect("pool")),
+            Vec::new(),
+            sync_slots as usize,
+            common::worker_bridge::WorkerBridgeHandle::create(&format!("daw01_test_wb_{}_{seq}", std::process::id()))
                 .expect("worker bridge"),
-            stall_notified: std::sync::atomic::AtomicBool::new(false),
-        })));
+        ))));
         engine
     }
 

@@ -114,6 +114,21 @@ pub fn beats_per_bar(time_sig: (u8, u8)) -> f64 {
     f64::from(time_sig.0) * 4.0 / f64::from(time_sig.1.max(1))
 }
 
+/// buffer の先頭から `delta_beats` 拍の位置にある境界 (note の発音 / 音の始まりと終わり) を、その位置以降で最初の
+/// frame に写す (`ceil`)。浮動小数の誤差で整数のすぐそばに来た値は整数へ吸着する。
+///
+/// 吸着しないと、buffer の境界ちょうどにある境界が buffer ごとに前後へぶれる: 切り捨てると
+/// `(playhead + frames/spb − playhead) * spb = 479.99999999998977` が 479 になり、音の続く buffer の最後の 1 sample が
+/// 書かれずに 0 のまま残る (buffer 周期のクリック = ブザー)。同じ規則で両端を写せば、buffer ごとに独立に計算しても
+/// 同じ絶対位置は必ず同じ frame に落ち、隣の buffer と重ならず隙間も空かない。
+#[must_use]
+#[inline]
+pub fn boundary_frame(delta_beats: f64, samples_per_beat: f64) -> f64 {
+    let x = delta_beats * samples_per_beat;
+    let nearest = x.round();
+    if (x - nearest).abs() < 1e-6 { nearest } else { x.ceil() }
+}
+
 /// Converts a beat-domain position to seconds using the song's constant
 /// tempo. Inverse of the constant-`bpm` mapping `playhead_to_beat` uses, so
 /// the displayed time matches the audio engine's playback position.

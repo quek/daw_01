@@ -1014,12 +1014,12 @@ impl AppData {
                     self.ipc.sample_rate = r.sample_rate;
                 }
                 self.send_plugin(common::protocol::PluginCommand::CloseWorkerPool);
-                self.send_plugin(r.pool.to_plugin_cmd());
+                self.send_plugin(common::protocol::PluginCommand::OpenWorkerPool(r.pool));
             }),
             ChildKind::PluginHost => supervisor.respawn_plugin().map(|r| {
                 self.ipc.plugin_tx = Some(r.tx);
                 self.send_audio(common::protocol::AudioCommand::CloseWorkerPool);
-                self.send_audio(r.pool.to_audio_cmd());
+                self.send_audio(common::protocol::AudioCommand::OpenWorkerPool(r.pool));
             }),
         };
         match respawn_result {

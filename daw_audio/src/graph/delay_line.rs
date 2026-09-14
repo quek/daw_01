@@ -69,23 +69,40 @@ impl DelayLine {
         self.write = 0;
     }
 
-    /// Schedule 再 compile 間の状態移送 (`Schedule::adopt_state_from`)。
-    /// capacity (= 補償 delay 長 + 1) が一致するときだけ ring の内容と
-    /// write cursor を `old` から引き継ぐ。`Vec` の中身は `mem::swap` の
-    /// ポインタ交換なので RT スレッド上で alloc/free が発生しない。
-    /// capacity 不一致 (= delay 長が変わった) は移送せず `false`
-    /// (呼び出し側はゼロ初期化のまま使う = リセット)。
-    pub fn try_adopt(&mut self, old: &mut DelayLine) -> bool {
+    /// Schedule 再 compile 間の状態移送 (`Schedule::adopt_state_from`)。`self` は compile 直後 (ゼロ)。
+    /// capacity (= 補償 delay 長 + 1) が一致すれば ring の内容と write cursor を `old` と交換する
+    /// (`mem::swap` のポインタ交換なので RT スレッド上で alloc/free が発生しない)。delay 長が変わっていれば
+    /// [`Self::carry_history_from`] で手元の過去を写す (ゼロのまま始めると、新しい遅延の長さぶん無音が挟まる)。
+    pub fn adopt(&mut self, old: &mut DelayLine) {
         if self.capacity != old.capacity {
-            return false;
+            self.carry_history_from(old);
+            return;
         }
         std::mem::swap(&mut self.buf_l, &mut old.buf_l);
         std::mem::swap(&mut self.buf_r, &mut old.buf_r);
         std::mem::swap(&mut self.write, &mut old.write);
-        true
     }
 
-    /// `step` の in-place 版: `l` / `r` 1 組のスライスを入力でも出力でも
+    /// 容量の違う `old` が持っている過去のうち新しい `min(容量)` サンプルを (古い順に) この line の頭へ写し、
+    /// 書き込み位置をその直後に置く。遅延が変わって line を差し替えても、手元にある過去はそのまま読み出せる
+    /// (写さないと新しい遅延の長さぶん無音が挟まる)。`old` は **走っていた** line であること (止まっていた line の
+    /// 中身は古い音)。`self` は確保直後 (ゼロ) であること。RT で呼ぶ: 確保せず高々 `self.capacity` 回ぶん写すだけ。
+    pub fn carry_history_from(&mut self, old: &DelayLine) {
+        let n = old.capacity.min(self.capacity);
+        if n == 0 {
+            return;
+        }
+        // `old.write` が最古、その 1 つ前が最新。新しい `n` サンプルは `old.write + (old.capacity - n)` から。
+        let start = (old.write + old.capacity - n) % old.capacity;
+        for (dst, src) in [(&mut self.buf_l, &old.buf_l), (&mut self.buf_r, &old.buf_r)] {
+            let first = (old.capacity - start).min(n);
+            dst[..first].copy_from_slice(&src[start..start + first]);
+            dst[first..n].copy_from_slice(&src[..n - first]);
+        }
+        self.write = n % self.capacity;
+    }
+
+    /// `step` の in-place 版:`l` / `r` 1 組のスライスを入力でも出力でも
     /// 兼用する。 audio engine の post-dispatch では track の scratch
     /// (`TrackScratch::track_l/r`) を **そのまま** 遅延線に通したいので、
     /// 別バッファを毎呼出しで確保するわけにはいかず in-place が必要。
@@ -155,5 +172,28 @@ mod tests {
             99,
         );
         assert_eq!(out_l, [0.0, 1.0, 2.0, 3.0]);
+    }
+
+    /// 遅延 2 で流している途中に line を容量 8 へ差し替え、遅延を 3 に伸ばす: 直前の出力 (4 サンプル前の入力) の
+    /// 続きは、差し替え前の line に残っている過去から出る。
+    #[test]
+    fn 大きい_line_へ差し替えても手元の過去を読み出せる() {
+        let mut old = DelayLine::with_capacity(3);
+        let (mut l, mut r) = ([1.0, 2.0, 3.0, 4.0, 5.0], [0.0; 5]);
+        old.step_in_place(&mut l, &mut r, 2);
+        assert_eq!(l, [0.0, 0.0, 1.0, 2.0, 3.0]);
+
+        let mut grown = DelayLine::with_capacity(8);
+        grown.carry_history_from(&old);
+        let (mut l, mut r) = ([6.0, 7.0, 8.0], [0.0; 3]);
+        grown.step_in_place(&mut l, &mut r, 3);
+        assert_eq!(l, [3.0, 4.0, 5.0], "入力 6 の 3 サンプル前 = 3 から続く (無音を挟まない)");
+
+        // 縮めるときは新しい側だけが残る: 遅延 1 (容量 2) では入力 9 の 1 つ前 = 8。
+        let mut shrunk = DelayLine::with_capacity(2);
+        shrunk.carry_history_from(&grown);
+        let (mut l, mut r) = ([9.0, 10.0], [0.0; 2]);
+        shrunk.step_in_place(&mut l, &mut r, 1);
+        assert_eq!(l, [8.0, 9.0]);
     }
 }

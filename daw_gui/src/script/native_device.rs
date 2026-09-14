@@ -2,8 +2,8 @@
 //! (`docs/plan_rack_native_devices.md` §10.19)。
 //!
 //! 編集は GUI と同じ `DeviceEvent` を `AppData::handle_event` に通す (自動 ON / 値 IPC / undo は
-//! handler の唯一の口が持つ)。headless にはフレーム末が無いので、Song を変えたら
-//! `flush_song_sync` で LoadSong を明示的に送る。GR と master の出力は engine が publish する
+//! handler の唯一の口が持つ)。LoadSong は `daw.*` の呼び出しを抜けたところで送られる
+//! (`script::register_daw_globals` の frame 境界)。GR と master の出力は engine が publish する
 //! テレメトリ面 (GUI のポーラと同じ面) を直接読む。
 
 use std::time::{Duration, Instant};
@@ -61,7 +61,6 @@ pub(super) fn daw_native_edit(_this: &JsValue, args: &[JsValue], ctx: &mut Conte
     let edit = parse_native_edit(&value).map_err(|e| js_native(format!("nativeEdit: {e}")))?;
     with_host(|h| {
         h.app.handle_event(AppEvent::Device(DeviceEvent::NativeEdit { device_id, edit }));
-        h.app.flush_song_sync();
     });
     Ok(JsValue::undefined())
 }
@@ -127,7 +126,6 @@ pub(super) fn daw_set_devices_bypassed(_this: &JsValue, args: &[JsValue], ctx: &
     let bypassed = args.get_or_undefined(1).to_boolean();
     with_host(|h| {
         h.app.handle_event(AppEvent::Device(DeviceEvent::SetDevicesBypassed { device_ids, bypassed }));
-        h.app.flush_song_sync();
     });
     Ok(JsValue::undefined())
 }
@@ -139,7 +137,6 @@ pub(super) fn daw_set_sc_listen(_this: &JsValue, args: &[JsValue], ctx: &mut Con
     let device_id = if arg.is_null() || arg.is_undefined() { None } else { Some(u64::try_from_js(arg, ctx)?) };
     with_host(|h| {
         h.app.handle_event(AppEvent::Device(DeviceEvent::SetScListen { device_id }));
-        h.app.flush_song_sync();
     });
     Ok(JsValue::undefined())
 }

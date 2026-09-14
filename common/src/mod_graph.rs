@@ -20,7 +20,7 @@
 use crate::automation::{mod_param_plain, mod_param_range, mod_param_norm};
 use crate::model::{
     AutomationTarget, MASTER_TRACK_ID, ModParam, ModRate, ModRateMode, ModSource,
-    ModSourceKind, Polarity, RetriggerMode, Song,
+    ModSourceKind, ParamStoreAt, Polarity, RetriggerMode, Song,
 };
 use crate::modulators::{GenParams, ModTime, cycle_pos, eval_generator};
 
@@ -44,8 +44,8 @@ pub const MOD_PARAM_COUNT: usize = 17;
 type RawEdge = (usize, ModParam, f32, Polarity, u32);
 /// `adj[dst]` = dst に入ってくる辺。
 type Adjacency = [Vec<RawEdge>];
-/// 深さが動く変調の作業用 (`ModRouting::id`, 深さを動かす辺, lane があるか)。
-type RawDepth = (u32, Vec<(usize, f32, Polarity)>, bool);
+/// 深さが動く変調の作業用 (`ModRouting::id`, 深さを動かす辺, lane の置き場)。
+type RawDepth = (u32, Vec<(usize, f32, Polarity)>, Option<ParamStoreAt>);
 
 /// このソースの位相が何に依存するか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,9 +91,18 @@ pub struct DepthGroup {
     pub base_depth: f32,
     /// この深さを動かす変調の辺。加算スタック (`modulation_offset_norm` と同契約)。
     pub edges: Vec<DepthEdge>,
-    /// `ModRoutingDepth` の automation lane があるか (engine が刻みごとに
+    /// `ModRoutingDepth` の automation lane の置き場 (無ければ `None`。engine が刻みごとに解決して
     /// [`ModRuntime::set_depth_base`] へ書く)。
-    pub has_lane: bool,
+    pub lane: Option<ParamStoreAt>,
+}
+
+/// automation lane が base を上書きする 1 param ([`ModPlan::lane_params`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneParam {
+    pub slot: u16,
+    pub param: ModParam,
+    /// lane の置き場 (そのソースの帰属トラック、master なら song 側)。
+    pub store: ParamStoreAt,
 }
 
 /// [`DepthGroup`] に入る 1 本の辺。
@@ -137,21 +146,21 @@ pub struct ModPlan {
     /// slot_ids と値面を跨いで読む瞬間のレースを塞ぐ世代。
     pub generation: u64,
     /// automation lane が base を上書きする param の一覧 (engine が刻みごとに解決して
-    /// [`ModRuntime::set_base`] へ書く)。`(slot, param)`。
-    pub lane_params: Vec<(u16, ModParam)>,
+    /// [`ModRuntime::set_base`] へ書く)。置き場は位置で持つので、plan は同じ `Song` の snapshot と組で使う。
+    pub lane_params: Vec<LaneParam>,
     /// **深さが動く変調** (r.md #89 Q9)。添字が [`ModEdge::depth_group`] /
-    /// [`ModRuntime::depth_for`] の鍵。
+    /// [`ModRuntime::depth_at`] の鍵。
     pub depth_groups: Vec<DepthGroup>,
+    /// `(ModSource::id, slot)` を id 昇順に並べた索引 ([`Self::slot_of`] — 刻みごとに引かれるので線形に探さない)。
+    slot_index: Vec<(u32, u16)>,
 }
 
 impl ModPlan {
     /// `source_id` の slot。
     #[must_use]
     pub fn slot_of(&self, source_id: u32) -> Option<u16> {
-        self.slot_ids
-            .iter()
-            .position(|id| *id == source_id)
-            .and_then(|i| u16::try_from(i).ok())
+        let i = self.slot_index.binary_search_by_key(&source_id, |&(id, _)| id).ok()?;
+        Some(self.slot_index[i].1)
     }
 
     /// 位相の積分が要る (= 表 / シードが要る) ソースが 1 つでもあるか。
@@ -222,7 +231,7 @@ pub fn build_plan(
         match v.iter().position(|(id, ..)| *id == rid) {
             Some(i) => i,
             None => {
-                v.push((rid, Vec::new(), false));
+                v.push((rid, Vec::new(), None));
                 v.len() - 1
             }
         }
@@ -239,9 +248,9 @@ pub fn build_plan(
     for rid in routings().map(|r| r.id).collect::<Vec<_>>() {
         let target = AutomationTarget::ModRoutingDepth { routing_id: rid };
         let owner = song.mod_routing_owner(rid).unwrap_or(MASTER_TRACK_ID);
-        if song_has_lane(song, owner, &target) {
+        if let Some(store) = lane_store(song, owner, &target) {
             let i = depth_slot(&mut depth_src, rid);
-            depth_src[i].2 = true;
+            depth_src[i].2 = Some(store);
         }
     }
     let base_depth_of = |rid: u32| {
@@ -323,7 +332,7 @@ pub fn build_plan(
     let rate_modulated: Vec<bool> = (0..n)
         .map(|i| {
             adj[i].iter().any(|(_, p, ..)| *p == ModParam::Rate)
-                || song_has_lane(
+                || lane_store(
                     song,
                     sources[i].owner_track_id,
                     &AutomationTarget::ModSourceParam {
@@ -331,6 +340,7 @@ pub fn build_plan(
                         param: ModParam::Rate,
                     },
                 )
+                .is_some()
         })
         .collect();
     // `audio_dep[x]` = x の **出力**が音に依存するか (どの param 経由でも伝播する)。
@@ -395,8 +405,8 @@ pub fn build_plan(
                 continue;
             }
             let target = AutomationTarget::ModSourceParam { source_id: src.id, param };
-            if song_has_lane(song, src.owner_track_id, &target) {
-                lane_params.push((slot_u16, param));
+            if let Some(store) = lane_store(song, src.owner_track_id, &target) {
+                lane_params.push(LaneParam { slot: slot_u16, param, store });
             }
         }
         nodes.push(ModNode {
@@ -420,7 +430,7 @@ pub fn build_plan(
     // 深さの群は slot 割当のあとで組む (辺の src を slot で持つため)。
     let depth_groups = depth_src
         .into_iter()
-        .map(|(routing_id, edges, has_lane)| DepthGroup {
+        .map(|(routing_id, edges, lane)| DepthGroup {
             routing_id,
             base_depth: base_depth_of(routing_id),
             edges: edges
@@ -431,10 +441,13 @@ pub fn build_plan(
                     polarity,
                 })
                 .collect(),
-            has_lane,
+            lane,
         })
         .collect();
-    ModPlan { nodes, slot_ids, generation, lane_params, depth_groups }
+    let mut slot_index: Vec<(u32, u16)> =
+        slot_ids.iter().enumerate().map(|(slot, &id)| (id, u16::try_from(slot).unwrap_or(u16::MAX))).collect();
+    slot_index.sort_unstable_by_key(|&(id, _)| id);
+    ModPlan { nodes, slot_ids, generation, lane_params, depth_groups, slot_index }
 }
 
 /// `from` から辺を辿って `to` に到達できるか (輪の塗り分け用)。
@@ -484,11 +497,12 @@ fn audio_dependency(
     dep
 }
 
-/// `owner_track_id` の置き場に `target` の automation lane があるか。
-fn song_has_lane(song: &Song, owner_track_id: u32, target: &AutomationTarget) -> bool {
+/// `owner_track_id` の置き場に `target` の automation lane があれば、その置き場。
+fn lane_store(song: &Song, owner_track_id: u32, target: &AutomationTarget) -> Option<ParamStoreAt> {
     // legacy の `owner_track_id == 0` は master (`Song::mod_source_owner` と同じ読み)。
     let owner = if owner_track_id == 0 { MASTER_TRACK_ID } else { owner_track_id };
-    song.param_stores(owner).is_some_and(|(lanes, _)| lanes.iter().any(|l| &l.target == target))
+    let store = song.param_store_at(owner)?;
+    song.lanes_at(store).iter().any(|l| &l.target == target).then_some(store)
 }
 
 /// **`ModParam` の「今の値」(plain) を読む唯一の口。** ラックのツマミ / オートメーション
@@ -635,22 +649,18 @@ impl ModRuntime {
         }
     }
 
-    /// `ModRoutingDepth` の automation lane が書いた深さ (r.md #89 Q9)。
-    /// `plan.depth_groups` に居ない `routing_id` は no-op。
-    pub fn set_depth_base(&mut self, plan: &ModPlan, routing_id: u32, plain: f32) {
-        if let Some(i) = plan.depth_group_of(routing_id)
-            && let Some(v) = self.depth_base.get_mut(usize::from(i))
-        {
+    /// `ModRoutingDepth` の automation lane が書いた深さ (r.md #89 Q9)。`group` は `plan.depth_groups` の添字
+    /// (刻みごとに routing id から群を探さない)。範囲外は no-op。
+    pub fn set_depth_base(&mut self, group: usize, plain: f32) {
+        if let Some(v) = self.depth_base.get_mut(group) {
             *v = plain.clamp(-1.0, 1.0);
         }
     }
 
-    /// `routing_id` の **刻み時点の実効深さ**。深さが動かない変調は `None`
-    /// (呼び出し側は `ModRouting::depth` をそのまま使う)。
+    /// 深さの群 `group` (`plan.depth_groups` の添字) の **刻み時点の実効深さ**。
     #[must_use]
-    pub fn depth_for(&self, plan: &ModPlan, routing_id: u32) -> Option<f32> {
-        let i = plan.depth_group_of(routing_id)?;
-        self.depth.get(usize::from(i)).copied()
+    pub fn depth_at(&self, group: usize) -> Option<f32> {
+        self.depth.get(group).copied()
     }
 
     /// 直近の刻みの出力 (unipolar 0..=1)。
@@ -1406,7 +1416,7 @@ mod tests {
         let mut seen: Vec<f32> = Vec::new();
         for k in 0..64 {
             tick(&plan, &mut rt, None, ctx_at(k, 120.0, 48_000.0));
-            seen.push(rt.depth_for(&plan, 10).unwrap());
+            seen.push(rt.depth_at(usize::from(plan.depth_group_of(10).unwrap())).unwrap());
         }
         assert!(
             seen.iter().any(|d| (*d - 0.5).abs() > 1e-6),

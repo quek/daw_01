@@ -274,7 +274,7 @@ impl ParkDriver {
     /// **呼び出し側が Mutex を保持していること** — 「今どちらか」の判定と実際の
     /// pause / play が割り込まれると、pause と play が入れ違って無音のまま
     /// 起きてこなくなる。
-    fn apply(&mut self, engine_shared: &EngineShared, want: bool) {
+    fn apply(&mut self, want: bool) {
         if self.parked == want {
             return;
         }
@@ -286,9 +286,6 @@ impl ParkDriver {
         match result {
             Ok(()) => {
                 self.parked = want;
-                if !want {
-                    engine_shared.live_parked.store(false, Ordering::Release);
-                }
                 tracing::info!(parked = want, "audio stream park state changed");
             }
             // 失敗しても状態は変えないので、次の reconcile で再試行される。
@@ -357,12 +354,12 @@ impl NotifyThread {
 ///
 /// 「要求 → 追従」の形にしておくと、コールバックが要求を取り下げただけの場合
 /// (= IPC を伴わずにアイドルが崩れた) も次の周回で自然に復帰する。
-fn reconcile_park(park: &Park, shared: &SharedState, engine_shared: &EngineShared) {
+fn reconcile_park(park: &Park, shared: &SharedState) {
     let mut d = park
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let want = shared.park_requested.load(Ordering::Acquire);
-    d.apply(engine_shared, want);
+    d.apply(want);
 }
 
 /// park 要求を取り下げて即座に起こす。receive loop がコマンド受信時に呼ぶ。
@@ -370,13 +367,13 @@ fn reconcile_park(park: &Park, shared: &SharedState, engine_shared: &EngineShare
 /// reconciler を待たずにここで起こすのは応答性のため (最大 100ms 遅れると
 /// 「Play を押してから音が出るまで一拍おく」になる)。要求の取り下げを先に
 /// 行うので、同時に走っている reconciler が pause 側へ倒すことはない。
-fn wake_stream(park: &Park, shared: &SharedState, engine_shared: &EngineShared) {
+fn wake_stream(park: &Park, shared: &SharedState) {
     shared.park_requested.store(false, Ordering::Release);
     shared.idle_silent_samples.store(0, Ordering::Release);
     let mut d = park
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    d.apply(engine_shared, false);
+    d.apply(false);
 }
 
 /// plan §4: quarantine / pool stall / MMCSS 失敗フラグを 100ms 周期で poll
@@ -399,11 +396,13 @@ fn spawn_notify_thread(
             // (r.md #61) `park` の Arc clone をこの thread が持つので、
             // **抜ける条件が無いと `cpal::Stream::drop` が永久に走らない**。
             // `stop` を見て抜け、clone をここで落とす。
+            // rig ごとに「pair が詰まったまま借り替えられない」状態が始まった時刻。
+            let mut degraded_since: Option<(usize, std::time::Instant)> = None;
             while !stop_for_thread.load(Ordering::Acquire) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 // r.md #49: stream の状態をコールバックの park 要求へ追従させる。
                 // pause 側 (アイドル検出) も play 側 (要求の取り下げ) もここが拾う。
-                reconcile_park(&park, &shared, &engine_shared);
+                reconcile_park(&park, &shared);
                 // CPAL callback の MMCSS join 失敗の one-shot warn (RT では
                 // tracing を出せないのでここで代行)。
                 if engine_shared.mmcss_join_failed.load(Ordering::Acquire)
@@ -412,16 +411,20 @@ fn spawn_notify_thread(
                     tracing::warn!("CPAL callback: MMCSS join (Pro Audio) failed");
                 }
                 notify_quarantined_devices(&engine_shared, &out_tx);
-                // worker pool 全体の完了待ち timeout → pool 停止を 1 回だけ通知
-                // (GUI は plugin_host respawn → OpenWorkerPool 再送で復旧する)。
-                if let Some(rig) = engine_shared.worker.load_full() // arch-lint: allow-arcswap-load (off-RT: notify thread)
-                    && rig.pool.as_ref().is_some_and(|p| p.is_stalled())
-                    && !rig.stall_notified.swap(true, Ordering::AcqRel)
-                {
-                    tracing::error!(
-                        "audio worker pool stalled; dispatch disabled until pool rebuild"
-                    );
-                    let _ = out_tx.send(AudioEvent::WorkerPoolStalled);
+                // worker pool 全体の完了待ち timeout、または pair が詰まったまま予備も尽きた状態の持続 → pool 停止を
+                // 1 回だけ通知 (GUI は plugin_host respawn → OpenWorkerPool 再送で復旧する)。
+                if let Some(rig) = engine_shared.worker.load_full() { // arch-lint: allow-arcswap-load (off-RT: notify thread)
+                    let key = Arc::as_ptr(&rig) as usize;
+                    degraded_since = rig
+                        .is_degraded()
+                        .then(|| degraded_since.filter(|(k, _)| *k == key).unwrap_or((key, std::time::Instant::now())));
+                    let escalate = std::time::Duration::from_millis(u64::from(common::plugin_ref::DISPATCH_TIMEOUT_MS) * 4);
+                    let exhausted = degraded_since.is_some_and(|(_, since)| since.elapsed() >= escalate);
+                    let stalled = rig.pool.as_ref().is_some_and(|p| p.is_stalled());
+                    if (stalled || exhausted) && !rig.stall_notified.swap(true, Ordering::AcqRel) {
+                        tracing::error!(stalled, exhausted, "audio worker pool unusable; rebuilding plugin host");
+                        let _ = out_tx.send(AudioEvent::WorkerPoolStalled);
+                    }
                 }
             }
             tracing::info!("audio notify thread exiting");
@@ -619,7 +622,7 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
         // 起こしたあと条件がまだ揃っていれば、コールバックが改めて数え直して
         // 再び park するので、余分に起きても害はない。
         if !matches!(msg, Ok(AudioCommand::SetAppActive(false))) {
-            wake_stream(&rl.park, &rl.shared, &rl.engine_shared);
+            wake_stream(&rl.park, &rl.shared);
         }
         let cmd = match msg {
             Ok(cmd) => cmd,
@@ -674,22 +677,12 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
                 rl.engine_shared.scope_project.store(project.0, Ordering::Release);
                 tracing::info!(project = project.0, "scope project (active tab) updated");
             }
-            AudioCommand::OpenWorkerPool {
-                n_workers,
-                worker_bridge_shmem_id,
-                wake_event_names,
-                done_event_names,
-            } => {
+            AudioCommand::OpenWorkerPool(spec) => {
                 // worker rig (bridge shmem + handshake events + audio worker
                 // threads) を **off-thread で** 構築し、 mirror + bundle で
                 // 配送する。 旧 rig は RT の swap 後 recycle ring 経由で
                 // ここに戻り、 off-thread で drop (= worker join) される。
-                match build_worker_rig(
-                    n_workers,
-                    &worker_bridge_shmem_id,
-                    &wake_event_names,
-                    &done_event_names,
-                ) {
+                match build_worker_rig(&spec) {
                     Ok(rig) => {
                         tracing::info!(
                             n_sync_slots = rig.slots.len(),
@@ -817,68 +810,43 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
 /// event creation never touches the CPAL callback (plan §4)。 event 名は
 /// daw_gui が世代込みで mint した opaque な文字列 (`worker_wake_event_name`)
 /// をそのまま使う — pool 再構築時に旧世代の stale signal が新 pool へ漏れない。
-fn build_worker_rig(
-    n_workers: u32,
-    worker_bridge_shmem_id: &str,
-    wake_event_names: &[String],
-    done_event_names: &[String],
-) -> Result<WorkerRig> {
-    anyhow::ensure!(
-        wake_event_names.len() == n_workers as usize,
-        "wake_event_names len {} != n_workers {}",
-        wake_event_names.len(),
-        n_workers
-    );
-    anyhow::ensure!(
-        done_event_names.len() == n_workers as usize,
-        "done_event_names len {} != n_workers {}",
-        done_event_names.len(),
-        n_workers
-    );
-    // IPC 由来の n_workers で worker_task[i] を indexing する前に上限検証
-    // (out-of-bounds panic を防ぐ)。
-    anyhow::ensure!(
-        (n_workers as usize) <= common::worker_bridge::MAX_WORKERS,
-        "n_workers {} exceeds MAX_WORKERS",
-        n_workers
-    );
-    let bridge = common::worker_bridge::WorkerBridgeHandle::open(worker_bridge_shmem_id)
+/// `generation` は依頼番号に焼き込む (`common::worker_bridge` の module doc)。
+fn build_worker_rig(spec: &common::protocol::WorkerPoolSpec) -> Result<WorkerRig> {
+    // IPC 由来の数で channels[i] / event 名を indexing する前に検証 (out-of-bounds panic を防ぐ)。
+    spec.validate()?;
+    let bridge = common::worker_bridge::WorkerBridgeHandle::open(&spec.worker_bridge_shmem_id)
         .context("failed to open worker_bridge shmem")?;
-    // Per-slot pointer into the bridge's worker_task array — the mapping's
+    // Per-slot pointer into the bridge's channel array — the mapping's
     // address is stable for the bridge handle's lifetime, which the rig owns
     // (moving the handle struct does not move the mapped view).
-    let mut slots = Vec::with_capacity(n_workers as usize);
-    for i in 0..n_workers as usize {
-        let wake = common::plugin_ref::create_named_event(&wake_event_names[i])
+    let mut slots = Vec::with_capacity(spec.n_pairs as usize);
+    for (i, (wake_name, done_name)) in spec.wake_event_names.iter().zip(&spec.done_event_names).enumerate() {
+        let wake = common::plugin_ref::create_named_event(wake_name)
             .with_context(|| format!("failed to open wake event {i}"))?;
-        let done = common::plugin_ref::create_named_event(&done_event_names[i])
+        let done = common::plugin_ref::create_named_event(done_name)
             .with_context(|| format!("failed to open done event {i}"))?;
         slots.push(SyncSlot {
             sync: common::plugin_ref::WorkerSyncRef {
                 worker_idx: i as u32,
-                worker_task: &bridge.bridge().worker_task[i] as *const _,
+                channel: &bridge.bridge().channels[i] as *const _,
+                generation: spec.generation,
                 event_wake: wake,
                 event_done: done,
             },
             poisoned: std::sync::atomic::AtomicBool::new(false),
         });
     }
-    // Spawn the audio-engine worker pool sized to the sync slots (master owns
-    // slot 0, worker i owns slot i+1). 失敗しても handshake 面は生かして
-    // serial fallback (slot 0 のみ) で動かす。
-    let pool = match audio_worker::AudioWorkerPool::new(n_workers) {
+    // Spawn the audio-engine worker pool sized to the runners (master is runner 0,
+    // worker i is runner i+1; each leases one pair, the rest are spares). 失敗しても handshake 面は生かして
+    // serial fallback (runner 0 のみ) で動かす。
+    let pool = match audio_worker::AudioWorkerPool::new(spec.n_runners) {
         Ok(pool) => Some(pool),
         Err(e) => {
             tracing::error!(error = ?e, "AudioWorkerPool::new failed; serial fallback");
             None
         }
     };
-    Ok(WorkerRig {
-        pool,
-        slots,
-        bridge,
-        stall_notified: std::sync::atomic::AtomicBool::new(false),
-    })
+    Ok(WorkerRig::new(pool, slots, spec.n_runners as usize, bridge))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1154,10 +1122,6 @@ fn build_stream(
                         dsp_load_ema = 0.0;
                         metrics.set_dsp_load_avg(0.0);
                     }
-                    // park 中は dispatch していないのが事実なので `live_parked` を
-                    // 立てる。これが無いと書き出しのたびに `export.rs` の
-                    // 「live callback が park するまで最大 2 秒待つ」を踏む。
-                    local.shared.live_parked.store(true, Ordering::Release);
                 } else if shared.park_requested.load(Ordering::Acquire) {
                     // 条件が崩れた (= resume 済み or 音が鳴り始めた)。要求を取り下げ
                     // れば notify thread の reconciler が stream を起こす。
@@ -1167,7 +1131,6 @@ fn build_stream(
                     // RMW すると notify thread と共有するキャッシュラインを 10ms ごとに
                     // 汚す。
                     shared.park_requested.store(false, Ordering::Release);
-                    local.shared.live_parked.store(false, Ordering::Release);
                 }
             },
             |err| tracing::error!(?err, "audio stream error"),

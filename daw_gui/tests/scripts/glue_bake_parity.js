@@ -355,7 +355,8 @@ expectSameLoudness(
 );
 
 // ---- 10. Bounce (with FX) が元と同じ音で鳴ること (r.md #129) ----
-// With FX は device チェーン (内蔵 Comp を含む) までを焼いて新しいトラックに置き、元トラックを mute する。フェーダー
+// With FX は device チェーン (内蔵 Comp を含む) までを焼いて新しいトラックに置き、元トラックは鳴らしたまま焼いた
+// クリップだけを mute する (group の子 / send / 同じトラックの他のクリップを消さない)。フェーダー
 // (volume / pan) は焼かずに新しいトラックへ写す (`Song::place_bounce_with_fx`)。焼く段がフェーダーを含むと、写した
 // フェーダーでもう一度掛かる (pan 中央で -3 dB、volume 0.5 で -6 dB)。device チェーンを焼かないと Comp が消える。
 function bounceWithFxAndWait(label) {
@@ -379,12 +380,15 @@ for (const [volume, pan] of [[1.0, 0.0], [1.0, -0.6], [0.5, 0.0]]) {
   withFx.tracks[0].pan = pan;
   daw.appLoadSongJson(JSON.stringify(withFx));
   daw.sleepMs(300);
-  // 焼くのはクリップ 1 (0..2 拍) だけ。元トラックはトラックごと mute されるので、同じ区間で比べる。
+  // 焼くのはクリップ 1 (0..2 拍) だけ。mute されるのはそのクリップだけなので、同じ区間で比べる。
   const fxBefore = JSON.parse(daw.analyzeLoudnessJson(0.0, 2.0, 60000));
   if (fxBefore.integrated_lufs === null) fail(label + ": 元の song が無音");
 
   s = bounceWithFxAndWait(label);
-  expectEq(s.tracks[0].muted, true, label + ": 元トラックは mute");
+  expectEq(s.tracks[0].muted, false, label + ": 元トラックは鳴らしたまま");
+  for (const clip of s.tracks[0].clips) {
+    expectEq(!!clip.muted, clip.id === 1, label + ": クリップ " + clip.id + " の mute (焼いたクリップだけ)");
+  }
   const bounced = s.tracks[1];
   expectEq(bounced.clips.length, 1, label + ": 焼いたクリップ");
   if (Math.abs(bounced.volume - volume) > 1e-6 || Math.abs(bounced.pan - pan) > 1e-6) {

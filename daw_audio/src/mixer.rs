@@ -149,6 +149,38 @@ impl Default for TrackScratch {
     }
 }
 
+/// per-track の入力遅延線 (サイドチェインの揃え) を新しい schedule の遅延に合わせる (bundle の install 時)。
+/// RT: 確保・解放なし。
+///
+/// - `old_delays[i] == 0` (または無い) の track のリングは止まっていたので、中身は古い音 (前 project の音も含む)。
+///   読み出す前に 0 にする。
+/// - 容量が足りない行は off-thread で確保済みの `replacements[i]` と swap する (旧 line は bundle 側で off-thread
+///   drop)。走っていたリングならその過去を写す — 写さないと新しい遅延の長さぶん無音が挟まる。
+/// - 遅延の無い track は読まないので触らない (全 track を memset しない)。
+pub(crate) fn install_input_delay_lines(
+    scratch: &mut [TrackScratch],
+    old_delays: &[u32],
+    new_delays: &[u32],
+    replacements: &mut [Option<DelayLine>],
+) {
+    for (i, (s, &d)) in scratch.iter_mut().zip(new_delays).enumerate() {
+        if d == 0 {
+            continue;
+        }
+        let running = old_delays.get(i).is_some_and(|&o| o > 0);
+        match replacements.get_mut(i).and_then(Option::as_mut) {
+            Some(line) if s.input_delay_line.capacity() < line.capacity() => {
+                if running {
+                    line.carry_history_from(&s.input_delay_line);
+                }
+                std::mem::swap(&mut s.input_delay_line, line);
+            }
+            _ if !running => s.input_delay_line.reset(),
+            _ => {}
+        }
+    }
+}
+
 /// per-track scratch の **成長便** (`RtBundle::scratch_growth`、`docs/plan_unbounded_tracks.md` §2.1)。
 ///
 /// `rows` = index `base..base + rows.len()` の行 (off-thread で確保)。容量は `base + rows.len()` 以上

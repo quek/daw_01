@@ -180,17 +180,45 @@ fn 依存の無い_bus_同士は別々の_job_で同時に走れる() {
     assert!(g.roots.len() >= song.tracks.len(), "track 本体は全部最初から走れる: roots {}", g.roots.len());
 }
 
+struct NoPark {
+    master: bool,
+}
+
+impl Park for NoPark {
+    fn is_master(&self) -> bool {
+        self.master
+    }
+    fn wake(&self, _: u32) {}
+    fn wake_master(&self) {}
+    fn finished(&self) {}
+    fn park(&self, _: &RenderGraph) -> bool {
+        panic!("1 スレッドなら寝る場面は無い");
+    }
+}
+
+/// master バスへ書く job は callback スレッドだけが取る: worker が取れるものを全部流しても master の合流は残り、
+/// callback スレッドがそれを (それだけを) 流して終わる。
+#[test]
+fn master_バスへの合流は_callback_スレッドだけが流す() {
+    let (song, lat) = busy_song();
+    let sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).expect("compile");
+    let (g, nodes) = (&sched.graph, &sched.nodes);
+    let writes_master =
+        |j: u32| g.steps(j).iter().any(|s| matches!(s, Step::Node(k) if matches!(nodes[*k as usize], NodeOp::Mix { dst: BufRef::Master, .. })));
+    g.begin();
+    let mut by_worker = Vec::new();
+    drain(g, &NoPark { master: false }, &mut |j| by_worker.push(j));
+    assert!(!g.is_done() && !by_worker.is_empty());
+    assert!(by_worker.iter().all(|&j| !writes_master(j)), "worker が master の合流を取った");
+    let mut by_master = Vec::new();
+    drain(g, &NoPark { master: true }, &mut |j| by_master.push(j));
+    assert!(g.is_done());
+    assert!(!by_master.is_empty() && by_master.iter().all(|&j| writes_master(j)), "callback スレッドに残ったのは合流だけ: {by_master:?}");
+}
+
 /// 1 スレッドで job を取り合う実行 (`run_graph`) が、全 job を 1 回ずつ、辺の順を守って流す。
 #[test]
 fn 待ち行列は全_job_を辺の順に_1_回ずつ流す() {
-    struct NoPark;
-    impl Park for NoPark {
-        fn wake(&self, _: u32) {}
-        fn finished(&self) {}
-        fn park(&self, _: &RenderGraph) -> bool {
-            panic!("1 スレッドなら寝る場面は無い");
-        }
-    }
     let (song, lat) = busy_song();
     let sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).expect("compile");
     let g = &sched.graph;
@@ -198,7 +226,7 @@ fn 待ち行列は全_job_を辺の順に_1_回ずつ流す() {
         g.begin();
         let mut done = vec![false; g.job_count()];
         let mut order = Vec::new();
-        assert!(run_graph(g, &NoPark, |j| {
+        assert!(run_graph(g, &NoPark { master: true }, |j| {
             assert!(!std::mem::replace(&mut done[j as usize], true), "job {j} が 2 回");
             order.push(j);
         }));

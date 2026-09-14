@@ -27,7 +27,8 @@ type Out = tokio::sync::mpsc::UnboundedSender<AudioEvent>;
 fn reserve(engine_shared: &EngineShared) -> bool {
     engine_shared
         .export_running
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        // SeqCst: `EngineShared::live_rendering` との Dekker handshake の片側。
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
 }
 
@@ -85,7 +86,7 @@ pub fn export_wav(
     // by the time this thread runs, the GUI has stopped
     // playback and reinitialised every plugin (deactivate→activate)
     // for a clean cold start. The export thread waits for the live
-    // CPAL callback to park, then freewheels and reports progress.
+    // CPAL callback to leave its buffer, then freewheels and reports progress.
     if let Err(e) = std::thread::Builder::new()
         .name("daw-audio-export".into())
         .spawn(move || {
@@ -166,7 +167,7 @@ pub fn export_wav(
 }
 
 /// r.md #54: 範囲ラウドネス解析。ExportWav と同じ engine 予約 /
-/// live park ハンドシェイク / cancel を共有し、走査の出力先だけ
+/// live との排他 (`live_rendering`) / cancel を共有し、走査の出力先だけ
 /// WAV writer から LoudnessCollector へ差し替える。
 pub fn analyze_loudness(
     engine_shared: &Arc<EngineShared>,
