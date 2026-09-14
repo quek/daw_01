@@ -267,6 +267,34 @@ pub struct Schedule {
     /// 空だが、walker の契約上バスが要る)。容量 `MAX_EVENTS` で確保済み。
     pub master_midi_a: Vec<crate::sequencer::TimedNoteEvent>,
     pub master_midi_b: Vec<crate::sequencer::TimedNoteEvent>,
+    /// 1 buffer の処理 (track 本体と `nodes`) の依存グラフと、その RT 作業領域
+    /// (`docs/plan_parallel_graph.md`)。`nodes` と同じ compile で組む。
+    pub graph: super::render_graph::RenderGraph,
+    /// solo の透過規則の表 (track index 順)。**render の間は読むだけ** — program (走行状態) とは別に持つので、
+    /// 並列実行で ある program を書いている手と、表を読む手 (`MixSend`) が同じ資源を奪い合わない。
+    pub solo: SoloTables,
+}
+
+/// solo の透過規則の表 (compile 時に焼いた配線の閉包、index = song-track index、`mix::any_soloed` が引く)。
+/// RT で Song の配線を歩かない (`docs/plan_unbounded_tracks.md` §2.3)。
+#[derive(Debug, Default)]
+pub struct SoloTables {
+    /// その track へ **流れ込む** track (子 → group、send 元 → return) の推移閉包 — 「子 / send 元が solo なら
+    /// bus 自身も透過」。
+    pub contributors: Vec<Vec<u32>>,
+    /// その track の祖先 group (`parent_group_id` を辿った順) — folder solo (「group を solo したら子も鳴る」)。
+    pub ancestors: Vec<Vec<u32>>,
+}
+
+impl SoloTables {
+    /// track `i` の (流れ込む track, 祖先 group)。範囲外は空。
+    #[must_use]
+    pub fn of(&self, i: u32) -> (&[u32], &[u32]) {
+        fn get(v: &[Vec<u32>], i: u32) -> &[u32] {
+            v.get(i as usize).map_or(&[][..], Vec::as_slice)
+        }
+        (get(&self.contributors, i), get(&self.ancestors, i))
+    }
 }
 
 impl Schedule {
@@ -299,6 +327,8 @@ impl Schedule {
             master_program: ChainProgram::empty(common::model::MASTER_TRACK_ID),
             master_midi_a: Vec::with_capacity(crate::mixer::MAX_EVENTS),
             master_midi_b: Vec::with_capacity(crate::mixer::MAX_EVENTS),
+            graph: super::render_graph::RenderGraph::default(),
+            solo: SoloTables::default(),
         }
     }
 

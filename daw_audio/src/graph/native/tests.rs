@@ -248,6 +248,30 @@ fn bypass_crossfades_then_settles_bit_exact_and_restarts_from_a_reset_dsp() {
     assert!(grs[100] < -10.0, "再開後は効いている: {}", grs[100]);
 }
 
+/// `NativeSidechainTap` の staging だけを本番と同じ手 (`graph::step::run_step`) で 1 buffer 走らせる。確保しない。
+fn stage_native_taps(sched: &mut Schedule, scratch: &mut [TrackScratch], song: &Song, n: usize) {
+    let refs: PluginRefs = HashMap::new();
+    let rec = HashSet::new();
+    let rows = RowSourceTable::default();
+    let (mut ml, mut mr) = ([0.0f32; MAX_FRAMES], [0.0f32; MAX_FRAMES]);
+    let params = crate::graph::step::BufferParams {
+        sample_rate: SR,
+        frames: n as u32,
+        playing: true,
+        any_solo: false,
+        recording_lanes: &rec,
+        current_bpm: 120.0,
+        playhead_beats: 0.0,
+        loop_region: LoopRegion::default(),
+        mod_plane: ModTickPlaneRef::default(),
+        follower_drive: FollowerDrive::default(),
+        rows: &rows,
+        native_io: NativeIo::default(),
+    };
+    let ctx = crate::graph::step::RenderCtx::new(song, sched, scratch, &mut ml, &mut mr, &refs, None, &[], params);
+    crate::graph::step::run_nodes_for_test(&ctx, |op| matches!(op, NodeOp::NativeSidechainTap { .. }));
+}
+
 fn native_taps(s: &Schedule) -> Vec<(BufRef, u32, u32)> {
     s.nodes
         .iter()
@@ -325,9 +349,7 @@ fn native_sidechain_is_staged_from_scratch_the_same_program_and_other_programs()
     p1.parallels[0].in_r[..n].copy_from_slice(&ramp(n, -4.0));
     sched.master_program.chains[0].post_fx_l[..n].copy_from_slice(&ramp(n, 5.0));
     sched.master_program.chains[0].post_fx_r[..n].copy_from_slice(&ramp(n, -5.0));
-    for (src, owner, slot) in &taps {
-        stage_native_sidechain(&scratch, &mut sched.track_programs, &mut sched.master_program, *src, *owner, *slot, n);
-    }
+    stage_native_taps(&mut sched, &mut scratch, &song, n);
     let staged = |p: &ChainProgram, id: u64| {
         let ns = &p.natives[slot_of(p, id)];
         assert_eq!(ns.sc_mode, ScMode::Staged, "device {id}");
@@ -570,7 +592,6 @@ fn native_ops_and_sidechain_staging_do_not_allocate() {
         s
     };
     let mut sched = compile_schedule_for_test(&song, SR, n as u32).expect("compile");
-    let taps = native_taps(&sched);
     let mut scratch = scratches(2);
     let x = sine(n, 0, 440.0, 0.7);
     let bridge = DeviceScopeBridgeHandle::create(&format!("daw01_test_native_rt_{}", std::process::id())).unwrap();
@@ -585,9 +606,7 @@ fn native_ops_and_sidechain_staging_do_not_allocate() {
     let mut step = |b: usize, song: &Song, scratch: &mut Vec<TrackScratch>, sched: &mut Schedule| {
         scratch[0].track_l[..n].copy_from_slice(&x);
         scratch[0].track_r[..n].copy_from_slice(&x);
-        for (src, owner, slot) in &taps {
-            stage_native_sidechain(scratch, &mut sched.track_programs, &mut sched.master_program, *src, *owner, *slot, n);
-        }
+        stage_native_taps(sched, scratch, song, n);
         l.copy_from_slice(&x);
         r.copy_from_slice(&x);
         let devices = &song.tracks[1].devices;
@@ -615,7 +634,7 @@ fn native_ops_and_sidechain_staging_do_not_allocate() {
         apply_listen_override(p, &mut l, &mut r, n);
         // PreFx tap (自トラック Pre-FX を読む Comp 21) を持つ track の pass 1 全体。
         crate::graph::process_track_owned(
-            1, &song.tracks[1], &mut scratch[1], p, &refs, None, None, SR, n as u32, true, Some(song), false, 0,
+            1, &song.tracks[1], &mut scratch[1], p, &refs, None, None, SR, n as u32, true, Some(song), false, &[], 0,
             &rec, 120.0, b as f64, LoopRegion::default(), ModTickPlaneRef::default(), TrackRows::default(), io,
         );
     };

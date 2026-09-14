@@ -20,19 +20,29 @@ use crate::mixer::TrackScratch;
 /// Resolve a tap `BufRef` (PostFader / PostFx / PreFx / chain / Parallel) to its
 /// `(L, R)` buffers. Returns `None` for a non-tap `BufRef` or out-of-range
 /// track. docs/plan_modulation_followups.md §1. RT-safe (pure slicing).
-pub(super) fn resolve_tap_buffers<'a>(
-    scratch: &'a [TrackScratch],
-    // r.md #110: chain / Parallel 入力の tap は program の scratch から引く。
-    programs: &'a [ChainProgram],
-    master_program: &'a ChainProgram,
+///
+/// 読み元は `scratch(track index)` / `program(owner、master は [`MASTER_OWNER`])` で引く (並列実行器は手ごとに
+/// 読む資源だけを借りる — `graph::step::RenderCtx`)。
+pub(super) fn resolve_tap<'a>(
     src: BufRef,
+    scratch: impl FnOnce(u32) -> Option<&'a TrackScratch>,
+    // r.md #110: chain / Parallel 入力の tap は program の scratch から引く。
+    program: impl FnOnce(u32) -> Option<&'a ChainProgram>,
 ) -> Option<(&'a [f32], &'a [f32])> {
     match program_tap_owner(src) {
-        None => resolve_scratch_tap(scratch, src),
+        None => resolve_scratch_tap(scratch(scratch_tap_track(src)?)?, src),
         Some(owner) => {
-            let p = if owner == MASTER_OWNER { master_program } else { programs.get(owner as usize)? };
+            let p = program(owner)?;
             resolve_program_tap(&p.chains, &p.parallels, src)
         }
+    }
+}
+
+/// scratch 系の tap (PostFader / PostFx / PreFx) の track index。
+pub(super) fn scratch_tap_track(src: BufRef) -> Option<u32> {
+    match src {
+        BufRef::TrackScratch(i) | BufRef::PreFaderScratch(i) | BufRef::PreFxScratch(i) => Some(i),
+        _ => None,
     }
 }
 
@@ -52,21 +62,12 @@ pub(super) fn program_tap_owner(src: BufRef) -> Option<u32> {
     }
 }
 
-/// track scratch 系の tap (PostFader / PostFx / PreFx)。
-pub(super) fn resolve_scratch_tap(scratch: &[TrackScratch], src: BufRef) -> Option<(&[f32], &[f32])> {
+/// track scratch 系の tap (PostFader / PostFx / PreFx) の信号 (`s` = その track の scratch)。
+pub(super) fn resolve_scratch_tap(s: &TrackScratch, src: BufRef) -> Option<(&[f32], &[f32])> {
     Some(match src {
-        BufRef::TrackScratch(i) => {
-            let s = scratch.get(i as usize)?;
-            (s.track_l.as_slice(), s.track_r.as_slice())
-        }
-        BufRef::PreFaderScratch(i) => {
-            let s = scratch.get(i as usize)?;
-            (s.pre_fader_l.as_slice(), s.pre_fader_r.as_slice())
-        }
-        BufRef::PreFxScratch(i) => {
-            let s = scratch.get(i as usize)?;
-            (s.pre_fx_l.as_slice(), s.pre_fx_r.as_slice())
-        }
+        BufRef::TrackScratch(_) => (s.track_l.as_slice(), s.track_r.as_slice()),
+        BufRef::PreFaderScratch(_) => (s.pre_fader_l.as_slice(), s.pre_fader_r.as_slice()),
+        BufRef::PreFxScratch(_) => (s.pre_fx_l.as_slice(), s.pre_fx_r.as_slice()),
         _ => return None,
     })
 }
@@ -100,12 +101,13 @@ pub(super) fn resolve_program_tap<'a>(
     })
 }
 
-/// Sum the listed source scratches into `scratch[target_idx]` (used to
+/// Sum the listed source scratches into `target` (= scratch `target_idx`, used to
 /// feed group buses with their children). Clears the target first so
-/// stale samples from a previous buffer don't leak.
-pub(super) fn mix_into_track_scratch(
-    scratch: &mut [TrackScratch],
-    target_idx: usize,
+/// stale samples from a previous buffer don't leak. `scratch(i)` は src の scratch を引く
+/// (`target_idx` 自身は引かない)。
+pub(super) fn mix_into<'a>(
+    target: &mut TrackScratch,
+    target_idx: u32,
     srcs: &[(BufRef, f32)],
     n: usize,
     // `true` clears `dst` first (normal group / return Mix). `false`
@@ -113,30 +115,21 @@ pub(super) fn mix_into_track_scratch(
     // group-with-instrument: keep the instrument's own main output written by
     // the pass-1 prefix before summing the children).
     clear: bool,
+    scratch: impl Fn(u32) -> Option<&'a TrackScratch>,
 ) {
-    if target_idx >= scratch.len() {
-        return;
-    }
+    let n = n.min(target.track_l.len()).min(target.track_r.len());
     if clear {
-        let target = &mut scratch[target_idx];
         target.track_l[..n].fill(0.0);
         target.track_r[..n].fill(0.0);
     }
-    let (left, right) = scratch.split_at_mut(target_idx);
-    let (target_slot, after) = right.split_first_mut().expect("split bounds checked above");
     for (src, gain) in srcs {
-        let BufRef::TrackScratch(s_idx) = src else {
+        let BufRef::TrackScratch(s_idx) = *src else {
             continue;
         };
-        let s = *s_idx as usize;
-        if s == target_idx {
+        if s_idx == target_idx {
             continue;
         }
-        let s_scratch = if s < target_idx {
-            &left[s]
-        } else if s - target_idx - 1 < after.len() {
-            &after[s - target_idx - 1]
-        } else {
+        let Some(s_scratch) = scratch(s_idx) else {
             continue;
         };
         if s_scratch.effective_mute {
@@ -144,8 +137,8 @@ pub(super) fn mix_into_track_scratch(
         }
         let g = *gain;
         for i in 0..n {
-            target_slot.track_l[i] += s_scratch.track_l[i] * g;
-            target_slot.track_r[i] += s_scratch.track_r[i] * g;
+            target.track_l[i] += s_scratch.track_l[i] * g;
+            target.track_r[i] += s_scratch.track_r[i] * g;
         }
     }
 }
@@ -153,19 +146,19 @@ pub(super) fn mix_into_track_scratch(
 /// Sum each non-muted source scratch (with its routing gain) into the
 /// master bus. The master buffers are zeroed earlier in the render so
 /// this is `+=` style accumulation.
-pub(super) fn mix_into_master(
-    scratch: &[TrackScratch],
+pub(super) fn mix_into_master<'a>(
     srcs: &[(BufRef, f32)],
     master_l: &mut [f32],
     master_r: &mut [f32],
     n: usize,
+    scratch: impl Fn(u32) -> Option<&'a TrackScratch>,
 ) {
     let n = n.min(master_l.len()).min(master_r.len());
     for (src, gain) in srcs {
         let BufRef::TrackScratch(s_idx) = src else {
             continue;
         };
-        let Some(s_scratch) = scratch.get(*s_idx as usize) else {
+        let Some(s_scratch) = scratch(*s_idx) else {
             continue;
         };
         if s_scratch.effective_mute {
@@ -181,20 +174,20 @@ pub(super) fn mix_into_master(
 
 /// Accumulate one aux send into a return / bus scratch.
 ///
-/// Reads `scratch[src_idx]`'s post-fader (`track_l/r`) or pre-fader
+/// Reads `src_scratch`'s post-fader (`track_l/r`) or pre-fader
 /// (`pre_fader_l/r`) buffer, scales it by the **live** send gain of
 /// the send with stable id `send_id` on `song.tracks[src_track_idx]` —
 /// sampled per-sample from a `SendGain` automation lane when present (and
 /// not being recorded), otherwise the constant `send.gain` — and adds it
-/// into `scratch[dst_idx].track_l/r` (`+=`, no clear). A disabled send or a
+/// into `dst_scratch.track_l/r` (`+=`, no clear; `dst_idx` = その track index). A disabled send or a
 /// muted source contributes nothing (Ableton: mute silences sends). The
 /// gain is read live, never baked into the schedule, so knob drags and
 /// `SendGain` automation apply without recompiling.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn mix_send_into_track_scratch(
-    scratch: &mut [TrackScratch],
-    dst_idx: usize,
-    src_idx: usize,
+pub(super) fn mix_send_into(
+    dst_scratch: &mut TrackScratch,
+    dst_idx: u32,
+    src_scratch: &TrackScratch,
     pre_fader: bool,
     song: &Song,
     src_track_idx: u32,
@@ -216,9 +209,6 @@ pub(super) fn mix_send_into_track_scratch(
 ) {
     use common::model::{AutomationTarget, TrackBuiltinParam};
 
-    if src_idx == dst_idx || src_idx >= scratch.len() || dst_idx >= scratch.len() {
-        return;
-    }
     let Some(track) = song.tracks.get(src_track_idx as usize) else {
         return;
     };
@@ -242,7 +232,7 @@ pub(super) fn mix_send_into_track_scratch(
     // everything routed to it). The source keeps its signal (see
     // process_track_owned), so the soloed-return audition still works.
     if any_solo {
-        let dest_soloed = song.tracks.get(dst_idx).is_some_and(|d| d.solo);
+        let dest_soloed = song.tracks.get(dst_idx as usize).is_some_and(|d| d.solo);
         if !dest_soloed && !track.solo && !any_soloed(song, src_contributors) {
             return;
         }
@@ -271,15 +261,6 @@ pub(super) fn mix_send_into_track_scratch(
     };
     let const_gain = send.gain;
 
-    // Borrow the source immutably and the destination mutably without
-    // overlap (`src_idx != dst_idx` checked above).
-    let (src_scratch, dst_scratch): (&TrackScratch, &mut TrackScratch) = if src_idx < dst_idx {
-        let (left, right) = scratch.split_at_mut(dst_idx);
-        (&left[src_idx], &mut right[0])
-    } else {
-        let (left, right) = scratch.split_at_mut(src_idx);
-        (&right[0], &mut left[dst_idx])
-    };
     let (src_l, src_r) = if pre_fader {
         (&src_scratch.pre_fader_l, &src_scratch.pre_fader_r)
     } else {

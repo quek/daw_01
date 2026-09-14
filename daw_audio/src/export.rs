@@ -1067,7 +1067,19 @@ mod tests {
 
     /// `engine` の worker rig (無ければ直列経路) で書き出す。
     fn render_mix_on(engine: &EngineShared, song: &Song, start_beat: f64, end_beat: f64) -> StereoCapture {
+        render_mix_with(engine, &crate::graph::DeviceLatencies::new(), song, start_beat, end_beat)
+    }
+
+    /// device の報告 latency (`latencies`、PDC の入力) も与えて書き出す。
+    fn render_mix_with(
+        engine: &EngineShared,
+        latencies: &crate::graph::DeviceLatencies,
+        song: &Song,
+        start_beat: f64,
+        end_beat: f64,
+    ) -> StereoCapture {
         let project = ProjectShared::new(common::protocol::ProjectKey(1), 0);
+        project.device_latencies.store(Arc::new(latencies.clone()));
         let span = RenderSpan::RangeWarm { start_beat, end_beat };
         let win = RenderWindow::resolve(song, BOUNCE_SR, span, false).expect("window");
         let mut sink = StereoCapture::default();
@@ -1422,18 +1434,109 @@ mod tests {
         song.enforce_edit_invariants();
 
         let serial = render_mix(&song, 0.0, 2.0);
+        let pooled = render_mix_on(&pooled_engine(3), &song, 0.0, 2.0);
+        assert!(peak(&serial) > 0.1, "前提: 鳴っている");
+        assert_bit_identical(&serial, &pooled, "pool 経路の音が直列と違う");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sync_slots` 本の runner (callback 役 1 + worker `sync_slots - 1`) の worker pool を持つ engine
+    /// (plugin host は居ないので slot は空)。
+    fn pooled_engine(sync_slots: u32) -> EngineShared {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let engine = EngineShared::new();
         engine.worker.store(Some(Arc::new(crate::engine_shared::WorkerRig {
-            pool: Some(crate::audio_worker::AudioWorkerPool::new(3).expect("pool")),
+            pool: Some(crate::audio_worker::AudioWorkerPool::new(sync_slots).expect("pool")),
             slots: Vec::new(),
-            bridge: common::worker_bridge::WorkerBridgeHandle::create(&format!("daw01_test_wb_{}", std::process::id()))
+            bridge: common::worker_bridge::WorkerBridgeHandle::create(&format!("daw01_test_wb_{}_{seq}", std::process::id()))
                 .expect("worker bridge"),
             stall_notified: std::sync::atomic::AtomicBool::new(false),
         })));
-        let pooled = render_mix_on(&engine, &song, 0.0, 2.0);
+        engine
+    }
+
+    fn assert_bit_identical(want: &StereoCapture, got: &StereoCapture, what: &str) {
+        let first_diff =
+            want.l.iter().chain(&want.r).zip(got.l.iter().chain(&got.r)).position(|(a, b)| a.to_bits() != b.to_bits());
+        assert_eq!((want.l.len(), first_diff), (got.l.len(), None), "{what}");
+    }
+
+    /// 1 buffer の処理を依存グラフで worker pool に流しても直列と bit 一致する (`docs/plan_parallel_graph.md`)。
+    /// 入れ子の group と return の chain、post / pre fader の send、内蔵 Comp のサイドチェイン (bus で消費する
+    /// pass 2 の consumer と leaf が次 buffer で消費する pass 1 の consumer)、PDC の遅延、envelope follower を含む曲を、
+    /// runner の数を変えて何度流しても同じ音になる。
+    #[test]
+    fn bus_を含む曲を_pool_で並列に流しても直列と_bit_一致する() {
+        use common::model::{
+            AudioTap, AuxInputRoute, Device, FollowerConfig, ModSource, ModSourceKind, NativeDevice, NativeKind,
+            PluginInstance, Send, SendMode,
+        };
+        let dir = bounce_temp_dir("pool_busy_graph");
+        let (mut song, content) = source_only_song(&dir);
+        push_tracks(&mut song, 8, content, &[0, 1, 2, 3, 5]);
+        let ids: Vec<u32> = song.tracks.iter().map(|t| t.id).collect();
+        let comp = |id: u64, tap: AudioTap| {
+            Device::Native(NativeDevice { aux_input: Some(AuxInputRoute { tap }), ..NativeDevice::new_added(NativeKind::Comp, id, 2) })
+        };
+        // G2 (6) ⊃ { G1 (4) ⊃ { 0, 1 }, 2 }。G1 の Comp は 2 の PostFader で検出する (bus = pass 2 の consumer)。
+        song.tracks[0].parent_group_id = Some(ids[4]);
+        song.tracks[1].parent_group_id = Some(ids[4]);
+        song.tracks[4].parent_group_id = Some(ids[6]);
+        song.tracks[2].parent_group_id = Some(ids[6]);
+        song.tracks[4].devices.push(comp(9001, AudioTap::post_fader(ids[2])));
+        // 3 は G1 の PostFader で検出し (leaf = pass 1 の consumer)、return R (7) へ post / pre fader で送る。5 も R へ。
+        song.tracks[3].devices.push(comp(9002, AudioTap::post_fader(ids[4])));
+        let send = |id: u32, gain: f32, mode: SendMode| Send { id, dest_track_id: ids[7], gain, mode, enabled: true };
+        song.tracks[3].sends = vec![send(1, 0.7, SendMode::PostFader), send(2, 0.4, SendMode::PreFader)];
+        song.tracks[5].sends = vec![send(1, 0.5, SendMode::PostFader)];
+        song.tracks[7].devices.push(Device::Native(NativeDevice::new_added(NativeKind::Eq, 9003, 2)));
+        // 1 に latency を報告する plugin を置き、G1 の合流に PDC を掛ける (plugin host が居ないので処理はされない)。
+        song.tracks[1].devices.push(Device::Plugin(PluginInstance {
+            id: 9004,
+            ..PluginInstance::with_ports(
+                "test.latent".into(),
+                common::plugin_format::PluginFormat::Clap,
+                common::port_config::PortConfig {
+                    has_note_input: false,
+                    has_note_output: false,
+                    has_audio_output: true,
+                    has_audio_input: true,
+                    has_video_input: false,
+                    has_video_output: false,
+                },
+            )
+        }));
+        song.mod_sources = vec![ModSource {
+            id: 1,
+            owner_track_id: ids[7],
+            color: [0.0; 3],
+            kind: ModSourceKind::EnvelopeFollower { tap: Some(AudioTap::post_fader(ids[7])), follower: FollowerConfig::default() },
+            enabled: true,
+        }];
+        song.enforce_edit_invariants();
+        let mut latencies = crate::graph::DeviceLatencies::new();
+        latencies.insert(9004, 300);
+
+        let sched = compile_schedule(&song, &latencies, BOUNCE_SR, common::process_data::MAX_FRAMES as u32, RenderScope::Mix)
+            .expect("compile");
+        let has = |pred: fn(&crate::graph::NodeOp) -> bool| sched.nodes.iter().any(pred);
+        use crate::graph::NodeOp as Op;
+        assert!(has(|op| matches!(op, Op::ApplyDelay { .. })), "前提: PDC");
+        assert!(has(|op| matches!(op, Op::NativeSidechainTap { .. })), "前提: サイドチェイン");
+        assert!(has(|op| matches!(op, Op::MixSend { .. })), "前提: send");
+        assert!(has(|op| matches!(op, Op::EnvelopeFollow { .. })), "前提: follower");
+        assert!(sched.nodes.iter().filter(|op| matches!(op, Op::ProcessGroupFx { .. })).count() >= 3, "前提: bus 3 本");
+
+        let serial = render_mix_with(&EngineShared::new(), &latencies, &song, 0.0, 4.0);
         assert!(peak(&serial) > 0.1, "前提: 鳴っている");
-        let first_diff = serial.l.iter().chain(&serial.r).zip(pooled.l.iter().chain(&pooled.r)).position(|(a, b)| a.to_bits() != b.to_bits());
-        assert_eq!((serial.l.len(), first_diff), (pooled.l.len(), None), "pool 経路の音が直列と違う");
+        for sync_slots in [2, 5, 9] {
+            let engine = pooled_engine(sync_slots);
+            for round in 0..3 {
+                let pooled = render_mix_with(&engine, &latencies, &song, 0.0, 4.0);
+                assert_bit_identical(&serial, &pooled, &format!("runner {sync_slots} 本の {round} 回目が直列と違う"));
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

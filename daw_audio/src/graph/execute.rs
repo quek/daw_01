@@ -25,13 +25,11 @@ use common::process_data::EventKind;
 
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::engine::{PluginEntry, PluginRefs, SyncSlot, WorkerRig};
-use crate::graph::mix::{
-    any_soloed, mix_into_master, mix_into_track_scratch, mix_send_into_track_scratch,
-    resolve_tap_buffers,
-};
-use crate::graph::native::{NativeIo, apply_listen_override, stage_native_sidechain};
+use crate::graph::mix::any_soloed;
+use crate::graph::native::{NativeIo, apply_listen_override};
 use crate::graph::program::Pass1Role;
-use crate::graph::{BufRef, ChainProgram, NodeOp, ProgramCtx, Schedule, run_chain_program};
+use crate::graph::step::{BufferParams, RenderCtx, run_step};
+use crate::graph::{ChainProgram, ProgramCtx, Schedule, run_chain_program};
 use crate::launcher::{RowSourceTable, TrackRows};
 use common::mod_plane::ModTickPlaneRef;
 use crate::mod_tick::FollowerDrive;
@@ -151,6 +149,8 @@ pub fn process_track_owned(
     playing: bool,
     song: Option<&Song>,
     any_solo: bool,
+    // この track の祖先 group (`SoloTables::ancestors`、folder solo)。
+    solo_ancestors: &[u32],
     input_delay_samples: u32,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     // Phase 5 Step 5.2: 当該 buffer の effective bpm (= SongTempo lane 評価
@@ -403,7 +403,7 @@ pub fn process_track_owned(
     // Folder solo: グループを solo したらその子も鳴る (Ableton / Reaper 準拠)。
     // 祖先 group のいずれかが solo なら、 この track 自身が非 solo でも透過させる (祖先は compile 時に焼いた表)。
     let effective_mute =
-        muted || (any_solo && !solo && !song.is_some_and(|s| any_soloed(s, &program.solo_ancestors)));
+        muted || (any_solo && !solo && !song.is_some_and(|s| any_soloed(s, solo_ancestors)));
 
     // strip は常に適用する — excluded track でも `track_l/r` に post-fader
     // signal を残す (solo された return への send / sidechain tap が読める、
@@ -489,11 +489,9 @@ pub fn process_master_fx_chain(
     run_chain_program(program, 0..len, master_l, master_r, midi_a, midi_b, &ctx);
 }
 
-/// Replay the post-dispatch portion of the routing schedule:
-/// `Mix { dst: TrackScratch }` (children → group bus), `ProcessGroupFx`
-/// (group's fx_chain + strip), and `Mix { dst: Master }` (top-level
-/// scratches → master). `ProcessTrack` ops are no-ops here because
-/// the pass-1 dispatch has already filled the per-track scratches.
+/// 旧 pass 2 (`Schedule::nodes` の op) だけを直列トレースの順に 1 buffer 走らせる (テスト用)。pass 1 の出力は
+/// 呼び側が scratch に置く。本番は [`render_master_buffer`] が pass 1 と合わせたグラフで流す。
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn execute_schedule_post_dispatch(
     schedule: &mut Schedule,
@@ -510,278 +508,30 @@ pub fn execute_schedule_post_dispatch(
     any_solo: bool,
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     current_bpm: f32,
-    // group fx の transport snapshot 用 (= 積分済み拍位置 + 実 loop トグル)。
     playhead_beats: f64,
     loop_region: LoopRegion,
-    // B3 (r.md #8): group fx の PluginParam 変調の値面 (track fx と同じ面)。
-    // post-dispatch 段への plumbing。 空なら変調なし。
     mod_plane: ModTickPlaneRef<'_>,
-    // r.md #89: フォロワーを刻みごとに進めるための係数表 (空なら従来どおり
-    // buffer 全体を 1 回で舐める)。
     follower_drive: FollowerDrive<'_>,
-    // r.md #87: 行ごとの時間軸の供給元 (group の automation レーン行に効く)。
     rows: &RowSourceTable,
-    // r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
     native_io: NativeIo<'_>,
 ) {
-    // `nodes` の不変参照と `delay_lines` の可変参照を同時に取りたい
-    // (ApplyDelay で line を引きながら nodes を回すため)。 `Schedule`
-    // を split borrow で 2 つの参照に分解する。
-    let Schedule {
-        nodes,
-        delay_lines,
-        delay_keys: _,
-        port_buffers: _,
-        input_delay_per_track: _,
-        follower_slots,
-        follower_keys: _,
-        mod_kinds: _,
-        master_latency_samples: _,
-        master_limiter_latency: _,
-        master_stage: _,
-        track_programs,
-        master_program,
-        master_midi_a: _,
-        master_midi_b: _,
-    } = schedule;
-    for op in nodes.iter() {
-        match op {
-            NodeOp::ProcessTrack { .. } => {
-                // Already handled by the pass-1 dispatch.
-            }
-            NodeOp::Mix {
-                srcs,
-                dst: BufRef::TrackScratch(target_idx),
-            } => {
-                mix_into_track_scratch(scratch, *target_idx as usize, srcs, n, true);
-            }
-            NodeOp::Mix {
-                srcs,
-                dst: BufRef::Master,
-            } => {
-                mix_into_master(scratch, srcs, master_l, master_r, n);
-            }
-            // パラアウト (docs/plan_paraout.md): a group-with-instrument's
-            // children are summed **on top of** its own instrument output
-            // (already in scratch from the pass-1 prefix), so we accumulate
-            // instead of clearing. dst is always its own TrackScratch.
-            NodeOp::MixAdditive {
-                srcs,
-                dst: BufRef::TrackScratch(target_idx),
-            } => {
-                mix_into_track_scratch(scratch, *target_idx as usize, srcs, n, false);
-            }
-            NodeOp::MixAdditive { .. } => {
-                // Only TrackScratch dsts are ever emitted for MixAdditive.
-            }
-            NodeOp::Mix {
-                dst:
-                    BufRef::Pooled(_)
-                    | BufRef::PreFaderScratch(_)
-                    | BufRef::PreFxScratch(_)
-                    | BufRef::ChainPostFx { .. }
-                    | BufRef::ChainPostFader { .. }
-                    | BufRef::ParallelInput { .. }
-                    | BufRef::ParallelOutput { .. },
-                ..
-            } => {
-                // Pooled targets land here once pooled-bus routing arrives.
-                // A Mix into a Pre*Scratch is never emitted (those are written
-                // by ProcessTrack), but the arm keeps the match exhaustive.
-            }
-            NodeOp::ProcessGroupFx { track_idx, start_op } => {
-                let Some(track) = song.tracks.get(*track_idx as usize) else {
-                    continue;
-                };
-                let Some(target) = scratch.get_mut(*track_idx as usize) else {
-                    continue;
-                };
-                let Some(program) = track_programs.get_mut(*track_idx as usize) else {
-                    continue;
-                };
-                run_group_fx_chain(
-                    *track_idx,
-                    track,
-                    song,
-                    target,
-                    program,
-                    plugin_refs,
-                    worker_sync,
-                    sample_rate,
-                    frames,
-                    playing,
-                    any_solo,
-                    recording_lanes,
-                    current_bpm,
-                    playhead_beats,
-                    loop_region,
-                    mod_plane,
-                    *start_op as usize,
-                    rows.track_rows(*track_idx as usize),
-                    native_io,
-                );
-            }
-            NodeOp::ApplyDelay {
-                buf,
-                line_idx,
-                frames: delay_frames,
-            } => {
-                // PR3: `buf` の scratch を in-place で `delay_frames` だけ
-                // 遅延させる。 `compile_schedule` は path latency が大きい
-                // 側に揃えるため、 小さい side の `BufRef::TrackScratch(i)`
-                // を絶対指す前提。 想定外 BufRef は無視。
-                let BufRef::TrackScratch(track_idx) = *buf else {
-                    continue;
-                };
-                let Some(s) = scratch.get_mut(track_idx as usize) else {
-                    continue;
-                };
-                let Some(line) = delay_lines.get_mut(*line_idx as usize) else {
-                    continue;
-                };
-                let n = (n).min(s.track_l.len()).min(s.track_r.len());
-                line.step_in_place(
-                    &mut s.track_l[..n],
-                    &mut s.track_r[..n],
-                    *delay_frames as usize,
-                );
-            }
-            NodeOp::SidechainTap {
-                src,
-                device_id,
-                aux_in_port,
-            } => {
-                // PR4 sidechain: copy the source track's scratch L/R into the
-                // destination plugin's `pd.buffer_aux_in[port]` shmem region,
-                // marking the port active so `daw_plugin_host` forwards it as a
-                // CLAP `clap_audio_buffer` / VST3 aux bus on the next
-                // `process()`. docs/plan_modulation_followups.md §1: the tap
-                // point picks the source buffer — PostFader / PostFx
-                // (pre-fader) / PreFx. v29: 宛先 plugin は安定 device id。
-                // RT path: skip silently on any miss (no per-buffer tracing).
-                let Some((src_l, src_r)) =
-                    resolve_tap_buffers(scratch, track_programs, master_program, *src)
-                else {
-                    continue;
-                };
-                let port = *aux_in_port as usize;
-                if port >= common::process_data::MAX_AUX_IN {
-                    continue;
-                }
-                let Some(entry) = plugin_refs.get(device_id) else {
-                    continue;
-                };
-                // quarantined device の pd には触らない (process が走ったまま
-                // の可能性がある — poisoning contract)。
-                if entry.quarantined.load(Ordering::Acquire) {
-                    continue;
-                }
-                let pd = entry.plugin_ref.data_mut();
-                let copy_n = n.min(src_l.len()).min(src_r.len());
-                pd.buffer_aux_in[port][0][..copy_n].copy_from_slice(&src_l[..copy_n]);
-                pd.buffer_aux_in[port][1][..copy_n].copy_from_slice(&src_r[..copy_n]);
-                pd.aux_in_active[port] = 1;
-            }
-
-            // r.md #129: 内蔵 device (Comp / Bus Comp) の外部サイドチェインの staging。
-            // 読み元 (scratch / 同じ program / 別 program) ごとの借用は `stage_native_sidechain` が持つ。
-            NodeOp::NativeSidechainTap { src, owner, native_slot } => {
-                stage_native_sidechain(scratch, track_programs, master_program, *src, *owner, *native_slot, n);
-            }
-
-            NodeOp::ParallelOutTap {
-                device_id,
-                port,
-                dst_track,
-            } => {
-                // パラアウト (docs/plan_paraout.md): read the source plugin's aux
-                // output `port` (`pd.buffer_aux_out[port]`, written by
-                // daw_plugin_host during the source plugin's pass-1 process) and
-                // **accumulate** it into the destination track's input scratch.
-                // The mirror of `SidechainTap` — v29: source plugin は安定
-                // device id で直接引く。 RT path: skip silently on any miss.
-                let port = *port as usize;
-                if port >= common::process_data::MAX_AUX_OUT {
-                    continue;
-                }
-                let Some(entry) = plugin_refs.get(device_id) else {
-                    continue;
-                };
-                if entry.quarantined.load(Ordering::Acquire) {
-                    continue;
-                }
-                let pd = entry.plugin_ref.data();
-                // The plugin host marks the port active only when the plugin
-                // actually declared (and wrote) this aux output; an unrouted /
-                // absent port stays silent (industry-standard behaviour).
-                if pd.aux_out_active[port] == 0 {
-                    continue;
-                }
-                let Some(target) = scratch.get_mut(*dst_track as usize) else {
-                    continue;
-                };
-                let copy_n = n.min(target.track_l.len()).min(target.track_r.len());
-                for i in 0..copy_n {
-                    target.track_l[i] += pd.buffer_aux_out[port][0][i];
-                    target.track_r[i] += pd.buffer_aux_out[port][1][i];
-                }
-            }
-
-            NodeOp::MixSend {
-                src,
-                dst,
-                src_track_idx,
-                send_id,
-            } => {
-                // PR4 aux send: accumulate the source's post- or pre-fader
-                // buffer into the destination return / bus scratch, scaled
-                // by the live (optionally automated) send gain.
-                let BufRef::TrackScratch(dst_idx) = *dst else {
-                    continue;
-                };
-                let (src_idx, pre_fader) = match *src {
-                    BufRef::TrackScratch(i) => (i, false),
-                    BufRef::PreFaderScratch(i) => (i, true),
-                    _ => continue,
-                };
-                mix_send_into_track_scratch(
-                    scratch,
-                    dst_idx as usize,
-                    src_idx as usize,
-                    pre_fader,
-                    song,
-                    *src_track_idx,
-                    *send_id,
-                    sample_rate,
-                    current_bpm,
-                    playhead_beats,
-                    any_solo,
-                    recording_lanes,
-                    n,
-                    rows.track_rows(*src_track_idx as usize),
-                    track_programs.get(*src_track_idx as usize).map_or(&[], |p| p.solo_contributors.as_slice()),
-                );
-            }
-
-            NodeOp::EnvelopeFollow { src, slot } => {
-                // docs/plan_modulation.md §3/§6: advance this source's envelope
-                // follower over its (settled) scratch, picking the buffer by
-                // tap point. The smoothed envelope lands in
-                // `follower_slots[slot].env`; the engine publishes it into the
-                // modulation plane after this walk. RT-safe: pure
-                // arithmetic, no alloc / lock.
-                let Some((src_l, src_r)) =
-                    resolve_tap_buffers(scratch, track_programs, master_program, *src)
-                else {
-                    continue;
-                };
-                let Some(fs) = follower_slots.get_mut(*slot as usize) else {
-                    continue;
-                };
-                advance_follower(fs, src_l, src_r, n, *slot, follower_drive, sample_rate);
-            }
-        }
-    }
+    let params = BufferParams {
+        sample_rate,
+        frames: frames.min(n as u32),
+        playing,
+        any_solo,
+        recording_lanes,
+        current_bpm,
+        playhead_beats,
+        loop_region,
+        mod_plane,
+        follower_drive,
+        rows,
+        native_io,
+    };
+    let slots = worker_sync.map(std::slice::from_ref).unwrap_or(&[]);
+    let ctx = RenderCtx::new(song, schedule, scratch, master_l, master_r, plugin_refs, None, slots, params);
+    crate::graph::step::run_nodes_for_test(&ctx, |_| true);
 }
 
 /// Run a Group track's audio fx chain on its already-mixed input
@@ -790,7 +540,7 @@ pub fn execute_schedule_post_dispatch(
 /// but skips the sequencer / MIDI FX / instrument stages because groups
 /// have no clips of their own.
 #[allow(clippy::too_many_arguments)]
-fn run_group_fx_chain(
+pub(super) fn run_group_fx_chain(
     track_idx: u32,
     song_track: &Track,
     song: &Song,
@@ -802,6 +552,8 @@ fn run_group_fx_chain(
     frames: u32,
     playing: bool,
     any_solo: bool,
+    // この bus の (流れ込む track, 祖先 group) (`SoloTables::of`)。
+    (solo_contributors, solo_ancestors): (&[u32], &[u32]),
     recording_lanes: &std::collections::HashSet<(u32, common::model::AutomationTarget)>,
     current_bpm: f32,
     // group fx の transport snapshot (= 積分済み拍位置 + 実 loop トグル)。
@@ -896,8 +648,8 @@ fn run_group_fx_chain(
     let effective_mute = muted
         || (any_solo
             && !solo
-            && !any_soloed(song, &program.solo_ancestors)
-            && !any_soloed(song, &program.solo_contributors));
+            && !any_soloed(song, solo_ancestors)
+            && !any_soloed(song, solo_contributors));
 
     // strip は常に適用 (mirrors process_track_owned) — mute 意味論は
     // `apply_strip` の doc 参照。
@@ -923,7 +675,7 @@ fn run_group_fx_chain(
 /// A / R / ゲイン / 帯域が**変調されている**フォロワーは係数を刻みごとに引き直し
 /// ながら区間で進める。変調されていないフォロワーは buffer 全体を 1 回で舐める
 /// 従来経路 — **変調していないソースのコストはゼロのまま**。
-fn advance_follower(
+pub(super) fn advance_follower(
     fs: &mut super::follower::FollowerSlot,
     src_l: &[f32],
     src_r: &[f32],
@@ -963,8 +715,8 @@ fn advance_follower(
 /// (`docs/plan_arch_refactor.md` §5):
 ///
 /// 1. master バスをゼロ初期化
-/// 2. per-track pass-1 dispatch (worker pool fan-out、無ければ serial)
-/// 3. schedule 実行 (group mix / PDC / send / sidechain / follower)
+/// 2. 依存グラフ (track 本体 → group mix / PDC / send / sidechain / bus の chain / follower) を worker pool で
+///    並列に、無ければ直列に流す (`docs/plan_parallel_graph.md`)
 /// 4. master fx chain (組み込み Bus Comp / Tone EQ を含む) → master の SC Listen
 /// 5. master gain
 /// 6. master limiter (フェーダーの後、先読み遅延は compile 時に焼いた値で決まる)
@@ -1007,91 +759,7 @@ pub fn render_master_buffer(
     master_r[..n].fill(0.0);
 
     let any_solo = song.tracks.iter().any(|t| t.solo);
-    let n_tracks = song.tracks.len().min(scratch.len());
-
-    // ---- pass 1: per-track render (worker pool fan-out / serial fallback) --
-    let pool = worker.and_then(|rig| rig.pool.as_ref());
-    let slots: &[SyncSlot] = worker.map(|rig| rig.slots.as_slice()).unwrap_or(&[]);
-    if let Some(pool) = pool {
-        pool.dispatch_and_wait(
-            Some(song),
-            &mut scratch[..n_tracks],
-            &mut schedule.track_programs,
-            plugin_refs,
-            audio_renderer,
-            slots,
-            sample_rate,
-            frames,
-            playing,
-            any_solo,
-            &schedule.input_delay_per_track,
-            recording_lanes,
-            current_bpm,
-            playhead_beats,
-            &loop_region,
-            mod_plane,
-            rows,
-            native_io,
-        );
-        // stall した pool は scratch を更新しない (dispatch_and_wait が冒頭で
-        // early-return する)。 その残余 (直前 buffer の per-track 出力) を後段の
-        // schedule mix が master に積むと、 契約上「無音」であるべき所が耳障りな
-        // stuck tone になる (plan §4: stalled = 無音)。 該当 track の scratch を
-        // 明示 zero して post-dispatch に無音を流す (RT-safe: pre-alloc buffer への
-        // fill のみ、 確保なし)。
-        if pool.is_stalled() {
-            for ts in scratch[..n_tracks].iter_mut() {
-                ts.track_l[..n].fill(0.0);
-                ts.track_r[..n].fill(0.0);
-            }
-        }
-    } else {
-        let worker_sync = slots.first();
-        for (track_idx, track_scratch) in scratch.iter_mut().enumerate().take(n_tracks) {
-            let song_track = &song.tracks[track_idx];
-            let input_delay = schedule
-                .input_delay_per_track
-                .get(track_idx)
-                .copied()
-                .unwrap_or(0);
-            let Some(program) = schedule.track_programs.get_mut(track_idx) else {
-                continue;
-            };
-            process_track_owned(
-                track_idx as u32,
-                song_track,
-                track_scratch,
-                program,
-                plugin_refs,
-                Some(audio_renderer),
-                worker_sync,
-                sample_rate,
-                frames,
-                playing,
-                Some(song),
-                any_solo,
-                input_delay,
-                recording_lanes,
-                current_bpm,
-                playhead_beats,
-                loop_region,
-                mod_plane,
-                rows.track_rows(track_idx),
-                native_io,
-            );
-        }
-    }
-
-    // ---- pass 2: schedule 実行 (group mix / PDC / send / sidechain) ----
-    execute_schedule_post_dispatch(
-        schedule,
-        scratch,
-        &mut master_l[..n],
-        &mut master_r[..n],
-        n,
-        song,
-        plugin_refs,
-        slots.first(),
+    let params = BufferParams {
         sample_rate,
         frames,
         playing,
@@ -1104,7 +772,46 @@ pub fn render_master_buffer(
         follower_drive,
         rows,
         native_io,
-    );
+    };
+
+    // ---- 依存グラフ: track 本体 / 合流 / PDC / send / sidechain / bus の chain / follower ----
+    // (`docs/plan_parallel_graph.md`)。worker pool があればグラフで並列に、無ければ直列トレースの順に流す
+    // (どちらも同じ `run_step`、結果は bit 一致)。
+    let pool = worker.and_then(|rig| rig.pool.as_ref());
+    let slots: &[SyncSlot] = worker.map(|rig| rig.slots.as_slice()).unwrap_or(&[]);
+    let ran = {
+        let ctx = RenderCtx::new(
+            song,
+            schedule,
+            scratch,
+            &mut master_l[..n],
+            &mut master_r[..n],
+            plugin_refs,
+            Some(audio_renderer),
+            slots,
+            params,
+        );
+        match pool {
+            Some(pool) => pool.run(&ctx),
+            None => {
+                for &step in &ctx.graph.trace {
+                    run_step(&ctx, step, 0);
+                }
+                true
+            }
+        }
+    };
+    // stall した pool はこの buffer を描き切っていない (plan §4: stalled = 無音)。途中までの track 出力 / 合流を
+    // master の段へ流すと耳障りな stuck tone になるので、scratch と master を明示的に 0 にする
+    // (RT-safe: 事前確保済みの buffer への fill のみ)。
+    if !ran {
+        for ts in scratch.iter_mut() {
+            ts.track_l[..n].fill(0.0);
+            ts.track_r[..n].fill(0.0);
+        }
+        master_l[..n].fill(0.0);
+        master_r[..n].fill(0.0);
+    }
 
     // bounce (`RenderScope::PostFx` / `Sources`) は master の段を通さない = 合流をそのまま出力する
     // (compile 時に焼いた値。master の fx chain の op も Limiter の遅延も焼いていない)。
@@ -1176,7 +883,7 @@ pub(crate) fn test_plugin_refs(
 #[cfg(test)]
 mod sidechain_tests {
     use super::*;
-    use crate::graph::compile_schedule_for_test;
+    use crate::graph::{NodeOp, compile_schedule_for_test};
     use common::model::{Device, PluginInstance, Song, Track};
     use common::plugin_format::PluginFormat;
 
@@ -1428,6 +1135,28 @@ mod send_tests {
         std::collections::HashSet::new()
     }
 
+    /// track 0 の send (`send_id`) を track 1 の scratch へ足す (`mix_send_into` を 1 回)。
+    fn send_0_to_1(scratch: &mut [TrackScratch], pre_fader: bool, song: &Song, send_id: u32, any_solo: bool) {
+        let [src, dst] = scratch.get_disjoint_mut([0, 1]).expect("2 本");
+        crate::graph::mix::mix_send_into(
+            dst,
+            1,
+            src,
+            pre_fader,
+            song,
+            0,
+            send_id,
+            48_000,
+            120.0,
+            0.0,
+            any_solo,
+            &empty_lanes(),
+            FRAMES,
+            crate::launcher::TrackRows::default(),
+            &[],
+        );
+    }
+
     /// A post-fader send accumulates `src * gain` into the return scratch
     /// **on top of** whatever is already there (the prior clearing Mix is
     /// a separate op), reading the source's post-fader `track_l/r`.
@@ -1441,13 +1170,7 @@ mod send_tests {
             scratch[1].track_l[i] = 1.0; // pre-existing return content
             scratch[1].track_r[i] = 2.0;
         }
-        let empty = empty_lanes();
-        mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
-            FRAMES,
-            crate::launcher::TrackRows::default(),
-            &[],
-        );
+        send_0_to_1(&mut scratch, false, &song, SEND_ID, false);
         for i in 0..FRAMES {
             let want_l = 1.0 + (i as f32) * 0.1 * 0.5;
             let want_r = 2.0 + (-(i as f32) * 0.1) * 0.5;
@@ -1465,13 +1188,7 @@ mod send_tests {
             scratch[0].track_l[i] = 1.0;
             scratch[1].track_l[i] = 3.0;
         }
-        let empty = empty_lanes();
-        mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
-            FRAMES,
-            crate::launcher::TrackRows::default(),
-            &[],
-        );
+        send_0_to_1(&mut scratch, false, &song, SEND_ID, false);
         for i in 0..FRAMES {
             assert_eq!(scratch[1].track_l[i], 3.0, "disabled send must not change dst");
         }
@@ -1487,13 +1204,7 @@ mod send_tests {
             scratch[0].track_l[i] = 1.0;
             scratch[1].track_l[i] = 3.0;
         }
-        let empty = empty_lanes();
-        mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
-            FRAMES,
-            crate::launcher::TrackRows::default(),
-            &[],
-        );
+        send_0_to_1(&mut scratch, false, &song, SEND_ID, false);
         for i in 0..FRAMES {
             assert_eq!(
                 scratch[1].track_l[i], 3.0,
@@ -1515,13 +1226,7 @@ mod send_tests {
             let mut scratch: Vec<TrackScratch> =
                 (0..4).map(|_| TrackScratch::new()).collect();
             scratch[0].track_l[0] = 0.5;
-            let empty = empty_lanes();
-            mix_send_into_track_scratch(
-                &mut scratch, 1, 0, false, &song, 0, SEND_ID, 48_000, 120.0, 0.0, true, &empty,
-                FRAMES,
-                crate::launcher::TrackRows::default(),
-            &[],
-            );
+            send_0_to_1(&mut scratch, false, &song, SEND_ID, true);
             scratch[1].track_l[0]
         };
         // A soloed source still feeds its own send.
@@ -1556,13 +1261,7 @@ mod send_tests {
             scratch[0].pre_fader_l[i] = 0.25; // pre-fader — must be used
             scratch[0].pre_fader_r[i] = 0.5;
         }
-        let empty = empty_lanes();
-        mix_send_into_track_scratch(
-            &mut scratch, 1, 0, true, &song, 0, SEND_ID, 48_000, 120.0, 0.0, false, &empty,
-            FRAMES,
-            crate::launcher::TrackRows::default(),
-            &[],
-        );
+        send_0_to_1(&mut scratch, true, &song, SEND_ID, false);
         for i in 0..FRAMES {
             assert!(
                 (scratch[1].track_l[i] - 0.25).abs() < 1e-6,
@@ -1580,12 +1279,7 @@ mod send_tests {
         let mut scratch: Vec<TrackScratch> = (0..4).map(|_| TrackScratch::new()).collect();
         scratch[0].track_l[0] = 1.0;
         scratch[1].track_l[0] = 3.0;
-        let empty = empty_lanes();
-        mix_send_into_track_scratch(
-            &mut scratch, 1, 0, false, &song, 0, 999, 48_000, 120.0, 0.0, false, &empty, FRAMES,
-            crate::launcher::TrackRows::default(),
-            &[],
-        );
+        send_0_to_1(&mut scratch, false, &song, 999, false);
         assert_eq!(scratch[1].track_l[0], 3.0, "unknown send id must be a no-op");
     }
 
@@ -1599,7 +1293,7 @@ mod send_tests {
         // song_with_send: Vocal (id 1) post-fader sends to Reverb (id 2).
         let mut song = song_with_send(1.0, SendMode::PostFader, true);
         let sched = crate::graph::compile_schedule_for_test(&song, 48_000, 0).expect("compile");
-        let reverb = &sched.track_programs[1].solo_contributors;
+        let reverb = sched.solo.of(1).0;
         song.tracks[0].solo = true; // solo the send SOURCE (Vocal)
         assert!(
             any_soloed(&song, reverb),
@@ -1637,7 +1331,7 @@ mod send_tests {
         };
 
         let sched = crate::graph::compile_schedule_for_test(&song, 48_000, 0).expect("compile");
-        let ancestors = |i: usize| sched.track_programs[i].solo_ancestors.as_slice();
+        let ancestors = |i: u32| sched.solo.of(i).1;
         assert_eq!(ancestors(1), [0], "child の祖先は group (song-track index)");
         // child: not soloed itself, but its ancestor group is → audible.
         assert!(any_soloed(&song, ancestors(1)), "child sees the soloed ancestor group");

@@ -22,18 +22,19 @@ pub mod native;
 mod port_buffer;
 pub mod program;
 mod program_build;
+pub mod render_graph;
 mod schedule;
 pub mod selector_split;
+pub mod step;
 pub mod voices;
 
 pub use compile::{DeviceLatencies, GraphError, compile_schedule};
 #[cfg(test)]
 pub(crate) use compile::compile_schedule_for_test;
 pub use delay_line::DelayLine;
-pub use execute::{
-    execute_schedule_post_dispatch, process_master_fx_chain, process_track_owned,
-    render_master_buffer, set_pd_transport,
-};
+#[cfg(test)]
+pub use execute::execute_schedule_post_dispatch;
+pub use execute::{process_master_fx_chain, process_track_owned, render_master_buffer, set_pd_transport};
 pub use follower::FollowerSlot;
 pub use native::{DeviceScopeTap, NativeIo};
 pub use port_buffer::{PortBuffer, PortBufferPool};

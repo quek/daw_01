@@ -41,7 +41,8 @@ use common::protocol::RenderScope;
 
 use super::program::Pass1Role;
 use super::program_build::{BuiltProgram, ChainLatency, build_program};
-use super::schedule::{BufRef, MASTER_OWNER, NodeOp, Schedule};
+use super::render_graph::RenderGraph;
+use super::schedule::{BufRef, MASTER_OWNER, NodeOp, Schedule, SoloTables};
 use deps::Topology;
 use pdc::master_output_latency;
 use sidechain::{TapCtx, bake_snapshot_needs, collect_chain_taps, compute_sc_delays};
@@ -164,11 +165,10 @@ pub fn compile_schedule(
         master_output_latency(chain, device_latencies, mix_latency, sample_rate, master_limiter_latency, scope)
     };
     if n == 0 {
+        let nodes = vec![NodeOp::Mix { srcs: Vec::new(), dst: BufRef::Master }];
         return Ok(Schedule {
-            nodes: vec![NodeOp::Mix {
-                srcs: Vec::new(),
-                dst: BufRef::Master,
-            }],
+            graph: RenderGraph::build(song, &nodes),
+            nodes,
             master_latency_samples: master_latency(0),
             master_limiter_latency,
             master_stage: scope.master(),
@@ -188,12 +188,7 @@ pub fn compile_schedule(
         };
     }
     // solo の透過規則の表 (「子 / send 元が solo なら bus も透過」と folder solo。RT で配線を歩かない)。
-    for (b, (contributors, ancestors)) in
-        built.iter_mut().zip(topo.solo_contributors(song).into_iter().zip(topo.solo_ancestors(song)))
-    {
-        b.program.solo_contributors = contributors;
-        b.program.solo_ancestors = ancestors;
-    }
+    let solo = SoloTables { contributors: topo.solo_contributors(song), ancestors: topo.solo_ancestors(song) };
     let taps = TapCtx {
         id_to_idx: &topo.id_to_idx,
         chains: &chain_map,
@@ -221,6 +216,8 @@ pub fn compile_schedule(
         emit::emit_followers(song, sample_rate, &topo.id_to_idx, &chain_map, &mut compensated.nodes);
 
     Ok(Schedule {
+        graph: RenderGraph::build(song, &compensated.nodes),
+        solo,
         nodes: compensated.nodes,
         delay_lines: compensated.delay_lines,
         delay_keys: compensated.delay_keys,

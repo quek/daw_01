@@ -300,60 +300,9 @@ pub fn apply_listen_override(program: &mut ChainProgram, bus_l: &mut [f32], bus_
     bus_r[..n].copy_from_slice(&buf.r[..n]);
 }
 
-/// `NodeOp::NativeSidechainTap` の staging: `src` の音を `owner` の program の
-/// `natives[native_slot].sc` へ写す。借用は 3 通り — 読み元が scratch / 同じ program の
-/// chain・Parallel / 別の program (master を含む)。どれかが解決できなければ何もしない。
-pub fn stage_native_sidechain(
-    scratch: &[TrackScratch],
-    track_programs: &mut [ChainProgram],
-    master_program: &mut ChainProgram,
-    src: BufRef,
-    owner: u32,
-    native_slot: u32,
-    n: usize,
-) {
-    let slot = native_slot as usize;
-    match program_tap_owner(src) {
-        // 読み元が scratch。
-        None => {
-            let Some((l, r)) = resolve_scratch_tap(scratch, src) else { return };
-            let Some(p) = program_at(track_programs, master_program, owner) else { return };
-            stage_into(p.natives.get_mut(slot), l, r, n);
-        }
-        // 同じ program の chain / Parallel: フィールドで借用を分ける。
-        Some(o) if o == owner => {
-            let Some(p) = program_at(track_programs, master_program, owner) else { return };
-            let ChainProgram { chains, parallels, natives, .. } = p;
-            let Some((l, r)) = resolve_program_tap(chains, parallels, src) else { return };
-            stage_into(natives.get_mut(slot), l, r, n);
-        }
-        // 別の program。
-        Some(o) => {
-            let (src_p, dst_p): (&ChainProgram, &mut ChainProgram) = if o == MASTER_OWNER {
-                let Some(dst) = track_programs.get_mut(owner as usize) else { return };
-                (master_program, dst)
-            } else if owner == MASTER_OWNER {
-                let Some(src_p) = track_programs.get(o as usize) else { return };
-                (src_p, master_program)
-            } else {
-                let Ok([a, b]) = track_programs.get_disjoint_mut([o as usize, owner as usize]) else { return };
-                (a, b)
-            };
-            let Some((l, r)) = resolve_program_tap(&src_p.chains, &src_p.parallels, src) else { return };
-            stage_into(dst_p.natives.get_mut(slot), l, r, n);
-        }
-    }
-}
-
-fn program_at<'a>(
-    track_programs: &'a mut [ChainProgram],
-    master_program: &'a mut ChainProgram,
-    owner: u32,
-) -> Option<&'a mut ChainProgram> {
-    if owner == MASTER_OWNER { Some(master_program) } else { track_programs.get_mut(owner as usize) }
-}
-
-fn stage_into(ns: Option<&mut NativeScratch>, l: &[f32], r: &[f32], n: usize) {
+/// `NodeOp::NativeSidechainTap` の staging の書き込み: `l` / `r` を内蔵 device の SC 受け皿へ写す
+/// (読み元の借用の分け方は `graph::step::stage_native_sidechain`)。受け皿が無ければ何もしない。
+pub(crate) fn stage_into(ns: Option<&mut NativeScratch>, l: &[f32], r: &[f32], n: usize) {
     if let Some(stage) = ns.and_then(|ns| ns.sc.as_mut()) {
         stage.stage(l, r, n);
     }
