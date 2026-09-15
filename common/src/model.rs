@@ -562,11 +562,14 @@ pub struct Song {
     /// v19 files forward-migrate to a map backfilled from `Clip.name`.
     #[serde(default)]
     pub clip_content_names: HashMap<ContentId, String>,
-    /// v42 (r.md #132 残件): content を複製して共有を解いたとき ([`Song::fork_content`]: Make Unique / 共有
-    /// content の伸縮 / 旧 ARA アーカイブの読み込み) の **複製元**。 ARA の audio modification は content と
-    /// take ごとなので (`crate::ara_ids`)、複製した content の modification は複製元の編集を写して始める
-    /// (Melodyne の編集が共有を解いても続く、別々に編集できる variation)。 キーの content が消えたら
-    /// `gc_clip_contents` が落とす (複製元が消えていても、そのアーカイブから写せるので値は残す)。
+    /// v42 (r.md #132 残件): audio content を複製して共有を解いたとき ([`Song::fork_content`]: Make Unique /
+    /// 共有 content の伸縮 / トラック複製など) の **複製元**。 ARA の audio modification は content と
+    /// take ごとなので (`crate::ara_ids`)、複製した content の modification は、plug-in host の document に
+    /// 初めて現れるとき複製元の編集を写して始める (Melodyne の編集が共有を解いても続く、別々に編集できる
+    /// variation。 一度 document に居た modification は自分の状態から戻る、`daw_plugin_host::ara::graph_plan::
+    /// modification_start`)。 キーの content が消えたら `gc_clip_contents` が落とす (複製元が消えていても、
+    /// そのアーカイブから写せるので値は残す)。 旧 ARA アーカイブの読み込みで分けた content は、クリップごとの
+    /// 編集をアーカイブに持つので記録しない (`crate::ara_ids::migrate_legacy_archives`)。
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub content_forked_from: HashMap<ContentId, ContentId>,
     /// §10 bullet 4: imported media source プール (audio / video / image)。旧 .daw は
@@ -1216,11 +1219,14 @@ impl Song {
         let content = self.clip_contents.get(&src).cloned().unwrap_or_default();
         let name = self.clip_content_names.get(&src).cloned();
         let id = self.alloc_content_id();
+        // 複製元を覚えるのは ARA の audio modification を持つ audio content だけ (`content_forked_from`)。
+        if matches!(content, ClipContent::Audio(_)) {
+            self.content_forked_from.insert(id, src);
+        }
         self.clip_contents.insert(id, content);
         if let Some(name) = name {
             self.clip_content_names.insert(id, name);
         }
-        self.content_forked_from.insert(id, src);
         id
     }
 

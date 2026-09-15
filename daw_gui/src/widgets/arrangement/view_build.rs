@@ -170,8 +170,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                         // ビューのズーム 1 本で決まる (`geometry::content_map`)。
                         content_offset_beats: c.content_offset_beats,
                         name: labels
-                            .content_labels
-                            .get(&c.content_id)
+                            .clip_labels
+                            .get(&ClipKey { track_id: t.id, clip_id: c.id })
                             .cloned()
                             .unwrap_or_else(|| clip_display_label(c, app.cur.song_doc.song())),
                         color: Some(clip_color_for(
@@ -554,12 +554,16 @@ fn content_id_to_hue(content_id: common::model::ContentId) -> f32 {
 }
 
 /// text clip の widget display label (32 文字 cap、非 Text / 空は `None`)。
+///
+/// 本文は **クリップの窓に見えている最初の字幕** から読む — Inspector の本文と rename の確定先
+/// (`handler::clip_window`、窓に見えている片だけに効く) と同じ片。 content の先頭を読むと、分割の片の
+/// クリップで本文を変えてもラベルが別の片の本文のまま残る。
 fn text_clip_label(
     clip: &common::model::Clip,
     contents: &HashMap<common::model::ContentId, common::model::ClipContent>,
 ) -> Option<String> {
     let events = contents.get(&clip.content_id)?.text_events()?;
-    let ev = events.first()?;
+    let ev = events.get(*common::model::shown_indices(events, clip.content_window()).first()?)?;
     if ev.text.is_empty() {
         return None;
     }

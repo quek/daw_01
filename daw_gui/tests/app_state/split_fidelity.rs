@@ -301,6 +301,34 @@ fn 続きの片は_ここから読む_で読み上げに戻せて_undo_で戻る
     assert_eq!(readings(&synced(&mut app, &mut rx, &mut last).1), vec![0.0]);
 }
 
+/// 分割した字幕クリップの rename (= 本文の編集) は **そのクリップの窓の片** だけを書き換え、編集の口
+/// (rename の初期値と「変わっていなければ何もしない」判定) も同じ片から読む。 content の先頭の片を読むと、
+/// 片ごとに本文が違うとき rename の初期値が別の片の本文になり、その本文へ戻す rename が黙って無視される。
+#[test]
+fn 分割した字幕クリップの_rename_は窓の片を書き換えその片から読む() {
+    let original = TextEvent { text: "はじめまして".into(), event_length_beats: 8.0, ..TextEvent::default() };
+    let (mut app, _rx) = vocal_app(ClipContent::Text(TextContent { events: vec![original.clone()] }), 8.0);
+    split_clip_on_grid(&mut app);
+    let pieces = sorted_clip_keys(&app);
+    let rename = |app: &mut AppData, clip: ClipKey, name: &str| {
+        app.handle_event(AppEvent::BeginRenameClip(clip));
+        app.handle_event(AppEvent::RenameClipChanged(name.into()));
+        app.handle_event(AppEvent::CommitRenameClip);
+    };
+    let texts = |app: &AppData| text_events(app).iter().map(|e| e.text.clone()).collect::<Vec<_>>();
+
+    rename(&mut app, pieces[1], "よろしく");
+    let renamed = vec![original.text.clone(), "よろしく".into(), original.text.clone(), original.text.clone()];
+    assert_eq!(texts(&app), renamed, "書き換わるのは 2 つ目のクリップの窓の片だけ");
+
+    app.handle_event(AppEvent::BeginRenameClip(pieces[1]));
+    assert_eq!(app.cur.peph.clip_rename_text, "よろしく", "rename の初期値はそのクリップの窓の本文");
+    app.handle_event(AppEvent::CancelRenameClip);
+
+    rename(&mut app, pieces[1], &original.text);
+    assert_eq!(texts(&app), vec![original.text.clone(); 4], "別の片と同じ本文へ戻す rename も効く");
+}
+
 /// ARA (Melodyne) トラックを割ると、片は **同じ audio modification** の region になり (Melodyne の編集が続く)、
 /// region は窓に見えている片だけを、分割前の region をちょうど切り分けた位置 (再生位置と modification の中の
 /// 位置) に置く。 persistent id は安定 id から作るので、片を動かしても source / modification の名前は変わらない。

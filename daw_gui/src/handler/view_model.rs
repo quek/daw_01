@@ -969,9 +969,8 @@ impl AppData {
 
     /// D3/D4: arrangement build 用ラベルキャッシュ ([`ArrLabelCache`])。 `song_epoch`
     /// が進んでいれば全 track 名 + content ラベルを 1 度だけ作り直し、 通常フレームは
-    /// 同一 `Arc<str>` の clone (refcount bump) を返す。 `clip_display_label` は
-    /// `clip.content_id` のみに依存するので content_id 単位で 1 回だけ算出する
-    /// (linked clip は同一ラベルを共有)。
+    /// 同一 `Arc<str>` の clone (refcount bump) を返す。 `clip_display_label` は clip の content と
+    /// 窓に依存する (分割の片は同じ content を別の窓で見る) ので clip 単位で算出する。
     /// レーンのノード名は Song に加えて host の param 表と plugin DB からも決まるので、別の鍵
     /// ([`LaneLabelsKey`]) で作り直す。
     pub(crate) fn arrangement_labels(&self) -> std::cell::Ref<'_, ArrLabelCache> {
@@ -984,19 +983,16 @@ impl AppData {
             }
             if cache.epoch != edit_epoch {
                 cache.track_names.clear();
-                cache.content_labels.clear();
+                cache.clip_labels.clear();
                 cache.section_names.clear();
                 cache.content_names.clear();
-                for (i, t) in self.cur.song_doc.song().tracks.iter().enumerate() {
+                let song = self.cur.song_doc.song();
+                for (i, t) in song.tracks.iter().enumerate() {
                     cache.track_names.insert(t.id, std::sync::Arc::from(t.display_name(i).as_ref()));
-                    for c in &t.clips {
-                        cache.content_labels.entry(c.content_id).or_insert_with(|| {
-                            crate::widgets::arrangement::view_build::clip_display_label(
-                                c,
-                                self.cur.song_doc.song(),
-                            )
-                        });
-                    }
+                    cache.clip_labels.extend(t.clips.iter().map(|c| {
+                        let label = crate::widgets::arrangement::view_build::clip_display_label(c, song);
+                        (ClipKey { track_id: t.id, clip_id: c.id }, label)
+                    }));
                 }
                 // D4 同件: section ruler / automation clip ラベルも世代キャッシュ。
                 for s in &self.cur.song_doc.song().sections {

@@ -96,21 +96,40 @@ pub fn plan(now: &GraphNow<'_>, specs: &[AraClipSpec]) -> GraphPlan {
 /// 新しく作る modification の中身をどこから始めるか。
 #[derive(Debug, PartialEq, Eq)]
 pub enum ModificationStart<'a> {
-    /// document に居る元の modification (content を複製した元) を `cloneAudioModification` で写す (今の編集)。
+    /// この編集の前から document に居る元の modification (content を複製した元) を `cloneAudioModification` で
+    /// 写す (今の編集)。
     Clone(&'a str),
-    /// 空で作り、アーカイブに id `.0` で書かれた状態を restore する (無ければ空のまま)。
-    Restore(&'a str),
+    /// 空で作り、この session が id `.0` の modification を destroy した時点の状態 (partial archive) を restore する。
+    Retired(&'a str),
+    /// 空で作り、保存したアーカイブに id `.0` で書かれた状態を restore する (無ければ空のまま)。
+    Saved(&'a str),
 }
 
-/// `spec` の modification の始め方。 document を丸ごと組み直す (`first_build` = 開いた直後) ときは、
-/// アーカイブはこの id で書かれているので自分の id から。 途中で増えた modification は、複製元が document に
-/// 居ればその今の編集を写し、居なければ複製元の保存した状態から、複製でなければ自分の id から。
+/// `spec` の modification の始め方。
+///
+/// 1. この session で destroy した同じ id の modification があれば、その destroy した時点の状態 (undo / redo で
+///    戻る object。 保存したアーカイブ = 最後に保存した時点より新しい。 複製元を写し直すと、共有を解いた後の
+///    自分の編集が複製元の編集で上書きされる)。
+/// 2. document を初めて組むとき (`first_build` = 開いた直後) は、アーカイブがこの id で書かれているので
+///    保存した自分の状態。
+/// 3. 途中で増えた、共有を解いた content の modification は、複製元が **この編集の前から** document に居れば
+///    (`origin_live`) その今の編集を写し、居なければ複製元を destroy した時点の状態、それも無ければ複製元の
+///    保存した状態。 同じ編集で作る複製元を写すと、restore の前の空の modification を写してしまう。
+/// 4. それ以外は保存した自分の状態。
 #[must_use]
-pub fn modification_start(spec: &AraClipSpec, first_build: bool, origin_live: bool) -> ModificationStart<'_> {
+pub fn modification_start<'a>(
+    spec: &'a AraClipSpec,
+    first_build: bool,
+    origin_live: bool,
+    retired: impl Fn(&str) -> bool,
+) -> ModificationStart<'a> {
+    let own = spec.modification_id.as_str();
     match spec.modification_origin.as_deref() {
+        _ if retired(own) => ModificationStart::Retired(own),
         Some(origin) if !first_build && origin_live => ModificationStart::Clone(origin),
-        Some(origin) if !first_build => ModificationStart::Restore(origin),
-        _ => ModificationStart::Restore(&spec.modification_id),
+        Some(origin) if !first_build && retired(origin) => ModificationStart::Retired(origin),
+        Some(origin) if !first_build => ModificationStart::Saved(origin),
+        _ => ModificationStart::Saved(own),
     }
 }
 
@@ -185,10 +204,26 @@ mod tests {
     /// 自分の状態から始める (保存したアーカイブはこの id で書かれている)。
     #[test]
     fn 複製した_modification_は元の編集から始める() {
+        let none = |_: &str| false;
         let unique = AraClipSpec { modification_origin: Some("m".into()), ..spec("s", "m2", "2.9") };
-        assert_eq!(modification_start(&unique, false, true), ModificationStart::Clone("m"));
-        assert_eq!(modification_start(&unique, false, false), ModificationStart::Restore("m"), "元が消えていたら元の保存した状態");
-        assert_eq!(modification_start(&unique, true, true), ModificationStart::Restore("m2"), "開いた直後は自分の保存した状態");
-        assert_eq!(modification_start(&spec("s", "m", "1.1"), false, false), ModificationStart::Restore("m"));
+        assert_eq!(modification_start(&unique, false, true, none), ModificationStart::Clone("m"));
+        assert_eq!(modification_start(&unique, false, false, none), ModificationStart::Saved("m"), "元が消えていたら元の保存した状態");
+        assert_eq!(
+            modification_start(&unique, false, false, |id| id == "m"),
+            ModificationStart::Retired("m"),
+            "同じ編集で元も消えたなら、元を destroy した時点の状態"
+        );
+        assert_eq!(modification_start(&unique, true, true, none), ModificationStart::Saved("m2"), "開いた直後は自分の保存した状態");
+        assert_eq!(modification_start(&spec("s", "m", "1.1"), false, false, none), ModificationStart::Saved("m"));
+    }
+
+    /// この session で destroy した modification を作り直す (undo / redo) ときは、destroy した時点の自分の状態から
+    /// 始める — 共有を解いた content でも複製元を写し直さない (写し直すと、共有を解いた後の自分の編集が消える)。
+    #[test]
+    fn 作り直す_modification_は_destroy_した時点の自分の状態から始める() {
+        let retired = |id: &str| id == "m2";
+        let unique = AraClipSpec { modification_origin: Some("m".into()), ..spec("s", "m2", "2.9") };
+        assert_eq!(modification_start(&unique, false, true, retired), ModificationStart::Retired("m2"));
+        assert_eq!(modification_start(&spec("s", "m2", "1.1"), false, false, retired), ModificationStart::Retired("m2"));
     }
 }

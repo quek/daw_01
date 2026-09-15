@@ -405,8 +405,8 @@ impl AppData {
                 out.push(common::protocol::AraClipSpec {
                     source_wav,
                     source_id: common::ara_ids::source_id(event.source_id),
-                    modification_id: common::ara_ids::modification_id(clip.content_id, event.take_key()),
-                    modification_origin: common::ara_ids::modification_origin(song, clip.content_id, event.take_key()),
+                    modification_id: common::ara_ids::modification_id(clip.content_id, event),
+                    modification_origin: common::ara_ids::modification_origin(song, clip.content_id, event),
                     region_key: common::ara_ids::region_key(clip.id, event.id),
                     placement: ara_region_placement(clip, &piece, sample_rate, bpm),
                 });

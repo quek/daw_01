@@ -1286,13 +1286,17 @@ mod tests {
         let unshared = clips[1].content_id;
         assert_ne!(unshared, linked, "旧版でクリップごとだった編集を分けるため、2 本目は content を分ける");
         assert_eq!(loaded.clip_contents[&unshared], loaded.clip_contents[&linked], "音は変わらない");
+        assert!(
+            !loaded.content_forked_from.contains_key(&unshared),
+            "分けた content の編集はアーカイブの自分の旧 id にあるので、複製元の編集を写す元にしない"
+        );
         let alias = |archived: String, current: String| AraIdAlias { archived, current };
         let expected = vec![
             alias("7:10:0".into(), source_id(7)),
-            alias("7:10:0/mod".into(), modification_id(linked, 1)),
-            alias("7:11:0/mod".into(), modification_id(unshared, 1)),
-            alias("7:12:0/mod".into(), modification_id(pair, 3)),
-            alias("7:12:1/mod".into(), modification_id(pair, 4)),
+            alias("7:10:0/mod".into(), modification_id(linked, &event(1, 0.0))),
+            alias("7:11:0/mod".into(), modification_id(unshared, &event(1, 0.0))),
+            alias("7:12:0/mod".into(), modification_id(pair, &event(3, 0.0))),
+            alias("7:12:1/mod".into(), modification_id(pair, &event(4, 2.0))),
         ];
         let device = |song: &Song| song.plugin_by_id(50).expect("device").clone();
         assert_eq!(device(&loaded).ara_archive_ids, expected, "素材の source は最初の 1 つ、modification はクリップと take ごと");

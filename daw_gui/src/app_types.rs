@@ -1283,14 +1283,14 @@ pub type PendingExport = (std::path::PathBuf, Option<(f64, f64)>, bool);
 /// (= `Arc::from` + 歌詞連結) を呼び再確保していた。 名前は編集時しか変わらない
 /// ので、 `SongDoc::edit_epoch` が進んだとき (= undo 境界をまたぐ編集) だけ作り直し、
 /// 通常フレームは `Arc` の clone (refcount bump) で済ませる。 `clip_display_label`
-/// は `clip.content_id` のみに依存するので content 単位で 1 回だけ算出する。
+/// は clip の content **と窓** に依存する (字幕の本文は窓に見えている片から読む、r.md #132 残件) ので
+/// clip 単位で持つ。
 #[derive(Default)]
 pub(crate) struct ArrLabelCache {
     /// このキャッシュ内容が対応する `SongDoc::edit_epoch`。 一致する間は再計算しない。
     pub(crate) epoch: u64,
     pub(crate) track_names: std::collections::HashMap<u32, std::sync::Arc<str>>,
-    pub(crate) content_labels:
-        std::collections::HashMap<common::model::ContentId, std::sync::Arc<str>>,
+    pub(crate) clip_labels: std::collections::HashMap<common::model::ClipKey, std::sync::Arc<str>>,
     /// D4 同件: section ruler / automation clip も同じ per-frame `Arc::from(&str)`
     /// だった。 user 編集可能 (= intern 不可・無制限成長する) なので track/clip 名と
     /// 同じ `edit_epoch` 世代キャッシュで持つ。

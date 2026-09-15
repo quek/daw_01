@@ -9,7 +9,7 @@
 //!
 //! - audio source = 素材 1 つ ([`source_id`])。 同ヘッダ "Typically a host will create an audio source object
 //!   for each audio file used with ARA plug-ins."
-//! - audio modification = content と take ([`modification_id`]、take は `AudioEvent::take_key`)。 分割の片は
+//! - audio modification = content と take と素材 ([`modification_id`]、take は `AudioEvent::take_key`)。 分割の片は
 //!   同じ take なので 1 つの modification を共有し、Melodyne の編集が片をまたいで続き、位置もずれない
 //!   (region は take の写像で置く)。 同ヘッダ "All playback regions that share the same audio modification play
 //!   back the same musical content"。 同じ content を見る linked clip も共有する (中身の編集を共有するのと同じ)。
@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{AudioSourceId, ClipContent, ContentId, Song, for_each_plugin_mut};
+use crate::model::{AudioEvent, AudioSourceId, ClipContent, ContentId, Song, for_each_plugin_mut};
 
 /// 素材 `source` の ARA audio source の persistent id。
 #[must_use]
@@ -35,19 +35,27 @@ pub fn source_id(source: AudioSourceId) -> String {
     format!("daw01.source.{source}")
 }
 
-/// content `content` の take `take` の ARA audio modification の persistent id。
+/// content `content` の event `event` が属する take の ARA audio modification の persistent id: content と take
+/// (`AudioEvent::take_key`) と **素材**。
+///
+/// 素材を含めるのは、modification の状態がその素材の上の編集だから (同ヘッダ: "Restoring an audio modification
+/// without restoring its underlying audio source may not succeed if the audio source state has changed")。 content を
+/// 丸ごと置き換える操作 (Bounce In Place の `Song::replace_window_content`) は新しい content の event id を 1 から
+/// 振るので、別の素材の take が置き換える前と同じ content / take の id になる。 素材を含めないと、焼いた音の
+/// modification に元の素材の上の編集 (保存したアーカイブや、plug-in host が destroy した時点で取っておいた状態) を
+/// restore してしまう。
 #[must_use]
-pub fn modification_id(content: ContentId, take: u32) -> String {
-    format!("daw01.take.{content}.{take}")
+pub fn modification_id(content: ContentId, event: &AudioEvent) -> String {
+    format!("daw01.take.{content}.{}.{}", event.take_key(), event.source_id)
 }
 
-/// content `content` の take `take` の modification を **写して始める元** の modification (content を複製して
+/// content `content` の event `event` の modification を **写して始める元** の modification (content を複製して
 /// 共有を解いたとき、複製元の同じ take の modification、`Song::content_forked_from`)。 複製でなければ `None`。
 /// 同ヘッダ `cloneAudioModification`: "used to create independent variations of the audio edits as opposed to
 /// creating aliases by merely adding playback regions to a given audio modification"。
 #[must_use]
-pub fn modification_origin(song: &Song, content: ContentId, take: u32) -> Option<String> {
-    song.content_forked_from.get(&content).map(|&origin| modification_id(origin, take))
+pub fn modification_origin(song: &Song, content: ContentId, event: &AudioEvent) -> Option<String> {
+    song.content_forked_from.get(&content).map(|&origin| modification_id(origin, event))
 }
 
 /// クリップ `clip_id` の event `event_id` の playback region のキー (永続しない、document の中で一意)。
@@ -104,6 +112,9 @@ fn unshare_audio_contents(song: &mut Song, t: usize) {
         content.ensure_element_ids();
         if !seen.insert(content_id) {
             let copy = song.fork_content(content_id);
+            // 複製した content の編集はアーカイブにクリップごとに書かれている (読み替え表で自分の旧 id から
+            // restore する) ので、複製元の編集を写す元としては記録しない。
+            song.content_forked_from.remove(&copy);
             song.tracks[t].clips[c].content_id = copy;
         }
     }
@@ -121,7 +132,7 @@ fn legacy_aliases(song: &Song, t: usize) -> Vec<AraIdAlias> {
             let legacy = format!("{}:{}:{index}", event.source_id, clip.id);
             let pairs = [
                 (legacy.clone(), source_id(event.source_id)),
-                (format!("{legacy}/mod"), modification_id(clip.content_id, event.take_key())),
+                (format!("{legacy}/mod"), modification_id(clip.content_id, event)),
             ];
             for (archived, current) in pairs {
                 if mapped.insert(current.clone()) {

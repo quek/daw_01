@@ -133,10 +133,11 @@ Celemony 公式も out-of-process ARA を `TestHost/IPC` でデモしており�
   既存 `PluginInstance.state` とは別の **`PluginInstance.ara_archive: Option<Vec<u8>>`** に格納し Song と一緒に保存。
 - 読込時: LoadSong → ARA document 再構築 (audio source/region) → `RestoreAraArchive` で編集復元。
 - archive 順序: ARA spec の store/restore (ARAArchivingController) に従い IBStream 相当を実装。
-- r.md #132 残件 (v42): persistent id は安定 id (素材 / content と take / クリップと event) から作り
+- r.md #132 残件 (v42): persistent id は安定 id (素材 / content と take と素材 / クリップと event) から作り
   (`common::ara_ids`)、document は差分で編集する (`daw_plugin_host/src/ara/graph_plan.rs`) — 分割の片は
-  modification を共有し、restore は新しく作った object にだけ filter で掛ける。旧 id のアーカイブは読み替え表で
-  restore する。正本は各モジュールの doc。
+  modification を共有し、restore は新しく作った object にだけ filter で掛ける。destroy する modification は
+  直前に partial archive を取り、作り直すときはそこから戻す (`session.rs` の `retired`)。旧 id のアーカイブは
+  読み替え表で restore する。正本は各モジュールの doc。
 
 ## 11. 実装順序 (MiniHost.c の配線順 = 事実上の仕様)
 

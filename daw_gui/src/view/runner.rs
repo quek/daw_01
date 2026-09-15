@@ -640,25 +640,8 @@ fn handle_preview_drag(
             // 比較すると静止カーソルでも同値イベントを再発火し続ける)。
             // 同 idiom で image / text どちらかの SetClip*Rotation を撃つ。
             let kind = preview_drag_target_kind(app, drag.target);
-            let cur_rot = {
-                let content = app
-                    .cur.song_doc.song()
-                    .track_by_id(drag.target.track_id)
-                    .and_then(|t| t.clip_by_id(drag.target.clip_id))
-                    .and_then(|c| app.cur.song_doc.song().clip_contents.get(&c.content_id));
-                match content {
-                    Some(c) if matches!(kind, PreviewDragTargetKind::Text) => c
-                        .text_events()
-                        .and_then(|ev| ev.first())
-                        .map(|ev| ev.rotation_radians),
-                    Some(c) => c
-                        .image_events()
-                        .and_then(|ev| ev.first())
-                        .map(|ev| ev.rotation_radians),
-                    None => None,
-                }
-                .unwrap_or(drag.start_rotation_radians)
-            };
+            let cur_rot =
+                preview_pip_geometry(app, drag.target).map_or(drag.start_rotation_radians, |(_, rot)| rot);
             if (new_rotation - cur_rot).abs() > 1e-3 {
                 let ev = match kind {
                     PreviewDragTargetKind::Text => AppEvent::SetClipTextRotation {
@@ -676,25 +659,10 @@ fn handle_preview_drag(
         }
     };
     // 値が変わった field だけ AppEvent を発火 (= 無駄な undo step を
-    // 発生させない)。 first event 比較。 image / text どちらかの events
-    // を持つ clip を見つけ、 同 idiom の現値 (x, y, w, h) を返す。
+    // 発生させない)。 比べる現値は確定先と同じ片から読む ([`preview_pip_geometry`])。
     let target = drag.target;
-    let content = app
-        .cur.song_doc.song()
-        .track_by_id(target.track_id)
-        .and_then(|t| t.clip_by_id(target.clip_id))
-        .and_then(|c| app.cur.song_doc.song().clip_contents.get(&c.content_id));
     let kind = preview_drag_target_kind(app, target);
-    let current = match content {
-        Some(c) if matches!(kind, PreviewDragTargetKind::Text) => {
-            c.text_events().and_then(|ev| ev.first()).map(|ev| (ev.x, ev.y, ev.w, ev.h))
-        }
-        Some(c) => {
-            c.image_events().and_then(|ev| ev.first()).map(|ev| (ev.x, ev.y, ev.w, ev.h))
-        }
-        None => None,
-    };
-    let Some((cx, cy, cw, ch)) = current else {
+    let Some(((cx, cy, cw, ch), _)) = preview_pip_geometry(app, target) else {
         return;
     };
     let send = |ev: AppEvent| {
@@ -733,6 +701,15 @@ fn handle_preview_drag(
 enum PreviewDragTargetKind {
     Image,
     Text,
+}
+
+/// preview の PiP 枠が映す clip `target` の rect `(x, y, w, h)` と回転。 drag が確定する
+/// `SetClipImage*` / `SetClipText*` と Inspector の値と同じく、**編集が効く片** (窓に見えている最初の
+/// ひと続き、`handler::clip_window`) から読む — content の先頭 event を読むと、分割の片のクリップで
+/// 枠と drag の起点が別の片の値になる。 image / text clip でない / 見えている片が無ければ `None`。
+fn preview_pip_geometry(app: &AppData, target: ClipKey) -> Option<((f32, f32, f32, f32), f32)> {
+    app.image_first_event(target, |e| ((e.x, e.y, e.w, e.h), e.rotation_radians))
+        .or_else(|| app.text_first_event(target, |e| ((e.x, e.y, e.w, e.h), e.rotation_radians)))
 }
 
 fn preview_drag_target_kind(app: &AppData, target: ClipKey) -> PreviewDragTargetKind {
@@ -1992,31 +1969,21 @@ impl Runner {
         // の生値ベースで縁取りを置く (= lane drag P5.3 で recording に
         // 切り替えた瞬間に event 値が override される動作で OK)。
         // docs/plan_text_overlay.md §4 P6: text clip も同 idiom で
-        // overlay 縁取り + handle を出す。 image / text を順に try。
+        // overlay 縁取り + handle を出す。 値は drag の確定先と同じ片から読む
+        // ([`preview_pip_geometry`])。
         let overlay_info = state
             .app
             .selected_clip_ref()
             .and_then(|cref| {
                 let track = song.track_by_id(cref.track_id)?;
                 let clip = track.clip_by_id(cref.clip_id)?;
-                let content = song.clip_contents.get(&clip.content_id)?;
-                if let Some(events) = content.image_events() {
-                    let ev = events.first()?;
-                    Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
-                } else if let Some(events) = content.text_events() {
-                    // (talk/v26) 字幕 (`builtin.video.subtitle`) device が刺さっている
-                    // トラックの Text だけ画面に出る (`text_compose` の表示 gate と一致)。
-                    // 出ない Text の選択枠 (縁取り + handle) を preview に出すと「刺して
-                    // ないのに枠が出る」混乱になるので gate する (`docs/plan_voicevox_talk.md`)。
-                    if track.has_subtitle_device() {
-                        let ev = events.first()?;
-                        Some(((ev.x, ev.y, ev.w, ev.h), ev.rotation_radians))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                // (talk/v26) 字幕 (`builtin.video.subtitle`) device が刺さっている
+                // トラックの Text だけ画面に出る (`text_compose` の表示 gate と一致)。
+                // 出ない Text の選択枠 (縁取り + handle) を preview に出すと「刺して
+                // ないのに枠が出る」混乱になるので gate する (`docs/plan_voicevox_talk.md`)。
+                let hidden_text = song.clip_contents.get(&clip.content_id)?.text_events().is_some()
+                    && !track.has_subtitle_device();
+                if hidden_text { None } else { preview_pip_geometry(&state.app, cref) }
             });
         let (overlay_rect, rotation) = match overlay_info {
             Some((r, rot)) => (Some(r), rot),

@@ -196,6 +196,31 @@ impl AraDocumentController {
         (ok != 0).then_some(writer.data)
     }
 
+    /// Serialise **only** the state of `modification` into a partial archive
+    /// (`ARAStoreObjectsFilter`, no document data, no audio sources) — the
+    /// host's copy of an object it is about to destroy, restored if the object
+    /// comes back (ARAInterface.h "Partial Document Persistency": ARA 2 plug-ins
+    /// "are required to fully support it"). Call outside an editing session
+    /// ("Archives may only be created from documents that are not being
+    /// currently edited"). `None` if unsupported or the store failed.
+    pub fn store_modification_to_archive(&self, modification: ARAAudioModificationRef) -> Option<Vec<u8>> {
+        let store = self.interface.storeObjectsToArchive?;
+        let refs = [modification];
+        let filter = ara_sys::ARAStoreObjectsFilter {
+            structSize: core::mem::size_of::<ara_sys::ARAStoreObjectsFilter>(),
+            documentData: ARABool::from(false),
+            audioSourceRefsCount: 0,
+            audioSourceRefs: ptr::null(),
+            audioModificationRefsCount: refs.len(),
+            audioModificationRefs: refs.as_ptr(),
+        };
+        let mut writer = host_controllers::AraArchiveWriter::default();
+        let writer_ref = ptr::from_mut(&mut writer) as ara_sys::ARAArchiveWriterHostRef;
+        // SAFETY: `filter` and `refs` outlive the call; ARA only reads them during it.
+        let ok = unsafe { store(self.controller_ref, writer_ref, &filter) };
+        (ok != 0 && !writer.data.is_empty()).then_some(writer.data)
+    }
+
     /// Restore plug-in edit state from an ARA archive into **only the listed
     /// objects** (`ARARestoreObjectsFilter`, partial persistency). Call inside an
     /// editing session, after those model objects have been created.

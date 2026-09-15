@@ -436,7 +436,10 @@ fn ara_selftest(path: &std::path::Path, target_id: &str, wav: Option<&str>) -> R
                 vec![common::protocol::AraClipSpec {
                     source_wav: std::path::PathBuf::from(w),
                     source_id: common::ara_ids::source_id(1),
-                    modification_id: common::ara_ids::modification_id(1, 1),
+                    modification_id: common::ara_ids::modification_id(
+                        1,
+                        &common::model::AudioEvent { id: 1, source_id: 1, ..Default::default() },
+                    ),
                     modification_origin: None,
                     region_key: common::ara_ids::region_key(1, 1),
                     placement: common::protocol::AraRegionPlacement {

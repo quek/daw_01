@@ -222,7 +222,6 @@ FN-NESTING | daw_gui/src/handler/export.rs::AppData::handle_file_dialog_result |
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_midi                     | 9/42 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::begin_rescan                           | 8/15 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_positions                     | 8/14 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/view_model.rs::AppData::arrangement_labels                | 8/12 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_clips_at                    | 8/8  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_points_at                   | 8/7  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::delete_selected_notes                  | 8/6  | edit_song 多重ループ。未起票
