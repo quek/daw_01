@@ -101,6 +101,19 @@ impl ClipboardPayload {
             | ClipboardPayload::Time(_) => Vec::new(),
         }
     }
+
+    /// payload が運ぶ audio event の全部 (写した take の Melodyne の編集を取っておくため)。
+    #[must_use]
+    pub fn audio_events(&self) -> Vec<&AudioEvent> {
+        fn from_contents(contents: Vec<&ClipContent>) -> Vec<&AudioEvent> {
+            contents.into_iter().filter_map(ClipContent::audio_events).flatten().collect()
+        }
+        match self {
+            ClipboardPayload::AudioEvents(events) => events.iter().collect(),
+            ClipboardPayload::Time(copy) => from_contents(copy.contents.values().map(|(c, _)| c).collect()),
+            _ => from_contents(self.clip_contents()),
+        }
+    }
 }
 
 /// セル群をアレンジのクリップに写す: 行 = 相対行、同じ行のセルは左の列から順に

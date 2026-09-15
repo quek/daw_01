@@ -1485,7 +1485,9 @@ fn current_version_is_pinned() {
     // (serde default で読める)。
     // v42 (r.md #132 残件): 時間軸を持つ event の窓 (take の頭 / 尻、fade ランプの張り出し) と
     // `TextEvent::continuation` (serde default の 0 / false = 分割していない event で読める)。
-    assert_eq!(CURRENT_VERSION, 42);
+    // v43 (r.md #132 残件、ARA のコピー): `AudioEvent::take_origins` と ARA アーカイブの目次
+    // (`project::migrate_forked_contents_to_take_origins` / `ara_ids::migrate_archive_contents` が v42 から移す)。
+    assert_eq!(CURRENT_VERSION, 43);
 }
 
 #[test]

@@ -785,8 +785,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
 
     // トラック copy/cut の非同期結果 (plugin state 収集後) を OS clipboard へ flush。
     if let Some(text) = app.ui_ephemeral.pending_clipboard_write.clone() {
-        ui.set_clipboard_text(text);
-        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+        ui.set_clipboard_text(text.clone());
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.snapshot_ara_for_clipboard(&text);
             app.ui_ephemeral.pending_clipboard_write = None;
         }));
     }

@@ -125,10 +125,10 @@ pub(crate) struct PluginStateWriteBack {
     states: HashMap<u64, DeviceState>,
 }
 
-/// 1 device ぶんの書き戻し: `PluginInstance::state` と、plug-in が出したときだけの ARA archive。
+/// 1 device ぶんの書き戻し: `PluginInstance::state` と、plug-in が出したときだけの ARA archive (とその目次)。
 struct DeviceState {
     state: Option<Arc<[u8]>>,
-    ara_archive: Option<Arc<[u8]>>,
+    ara_archive: Option<(Arc<[u8]>, Vec<String>)>,
 }
 
 impl PluginStateWriteBack {
@@ -150,7 +150,8 @@ impl PluginStateWriteBack {
             })
             .map(|s| {
                 let state = s.data.as_deref().map(Arc::from);
-                (s.device_id, DeviceState { state, ara_archive: s.ara_archive.as_deref().map(Arc::from) })
+                let ara_archive = s.ara_archive.as_ref().map(|a| (Arc::from(a.bytes.as_slice()), a.ids.clone()));
+                (s.device_id, DeviceState { state, ara_archive })
             })
             .collect();
         Self { states }
@@ -168,10 +169,10 @@ impl PluginStateWriteBack {
             p.state = written.state.clone();
             // (r.md #5 ARA2) Only overwrite the ARA archive when the plug-in actually produced one; a non-ARA
             // device or a not-yet-bound session reports None, and we must not wipe a previously-saved archive.
-            // A fresh archive is written with the current persistent ids, so the legacy-id aliases go with the
-            // replaced one (`set_ara_archive`).
-            if let Some(archive) = &written.ara_archive {
-                p.set_ara_archive(archive.clone());
+            // A fresh archive is written with the current persistent ids; its table of contents replaces the old
+            // one (`set_ara_archive`).
+            if let Some((archive, ids)) = &written.ara_archive {
+                p.set_ara_archive(archive.clone(), ids.clone());
             }
         });
     }

@@ -272,7 +272,8 @@ fn paste_one(
 /// (セルの `start_beat` は常に 0)。
 fn track_cell_payload(song: &common::model::Song, k: ClipKey) -> Option<LauncherCellPayload> {
     let c = song.track_by_id(k.track_id)?.session_clip_by_id(k.clip_id)?;
-    let content = song.clip_contents.get(&c.clip.content_id).cloned()?;
+    // 写しから content を作る貼り付けは、audio の take を元の編集から始める (`AudioEvent::take_origins`)。
+    let content = song.clip_contents.get(&c.clip.content_id)?.copied_from(song.project_id, c.clip.content_id);
     Some(LauncherCellPayload::Track(ClipCopy {
         track_offset: 0,
         start_beat: 0.0,

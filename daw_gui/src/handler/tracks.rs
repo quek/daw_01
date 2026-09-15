@@ -136,12 +136,9 @@ impl AppData {
             }
             for cid in cids {
                 if seen.insert(cid) {
-                    let content = self
-                        .cur.song_doc.song()
-                        .clip_contents
-                        .get(&cid)
-                        .cloned()
-                        .unwrap_or_default();
+                    // 写しから content を作る貼り付け / 独立複製は、audio の take を元の編集から始める。
+                    let song = self.cur.song_doc.song();
+                    let content = song.clip_contents.get(&cid).map(|c| c.copied_from(song.project_id, cid)).unwrap_or_default();
                     let name = self.cur.song_doc.song().clip_content_names.get(&cid).cloned();
                     contents.push(crate::clipboard::ContentEntry {
                         content_id: cid,
@@ -353,6 +350,13 @@ impl AppData {
                 });
                 Self::remap_pasted_device_refs(&mut t, &device_remap);
             }
+            // ARA のアーカイブは元の content / 素材の id で書かれたまま運ばれてくる。 目次の今の id をこのトラックの
+            // クリップが指す新しい id へ移し、載せたときに自分の状態として restore する (`ara_ids::remap_archive_contents`)。
+            common::model::for_each_plugin_mut(&mut t.devices, &mut |p| {
+                if p.ara_archive.is_some() {
+                    p.ara_archive_ids = common::ara_ids::remap_archive_contents(&p.ara_archive_ids, &content_remap, &media_remap.audio);
+                }
+            });
             Self::resolve_pasted_aux_refs(song, &track_remap, same_project, &mut t);
             t.lipsync_target_track = match t.lipsync_target_track {
                 Some(old) if track_remap.contains_key(&old) => Some(track_remap[&old]),

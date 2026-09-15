@@ -250,7 +250,8 @@ impl AppData {
         let min_track = resolved.iter().map(|(ti, _)| *ti).min().unwrap_or(0);
         let mut clips = Vec::with_capacity(resolved.len());
         for (ti, c) in &resolved {
-            let content = song.clip_contents.get(&c.content_id).cloned().unwrap_or_default();
+            // 写しから content を作る貼り付けは、audio の take を元の編集から始める (`AudioEvent::take_origins`)。
+            let content = song.clip_contents.get(&c.content_id).map(|x| x.copied_from(song.project_id, c.content_id)).unwrap_or_default();
             let name = song.clip_content_names.get(&c.content_id).cloned();
             clips.push(crate::clipboard::ClipCopy {
                 track_offset: (*ti as i64) - (min_track as i64),

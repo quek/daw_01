@@ -72,11 +72,12 @@ pub(crate) fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface:
     }
 }
 
-/// copy 成立時の共通後始末 (clipboard へ書いて status に件数を出す)。
+/// copy 成立時の共通後始末 (clipboard へ書いて、写した take の Melodyne の編集を取っておかせ、status に件数を出す)。
 fn finish_copy(ui: &mut Ui<'_, AppData>, json: String, count: usize, label: &str) {
-    ui.set_clipboard_text(json);
+    ui.set_clipboard_text(json.clone());
     let label = label.to_string();
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.snapshot_ara_for_clipboard(&json);
         app.ui_ephemeral.status_message = format!("コピー: {count} {label}");
     }));
 }
@@ -91,9 +92,11 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
     // r.md #87: セルの cut は「セルとしてコピー + セル削除」。 削除は
     // `DeleteCells` (アレンジのクリップは触らない) を使う。
     if let Some((json, count)) = app.copy_launcher_cells_clip() {
-        ui.set_clipboard_text(json);
+        ui.set_clipboard_text(json.clone());
         let cells = app.selected_launcher_cells();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            // 消す前に写した時点の Melodyne の編集を取っておかせる (copy と同じ)。
+            app.snapshot_ara_for_clipboard(&json);
             app.handle_event(AppEvent::Launcher(
                 crate::event_launcher::LauncherEvent::DeleteCells(cells.clone()),
             ));
@@ -128,7 +131,7 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
         | EditSurface::Devices => None,
     };
     if let Some((json, count, label)) = synced {
-        ui.set_clipboard_text(json);
+        ui.set_clipboard_text(json.clone());
         let del = match surface {
             EditSurface::AudioEvents => AppEvent::DeleteAudioEditorSelection,
             EditSurface::Notes => AppEvent::DeleteSelectedNotes,
@@ -143,6 +146,7 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
         };
         let label = label.to_string();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.snapshot_ara_for_clipboard(&json);
             app.handle_event(del);
             app.ui_ephemeral.status_message = format!("カット: {count} {label}");
         }));

@@ -15,6 +15,7 @@
 
 mod support;
 
+mod ara_copy;
 mod clip_rename;
 mod dangling_routes;
 mod default_track_names;

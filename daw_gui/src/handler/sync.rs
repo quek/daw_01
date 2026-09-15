@@ -5,7 +5,7 @@ use crate::state::*;
 use crate::app_types::*;
 use std::path::{Path, PathBuf};
 use common::plugin_db::PluginDatabase;
-use common::protocol::{AudioCommand, PluginCommand};
+use common::protocol::{AudioCommand, PluginCommand, ProjectKey};
 
 impl AppData {
     // -------- IPC -----------------------------------------------------------
@@ -231,7 +231,11 @@ impl AppData {
             .copied()
             .collect();
 
+        let dormant = self.dormant_ara_archives(&rebuilds);
         self.cur.pipc.ara_doc_cache = live;
+        for command in dormant {
+            self.send_plugin(command);
+        }
         for (device_id, clips) in rebuilds {
             // The saved ARA edits for this device: the host restores them only into
             // the objects this update creates (objects already in the document keep
@@ -257,6 +261,68 @@ impl AppData {
         for device_id in stale {
             self.send_plugin(PluginCommand::ClearAraDocument { device: self.dev(device_id) });
         }
+    }
+
+    /// 組み直す document (`rebuilds`) に新しく現れる modification (自分の id と写した元) のうち、組み直す device の
+    /// アーカイブに状態の無いものの、document の無い device の保存したアーカイブを預ける command
+    /// ([`Self::dormant_ara_archive_commands`])。 `ara_doc_cache` を置き換える前に呼ぶ (前の同期で document に居た
+    /// modification を見る)。
+    fn dormant_ara_archives(&self, rebuilds: &[(u64, Vec<common::protocol::AraClipSpec>)]) -> Vec<PluginCommand> {
+        let song = self.cur.song_doc.song();
+        let mut out = Vec::new();
+        for (device_id, clips) in rebuilds {
+            let Some(target) = song.plugin_by_id(*device_id) else { continue };
+            let known: std::collections::HashSet<&str> =
+                self.cur.pipc.ara_doc_cache.get(device_id).into_iter().flatten().map(|c| c.modification_id.as_str()).collect();
+            let fresh = clips.iter().filter(|c| !known.contains(c.modification_id.as_str()));
+            let ids = fresh.flat_map(|c| {
+                let own = std::iter::once((Some(self.pk()), c.modification_id.as_str()));
+                own.chain(c.modification_origins.iter().map(|o| (o.project, o.modification_id.as_str())))
+            });
+            // 組み直す device のアーカイブにある状態は host がそこから戻す (ほかのアーカイブより先)。 別のタブの id は
+            // このタブの目次と比べない。
+            let wanted: Vec<(ProjectKey, &str)> = ids
+                .filter_map(|(project, id)| project.map(|p| (p, id)))
+                .filter(|&(p, id)| p != self.pk() || common::ara_ids::archived_id(&target.ara_archive_ids, id).is_none())
+                .collect();
+            for command in self.dormant_ara_archive_commands(&wanted, Some(&target.plugin_id)) {
+                let device_of = |c: &PluginCommand| match c {
+                    PluginCommand::KeepDormantAraArchive { device, .. } => Some(*device),
+                    _ => None,
+                };
+                if !out.iter().any(|c| device_of(c) == device_of(&command)) {
+                    out.push(command);
+                }
+            }
+        }
+        out
+    }
+
+    /// modification `wanted` (`(それが居るタブ, id)`) の状態を保存したアーカイブに持つ、plug-in host に document の無い
+    /// device (無効のトラック / まだ document を送っていない) の、アーカイブを預ける command
+    /// (`PluginCommand::KeepDormantAraArchive`、r.md #132 残件)。 無効のトラックから移す / 写すクリップの Melodyne の
+    /// 編集はそのアーカイブにしか無い (有効なまま降ろした document は host が畳んだ時点の状態を持つ)。 `plugin_id` = 状態を
+    /// restore する device の plug-in (クリップボードの写しは `None`)。
+    pub(crate) fn dormant_ara_archive_commands(&self, wanted: &[(ProjectKey, &str)], plugin_id: Option<&str>) -> Vec<PluginCommand> {
+        let tabs = std::iter::once(&self.cur).chain(&self.tabs.parked);
+        let mut out = Vec::new();
+        for tab in tabs.filter(|tab| wanted.iter().any(|(p, _)| *p == tab.key)) {
+            let ids: Vec<&str> = wanted.iter().filter(|(p, _)| *p == tab.key).map(|(_, id)| *id).collect();
+            let holders = tab.song_doc.song().all_plugins().filter(|d| {
+                plugin_id.is_none_or(|p| d.plugin_id == p)
+                    && !tab.pipc.ara_doc_cache.contains_key(&d.id)
+                    && ids.iter().any(|id| common::ara_ids::archived_id(&d.ara_archive_ids, id).is_some())
+            });
+            out.extend(holders.filter_map(|d| {
+                Some(PluginCommand::KeepDormantAraArchive {
+                    device: common::protocol::DeviceAddr { project: tab.key, device_id: d.id },
+                    plugin_id: d.plugin_id.clone(),
+                    archive: d.ara_archive.as_deref()?.to_vec(),
+                    archive_ids: d.ara_archive_ids.clone(),
+                })
+            }));
+        }
+        out
     }
 
     /// Send `ClearAraDocument` for every cached ARA device and empty the cache.
@@ -383,9 +449,10 @@ impl AppData {
     /// playback region per **piece shown in a clip's window** (r.md #132 残件 —
     /// an event hidden outside the window is not heard, and the window's edges
     /// crop the region), on the audio modification of its content and take and
-    /// the audio source of its file (`common::ara_ids`). Times convert from
-    /// beats to seconds (ARA playback time is in seconds). File sources resolve
-    /// to an absolute path; `Generated` resolves to its materialized WAV.
+    /// the audio source of its file (`common::ara_ids`), with the takes it was
+    /// copied from (`AudioEvent::take_origins`, resolved to the tab they live in).
+    /// Times convert from beats to seconds (ARA playback time is in seconds). File
+    /// sources resolve to an absolute path; `Generated` resolves to its materialized WAV.
     pub(crate) fn collect_ara_clips_for_track(
         &self,
         track: &common::model::Track,
@@ -411,13 +478,28 @@ impl AppData {
                     source_wav,
                     source_id: common::ara_ids::source_id(event.source_id),
                     modification_id: common::ara_ids::modification_id(clip.content_id, event),
-                    modification_origin: common::ara_ids::modification_origin(song, clip.content_id, event),
+                    modification_origins: event.take_origins.iter().map(|o| self.ara_origin(o)).collect(),
                     region_key: common::ara_ids::region_key(clip.id, event.id),
                     placement: ara_region_placement(clip, &piece, sample_rate, bpm),
                 });
             }
         }
         out
+    }
+
+    /// 写した元の take `origin` を plug-in host が引ける形にする: 元のプロジェクトが開いているタブ (いまのタブを先に)。
+    fn ara_origin(&self, origin: &common::model::TakeOrigin) -> common::protocol::AraModificationOrigin {
+        let here = self.cur.song_doc.song().project_id == origin.project_id;
+        let project = if here {
+            Some(self.pk())
+        } else {
+            self.tabs.parked.iter().find(|p| p.song_doc.song().project_id == origin.project_id).map(|p| p.key)
+        };
+        common::protocol::AraModificationOrigin {
+            project,
+            project_id: origin.project_id,
+            modification_id: common::ara_ids::origin_modification_id(origin),
+        }
     }
 
     /// ARA に渡す素材 `source_id` の絶対 WAV path と sample rate。 解決できなければ `None`。

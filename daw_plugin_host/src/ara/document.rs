@@ -151,6 +151,39 @@ impl AraDocumentController {
             .unwrap_or(0)
     }
 
+    /// The archive format this document controller writes (`ARAFactory::documentArchiveID`) and the formats it
+    /// can import (`compatibleDocumentArchiveIDs`). ARAInterface.h: the ID "is shared only amongst document
+    /// controllers that create the same archives"; the compatible list names "other identifiers of archives that
+    /// the document controller can import". An archive from another document may only be restored here if its
+    /// format is one of these.
+    pub fn archive_formats(&self) -> (String, Vec<String>) {
+        /// Upper bound on the plug-in-supplied compatible-id count (defensive; real plug-ins list a handful).
+        const MAX_COMPATIBLE_IDS: usize = 64;
+        let Some(fac) = (unsafe { self.factory.as_ref() }) else {
+            return (String::new(), Vec::new());
+        };
+        let text = |id: ara_sys::ARAPersistentID| {
+            (!id.is_null()).then(|| unsafe { CStr::from_ptr(id) }.to_string_lossy().into_owned())
+        };
+        let own = text(fac.documentArchiveID).unwrap_or_default();
+        let count = fac.compatibleDocumentArchiveIDsCount.min(MAX_COMPATIBLE_IDS);
+        let compatible = if fac.compatibleDocumentArchiveIDs.is_null() || count == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: the factory owns a C array of `compatibleDocumentArchiveIDsCount` ids (clamped above).
+            let ids = unsafe { core::slice::from_raw_parts(fac.compatibleDocumentArchiveIDs, count) };
+            ids.iter().filter_map(|&id| text(id)).collect()
+        };
+        (own, compatible)
+    }
+
+    /// Whether the plug-in implements `cloneAudioModification` (a plug-in of an older ARA revision may not).
+    pub fn can_clone_audio_modification(&self) -> bool {
+        // The vtable struct is packed: copy the fn pointer out instead of borrowing the field.
+        let clone = self.interface.cloneAudioModification;
+        clone.is_some()
+    }
+
     /// Opaque controller ref for model-graph calls (audio sources, regions, …).
     pub fn controller_ref(&self) -> ARADocumentControllerRef {
         self.controller_ref
@@ -196,27 +229,36 @@ impl AraDocumentController {
         (ok != 0).then_some(writer.data)
     }
 
-    /// Serialise **only** the state of `modification` into a partial archive
-    /// (`ARAStoreObjectsFilter`, no document data, no audio sources) — the
-    /// host's copy of an object it is about to destroy, restored if the object
-    /// comes back (ARAInterface.h "Partial Document Persistency": ARA 2 plug-ins
-    /// "are required to fully support it"). Call outside an editing session
-    /// ("Archives may only be created from documents that are not being
-    /// currently edited"). `None` if unsupported or the store failed.
-    pub fn store_modification_to_archive(&self, modification: ARAAudioModificationRef) -> Option<Vec<u8>> {
+    /// Serialise **only** the state of `sources` and `modifications` into one partial archive
+    /// (`ARAStoreObjectsFilter`, no document data) — the host's copy of objects it is about to destroy, or of
+    /// objects copied into another document (ARAInterface.h "Partial Document Persistency": ARA 2 plug-ins "are
+    /// required to fully support it"; `documentData` "should be set to kARAFalse if the archive is intended for
+    /// copy/paste or other means of data import/export between documents"). A modification copied into a
+    /// document whose audio source has no state yet travels with its source's state ("Restoring an audio
+    /// modification without restoring its underlying audio source may not succeed if the audio source state has
+    /// changed since storing the audio modification"). Call outside an editing session ("Archives may only be
+    /// created from documents that are not being currently edited"). `None` if unsupported, nothing to store, or
+    /// the store failed.
+    pub fn store_partial_archive(
+        &self,
+        sources: &[ARAAudioSourceRef],
+        modifications: &[ARAAudioModificationRef],
+    ) -> Option<Vec<u8>> {
         let store = self.interface.storeObjectsToArchive?;
-        let refs = [modification];
+        if sources.is_empty() && modifications.is_empty() {
+            return None;
+        }
         let filter = ara_sys::ARAStoreObjectsFilter {
             structSize: core::mem::size_of::<ara_sys::ARAStoreObjectsFilter>(),
             documentData: ARABool::from(false),
-            audioSourceRefsCount: 0,
-            audioSourceRefs: ptr::null(),
-            audioModificationRefsCount: refs.len(),
-            audioModificationRefs: refs.as_ptr(),
+            audioSourceRefsCount: sources.len(),
+            audioSourceRefs: if sources.is_empty() { ptr::null() } else { sources.as_ptr() },
+            audioModificationRefsCount: modifications.len(),
+            audioModificationRefs: if modifications.is_empty() { ptr::null() } else { modifications.as_ptr() },
         };
         let mut writer = host_controllers::AraArchiveWriter::default();
         let writer_ref = ptr::from_mut(&mut writer) as ara_sys::ARAArchiveWriterHostRef;
-        // SAFETY: `filter` and `refs` outlive the call; ARA only reads them during it.
+        // SAFETY: `filter` and the ref arrays outlive the call; ARA only reads them during it.
         let ok = unsafe { store(self.controller_ref, writer_ref, &filter) };
         (ok != 0 && !writer.data.is_empty()).then_some(writer.data)
     }

@@ -422,7 +422,8 @@ fn ara_トラックの片は_modification_を共有し_region_は分割前の位
     let unique = common::ara_ids::region_key(second.clip_id, shown_event);
     let piece = doc.iter().find(|c| c.region_key == unique).expect("独立した片の region");
     assert_ne!(piece.modification_id, whole.modification_id, "独立した片は別の modification");
-    assert_eq!(piece.modification_origin.as_deref(), Some(whole.modification_id.as_str()), "元の編集を写して始める");
+    let origin = piece.modification_origins.first().expect("写した元");
+    assert_eq!((origin.project, origin.modification_id.as_str()), (Some(app.pk()), whole.modification_id.as_str()), "元の編集を写して始める");
     assert_eq!(doc.iter().filter(|c| c.modification_id == whole.modification_id).count(), 3, "残りの片は共有のまま");
 }
 

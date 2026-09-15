@@ -6,13 +6,48 @@
 
 use std::collections::HashMap;
 
-use super::{AudioContent, AudioEvent, StretchMode};
+use super::{AudioContent, AudioEvent, ClipContent, ContentId, StretchMode, TakeOrigin};
+
+/// [`AudioEvent::take_origins`] を何段まで覚えるか。 写した元がどこにも状態を残していなくても、さらにその元から
+/// 写せるように祖先を持つ (元の content が消えても辿れる)。
+pub const TAKE_ORIGIN_DEPTH: usize = 8;
+
+impl ClipContent {
+    /// audio の全 event を、プロジェクト `project_id` の content `content` から写したと記録する
+    /// ([`AudioEvent::record_copied_from`])。 audio 以外は何もしない (ARA の編集は audio の take にだけある)。
+    pub fn record_copied_from(&mut self, project_id: u64, content: ContentId) {
+        if let ClipContent::Audio(audio) = self {
+            for event in &mut audio.events {
+                event.record_copied_from(project_id, content);
+            }
+        }
+    }
+
+    /// [`Self::record_copied_from`] を掛けた写し (クリップボードへ載せる中身)。
+    #[must_use]
+    pub fn copied_from(&self, project_id: u64, content: ContentId) -> Self {
+        let mut copy = self.clone();
+        copy.record_copied_from(project_id, content);
+        copy
+    }
+}
 
 impl AudioEvent {
     /// この event が属する take の id ([`Self::take_id`] の doc)。 分割していない event は自分の `id`。
     #[must_use]
     pub fn take_key(&self) -> u32 {
         if self.take_id == 0 { self.id } else { self.take_id }
+    }
+
+    /// この event を、プロジェクト `project_id` の content `content` に居る **今の take から写した** と記録する
+    /// ([`Self::take_origins`] の先頭へ)。 id / take を採り直す **前** に呼ぶ (元の take を指すため)。
+    pub fn record_copied_from(&mut self, project_id: u64, content: ContentId) {
+        let origin = TakeOrigin { project_id, content, take: self.take_key(), source: self.source_id };
+        if self.take_origins.first() == Some(&origin) {
+            return;
+        }
+        self.take_origins.insert(0, origin);
+        self.take_origins.truncate(TAKE_ORIGIN_DEPTH);
     }
 
     /// take の長さ (拍) = 見えている長さ + 頭と尻の隠れている分。 `source_*_frames` の窓はこの長さへ
@@ -317,7 +352,8 @@ impl AudioContent {
     ///
     /// 来た event の中で同じ take だった片同士は、ここでも同じ take にまとめる (片を並べて貼ったら
     /// Glue で元に戻せる)。 元の take とは別の take になる — ARA の編集 (audio modification) は
-    /// content と take で 1 つなので、写した先は元と編集を共有しない。
+    /// content と take で 1 つなので、写した先は元と編集を共有しない (元の編集から始めるのは、写す側が
+    /// 付けた [`AudioEvent::take_origins`] による)。
     pub fn adopt_events(&mut self, events: impl IntoIterator<Item = AudioEvent>) -> Vec<usize> {
         let mut takes: HashMap<u32, u32> = HashMap::new();
         let mut added = Vec::new();

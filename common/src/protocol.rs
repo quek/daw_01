@@ -262,9 +262,17 @@ pub struct SlotState {
     pub data: Option<Vec<u8>>,
     /// (r.md #5 ARA2) ARA document archive for this device, if it is an ARA
     /// plug-in with a live session. Collected alongside `data` on project save
-    /// and stored into `PluginInstance.ara_archive`.
-    pub ara_archive: Option<Vec<u8>>,
+    /// and stored into `PluginInstance.ara_archive` (its table of contents into
+    /// `PluginInstance.ara_archive_ids`).
+    pub ara_archive: Option<AraArchive>,
     pub error: Option<String>,
+}
+
+/// plug-in host が書いた ARA アーカイブと、その **目次** (中にある audio source / audio modification の persistent id)。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct AraArchive {
+    pub bytes: Vec<u8>,
+    pub ids: Vec<String>,
 }
 
 /// Timeline placement + stretch of one ARA playback region, in seconds. Shared
@@ -304,12 +312,24 @@ pub struct AraClipSpec {
     /// ARA audio modification の persistent id (content と take ごとに 1 つ、`ara_ids::modification_id`)。
     /// 同じ id の region は 1 つの modification を共有する (分割の片は Melodyne の編集を共有する)。
     pub modification_id: String,
-    /// modification を新しく作るとき、編集を写して始める元の modification (`ara_ids::modification_origin`、
-    /// content を複製して共有を解いた場合)。
-    pub modification_origin: Option<String>,
+    /// modification を document に新しく作るとき、編集を写して始める元の候補 (近い順、event の
+    /// `AudioEvent::take_origins`)。 自分の状態がどこにも無いときに使う (`daw_plugin_host::ara::graph_plan`)。
+    pub modification_origins: Vec<AraModificationOrigin>,
     /// playback region のキー (`ara_ids::region_key`、永続しない)。
     pub region_key: String,
     pub placement: AraRegionPlacement,
+}
+
+/// 写して始める元の modification 1 つ ([`AraClipSpec::modification_origins`])。
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct AraModificationOrigin {
+    /// 元の take が居るプロジェクトの engine slot。 開いていなければ `None` (クリップボードの写しからだけ引ける)。
+    pub project: Option<ProjectKey>,
+    /// 元の take が居たプロジェクトの `Song::project_id` (クリップボードの写し
+    /// [`PluginCommand::SnapshotAraClipboard`] を引く鍵)。
+    pub project_id: u64,
+    /// 元の modification の persistent id (元のプロジェクトの id の空間、`ara_ids::origin_modification_id`)。
+    pub modification_id: String,
 }
 
 /// A lightweight update of an existing ARA playback region's placement, matched
@@ -1112,12 +1132,27 @@ pub enum PluginCommand {
         /// objects that already live in the document keep their live edits.
         /// `None` for a fresh document.
         archive: Option<Vec<u8>>,
-        /// `archive` が旧 persistent id で書かれているときの読み替え表
-        /// (`PluginInstance.ara_archive_ids`、空 = 今の id のまま)。
-        archive_ids: Vec<crate::ara_ids::AraIdAlias>,
+        /// `archive` の目次 (`PluginInstance.ara_archive_ids`): 中にある object の今の id と書かれている id。
+        archive_ids: Vec<crate::ara_ids::AraArchiveEntry>,
     },
     /// (r.md #5 ARA2) Tear down the ARA document/session for `device`.
     ClearAraDocument { device: DeviceAddr },
+    /// (r.md #132 残件) クリップボードへ写した audio の take の Melodyne の編集を、**写した時点の状態** で取っておく
+    /// (`project` の document に居る modification `modifications` の partial archive、前の写しは捨てる)。 元の
+    /// プロジェクトを閉じた後に貼っても、貼った take は写した元の編集から始まる
+    /// ([`AraModificationOrigin::project_id`] で引く)。
+    SnapshotAraClipboard { project: ProjectKey, project_id: u64, modifications: Vec<String> },
+    /// (r.md #132 残件) plug-in host に document の無い ARA device `device` (無効のトラックに居る / まだ組んでいない) の
+    /// 保存したアーカイブ (`PluginInstance.ara_archive` と目次) を、そこから移す / 写す take の状態の元として預ける
+    /// (daw_gui が、組み直す document に新しく現れる modification の状態をこのアーカイブが持つときだけ送る)。
+    /// `plugin_id` の同じ device の document にだけ restore する。 同じ device の document を組むか、プロジェクトを
+    /// 閉じると捨てる。
+    KeepDormantAraArchive {
+        device: DeviceAddr,
+        plugin_id: String,
+        archive: Vec<u8>,
+        archive_ids: Vec<crate::ara_ids::AraArchiveEntry>,
+    },
     /// (r.md #7 ARA2) Update only the playback-region placements of an
     /// existing ARA document (matched by `region_key`).
     UpdateAraRegions {

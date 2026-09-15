@@ -43,6 +43,7 @@ mod view_state;
 mod track;
 mod track_enable;
 mod window_edit;
+pub use audio_take::TAKE_ORIGIN_DEPTH;
 pub use automation::*;
 pub use bounce_ops::*;
 pub use clip_window::*;
@@ -314,13 +315,22 @@ pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, ru
 /// warp marker の拍は take の座標)、4 種の event の fade ランプの張り出し
 /// (`fade_in_lead_beats` / `fade_out_trail_beats`)、`TextEvent::continuation` (読み上げない続きの片)、
 /// `AudioEvent::take_id` (片が継ぐ take の安定 id = ARA の audio modification の単位)、`Song::content_forked_from`
-/// (共有を解いた content の複製元 = modification の編集を写す元)。 ARA のアーカイブ
+/// (共有を解いた content の複製元 = modification の編集を写す元、v43 で撤去)。 ARA のアーカイブ
 /// は位置由来の旧 persistent id から安定 id へ読み替える表を `PluginInstance::ara_archive_ids` に持つ
 /// (旧ファイルの load で作る、`crate::ara_ids::migrate_legacy_archives`)。
 /// 旧ファイルは `serde(default)` の 0 / `false` (= 分割していない event) で読める (migration 不要)。
 /// 新ファイルを旧ビルドで開くと片が窓を失い、続きの片が同じ文をもう一度読み上げる (未知フィールドを
 /// 捨てる) ので、版を上げて gate で弾く。
-pub const CURRENT_VERSION: u32 = 42;
+///
+/// v43 (r.md #132 残件、ARA のコピー): コピーは元と同じ音で鳴る — どの経路で写した take も元の take の Melodyne の
+/// 編集から始める。 写した元を **take ごと** に [`AudioEvent::take_origins`] に持ち (独立コピー / 貼り付け / 複製 /
+/// 別のプロジェクトからの貼り付け、分割の片は継ぐ)、v42 の `Song::content_forked_from` (content ごとで、event の
+/// 貼り付けや祖先を表せなかった) を撤去した。 `PluginInstance::ara_archive_ids` は **アーカイブの目次** (中に
+/// ある全 object の今の id と書かれている id、`crate::ara_ids::AraArchiveEntry`) になった。 v42 のファイルは
+/// `content_forked_from` を複製の event の `take_origins` へ移し、目次の無いアーカイブにはトラックの document の
+/// object から目次を作る (`project::migrate_forked_contents_to_take_origins` / `ara_ids::migrate_archive_contents`)。
+/// 新ファイルを旧ビルドで開くと写した元が消え、目次を旧い読み替え表と取り違えるので、版を上げて gate で弾く。
+pub const CURRENT_VERSION: u32 = 43;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -562,16 +572,6 @@ pub struct Song {
     /// v19 files forward-migrate to a map backfilled from `Clip.name`.
     #[serde(default)]
     pub clip_content_names: HashMap<ContentId, String>,
-    /// v42 (r.md #132 残件): audio content を複製して共有を解いたとき ([`Song::fork_content`]: Make Unique /
-    /// 共有 content の伸縮 / トラック複製など) の **複製元**。 ARA の audio modification は content と
-    /// take ごとなので (`crate::ara_ids`)、複製した content の modification は、plug-in host の document に
-    /// 初めて現れるとき複製元の編集を写して始める (Melodyne の編集が共有を解いても続く、別々に編集できる
-    /// variation。 一度 document に居た modification は自分の状態から戻る、`daw_plugin_host::ara::graph_plan::
-    /// modification_start`)。 キーの content が消えたら `gc_clip_contents` が落とす (複製元が消えていても、
-    /// そのアーカイブから写せるので値は残す)。 旧 ARA アーカイブの読み込みで分けた content は、クリップごとの
-    /// 編集をアーカイブに持つので記録しない (`crate::ara_ids::migrate_legacy_archives`)。
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub content_forked_from: HashMap<ContentId, ContentId>,
     /// §10 bullet 4: imported media source プール (audio / video / image)。旧 .daw は
     /// `audio_sources` / `video_sources` / `image_sources` を Song 直下にフラット保存していたが、
     /// serde `flatten` は `HashMap<u32, _>` の整数キーを content-buffer 経由で復元できない
@@ -752,7 +752,6 @@ impl Default for Song {
             },
             clip_contents: HashMap::new(),
             clip_content_names: HashMap::new(),
-            content_forked_from: HashMap::new(),
             media: MediaPools::default(),
             song_lanes: Vec::new(),
             midi_bindings: Vec::new(),
@@ -1215,14 +1214,13 @@ impl Song {
     /// content payload AND its shared name under a fresh id. Use at every
     /// independent-copy / Make-Unique site. Returns the new id. The
     /// source content/name are left untouched.
+    ///
+    /// audio の take は複製元の take から写したと記録する ([`AudioEvent::take_origins`]) — ARA の audio
+    /// modification は content と take ごとなので、複製の modification は複製元の編集を写して始める。
     pub fn fork_content(&mut self, src: ContentId) -> ContentId {
-        let content = self.clip_contents.get(&src).cloned().unwrap_or_default();
+        let content = self.clip_contents.get(&src).map(|c| c.copied_from(self.project_id, src)).unwrap_or_default();
         let name = self.clip_content_names.get(&src).cloned();
         let id = self.alloc_content_id();
-        // 複製元を覚えるのは ARA の audio modification を持つ audio content だけ (`content_forked_from`)。
-        if matches!(content, ClipContent::Audio(_)) {
-            self.content_forked_from.insert(id, src);
-        }
         self.clip_contents.insert(id, content);
         if let Some(name) = name {
             self.clip_content_names.insert(id, name);
@@ -1486,7 +1484,6 @@ impl Song {
         // Shared names follow content lifecycle: drop names whose
         // content_id no longer has any referencing clip.
         self.clip_content_names.retain(|id, _| live.contains(id));
-        self.content_forked_from.retain(|id, _| live.contains(id));
     }
 
     /// クリップ (arrangement / launcher セル / track・song automation lane) から
