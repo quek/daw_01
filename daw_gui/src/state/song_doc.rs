@@ -113,6 +113,14 @@ pub struct EventSave {
     outer_label: Option<&'static str>,
 }
 
+impl EventSave {
+    /// dispatch の一番外の event か (handler の中から呼ばれた入れ子でない)。
+    #[must_use]
+    pub fn is_outermost(&self) -> bool {
+        self.outer_label.is_none()
+    }
+}
+
 /// Begin/End bracket を持たない連続編集源の識別子
 /// ([`SongDoc::use_stream_scope`] のキー)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -100,14 +100,14 @@ impl AppData {
     /// LoadSong して engine state を復元する。歌唱の合成待ちは `request_bounce` が前段で行う。
     /// `label` = 発注した操作の履歴ラベル (完了時の 1 undo step の名前)。
     pub(crate) fn start_clip_bounce(&mut self, target: ClipKey, mode: BounceMode, label: &'static str) {
-        // Glue の焼き込みも同じ offline render を使う (engine は同時 1 本)。
-        if self.cur.pipc.pending_clip_fx_bounce.is_some() || self.cur.pipc.pending_glue_bake.is_some() {
-            self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
+        // 書き出し / 解析 / Glue の焼き込みも同じ offline render を使う (engine は同時 1 本)。
+        if self.refuse_render_while_another("Bounce") {
             return;
         }
-        // 歌唱の合成待ち (`request_bounce`) を挟んでも、焼き始める瞬間に確かめる。
-        if self.reject_offline_render_while_loading("Bounce") {
-            return;
+        // 歌唱の合成待ち (`request_bounce`) の間に plugin を足していれば、焼き始める瞬間にもう一度待つ
+        // (確定したら `request_bounce` からやり直す = 合成が最新かも確かめ直す)。
+        if self.plugin_loads_pending() {
+            return self.defer_render(PendingRender::Bounce { target, mode, label });
         }
         let Some(track) = self.cur.song_doc.song().track_by_id(target.track_id) else {
             return;
@@ -202,7 +202,8 @@ impl AppData {
     /// In Place = 音源/synth の素の音 (insert FX 抜き) を engine offline
     /// render で焼き、**同じクリップに置換** (async)。歌唱の合成待ちは `request_bounce` 経由。
     pub(crate) fn bounce_clip_in_place(&mut self, target: ClipKey) {
-        self.request_bounce(target, BounceMode::InPlace);
+        let label = self.cur.song_doc.event_label();
+        self.request_bounce(target, BounceMode::InPlace, label);
     }
 
     /// track の builtin VOICEVOX device の安定 device id を返す
@@ -224,12 +225,12 @@ impl AppData {
     /// 送り、 plugin host の `VocalSynthReady`（builtin の synth 世代が最新メタデータまで
     /// 進んだ通知）を待ってから `start_clip_bounce` する。歌唱以外 (Audio / 通常 MIDI)、
     /// または plugin_id 未確定なら即 `start_clip_bounce`。
-    pub(crate) fn request_bounce(&mut self, target: ClipKey, mode: BounceMode) {
-        if self.cur.pipc.pending_clip_fx_bounce.is_some()
-            || self.cur.pipc.pending_vocal_synth_bounce.is_some()
-            || self.cur.pipc.pending_glue_bake.is_some()
-        {
-            self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
+    ///
+    /// plugin の読み込みが残っていれば、歌唱かどうかを決める前に確定を待つ (`PendingRender::Bounce`、読み込み待ち
+    /// からの再開もここ) — 読み込み中の VOICEVOX は `vocal_builtin_plugin_id` に出ないので、待たずに決めると合成を
+    /// 待たずに焼く。`label` = 発注した操作の履歴ラベル (完了時の 1 undo step の名前)。
+    pub(crate) fn request_bounce(&mut self, target: ClipKey, mode: BounceMode, label: &'static str) {
+        if self.refuse_render_while_another("Bounce") {
             return;
         }
         // r.md #131: 無効なトラックは実行系に居ない (plugin も host から降りている) ので焼けない。焼くと無音 /
@@ -237,6 +238,9 @@ impl AppData {
         if !self.cur.song_doc.song().track_effectively_enabled(target.track_id) {
             self.ui_ephemeral.status_message = "Bounce: 無効なトラックは焼けません (有効にしてから)".into();
             return;
+        }
+        if self.plugin_loads_pending() {
+            return self.defer_render(PendingRender::Bounce { target, mode, label });
         }
         // 歌唱トラック + builtin plugin_id 解決済み → 合成完了を待ってから render。
         // 待ち中の編集で index が動いても追跡できるよう stable id で退避する。
@@ -249,7 +253,6 @@ impl AppData {
                 let clip_id = t.clip_by_id(target.clip_id)?.id;
                 Some((plugin_id, t.id, clip_id))
             });
-        let label = self.cur.song_doc.event_label();
         if let Some((device_id, track_id, clip_id)) = vocal {
             self.cur.pipc.pending_vocal_synth_bounce =
                 Some(PendingVocalSynthBounce { track_id, clip_id, mode, label });
@@ -278,7 +281,8 @@ impl AppData {
     /// isolate するので他トラックは混ざらない
     /// (旧実装は時間範囲の全ミックスを焼くバグがあった)。歌唱の合成待ちは `request_bounce` 経由。
     pub(crate) fn bounce_clip_with_fx(&mut self, target: ClipKey) {
-        self.request_bounce(target, BounceMode::WithFx);
+        let label = self.cur.song_doc.event_label();
+        self.request_bounce(target, BounceMode::WithFx, label);
     }
 
     /// bounce 完了/失敗時に、 `start_clip_bounce` が `LoadSong(isolated)` で退避させた

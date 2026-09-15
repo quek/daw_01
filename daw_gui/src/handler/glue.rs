@@ -254,11 +254,18 @@ impl AppData {
             self.ui_ephemeral.status_message = "Glue: 範囲を選択してください".to_string();
             return;
         };
-        if self.cur.pipc.pending_glue_bake.is_some() || self.cur.pipc.pending_clip_fx_bounce.is_some() {
-            self.ui_ephemeral.status_message =
-                "Glue: 焼き込み中です。 完了をお待ちください".into();
-            return;
-        }
+        let label = self.cur.song_doc.event_label();
+        self.glue_selection(sel, label);
+    }
+
+    /// `sel` を結合する本体 (`J` と、読み込み待ちからの再開の共通の口)。`label` = `J` の履歴ラベル。
+    /// audio を焼くときは plugin の読み込みが残っていれば確定を待つ (`PendingRender::Glue`) — 再開時はそのときの
+    /// Song で `sel` の中身を集め直す。
+    ///
+    /// ほかの描画との排他 (`refuse_render_while_another`) は **焼くときだけ**。audio の無い結合は engine を使わない
+    /// ただの編集なので、ほかの編集と同じ規則に従う — 描画が走っている間は `edit_song` の書き出しロックが断り、
+    /// 読み込み待ちで開始を待っている (まだ何も占有していない) 間はそのまま結合する。
+    pub(crate) fn glue_selection(&mut self, sel: TimeSelection, label: &'static str) {
         let refs_by_track = self.glue_refs_by_track(&sel, false);
         if refs_by_track.is_empty() {
             tracing::warn!("Glue: 範囲内にクリップが無い");
@@ -271,8 +278,11 @@ impl AppData {
             .map(|(id, _)| *id)
             .collect();
         if audio_tracks.is_empty() {
-            let label = self.cur.song_doc.event_label();
             self.apply_glue(&sel, &BTreeMap::new(), label);
+            return;
+        }
+        // engine の offline render は同時に 1 本 (書き出し / 解析 / Bounce / Glue の焼き込み、読み込み待ちの開始待ちを含む)。
+        if self.refuse_render_while_another("Glue") {
             return;
         }
         // r.md #131: audio の結合は offline render で焼く。無効なトラックは実行系に居ないので焼けない。
@@ -280,10 +290,10 @@ impl AppData {
             self.ui_ephemeral.status_message = "Glue: 無効なトラックの audio は焼けません (有効にしてから)".into();
             return;
         }
-        if self.reject_offline_render_while_loading("Glue") {
-            return;
+        if self.plugin_loads_pending() {
+            return self.defer_render(PendingRender::Glue { sel, label });
         }
-        self.start_glue_bake(sel, &audio_tracks);
+        self.start_glue_bake(sel, &audio_tracks, label);
     }
 
     /// 選択範囲 × レーンに掛かるクリップをトラック別 (開始拍順) に集める。
@@ -325,7 +335,7 @@ impl AppData {
     }
 
     /// audio トラックの焼き込みキューを組んで 1 本目の render を撃つ。
-    fn start_glue_bake(&mut self, sel: TimeSelection, tracks: &[u32]) {
+    fn start_glue_bake(&mut self, sel: TimeSelection, tracks: &[u32], label: &'static str) {
         let refs_by_track = self.glue_refs_by_track(&sel, false);
         let mut jobs: Vec<GlueBakeJob> = Vec::with_capacity(tracks.len());
         for &track_id in tracks {
@@ -352,7 +362,6 @@ impl AppData {
         }
         self.ui_ephemeral.status_message =
             format!("Glue: {} トラックを焼き込み中...", jobs.len());
-        let label = self.cur.song_doc.event_label();
         self.cur.pipc.pending_glue_bake = Some(PendingGlueBake { sel, jobs, current: 0, label });
         if !self.send_glue_bake(0) {
             self.abort_glue_bake("Glue: 焼き込みを開始できませんでした".into());

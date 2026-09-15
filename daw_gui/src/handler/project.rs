@@ -122,6 +122,10 @@ impl AppData {
         // 指すクリップが置かれる = 開いた直後の曲が黙って壊れる)。
         self.cur.pipc.pending_clip_fx_bounce = None;
         self.cur.pipc.pending_vocal_synth_bounce = None;
+        // 読み込み待ちで預かった描画も前の曲のもの (前の曲の clip / 範囲 / 書き出し先)。まだ何も始めていないので捨てる。
+        if let Some(render) = self.cur.transport.pending_render.take() {
+            self.ui_ephemeral.status_message = format!("プロジェクトを切り替えたので{}を中止しました", render.name());
+        }
         if self.cur.pipc.pending_glue_bake.is_some() {
             self.abort_glue_bake(
                 "プロジェクトを切り替えたので Glue の焼き込みを中止しました".into(),
@@ -602,12 +606,13 @@ impl AppData {
 
     /// background decode から 1 件 decode 完了するたびに発火。 staging に
     /// 溜まった結果を self caches へ流し込み (= 該当 clip の波形 / 画像が描画
-    /// 開始)、 全件完了で gate を外して queue 中の Play を流す。
+    /// 開始)。 音が揃えば (`audio_decode_pending` が偽になれば、画像 / サムネイルは待たない)
+    /// queue 中の Play は、この event の終わりに `resume_after_plugin_loads` が流す。
     pub(crate) fn on_asset_decode_tick(&mut self) {
         let Some(staging) = self.cur.media.asset_decode.clone() else {
             return;
         };
-        let (audio, image, video_thumbnail, done, total, audio_remaining) = {
+        let (audio, image, video_thumbnail, done, total) = {
             let Ok(mut g) = staging.lock() else {
                 return;
             };
@@ -617,7 +622,6 @@ impl AppData {
                 std::mem::take(&mut g.video_thumbnail),
                 g.done,
                 g.total,
-                g.audio_remaining,
             )
         };
         for (id, buf) in audio {
@@ -630,10 +634,6 @@ impl AppData {
         for (id, (w, h, rgba)) in video_thumbnail {
             self.cur.media.video_thumbnail_rgba.insert(id, (w, h, rgba));
             self.cur.media.pending_thumbnail_uploads.push(id);
-        }
-        // 音が揃った時点で再生 gate を外す (画像 / サムネイルは待たない)。
-        if audio_remaining == 0 && self.cur.transport.pending_play.is_some() {
-            self.fire_pending_play();
         }
         if done >= total {
             tracing::info!(total, "asset decode complete");

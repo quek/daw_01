@@ -111,7 +111,8 @@ pub struct UiEphemeral {
     pub plugin_picker_query: String,
     pub is_plugin_picker_open: bool,
     /// r.md #110: picker を開いた `+ Plugin` の chain (挿入先)。 `None` = cursor track の
-    /// top-level 末尾。
+    /// top-level 末尾。 picker が開いている間 (`is_plugin_picker_open`) だけ有効 — 閉じた後の
+    /// 値は読まない (`AppData::select_plugin_from_db`)。
     pub plugin_picker_target: Option<common::model::ChainRef>,
     /// 検索結果リスト ([`plugin_picker_visible`]) 内のカーソル位置 (0-based)。
     /// `text_input` focus 中の ↑↓ (gui_01 #057 / Phase 86 `TextInputResponse::nav_up/nav_down`)

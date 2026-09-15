@@ -56,6 +56,8 @@ pub mod range_ops;
 pub mod recovery;
 /// r.md #129: Rack の Par パネルの開閉 (見方の都合)。
 pub mod rack_view;
+/// オフライン描画を plugin の読み込みの確定まで待たせる門と、読み込み待ちの要求 (再生 A7 を含む) を出す唯一の口。
+pub mod render_wait;
 pub mod save_bundle;
 /// `AppEvent::Section(..)` の入口 (Arranger セクション帯の編集)。
 pub mod section_event;

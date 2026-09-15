@@ -10,7 +10,8 @@ use common::protocol::AudioCommand;
 pub(crate) enum PlayOutcome {
     /// engine へ `Play` を送った (実際に走り出したかは `on_tick` が観測する)。
     Started,
-    /// 読み込み待ちで queue した。 完了時に `pending_play` が再発火する。
+    /// 読み込み待ちで queue した。 揃った event の終わりに `pending_play` が再発火する
+    /// (`resume_after_plugin_loads`)。
     Queued,
     /// 開始できない (書き出し中)。 status_message は `play()` が出している。
     Refused,
@@ -46,16 +47,9 @@ impl AppData {
         // 再生できてしまい render を壊しえた）。
         // r.md #54: ラウドネス解析も同じ freewheel 経路なので同じ gate で止める
         // (解析中はオーディオ出力が無音化され、プラグインは走査スレッドが占有する
-        // ので、そもそも音は出せない)。
-        if self.offline_render_busy() {
-            self.ui_ephemeral.status_message = if self.cur.loudness.phase.is_busy() {
-                "ラウドネス解析中は再生できません".into()
-            } else if !self.export_or_analysis_busy() {
-                // bounce / Glue の焼き込みも同じ freewheel を占有する。
-                "焼き込み中は再生できません".into()
-            } else {
-                "書き出し中は再生できません".into()
-            };
+        // ので、そもそも音は出せない)。読み込み待ちで開始を待っている書き出し / 解析も同じ。
+        if let Some(reason) = self.offline_render_refuses_play() {
+            self.ui_ephemeral.status_message = reason.into();
             return PlayOutcome::Refused;
         }
         // プロジェクトロードの asset decode 中は音声がまだ揃って
@@ -133,8 +127,8 @@ impl AppData {
         PlayOutcome::Started
     }
 
-    /// 読み込み待ちで queue しておいた再生要求を発火する (プラグインロード完了 /
-    /// asset decode 完了の 3 経路から呼ぶ唯一の口)。 queue 時に「録音だったか /
+    /// 読み込み待ちで queue しておいた再生要求を発火する (読み込みと asset decode が揃った
+    /// event の終わりに `resume_after_plugin_loads` が呼ぶ)。 queue 時に「録音だったか /
     /// count-in が何拍か」を復元するので、録音開始が queue されても録音のまま再開する。
     pub(crate) fn fire_pending_play(&mut self) {
         let Some(from) = self.cur.transport.pending_play.take() else { return };
@@ -297,24 +291,6 @@ impl AppData {
         generation
     }
 
-    /// オフライン描画 (WAV / Video 書き出し・ラウドネス解析・Bounce・Glue) を **plugin の読み込みが全部確定してから**
-    /// だけ始める門。読み込み中なら理由を status に出して `true` (呼び出し側は始めない)。
-    ///
-    /// 読み込み中の plugin を鳴らすトラックは engine のグラフに入らない (r.md #131、`Song::executable_mask`) ので、
-    /// そのまま焼くとそのトラックは無音になる。しかも書き出し / 解析の間は host の instance を組み替えないよう
-    /// 読み込み応答を捨てる (`AppData::handle_event` の block-list) — 捨てた device は応答待ちのまま残り、終わった
-    /// 後もそのトラックは鳴らず、再生も A7 で待ち続ける。再生 (A7) は待ち合わせるが、オフライン描画は他の前提
-    /// (描画中 / 音声エンジン不在) と同じく始めない。
-    pub(crate) fn reject_offline_render_while_loading(&mut self, what: &str) -> bool {
-        let remaining = self.cur.pipc.pending_plugin_loads.len();
-        if remaining == 0 {
-            return false;
-        }
-        self.ui_ephemeral.status_message =
-            format!("{what}: プラグインの読み込み中は開始できません (残 {remaining})");
-        true
-    }
-
     /// 停止を **要求する** 唯一の口。 実際に止まったことの反映 (録音セッションを閉じる /
     /// 停止位置の確定) は、engine が止まったのを観測した [`Self::on_transport_stopped`]
     /// が行う。
@@ -322,7 +298,13 @@ impl AppData {
     /// 録音セッションだけはここでも即座に閉じる。ユーザーが明示的に止めた以上、
     /// 観測が届くまでの数十 ms に鍵盤を叩いたぶんが録音に混ざってはいけない。
     /// クローズは冪等なので二重に呼ばれても害はない。
+    ///
+    /// 読み込み待ちで預かった再生 (A7 の `pending_play`、読み込みで一時停止した再生の再開を含む) も取り消す —
+    /// 止めた後に読み込みが確定して (応答 / 失敗 / 読み込み中の device を消す undo) 勝手に走り出さないように。
+    /// 読み込みのための一時停止は `track_pending_load` が `Stop` を直に送るのでここを通らない。
     pub(crate) fn stop(&mut self) {
+        self.cur.transport.pending_play = None;
+        self.cur.transport.pending_play_record = None;
         self.send_audio(AudioCommand::Stop { project: self.pk() });
         self.close_recording_session();
     }

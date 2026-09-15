@@ -112,6 +112,8 @@ impl AppData {
         }
         // in-process の映像 render はタブごとの cancel フラグで畳む。
         self.for_each_tab(AppData::cancel_inflight_video_export);
+        // 読み込み待ちで預かった描画は、まだ何も始めていないので捨てるだけ (待機表示も消える)。
+        self.for_each_tab(|app| app.cur.transport.pending_render = None);
 
         // (2) transport 停止。
         for key in self.tabs.order.clone() {

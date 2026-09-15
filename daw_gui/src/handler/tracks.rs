@@ -1345,16 +1345,6 @@ impl AppData {
         }
     }
 
-    pub(crate) fn ensure_first_track(&mut self) {
-        if self.cur.song_doc.song().tracks.is_empty() {
-            self.edit_song(|song| {
-                let id = song.alloc_track_id();
-                song.tracks.push(track_with(|t| t.id = id));
-            });
-            self.resize_track_peak_display();
-        }
-    }
-
 }
 
 /// r.md #87: トラックの copy/paste/複製が **ランチャーのセル** を落とさないこと。

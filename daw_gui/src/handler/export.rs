@@ -49,13 +49,18 @@ impl AppData {
     /// で `kind` に応じた既存の export action (file dialog) を起動する。 Ardour /
     /// REAPER の time-selection export と同じ「範囲を指定して書き出す」 UX。
     pub(crate) fn open_export_range_picker(&mut self, kind: ExportRangeKind) {
-        // video export は実行中だと二重起動できない (旧 action_open_export_mp4_dialog
-        // のガードをここへ移設)。
-        if matches!(kind, ExportRangeKind::Mp4)
-            && (self.cur.transport.export_stage.is_some()
-                || self.cur.transport.pending_video_export.is_some()
-                || self.ui_ephemeral.export_dialog_open)
-        {
+        // engine の offline render は同時に 1 本。走っている / 読み込み待ちで開始を待っている描画があれば、範囲と
+        // 保存先を選ばせる前に断る (選ばせてから断ると入力が無駄になる)。
+        let what = match kind {
+            ExportRangeKind::Wav => "WAV 書き出し",
+            ExportRangeKind::Mp4 => "Video export",
+            ExportRangeKind::Loudness => "ラウドネス解析",
+        };
+        if self.refuse_render_while_another(what) {
+            return;
+        }
+        // video export の保存先ダイアログが開いている間は二重起動しない。
+        if matches!(kind, ExportRangeKind::Mp4) && self.ui_ephemeral.export_dialog_open {
             self.ui_ephemeral.status_message = "Video export を実行中です".into();
             return;
         }
@@ -148,6 +153,38 @@ impl AppData {
         .filter(|(s, e)| e > s)
     }
 
+    /// 保存先が決まった WAV 書き出しを始める (`FileDialogKind::ExportWav` の後段と、読み込み待ちからの再開の共通の口)。
+    /// plugin の読み込みが残っていれば確定を待ってから始める (`PendingRender::Wav`)。
+    pub(crate) fn export_wav_to(&mut self, path: PathBuf, range: Option<(f64, f64)>) {
+        // audio engine が死んでいる (respawn 失敗 / crash-loop give-up で
+        // audio_tx=None) と、ExportWav は send_audio に黙って drop される。
+        // ここで export_stage を立ててしまうと完了通知が永遠に来ず overlay
+        // + 入力 gate で GUI が永久ロックする。先にガードして start しない。
+        if self.ipc.audio_tx.is_none() {
+            self.ui_ephemeral.status_message =
+                "音声エンジンが利用できないため WAV 書き出しを開始できません".into();
+            return;
+        }
+        if self.refuse_render_while_another("WAV 書き出し") {
+            return;
+        }
+        if self.plugin_loads_pending() {
+            return self.defer_render(PendingRender::Wav { path, range });
+        }
+        self.ui_ephemeral.status_message = "WAV 書き出し中...".to_string();
+        // 進捗オーバーレイ（modal）を即表示。最初の `ExportWavProgress` が
+        // 来るまでは 0% 表示、以降 daw_audio の freewheel 進捗で更新、
+        // `ExportWavComplete` で None に戻して閉じる。これで WAV export 中
+        // の入力 gate / 再生抑止も video と同様に効く。
+        self.cur.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
+        self.cur.transport.export_progress_at = Some(std::time::Instant::now());
+        // standalone WAV export — stop → reinit plugins →
+        // (on PluginsReinitDone) ExportWav。begin_wav_export が再生停止 /
+        // LoadSong / SetRenderMode(Offline) / 全 plugin 再初期化を行う。
+        // modulation は音に焼き込み済みなので `.modenv` sidecar は書かない。
+        self.begin_wav_export(path, range, false);
+    }
+
     /// begin an offline WAV export the right way — stop playback,
     /// push the latest song + offline render mode, then **reinitialise every
     /// plugin** (deactivate→activate) for a clean cold render before the render
@@ -202,14 +239,6 @@ impl AppData {
         }
     }
 
-    /// 子プロセス切断時に、進行中の bounce / 書き出しを畳む脱出口。中止したら `true`。
-    ///
-    /// bounce 進行中の crash では `BounceClipFxComplete` / `VocalSynthReady` が永遠に
-    /// 来ない。pending を放置すると以後の bounce が全て「既に bounce 中」で拒否され、
-    /// audio 側は isolated song のまま残る。`abort_audio_export` と同型の脱出口
-    /// (どちらの子の crash でも安全に解除できる)。
-    ///
-    /// r.md #75 の合成完了ゲート (`pending_vocal_synth_export`) も同じ理由で畳む。
     /// 走っている **映像** 書き出し (in-process の render スレッド) に中断を伝える。
     /// engine 側の freewheel は `AudioCommand::CancelExport` の担当なので触らない。
     /// 終了シーケンスが全タブぶん呼ぶ (`docs/plan_project_tabs.md` §5.4)。
@@ -219,8 +248,18 @@ impl AppData {
         }
     }
 
+    /// 子プロセス切断時に、進行中の bounce / 書き出しを畳む脱出口。中止したら `true`。
+    ///
+    /// bounce 進行中の crash では `BounceClipFxComplete` / `VocalSynthReady` が永遠に
+    /// 来ない。pending を放置すると以後の bounce が全て「Bounce の実行中」で拒否され、
+    /// audio 側は isolated song のまま残る。`abort_audio_export` と同型の脱出口
+    /// (どちらの子の crash でも安全に解除できる)。
+    ///
+    /// r.md #75 の合成完了ゲート (`pending_vocal_synth_export`) も同じ理由で畳む。
     pub(crate) fn abort_inflight_renders_on_disconnect(&mut self) -> bool {
-        let mut aborted = false;
+        // 読み込み待ちで預かった描画も畳む: plugin host が落ちると読み込みの帳簿ごと消え、この event の終わりに
+        // (読み込みが空に見えて) 走り出してしまう。走っている描画を中止するのと同じ規則。
+        let mut aborted = self.cur.transport.pending_render.take().is_some();
         // `J` (Glue) の焼き込みも同じ offline render を使う。 自前の後始末
         // (出力ファイルの削除 + bookend + engine song 復元) を持っているので、
         // pending を落とすだけでなくそちらへ委ねる。
@@ -241,6 +280,30 @@ impl AppData {
         }
         aborted
             | self.abort_vocal_synth_export_gate("子プロセスが切断されたため書き出しを中止しました")
+    }
+
+    /// 進捗オーバーレイの キャンセル / Esc (`AppEvent::CancelExport`)。読み込み待ちなら預かった書き出しを捨てるだけ、
+    /// 映像フェーズは in-process の flag、音声フェーズは daw_audio への cancel。
+    pub(crate) fn cancel_export(&mut self) {
+        if self.cancel_pending_render(PendingRender::is_export) {
+            return;
+        }
+        match self.cur.transport.export_stage {
+            // 映像フェーズは daw_gui プロセス内の render thread。in-process の
+            // atomic flag で次フレーム中断させる。
+            Some(ExportStage::VideoRender { .. }) => {
+                if let Some(flag) = &self.cur.transport.export_cancel {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.ui_ephemeral.status_message = "Video export をキャンセル中...".into();
+                }
+            }
+            // 音声 freewheel は daw_audio プロセス。IPC で cancel を送り、
+            // freewheel ループが次 buffer で中断 → `ExportWavComplete
+            // { error: None, cancelled: true }` が返る (cancel は typed flag で
+            // 伝わる)。標準 WAV export / video 前段のどちらでも有効。
+            Some(ExportStage::AudioRender { .. }) => self.cancel_audio_render(),
+            None => {}
+        }
     }
 
     /// 音声 freewheel フェーズ (`AudioRender`) のキャンセル要求。
@@ -304,10 +367,10 @@ impl AppData {
         resolution: (u32, u32),
         framerate: f32,
     ) {
-        if self.cur.transport.export_stage.is_some()
-            || self.cur.transport.pending_video_export.is_some()
-            || self.ui_ephemeral.export_dialog_open
-        {
+        if self.refuse_render_while_another("Video export") {
+            return;
+        }
+        if self.ui_ephemeral.export_dialog_open {
             self.ui_ephemeral.status_message = "Video export を実行中です".into();
             return;
         }
@@ -337,6 +400,7 @@ impl AppData {
     /// dialog 別スレッド化に伴いここへ移設した。 `range_beats` は
     /// 書き出し窓 (拍)。 音声 temp WAV はこの窓に trim して書き、 video render も
     /// 同じ窓で回す (`pending_video_export_range` 経由) ので A/V が揃う。
+    /// plugin の読み込みが残っていれば確定を待ってから始める (`PendingRender::Video`、読み込み待ちからの再開もここ)。
     pub(crate) fn action_begin_export_mp4(
         &mut self,
         output_path: PathBuf,
@@ -352,8 +416,11 @@ impl AppData {
                 "音声エンジンが利用できないため Video export を開始できません".into();
             return;
         }
-        if self.reject_offline_render_while_loading("Video export") {
+        if self.refuse_render_while_another("Video export") {
             return;
+        }
+        if self.plugin_loads_pending() {
+            return self.defer_render(PendingRender::Video { output_path, range_beats, resolution, framerate });
         }
         let temp_wav = std::env::temp_dir()
             .join(format!("daw01_export_audio_{}.wav", std::process::id()));
@@ -471,33 +538,9 @@ impl AppData {
             FileDialogKind::ExportWav { range } => {
                 // dialog が閉じた（確定 or キャンセル）ので二重起動ガードを解除。
                 self.ui_ephemeral.export_dialog_open = false;
-                let Some(path) = paths.into_iter().next() else {
-                    return;
-                };
-                // audio engine が死んでいる (respawn 失敗 / crash-loop give-up で
-                // audio_tx=None) と、ExportWav は send_audio に黙って drop される。
-                // ここで export_stage を立ててしまうと完了通知が永遠に来ず overlay
-                // + 入力 gate で GUI が永久ロックする。先にガードして start しない。
-                if self.ipc.audio_tx.is_none() {
-                    self.ui_ephemeral.status_message =
-                        "音声エンジンが利用できないため WAV 書き出しを開始できません".into();
-                    return;
+                if let Some(path) = paths.into_iter().next() {
+                    self.export_wav_to(path, range);
                 }
-                if self.reject_offline_render_while_loading("WAV 書き出し") {
-                    return;
-                }
-                self.ui_ephemeral.status_message = "WAV 書き出し中...".to_string();
-                // 進捗オーバーレイ（modal）を即表示。最初の `ExportWavProgress` が
-                // 来るまでは 0% 表示、以降 daw_audio の freewheel 進捗で更新、
-                // `ExportWavComplete` で None に戻して閉じる。これで WAV export 中
-                // の入力 gate / 再生抑止も video と同様に効く。
-                self.cur.transport.export_stage = Some(ExportStage::AudioRender { done: 0, total: 0 });
-                self.cur.transport.export_progress_at = Some(std::time::Instant::now());
-                // standalone WAV export — stop → reinit plugins →
-                // (on PluginsReinitDone) ExportWav。begin_wav_export が再生停止 /
-                // LoadSong / SetRenderMode(Offline) / 全 plugin 再初期化を行う。
-                // modulation は音に焼き込み済みなので `.modenv` sidecar は書かない。
-                self.begin_wav_export(path, range, false);
             }
             FileDialogKind::ExportMidi => {
                 let Some(path) = paths.into_iter().next() else {

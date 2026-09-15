@@ -103,7 +103,7 @@ fn clamp_fully_visible(r: Rect, screen: Rect) -> Rect {
 pub fn window_rect(app: &AppData, screen: Rect) -> Rect {
     let r = app.ui_prefs.loudness_report_rect.unwrap_or_else(|| default_rect(screen));
     let r = clamp_to_screen(r, screen);
-    if app.cur.loudness.phase.is_busy() {
+    if app.loudness_in_progress() {
         clamp_fully_visible(r, screen)
     } else {
         r
@@ -118,7 +118,7 @@ pub fn reserve(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     if !app.ui_prefs.loudness_report_open {
         return;
     }
-    if app.cur.loudness.phase.is_busy() {
+    if app.loudness_in_progress() {
         ui.reserve_floating_region(screen);
     } else {
         ui.reserve_floating_region(window_rect(app, screen));
@@ -131,7 +131,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
         return;
     }
     ui.with_floating_region(|ui| {
-        if app.cur.loudness.phase.is_busy() {
+        if app.loudness_in_progress() {
             // 背景の暗転。入力は reserve が既に落としているので、これは
             // 「触れない」ことを見せるためだけの層。
             ui.push_rect(RectCommand {
@@ -155,7 +155,7 @@ fn draw_window(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     let mut commit = false;
     // 走査中は動かせない (暗転で全遮断しているので、窓だけ動かせると
     // 「遮断しているのに動く」という矛盾した見え方になる)。
-    let busy = app.cur.loudness.phase.is_busy();
+    let busy = app.loudness_in_progress();
 
     if !busy {
         let title_drag = Rect {
@@ -215,7 +215,7 @@ fn draw_window(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
 
 fn draw_chrome_and_body(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     let p = &app.theme.core;
-    let busy = app.cur.loudness.phase.is_busy();
+    let busy = app.loudness_in_progress();
 
     ui.push_rect(RectCommand {
         rect,
@@ -275,7 +275,7 @@ fn draw_chrome_and_body(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
 /// 1 行目: 測った範囲 + 状態 + ボタン。
 fn draw_header_row(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) -> f32 {
     let p = &app.theme.core;
-    let busy = app.cur.loudness.phase.is_busy();
+    let busy = app.loudness_in_progress();
     let time_sig = app.cur.song_doc.song().time_sig;
 
     let text = match app.cur.loudness.report.as_ref() {
@@ -344,7 +344,13 @@ fn draw_header_row(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) 
 /// 進捗バー。
 fn draw_progress(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) -> f32 {
     let p = &app.theme.core;
+    let waiting_loads = matches!(app.cur.transport.pending_render, Some(crate::state::PendingRender::Loudness { .. }));
     let (frac, label) = match app.cur.loudness.phase {
+        // plugin の読み込みが確定したら走査を始める (中止は預かった解析を捨てる)。
+        _ if waiting_loads => (
+            0.0,
+            format!("プラグインの読み込みを待っています... (残 {})", app.cur.pipc.pending_plugin_loads.len()),
+        ),
         LoudnessPhase::AwaitingReinit { .. } => (0.0, "プラグインを初期化中...".to_string()),
         _ => {
             let f = app.cur.loudness.report.as_ref().map_or(0.0, |r| r.progress());

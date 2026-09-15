@@ -37,7 +37,7 @@ pub use tabs::Tabs;
 pub use song_doc::{EditScope, GestureOwner, HistoryJump, SongDoc, StreamGesture};
 pub use plugin_params::PluginParamTable;
 pub use activity::ActivityState;
-pub use transport::{LoadPlayback, PlayFrom, TransportState};
+pub use transport::{LoadPlayback, PendingRender, PlayFrom, TransportState};
 pub use selection::SelectionState;
 pub use ipc::{DeviceParamKey, IpcState};
 pub use voicevox::VoicevoxState;

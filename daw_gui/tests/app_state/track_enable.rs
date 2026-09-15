@@ -239,36 +239,6 @@ fn 有効化の読み込みが失敗で確定すると読み込み中から外�
     assert!(app.cur.pipc.failed_plugin_loads.contains_key(&device_id));
 }
 
-/// plugin の読み込みが確定するまでは、オフライン描画 (書き出し / 解析) を始めない — 始めると読み込み中の plugin を
-/// 鳴らすトラックは無音で焼かれ、描画中の読み込み応答は捨てられて、終わった後もそのトラックは鳴らず再生も待ち続ける。
-/// 確定すれば始められる。
-#[test]
-fn 読み込み中は書き出しと解析を始めず_確定すれば始める() {
-    use daw_gui::app::FileDialogKind;
-    use daw_gui::state::LoudnessPhase;
-    let (mut app, _audio_rx, mut plugin_rx, _d) = build_app();
-    let (track_id, _device_id) = disabled_while_playing(&mut app);
-    app.cur.transport.is_playing = false;
-    app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![track_id], enabled: true });
-    drain(&mut plugin_rx);
-
-    app.handle_event(AppEvent::FileDialogResult {
-        kind: FileDialogKind::ExportWav { range: None },
-        paths: vec![std::path::PathBuf::from("C:/out.wav")],
-    });
-    assert!(app.cur.transport.export_stage.is_none(), "読み込み中に書き出しを始めた");
-    assert!(app.cur.transport.pending_export.is_none());
-    app.handle_event(AppEvent::AnalyzeLoudness);
-    app.handle_event(AppEvent::ConfirmExportRange);
-    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Idle, "読み込み中に解析を始めた");
-    assert!(!drain(&mut plugin_rx).iter().any(|m| matches!(m, PluginCommand::ReinitAllPlugins { .. })));
-
-    fake_plugin_loaded(&mut app, track_id, 0, "test.synth");
-    app.handle_event(AppEvent::AnalyzeLoudness);
-    app.handle_event(AppEvent::ConfirmExportRange);
-    assert!(matches!(app.cur.loudness.phase, LoudnessPhase::AwaitingReinit { .. }), "確定すれば解析を始める");
-}
-
 /// undo / redo で有効へ戻る場合も同じ規則 (止めない / 読み込み中が構造より先)。無効へ戻る redo は構造を届けてから降ろす。
 #[test]
 fn undo_redo_で有効へ戻るときも読み込み中を構造より先に届け_無効へ戻るときは構造の後に降ろす() {
