@@ -435,7 +435,13 @@ fn ara_selftest(path: &std::path::Path, target_id: &str, wav: Option<&str>) -> R
                 step(&format!("building clip from {w}"));
                 vec![common::protocol::AraClipSpec {
                     source_wav: std::path::PathBuf::from(w),
-                    persistent_id: "ara-selftest-source-1".to_string(),
+                    source_id: common::ara_ids::source_id(1),
+                    modification_id: common::ara_ids::modification_id(
+                        1,
+                        &common::model::AudioEvent { id: 1, source_id: 1, ..Default::default() },
+                    ),
+                    modification_origin: None,
+                    region_key: common::ara_ids::region_key(1, 1),
                     placement: common::protocol::AraRegionPlacement {
                         start_in_playback_seconds: 0.0,
                         duration_in_playback_seconds: 10.0,
@@ -1041,16 +1047,17 @@ impl PluginHost {
                     vs.set_priority_beats(playhead_beats);
                 }
             }
-            PluginCommand::SetupAraDocument { device, clips, bpm, time_sig, archive } => {
+            PluginCommand::SetupAraDocument { device, clips, bpm, time_sig, archive, archive_ids } => {
                 // setup_ara は内部で deactivate→activate するので quiesce 契約。
                 let Ok(saved) = self.detach_and_quiesce(device) else { return };
                 let published = saved.is_some();
+                let archive = archive.as_deref().map(|bytes| crate::ara::SavedArchive { bytes, ids: &archive_ids });
                 match self.instances.get_mut(&device) {
                     Some(rec) => {
                         if published {
                             rec.plugin.stop_processing();
                         }
-                        match rec.plugin.setup_ara(&clips, bpm, time_sig, archive.as_deref()) {
+                        match rec.plugin.setup_ara(&clips, bpm, time_sig, archive) {
                             Ok(true) => {
                                 tracing::info!(?device, n = clips.len(), "ARA document set up");
                             }

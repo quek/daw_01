@@ -183,23 +183,26 @@ impl AppData {
             }
         }
 
-        /// Two resolved ARA clip sets have the same regions (same persistent_id
-        /// and source, in order) — only their placement / stretch may differ, so
-        /// the device can be updated in place instead of rebuilt.
+        /// Two resolved ARA clip sets have the same graph (same regions on the same
+        /// modifications and sources, in order) — only their placement / stretch
+        /// may differ, so the device can be updated in place.
         fn ara_same_clip_set(
             a: &[common::protocol::AraClipSpec],
             b: &[common::protocol::AraClipSpec],
         ) -> bool {
             a.len() == b.len()
-                && a.iter()
-                    .zip(b)
-                    .all(|(x, y)| x.persistent_id == y.persistent_id && x.source_wav == y.source_wav)
+                && a.iter().zip(b).all(|(x, y)| {
+                    x.region_key == y.region_key
+                        && x.modification_id == y.modification_id
+                        && x.source_id == y.source_id
+                        && x.source_wav == y.source_wav
+                })
         }
         fn ara_region_update_of(
             clip: &common::protocol::AraClipSpec,
         ) -> common::protocol::AraRegionUpdate {
             common::protocol::AraRegionUpdate {
-                persistent_id: clip.persistent_id.clone(),
+                region_key: clip.region_key.clone(),
                 placement: clip.placement,
             }
         }
@@ -230,18 +233,22 @@ impl AppData {
 
         self.cur.pipc.ara_doc_cache = live;
         for (device_id, clips) in rebuilds {
-            // Restore any saved ARA edits for this device alongside the rebuild.
-            let archive = self
+            // The saved ARA edits for this device: the host restores them only into
+            // the objects this update creates (objects already in the document keep
+            // their live edits), reading legacy persistent ids through the aliases.
+            let (archive, archive_ids) = self
                 .cur.song_doc
                 .song()
                 .plugin_by_id(device_id)
-                .and_then(|d| d.ara_archive.as_deref().map(<[u8]>::to_vec));
+                .map(|d| (d.ara_archive.as_deref().map(<[u8]>::to_vec), d.ara_archive_ids.clone()))
+                .unwrap_or_default();
             self.send_plugin(PluginCommand::SetupAraDocument {
                 device: self.dev(device_id),
                 clips,
                 bpm,
                 time_sig: (self.cur.song_doc.song().time_sig.0 as u16, self.cur.song_doc.song().time_sig.1 as u16),
                 archive,
+                archive_ids,
             });
         }
         for (device_id, regions) in updates {
@@ -372,81 +379,65 @@ impl AppData {
         Ok(())
     }
 
-    /// (r.md #5 ARA2) Resolve a track's audio clips into ARA clip specs. Times
-    /// convert from beats to seconds (ARA playback time is in seconds); the
-    /// source slice maps 1:1 without time-stretch. File sources resolve to an
-    /// absolute path; `Generated` (no on-disk file) is skipped for now.
+    /// (r.md #5 ARA2) Resolve a track's audio clips into ARA clip specs: one
+    /// playback region per **piece shown in a clip's window** (r.md #132 残件 —
+    /// an event hidden outside the window is not heard, and the window's edges
+    /// crop the region), on the audio modification of its content and take and
+    /// the audio source of its file (`common::ara_ids`). Times convert from
+    /// beats to seconds (ARA playback time is in seconds). File sources resolve
+    /// to an absolute path; `Generated` resolves to its materialized WAV.
     pub(crate) fn collect_ara_clips_for_track(
         &self,
         track: &common::model::Track,
         project_dir: Option<&Path>,
         bpm: f64,
     ) -> Vec<common::protocol::AraClipSpec> {
-        use common::model::{AudioSourcePath, ClipContent};
+        use common::model::ClipContent;
+        let song = self.cur.song_doc.song();
         let mut out = Vec::new();
         for clip in &track.clips {
-            let Some(ClipContent::Audio(audio)) = self.cur.song_doc.song().clip_contents.get(&clip.content_id)
-            else {
+            let Some(ClipContent::Audio(audio)) = song.clip_contents.get(&clip.content_id) else {
                 continue;
             };
-            for (event_index, event) in audio.events.iter().enumerate() {
-                let Some(source) = self.cur.song_doc.song().media.audio_sources.get(&event.source_id) else {
+            let (lo, hi) = clip.content_window();
+            for i in common::model::shown_indices(&audio.events, (lo, hi)) {
+                let event = &audio.events[i];
+                let Some((source_wav, sample_rate)) = self.ara_source_wav(event.source_id, project_dir) else {
                     continue;
                 };
-                let abs = match &source.path {
-                    AudioSourcePath::Absolute(p) => p.clone(),
-                    AudioSourcePath::ProjectRelative(rel) => match project_dir {
-                        Some(dir) => dir.join(rel),
-                        None => continue,
-                    },
-                    // (v29 §2) in-memory audio は wire に載せず、 事前に
-                    // `materialize_generated_sources_for_ara` が書き出した
-                    // WAV path を渡す (未 materialize = decoded buffer 無し
-                    // は従来どおり skip)。
-                    AudioSourcePath::Generated { .. } => {
-                        match self.cur.pipc.ara_pcm_materialized.get(&event.source_id) {
-                            Some(p) => p.clone(),
-                            None => continue,
-                        }
-                    }
-                };
-                let sample_rate = f64::from(source.sample_rate).max(1.0);
-                let start_in_modification = event.source_start_frames as f64 / sample_rate;
-                let duration_in_modification = event
-                    .source_end_frames
-                    .saturating_sub(event.source_start_frames)
-                    as f64
-                    / sample_rate;
-                // r.md #44: event の song 位置は content 原点基準。
-                let start_in_playback =
-                    clip.content_to_song_beat(event.event_start_in_clip_beats) * 60.0 / bpm;
-                // Raw plays the slice natively (no stretch): playback duration ==
-                // modification duration. Every other mode follows the clip's
-                // timeline length, so the playback duration is the event's beat
-                // span in seconds (event_length_beats × 60/bpm) and the plug-in
-                // pitch-preservingly time-stretches the slice onto it. Manual
-                // edge-drag changes event_length_beats; a tempo change changes
-                // bpm — both flow through here (mirrors #6 for non-ARA audio).
-                let time_stretch = event.stretch_mode != common::model::StretchMode::Raw;
-                let duration_in_playback = if time_stretch {
-                    event.event_length_beats * 60.0 / bpm
-                } else {
-                    duration_in_modification
-                };
+                let (start, end) = (event.event_start_in_clip_beats, event.event_start_in_clip_beats + event.event_length_beats);
+                let piece = common::model::event_piece(event, start.max(lo), end.min(hi));
                 out.push(common::protocol::AraClipSpec {
-                    source_wav: abs,
-                    persistent_id: format!("{}:{}:{event_index}", event.source_id, clip.id),
-                    placement: common::protocol::AraRegionPlacement {
-                        start_in_playback_seconds: start_in_playback,
-                        duration_in_playback_seconds: duration_in_playback,
-                        start_in_modification_seconds: start_in_modification,
-                        duration_in_modification_seconds: duration_in_modification,
-                        time_stretch,
-                    },
+                    source_wav,
+                    source_id: common::ara_ids::source_id(event.source_id),
+                    modification_id: common::ara_ids::modification_id(clip.content_id, event),
+                    modification_origin: common::ara_ids::modification_origin(song, clip.content_id, event),
+                    region_key: common::ara_ids::region_key(clip.id, event.id),
+                    placement: ara_region_placement(clip, &piece, sample_rate, bpm),
                 });
             }
         }
         out
+    }
+
+    /// ARA に渡す素材 `source_id` の絶対 WAV path と sample rate。 解決できなければ `None`。
+    fn ara_source_wav(
+        &self,
+        source_id: common::model::AudioSourceId,
+        project_dir: Option<&Path>,
+    ) -> Option<(PathBuf, f64)> {
+        use common::model::AudioSourcePath;
+        let source = self.cur.song_doc.song().media.audio_sources.get(&source_id)?;
+        let path = match &source.path {
+            AudioSourcePath::Absolute(p) => p.clone(),
+            AudioSourcePath::ProjectRelative(rel) => project_dir?.join(rel),
+            // (v29 §2) in-memory audio は wire に載せず、 事前に
+            // `materialize_generated_sources_for_ara` が書き出した
+            // WAV path を渡す (未 materialize = decoded buffer 無し
+            // は従来どおり skip)。
+            AudioSourcePath::Generated { .. } => self.cur.pipc.ara_pcm_materialized.get(&source_id)?.clone(),
+        };
+        Some((path, f64::from(source.sample_rate).max(1.0)))
     }
 
     /// v23 (review fix): `ports` が未解決 (全 false) の device を plugin DB
@@ -490,4 +481,41 @@ impl AppData {
         });
     }
 
+}
+
+/// (r.md #5 ARA2) audio event 1 つの ARA region の置き方 (秒)。
+///
+/// 見せるのは event の **窓** (r.md #132 残件: 分割の片は take の一部): modification の範囲は take の
+/// 写像で窓に当たる source の区間、playback は窓の song 位置と長さ。 Raw は source を native rate で
+/// そのまま鳴らす (playback 長 = modification 長、窓の長さで打ち切る)。 それ以外の mode は take の伸縮率で
+/// 窓の source 区間を窓の拍の長さへ time-stretch する (手の端 drag / テンポ変更も同じ式に流れる。 #6 と対)。
+fn ara_region_placement(
+    clip: &common::model::Clip,
+    event: &common::model::AudioEvent,
+    sample_rate: f64,
+    bpm: f64,
+) -> common::protocol::AraRegionPlacement {
+    let secs_per_beat = 60.0 / bpm;
+    let time_stretch = event.stretch_mode != common::model::StretchMode::Raw;
+    let window_start = event.source_start_frames as f64 / sample_rate;
+    let playback_secs = event.event_length_beats * secs_per_beat;
+    let (start_in_modification, duration_in_modification) = if time_stretch {
+        let frames_per_beat = event.take_frames_per_beat(sample_rate * secs_per_beat);
+        (
+            window_start + event.take_head_beats * frames_per_beat / sample_rate,
+            event.event_length_beats * frames_per_beat / sample_rate,
+        )
+    } else {
+        let head_secs = event.take_head_beats * secs_per_beat;
+        let remaining = event.source_window_frames() as f64 / sample_rate - head_secs;
+        (window_start + head_secs, remaining.min(playback_secs).max(0.0))
+    };
+    common::protocol::AraRegionPlacement {
+        // r.md #44: event の song 位置は content 原点基準。
+        start_in_playback_seconds: clip.content_to_song_beat(event.event_start_in_clip_beats) * secs_per_beat,
+        duration_in_playback_seconds: if time_stretch { playback_secs } else { duration_in_modification },
+        start_in_modification_seconds: start_in_modification,
+        duration_in_modification_seconds: duration_in_modification,
+        time_stretch,
+    }
 }

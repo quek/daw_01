@@ -1261,17 +1261,12 @@ impl AppData {
     }
 
     /// clip rename の編集バッファ seed / no-op 判定の比較基準となる現在の表示名。
-    /// Text clip は先頭の非空 TextEvent 本文、 それ以外は content_name (未設定は "")。
+    /// Text clip は窓に見えている最初の字幕の本文 (確定先 `set_clip_text_event_content` が書く片と同じ、
+    /// `handler::clip_window`)、 それ以外は content_name (未設定は "")。
     /// `begin_rename_clip` の pre-fill と `commit_rename_clip` の同名判定で共有する
     /// (DRY: 両者が同じ「現在名」を見ることで、 未編集 commit が確実に no-op になる)。
-    fn clip_rename_current(&self, content_id: common::model::ContentId) -> String {
-        self.cur.song_doc
-            .song()
-            .clip_contents
-            .get(&content_id)
-            .and_then(|c| c.text_events())
-            .and_then(|events| events.first())
-            .map(|ev| ev.text.clone())
+    fn clip_rename_current(&self, target: ClipKey, content_id: common::model::ContentId) -> String {
+        self.text_first_event(target, |ev| ev.text.clone())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| self.cur.song_doc.song().content_name(content_id).to_string())
     }
@@ -1287,7 +1282,7 @@ impl AppData {
         };
         // 表示されている名前 (= clip_display_label と同じ) を編集開始値にする。
         // Text clip は本文 (= first TextEvent.text) を、 それ以外は content_name を pre-fill。
-        self.cur.peph.clip_rename_text = self.clip_rename_current(content_id);
+        self.cur.peph.clip_rename_text = self.clip_rename_current(target, content_id);
         self.cur.peph.clip_rename = Some(target);
     }
 
@@ -1318,7 +1313,7 @@ impl AppData {
         };
         // 同名なら no-op (r.md #12: dirty 化させない)。 begin と同じ「現在名」で
         // 比較するので、 未編集のまま確定した場合も必ず一致して no-op になる。
-        if new_name == self.clip_rename_current(content_id) {
+        if new_name == self.clip_rename_current(target, content_id) {
             return;
         }
         let is_text = matches!(
@@ -1326,14 +1321,14 @@ impl AppData {
             Some(common::model::ClipContent::Text(_))
         );
         if is_text {
-            // Text (字幕) clip は本文 (= 全 TextEvent.text) がそのまま表示名。 空文字
+            // Text (字幕) clip は本文 (= 窓に見えている TextEvent.text) がそのまま表示名。 空文字
             // リネームで本文を丸ごと消すのは破壊的なので **no-op** にする (字幕を空に
             // したいときは inspector の本文編集を使う)。 r.md #15 の「空でクリア」は
             // 名前を別に持つ非 Text clip 向けの挙動。
             if new_name.is_empty() {
                 return;
             }
-            // set_clip_text_event_content が全 event 書換え + edit buffer resync + dirty を
+            // set_clip_text_event_content が窓に見えている片の書換え + edit buffer resync + dirty を
             // 行う (inspector の content 編集と同経路)。
             self.set_clip_text_event_content(target, new_name);
         } else if new_name.is_empty() {

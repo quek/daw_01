@@ -55,14 +55,14 @@ fn hash_lipsync_clip(
         // sing: build_sing_query が読む note フィールドのみ
         // (`velocity` / `muted` は phoneme へ影響しないので含めない)。音程は歌う音程 (移調込み)。
         common::lipsync::LipsyncSource::Sing { notes, .. } => {
-            for n in *notes {
+            for n in notes {
                 n.start_beat.to_bits().hash(h);
                 n.duration_beats.to_bits().hash(h);
                 sung_pitch(transpose, clip, in_song, n).hash(h);
                 n.lyric.hash(h);
             }
         }
-        // talk: 先頭の非空 TextEvent + 声 + 話速のみ (pitch / intonation / volume は
+        // talk: 読み上げを始める先頭の TextEvent + 声 + 話速のみ (pitch / intonation / volume は
         // phoneme 長に効かないので含めない)。
         common::lipsync::LipsyncSource::Talk(ev) => {
             ev.text.hash(h);
@@ -112,7 +112,8 @@ fn collect_lipsync_snaps(
                 // (= 合成 wav 先頭と同じ位置、r.md #39)。r.md #44: phoneme は
                 // content-local 起点なので原点基準で置き、長さの上限は窓の末尾にする。
                 // r.md #130: 問い合わせるのは **歌う音程** のノート (合成のメタデータと同じ移調、範囲外は
-                // 歌わないので除く)。基準ノートも歌うノートから引き直す。
+                // 歌わないので除く)。基準ノートも歌うノートから引き直す。 ノートは既にこの clip の窓で
+                // 歌う分だけ (`lipsync_source_of`、歌唱のメタデータと同じ門)。
                 Some(common::lipsync::LipsyncSource::Sing { notes, .. }) => {
                     let in_song = place.container == common::lipsync::LipsyncContainer::Arrangement;
                     let sung: Vec<common::model::Note> = notes
@@ -203,28 +204,34 @@ const TALK_TAIL_ALLOWANCE_SECS: f64 = 60.0;
 
 /// アレンジのクリップ 1 つが合成タイムラインで占める終端の拍。
 ///
-/// **クリップの窓だけでは足りない** — [`collect_sing_metadata`] /
-/// [`collect_talk_metadata`] は窓の外にある content の note / TextEvent も
-/// metadata に載せるので、窓の終端で測るとセルの仮想区間がアレンジの尻尾に
-/// 食い込む (= セルの歌に前の歌が混ざる)。実際に置かれる拍で測る。
+/// **クリップの窓だけでは足りない** — 読み上げ ([`collect_talk_metadata`]) は窓の中で始まっても
+/// WAV が窓の末尾を越えて鳴り続けるので、窓の終端で測るとセルの仮想区間がアレンジの尻尾に
+/// 食い込む (= セルの声に前の読み上げが混ざる)。実際に置かれる拍で測る (歌唱は窓の末尾で
+/// 切るので窓の終端に収まる)。
 fn arrangement_synth_end_beat(song: &common::model::Song, clip: &Clip, bpm: f32) -> f64 {
-    let mut end = clip.start_beat + clip.length_beats;
-    let Some(content) = song.clip_contents.get(&clip.content_id) else {
-        return end;
-    };
-    if let Some(notes) = content.notes() {
-        for n in notes {
-            end = end.max(clip.content_to_song_beat(n.start_beat) + n.duration_beats);
-        }
-    }
-    if let Some(events) = content.text_events() {
-        let allowance = TALK_TAIL_ALLOWANCE_SECS * f64::from(bpm) / 60.0;
-        for ev in events.iter().filter(|e| !e.text.is_empty()) {
-            end = end
-                .max(clip.content_to_song_beat(ev.event_start_in_clip_beats) + allowance);
-        }
-    }
-    end
+    let end = clip.start_beat + clip.length_beats;
+    let allowance = TALK_TAIL_ALLOWANCE_SECS * f64::from(bpm) / 60.0;
+    clip_readings(song, clip)
+        .map(|(_, ev)| clip.content_to_song_beat(ev.event_start_in_clip_beats) + allowance)
+        .fold(end, f64::max)
+}
+
+/// この clip が **読み上げる** TextEvent (content 内の index 付き): 読み上げを始める event
+/// ([`common::model::TextEvent::starts_reading`]、分割の続きの片は読まない) で、始まりが窓の中
+/// ([`Clip::window_has_onset`]、sequencer の読み上げトリガと同じ門)。
+///
+/// 分割の片は同じ content を別の窓で見るので、窓を見ないと片の数だけ同じ文を合成して重ねる。
+fn clip_readings<'a>(
+    song: &'a common::model::Song,
+    clip: &'a Clip,
+) -> impl Iterator<Item = (usize, &'a common::model::TextEvent)> + 'a {
+    song.clip_contents
+        .get(&clip.content_id)
+        .and_then(|c| c.text_events())
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .filter(|(_, ev)| ev.starts_reading() && clip.window_has_onset(ev.event_start_in_clip_beats))
 }
 
 /// 1 clip の notes を builtin VOICEVOX 向けの [`NoteMetadata`] へ変換する。
@@ -243,6 +250,11 @@ fn arrangement_synth_end_beat(song: &common::model::Song, clip: &Clip, bpm: f32)
 /// r.md #130: `pitch` は **歌う音程** ([`sung_pitch`]、移調込み)。範囲外で歌わないノートは載せない
 /// (sequencer も同じノートを鳴らさない)。`in_song` = アレンジのクリップ。VOICEVOX のキャッシュキーは音程を
 /// 含むので、移調すると再合成され、元に戻せばキャッシュに当たる。
+///
+/// 載せるのは **この clip が歌う** note だけ — 始まりが窓の中、長さは窓の末尾まで
+/// ([`Clip::sounding_note_len`]、sequencer が note を鳴らす姿と同じ)。 合成した歌は clip の窓で切られずに
+/// 流れるので、窓の外を載せると、分割の片 (同じ content を別の窓で見る) を動かしたときに隠れている
+/// 前後の片まで動かした先で歌う。
 fn collect_sing_metadata(
     song: &common::model::Song,
     clip: &Clip,
@@ -261,7 +273,7 @@ fn collect_sing_metadata(
             Some(common::plugin_metadata::NoteMetadata {
                 note_id: common::plugin_metadata::sing_note_id(clip.id, n.id),
                 start_beat: base_beat + clip.content_to_song_beat(n.start_beat),
-                duration_beats: n.duration_beats,
+                duration_beats: clip.sounding_note_len(n)?,
                 pitch: sung_pitch(transpose, clip, in_song, n)?,
                 velocity: n.velocity,
                 lyric: n.lyric.clone().unwrap_or_default(),
@@ -277,27 +289,18 @@ fn collect_sing_metadata(
 /// (`docs/plan_voicevox_talk.md` §3.2)。
 ///
 /// `event_id` は `talk_event_id(clip.id, event_index)` で決定論的に導出する
-/// (sequencer の talk-trigger と同式)。**空テキストは両側で skip** して event_id の
-/// 対応を保つ。声は per-clip (`clip.speaker_id` を talk style として解釈)、
-/// スケールは `clip.talk`。`clip_id` は合成進捗のクリップ帰属 (r.md #75) —
-/// これが無いと Text クリップにスピナーが一切点かない。
+/// (sequencer の talk-trigger と同式)。**読み上げを始めない event (空テキスト / 分割の続きの片) と
+/// 窓の外で始まる event は両側で skip** して event_id の対応を保つ ([`clip_readings`]) — 1 つの文は
+/// 最初の片が 1 回だけ読み、読み上げの WAV は片の終わりで切られずに最後まで鳴る。声は per-clip
+/// (`clip.speaker_id` を talk style として解釈)、スケールは `clip.talk`。`clip_id` は合成進捗の
+/// クリップ帰属 (r.md #75) — これが無いと Text クリップにスピナーが一切点かない。
 fn collect_talk_metadata(
     song: &common::model::Song,
     clip: &Clip,
     base_beat: f64,
 ) -> Vec<common::plugin_metadata::TalkMetadata> {
-    let Some(events) = song
-        .clip_contents
-        .get(&clip.content_id)
-        .and_then(|c| c.text_events())
-    else {
-        return Vec::new();
-    };
     let scales = clip.talk.unwrap_or_default();
-    events
-        .iter()
-        .enumerate()
-        .filter(|(_, ev)| !ev.text.is_empty())
+    clip_readings(song, clip)
         .map(|(event_index, ev)| common::plugin_metadata::TalkMetadata {
             event_id: common::plugin_metadata::talk_event_id(clip.id, event_index as u32),
             start_beat: base_beat + clip.content_to_song_beat(ev.event_start_in_clip_beats),

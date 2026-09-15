@@ -187,6 +187,27 @@ impl Clip {
     pub fn song_window(&self) -> (f64, f64) {
         (self.start_beat, self.start_beat + self.length_beats)
     }
+
+    /// content-local 拍 `beat` に始まる発音 (note / 読み上げ) を **この clip が鳴らすか** =
+    /// 始まりが窓 `[offset, offset + length)` に入るか。
+    ///
+    /// **発音の窓の門の SSoT**。 sequencer (note / 読み上げのトリガ)・VOICEVOX へ渡す歌唱 /
+    /// 読み上げの一覧・口パク・Glue が同じ門を通る。 1 つでも窓を見ないと、分割の片 (同じ
+    /// content を別の窓で見る) を動かしたときに、窓の外に隠れている前後の片まで鳴らす。
+    #[must_use]
+    #[inline]
+    pub fn window_has_onset(&self, beat: f64) -> bool {
+        let (lo, hi) = self.content_window();
+        beat >= lo && beat < hi
+    }
+
+    /// note がこの clip で **実際に鳴る長さ** (拍)。 始まりが窓の外なら `None`、窓の末尾を越える
+    /// note は末尾で切る (sequencer が note-off を clip の末尾で出すのと同じ姿)。
+    #[must_use]
+    pub fn sounding_note_len(&self, note: &Note) -> Option<f64> {
+        self.window_has_onset(note.start_beat)
+            .then(|| note.duration_beats.min(self.content_window().1 - note.start_beat).max(0.0))
+    }
 }
 
 /// Shared content referenced by one or more `Clip`s via
@@ -258,6 +279,78 @@ pub struct EventFade {
     pub fade_out_beats: f64,
     pub fade_in_curve: FadeCurve,
     pub fade_out_curve: FadeCurve,
+    /// fade-in のランプが event の左端より何拍**前**から始まっているか (`0` = 端から始まる通常の
+    /// fade)。 分割の切り口がランプの途中に来たとき、後ろの片がランプの続きを持つ
+    /// (`event_window::event_piece`)。
+    pub fade_in_lead_beats: f64,
+    /// fade-out のランプが event の右端より何拍**後**で終わるか (`fade_in_lead_beats` の対)。
+    pub fade_out_trail_beats: f64,
+}
+
+impl EventFade {
+    /// event-local 拍 `local` (= event の左端から) の fade ゲイン (`0..=1`)。 event より前は `0`。
+    ///
+    /// **拍領域の fade envelope の SSoT** — 映像 (`video_playback`) / 画像 (`image_compose`) /
+    /// 字幕 (`text_compose`) / アレンジ画面の描画が通る。 音 (`audio_clip_renderer`) は同じ
+    /// ランプを sample 領域で評価する。 ランプは event の端より外 (`*_lead_beats` /
+    /// `*_trail_beats`) から始まり / 終わりうる。
+    #[must_use]
+    pub fn gain_at(&self, local: f64) -> f32 {
+        if local < 0.0 {
+            return 0.0;
+        }
+        let mut gain = 1.0_f32;
+        let into_in = local + self.fade_in_lead_beats;
+        if self.fade_in_beats > 0.0 && into_in < self.fade_in_beats {
+            #[allow(clippy::cast_possible_truncation)]
+            let progress = (into_in / self.fade_in_beats) as f32;
+            gain *= crate::audio_render::fade_curve_at(progress, self.fade_in_curve);
+        }
+        let remaining = self.len_beats + self.fade_out_trail_beats - local;
+        if self.fade_out_beats > 0.0 && remaining > 0.0 && remaining < self.fade_out_beats {
+            #[allow(clippy::cast_possible_truncation)]
+            let progress = (remaining / self.fade_out_beats) as f32;
+            gain *= crate::audio_render::fade_curve_at(progress, self.fade_out_curve);
+        }
+        gain.clamp(0.0, 1.0)
+    }
+
+    /// fade-in のランプのうち event の中に見えている長さ (拍) = 掴む正方形の位置。
+    #[must_use]
+    pub fn visible_fade_in_beats(&self) -> f64 {
+        (self.fade_in_beats - self.fade_in_lead_beats).clamp(0.0, self.len_beats.max(0.0))
+    }
+
+    /// fade-out のランプのうち event の中に見えている長さ (拍)。
+    #[must_use]
+    pub fn visible_fade_out_beats(&self) -> f64 {
+        (self.fade_out_beats - self.fade_out_trail_beats).clamp(0.0, self.len_beats.max(0.0))
+    }
+
+    /// event の左端から `inward` 拍の位置での fade-in ランプの進度 (0 = 無音側の端、1 = フル)。
+    /// fade が無ければ 0。 分割の片の端はランプの途中にありうる (`fade_in_lead_beats`)。
+    #[must_use]
+    pub fn fade_in_progress(&self, inward: f64) -> f32 {
+        ramp_progress(self.fade_in_lead_beats + inward, self.fade_in_beats)
+    }
+
+    /// event の右端から `inward` 拍の位置での fade-out ランプの進度 (0 = 無音側の端、1 = フル)。
+    /// fade が無ければ 0。
+    #[must_use]
+    pub fn fade_out_progress(&self, inward: f64) -> f32 {
+        ramp_progress(self.fade_out_trail_beats + inward, self.fade_out_beats)
+    }
+}
+
+/// ランプの無音側の端から `offset` 拍の進度 (`0..=1`)。 ランプが無ければ 0。
+fn ramp_progress(offset: f64, ramp: f64) -> f32 {
+    if ramp > 0.0 {
+        #[allow(clippy::cast_possible_truncation)]
+        let p = (offset / ramp).clamp(0.0, 1.0) as f32;
+        p
+    } else {
+        0.0
+    }
 }
 
 impl Default for ClipContent {
@@ -363,82 +456,6 @@ impl ClipContent {
             | ClipContent::Video(_)
             | ClipContent::Image(_)
             | ClipContent::Text(_) => None,
-        }
-    }
-
-    /// r.md #38: clip 内の各 event の fade 情報を **content 種別に依らず** 列挙する。
-    ///
-    /// `AudioEvent` / `VideoEvent` / `ImageEvent` / `TextEvent` は
-    /// `event_start_in_clip_beats` / `event_length_beats` / `fade_in_beats` /
-    /// `fade_out_beats` / `fade_in_curve` / `fade_out_curve` を同じ意味で持ち、
-    /// 適用側も全部 [`crate::audio_render::fade_curve_at`] を通る。 よって
-    /// 「fade をどう描き、 どう掴み、 どう編集するか」 は content に依存しない。
-    /// アレンジ画面の描画 / hit-test / drag はこの 1 本を SSoT にする
-    /// (種別ごとに 4 実装を持たない = DRY)。
-    ///
-    /// `Midi` / `Automation` は fade を持たないので空 Vec。
-    #[must_use]
-    pub fn event_fades(&self) -> Vec<EventFade> {
-        macro_rules! collect {
-            ($events:expr) => {
-                $events
-                    .iter()
-                    .map(|e| EventFade {
-                        start_in_clip_beats: e.event_start_in_clip_beats,
-                        len_beats: e.event_length_beats,
-                        fade_in_beats: e.fade_in_beats,
-                        fade_out_beats: e.fade_out_beats,
-                        fade_in_curve: e.fade_in_curve,
-                        fade_out_curve: e.fade_out_curve,
-                    })
-                    .collect()
-            };
-        }
-        match self {
-            ClipContent::Audio(c) => collect!(c.events),
-            ClipContent::Video(c) => collect!(c.events),
-            ClipContent::Image(c) => collect!(c.events),
-            ClipContent::Text(c) => collect!(c.events),
-            ClipContent::Midi(_) | ClipContent::Automation(_) => Vec::new(),
-        }
-    }
-
-    /// r.md #38: `index` 番目の event の fade フィールドを content 種別に依らず
-    /// 書き換える。 `f` には現在値を渡し、 戻り値をそのまま書き戻す
-    /// (clamp は caller の責務 = [`EventFade::len_beats`] を上限にする)。
-    ///
-    /// event が存在しない / fade を持たない content なら `false`。
-    pub fn set_event_fade(
-        &mut self,
-        index: usize,
-        f: impl FnOnce(EventFade) -> EventFade,
-    ) -> bool {
-        macro_rules! apply {
-            ($events:expr) => {{
-                let Some(e) = $events.get_mut(index) else {
-                    return false;
-                };
-                let next = f(EventFade {
-                    start_in_clip_beats: e.event_start_in_clip_beats,
-                    len_beats: e.event_length_beats,
-                    fade_in_beats: e.fade_in_beats,
-                    fade_out_beats: e.fade_out_beats,
-                    fade_in_curve: e.fade_in_curve,
-                    fade_out_curve: e.fade_out_curve,
-                });
-                e.fade_in_beats = next.fade_in_beats;
-                e.fade_out_beats = next.fade_out_beats;
-                e.fade_in_curve = next.fade_in_curve;
-                e.fade_out_curve = next.fade_out_curve;
-                true
-            }};
-        }
-        match self {
-            ClipContent::Audio(c) => apply!(c.events),
-            ClipContent::Video(c) => apply!(c.events),
-            ClipContent::Image(c) => apply!(c.events),
-            ClipContent::Text(c) => apply!(c.events),
-            ClipContent::Midi(_) | ClipContent::Automation(_) => false,
         }
     }
 
@@ -735,6 +752,27 @@ pub struct AudioEvent {
     pub event_length_beats: f64,
     pub source_start_frames: u64,
     pub source_end_frames: u64,
+    /// v42 (r.md #132 残件): **take の窓**。 event の時間写像 (source の読み出し位置 / 伸縮率 /
+    /// slice の trigger / warp marker / テンポ追従の起点) は「take」 = 分割する前の 1 つの event の
+    /// 上で決まり、event はその一部を見せる窓。 `take_head_beats` は見えている先頭が take の頭から
+    /// 何拍後か、`take_tail_beats` は見えている末尾から take の終わりまで何拍か。
+    ///
+    /// take の長さ ([`AudioEvent::take_length_beats`] = head + length + tail) に `source_*_frames`
+    /// の窓が写り、`onsets` / `beat_markers` も take の座標で持つ。 **分割は窓を割るだけ**で
+    /// 写像に触らないので、片を並べた再生・描画は分割前と一致する (クリップの
+    /// `content_offset_beats` と同じ窓モデルを event の中に持ち込んだもの)。 分割していない
+    /// event は両方 0 (= 旧版の「event = take」そのもの、v41 以前はこれで読める)。
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub take_head_beats: f64,
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub take_tail_beats: f64,
+    /// v42 (r.md #132 残件): **take の安定 id** (content 内)。 `0` = この event 自身が take
+    /// (= [`Self::id`])、それ以外は分割の片が継いだ元の event の take。 読み出しは
+    /// [`AudioEvent::take_key`] 1 本。 ARA の audio modification (= Melodyne の編集の単位) は
+    /// content と take で 1 つ ([`crate::ara_ids`]) なので、片同士は同じ編集を共有し、分割しても
+    /// 編集が続く。 片の中身の比較 (Glue でつなげるか) にも入る。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub take_id: u32,
 
     pub gain_db: f32,
     pub pan: f32,
@@ -766,6 +804,11 @@ pub struct AudioEvent {
     pub fade_out_beats: f64,
     pub fade_in_curve: FadeCurve,
     pub fade_out_curve: FadeCurve,
+    /// v42: fade ランプの張り出し ([`EventFade::fade_in_lead_beats`] / `fade_out_trail_beats`)。
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub fade_in_lead_beats: f64,
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub fade_out_trail_beats: f64,
 
     pub reversed: bool,
     pub muted: bool,
@@ -773,11 +816,12 @@ pub struct AudioEvent {
     /// Auto-detected transient frame positions (`source_start_frames` 起点、
     /// `StretchMode::Slice` の slice trigger 位置)。 Slice 切替時に daw_gui が
     /// `common::onset::detect_onsets` で検出して埋める (r.md #8 B1)。 空 = 未検出で
-    /// source 全体が 1 slice (= Raw 等価)。
+    /// source 全体が 1 slice (= Raw 等価)。 trigger の拍は **take** の頭から数える
+    /// (`take_head_beats`)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub onsets: Vec<u64>,
-    /// User-placed beat markers for `StretchMode::Stretch`. Phase 3+;
-    /// empty in Phase 1.
+    /// `StretchMode::Stretch` の warp marker。 `locked_beat` は **take** の頭から数えた拍
+    /// (`take_head_beats`、分割していない event では event-local と同じ)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beat_markers: Vec<BeatMarker>,
 }
@@ -791,6 +835,9 @@ impl Default for AudioEvent {
             event_length_beats: 0.0,
             source_start_frames: 0,
             source_end_frames: 0,
+            take_head_beats: 0.0,
+            take_tail_beats: 0.0,
+            take_id: 0,
             gain_db: 0.0,
             pan: 0.0,
             pitch_semitones: 0.0,
@@ -807,6 +854,8 @@ impl Default for AudioEvent {
             fade_out_beats: 0.0,
             fade_in_curve: FadeCurve::Linear,
             fade_out_curve: FadeCurve::Linear,
+            fade_in_lead_beats: 0.0,
+            fade_out_trail_beats: 0.0,
             reversed: false,
             muted: false,
             onsets: Vec::new(),
@@ -882,8 +931,9 @@ impl FadeCurve {
 pub struct BeatMarker {
     /// Position inside the source file (sample frames).
     pub source_frame: u64,
-    /// Position inside the event (event-local beats) where the source
-    /// frame is locked to land.
+    /// Position inside the event's **take** (take-local beats, v42
+    /// [`AudioEvent::take_head_beats`]) where the source frame is locked to land.
+    /// Equal to the event-local beat for an event that has not been split.
     pub locked_beat: f64,
 }
 
@@ -944,6 +994,13 @@ pub struct VideoEvent {
     pub source_start_micros: u64,
     pub source_end_micros: u64,
 
+    /// v42 (r.md #132 残件): 見えている先頭が **take** (= 分割する前の 1 つの event) の頭から
+    /// 何拍後か。 source の時刻は take の頭からの実時間で進む
+    /// (`source_micros = source_start_micros + 実時間(take の頭 → 今)`) ので、分割の片は
+    /// source の範囲を配り直さずにこれだけを進める ([`AudioEvent::take_head_beats`] と同じ窓モデル)。
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub take_head_beats: f64,
+
     /// When `true` the event renders as a solid clear color (= black
     /// frame, no `VideoSource` decode). Useful for "blank" placeholders
     /// without removing the event.
@@ -952,6 +1009,11 @@ pub struct VideoEvent {
     pub fade_out_beats: f64,
     pub fade_in_curve: FadeCurve,
     pub fade_out_curve: FadeCurve,
+    /// v42: fade ランプの張り出し ([`EventFade::fade_in_lead_beats`] / `fade_out_trail_beats`)。
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub fade_in_lead_beats: f64,
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub fade_out_trail_beats: f64,
 }
 
 impl Default for VideoEvent {
@@ -962,11 +1024,14 @@ impl Default for VideoEvent {
             event_length_beats: 0.0,
             source_start_micros: 0,
             source_end_micros: 0,
+            take_head_beats: 0.0,
             muted: false,
             fade_in_beats: 0.0,
             fade_out_beats: 0.0,
             fade_in_curve: FadeCurve::Linear,
             fade_out_curve: FadeCurve::Linear,
+            fade_in_lead_beats: 0.0,
+            fade_out_trail_beats: 0.0,
         }
     }
 }
@@ -1100,6 +1165,11 @@ pub struct ImageEvent {
     pub fade_out_beats: f64,
     pub fade_in_curve: FadeCurve,
     pub fade_out_curve: FadeCurve,
+    /// v42: fade ランプの張り出し ([`EventFade::fade_in_lead_beats`] / `fade_out_trail_beats`)。
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub fade_in_lead_beats: f64,
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub fade_out_trail_beats: f64,
 }
 
 impl Default for ImageEvent {
@@ -1124,6 +1194,8 @@ impl Default for ImageEvent {
             fade_out_beats: 0.0,
             fade_in_curve: FadeCurve::Linear,
             fade_out_curve: FadeCurve::Linear,
+            fade_in_lead_beats: 0.0,
+            fade_out_trail_beats: 0.0,
         }
     }
 }
@@ -1270,6 +1342,29 @@ pub struct TextEvent {
     pub fade_out_beats: f64,
     pub fade_in_curve: FadeCurve,
     pub fade_out_curve: FadeCurve,
+    /// v42: fade ランプの張り出し ([`EventFade::fade_in_lead_beats`] / `fade_out_trail_beats`)。
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub fade_in_lead_beats: f64,
+    #[serde(default, skip_serializing_if = "is_zero_beats")]
+    pub fade_out_trail_beats: f64,
+    /// v42 (r.md #132 残件、2026-09-15 ユーザー決定): **分割でできた続きの片**。 字幕は出すが
+    /// VOICEVOX の読み上げは始めない — 1 つの文は最初の片だけが 1 回読み、続きの片はその
+    /// 読み上げの間も字幕を切れ目なく出し続ける (ノートの後ろの片を長音「ー」にするのと同じ
+    /// 考え方)。 片を単独で動かしても、最初の片を消しても続きの片は読み上げを始めない
+    /// (「ー」が歌い直さないのと同じ)。 Glue (`J`) で前の片とつなぐと元の 1 つに戻る。
+    /// 読み上げの判定は [`TextEvent::starts_reading`] 1 本を通す。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continuation: bool,
+}
+
+impl TextEvent {
+    /// この event が **読み上げを始める**か: 本文があり、分割の続きの片 ([`Self::continuation`])
+    /// ではない。 sequencer の読み上げトリガ・VOICEVOX へ渡す読み上げの一覧・口パクの入力が
+    /// 全部これを通る (どれか 1 つでも続きの片を読むと、切り口ごとに同じ文を読み直す)。
+    #[must_use]
+    pub fn starts_reading(&self) -> bool {
+        !self.text.is_empty() && !self.continuation
+    }
 }
 
 impl Default for TextEvent {
@@ -1299,6 +1394,9 @@ impl Default for TextEvent {
             fade_out_beats: 0.0,
             fade_in_curve: FadeCurve::Linear,
             fade_out_curve: FadeCurve::Linear,
+            fade_in_lead_beats: 0.0,
+            fade_out_trail_beats: 0.0,
+            continuation: false,
         }
     }
 }

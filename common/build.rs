@@ -70,6 +70,8 @@ const WIRE_SOURCES: &[&str] = &[
     "src/sampler_ring.rs",
     "src/worker_bridge.rs",
     "src/plugin_ref.rs",
+    // r.md #132 残件: ARA の persistent id の読み替え表 (`SetupAraDocument.archive_ids` として wire を渡る)。
+    "src/ara_ids.rs",
 ];
 
 fn main() {

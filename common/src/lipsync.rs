@@ -313,13 +313,15 @@ pub fn tachie_body_range(song: &Song, mouth_track_id: u32) -> Option<(f64, f64)>
 // ===========================================================================
 
 /// 口パクの入力になる clip の中身。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LipsyncSource<'a> {
-    /// 歌唱。`base_beat` は `voicevox::sing_base_beat` の解 (= 歌う note の
-    /// いちばん早い開始、content-local)。**呼び側が引き直さなくて済むよう**
-    /// ここへ載せる (分類と基準拍で条件が食い違わない)。
-    Sing { notes: &'a [Note], base_beat: f64 },
-    /// 読み上げ。clip の**先頭の非空** `TextEvent` 1 つ。
+    /// 歌唱。`notes` は **この clip が歌う** note (始まりが窓の中、長さは窓の末尾まで =
+    /// [`Clip::sounding_note_len`]、VOICEVOX へ渡す歌唱の一覧と同じ)。`base_beat` は
+    /// `voicevox::sing_base_beat` の解 (= 歌う note のいちばん早い開始、content-local)。
+    /// **呼び側が引き直さなくて済むよう** ここへ載せる (分類と基準拍で条件が食い違わない)。
+    Sing { notes: Vec<Note>, base_beat: f64 },
+    /// 読み上げ。この clip が **読み上げを始める** 先頭の `TextEvent` 1 つ
+    /// ([`TextEvent::starts_reading`] かつ始まりが窓の中)。
     Talk(&'a TextEvent),
 }
 
@@ -328,15 +330,25 @@ pub enum LipsyncSource<'a> {
 /// **入力 fingerprint と phoneme query の snap 収集は必ずこの 1 本で分類すること。**
 /// 片方だけ条件がずれると「歌詞を変えたのに口パクが再生成されない」/「無関係な
 /// 編集のたびに再生成される」が静かに起きる (どちらもログにも `*` にも出ない)。
+///
+/// 窓の門は歌唱 / 読み上げと同じ [`Clip::window_has_onset`]: 分割の片 (同じ content を別の窓で
+/// 見る) を動かしても、窓の外に隠れている前後の片の口は動かさない。
 #[must_use]
 pub fn lipsync_source_of<'a>(song: &'a Song, clip: &Clip) -> Option<LipsyncSource<'a>> {
     let content = song.clip_contents.get(&clip.content_id)?;
-    if let Some(notes) = content.notes()
-        && let Some(base_beat) = crate::voicevox::sing_base_beat(notes)
-    {
-        return Some(LipsyncSource::Sing { notes, base_beat });
+    if let Some(notes) = content.notes() {
+        let sounding: Vec<Note> = notes
+            .iter()
+            .filter_map(|n| Some(Note { duration_beats: clip.sounding_note_len(n)?, ..n.clone() }))
+            .collect();
+        if let Some(base_beat) = crate::voicevox::sing_base_beat(&sounding) {
+            return Some(LipsyncSource::Sing { notes: sounding, base_beat });
+        }
     }
-    let ev = content.text_events()?.iter().find(|e| !e.text.is_empty())?;
+    let ev = content
+        .text_events()?
+        .iter()
+        .find(|e| e.starts_reading() && clip.window_has_onset(e.event_start_in_clip_beats))?;
     Some(LipsyncSource::Talk(ev))
 }
 

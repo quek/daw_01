@@ -73,6 +73,8 @@
             fade_out_beats: fo,
             fade_in_curve: ci,
             fade_out_curve: co,
+            fade_in_lead_beats: 0.0,
+            fade_out_trail_beats: 0.0,
         }
     }
 
@@ -2034,6 +2036,8 @@
                 fade_out_beats: 0.0,
                 fade_in_curve: FadeCurve::Linear,
                 fade_out_curve: FadeCurve::Linear,
+                fade_in_lead_beats: 0.0,
+                fade_out_trail_beats: 0.0,
             },
         };
         let g = fade_geometry(r, test_content_map(r, 4.0), &f, FadeEdge::In, &style);

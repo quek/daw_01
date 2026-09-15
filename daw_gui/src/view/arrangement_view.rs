@@ -334,6 +334,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // そのトラックの全 clip に、口パク再生成中なら口 track の auto_lipsync clip に、
         // 右上角へ回転スピナーを出す (= このクリップはまだ最新を反映していない の合図)。
         draw_clip_synth_spinner(app, ui, *clip_key, *rect);
+        draw_clip_continuation_badge(app, ui, *clip_key, *rect);
 
         // clip rename mode 中はこの clip rect の上端に text_input を重ね描き。
         // track rename と同 idiom (text_input_at_focused が click で focus 取得、
@@ -1243,6 +1244,57 @@ fn draw_clip_synth_spinner(
 }
 
 // ---------------------------------------------------------------------------
+// r.md #132 残件: 読み上げない続きの片 (字幕) の「続き」の印
+// ---------------------------------------------------------------------------
+
+/// 「続き」の印の文字。
+const CONTINUATION_BADGE_TEXT: &str = "続き";
+
+/// 「続き」の印の色 `(チップの塗り, 縁, 文字)`。 チップは **極性固定インクの逆極性の縁取り**: 暗い塗りは
+/// 明るいクリップの上で、明るい縁は暗いクリップの上で輪郭を出し、文字は塗りに対して読める。 載るのは
+/// ユーザー着色クリップ (選択中の黄 / 減光を含む) の上なので、テーマ従属トークンを使わない
+/// (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
+fn continuation_badge_colors(p: &daw_ui_core::theme::Palette) -> (Color, Color, Color) {
+    (p.ink_on_bright, p.ink_on_dark, p.ink_on_dark)
+}
+
+/// VOICEVOX トラックの字幕クリップのうち、**窓の頭が読み上げない続きの片** (分割の後ろの片) の左下に
+/// 「続き」のチップを出す (読み上げは前の片が 1 回だけ、`TextEvent::continuation`)。 Inspector の
+/// 「ここから読む」で普通の読み上げに戻すと消える。 rect が小さい (zoom out) ときは名前に被るので省略する。
+fn draw_clip_continuation_badge(app: &AppData, ui: &mut Ui<'_, AppData>, clip_key: ClipKey, clip_rect: Rect) {
+    const FONT: f32 = 9.0;
+    if clip_rect.w < 36.0 || clip_rect.h < 30.0 {
+        return;
+    }
+    let continues = app.cur.song_doc.song().track_by_id(clip_key.track_id).is_some_and(common::model::Track::is_voicevox_vocal)
+        && app.clip_text_reads(clip_key) == Some(false);
+    if !continues {
+        return;
+    }
+    let text_w = ui.measure_text(CONTINUATION_BADGE_TEXT, FONT);
+    let chip = Rect { x: clip_rect.x + 3.0, y: clip_rect.y + clip_rect.h - FONT * 1.2 - 6.0, w: text_w + 8.0, h: FONT * 1.2 + 4.0 };
+    if chip.x + chip.w > clip_rect.x + clip_rect.w - 3.0 {
+        return;
+    }
+    let (fill, border, ink) = continuation_badge_colors(ui.palette());
+    ui.push_rect(RectCommand {
+        rect: chip,
+        fill,
+        border,
+        border_width: 1.0,
+        radius: [3.0; 4],
+        clip_rect: Some(clip_rect),
+    });
+    ui.label_at_clipped(
+        (b"clip_continuation_badge", clip_key.track_id, clip_key.clip_id),
+        CONTINUATION_BADGE_TEXT,
+        Rect { x: chip.x + 4.0, y: chip.y + 2.0, w: text_w, h: FONT * 1.2 },
+        FONT,
+        ink,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Phase 1 PR4: audio clip 内の波形描画 (`Ui::waveform` を clip rect に重ねる)
 // ---------------------------------------------------------------------------
 
@@ -1282,17 +1334,23 @@ fn draw_audio_clip_value_overlay(
     let Some(content) = app.cur.song_doc.song().clip_contents.get(&clip.content_id) else {
         return;
     };
-    let Some(events) = content.audio_events() else {
+    // 値は Inspector と同じく **この clip の窓に見えているひと続き** から読む
+    // (`ClipContent::window_fades`、`handler::clip_window`): gain は最初のひと続きの先頭の event、fade-in は
+    // 最初の / fade-out は最後のひと続きの、窓の中に見えているランプの長さ。 content の先頭 event を読むと、
+    // 分割の片 (同じ content を別の窓で見る) で別の片の値が出る。
+    let fades = content.window_fades(clip.content_window());
+    let (Some(&(first_index, first)), Some(&(_, last))) = (fades.first(), fades.last()) else {
         return;
     };
-    let Some(event) = events.first() else {
+    let Some(event) = content.audio_events().and_then(|events| events.get(first_index)) else {
         return;
     };
+    let (fade_in, fade_out) = (first.visible_fade_in_beats(), last.visible_fade_out_beats());
 
     // Default 値は無表示 (= clip 名で混雑するのを避ける)。
     let show_gain = event.gain_db.abs() > 0.05;
-    let show_fade_in = event.fade_in_beats > 0.0;
-    let show_fade_out = event.fade_out_beats > 0.0;
+    let show_fade_in = fade_in > 0.0;
+    let show_fade_out = fade_out > 0.0;
     if !(show_gain || show_fade_in || show_fade_out) {
         return;
     }
@@ -1334,11 +1392,11 @@ fn draw_audio_clip_value_overlay(
         *x_right -= 6.0;
     };
     if show_fade_out {
-        let s = format!("Fo {:.2}b", event.fade_out_beats);
+        let s = format!("Fo {fade_out:.2}b");
         emit(ui, "audio_clip_lbl_fo", &s, &mut x_right);
     }
     if show_fade_in {
-        let s = format!("Fi {:.2}b", event.fade_in_beats);
+        let s = format!("Fi {fade_in:.2}b");
         emit(ui, "audio_clip_lbl_fi", &s, &mut x_right);
     }
     if show_gain {
@@ -1357,6 +1415,37 @@ mod tests {
     use super::track_index_at_y;
     use crate::widgets::arrangement::view_build::clip_display_label;
     use daw_ui_renderer::Rect;
+
+    /// 「続き」の印は **どのクリップ色の上でも** 輪郭が出て (塗りか縁のどちらかが背景に 3:1)、文字が塗りに
+    /// 対して読める (4.5:1)。 背景には沈む側 (明るいクリーム / 選択中の黄 / ライトテーマの地 / 暗い青) と
+    /// クリップ色のパレット全色を入れる (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
+    #[test]
+    fn continuation_badge_is_readable_on_every_clip_color() {
+        use daw_ui_core::theme::{Palette, contrast_ratio};
+        use daw_ui_renderer::Color;
+        for p in [Palette::dark(), Palette::light()] {
+            let mut backgrounds: Vec<(String, Color)> = vec![
+                ("明るいクリーム".into(), Color::rgb(0.93, 0.90, 0.72)),
+                ("選択中の黄".into(), p.selection_warm),
+                ("地".into(), p.window_bg),
+                ("暗い青".into(), Color::rgb(0.05, 0.08, 0.16)),
+                ("白".into(), Color::rgb(1.0, 1.0, 1.0)),
+                ("黒".into(), Color::rgb(0.0, 0.0, 0.0)),
+            ];
+            backgrounds.extend(
+                crate::view::track_color::PALETTE
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (format!("palette[{i}]"), Color::rgb(c[0], c[1], c[2]))),
+            );
+            let (fill, border, ink) = super::continuation_badge_colors(&p);
+            assert!(contrast_ratio(ink, fill) >= 4.5, "文字がチップの塗りに対して読めない");
+            for (name, bg) in backgrounds {
+                let outline = contrast_ratio(fill, bg).max(contrast_ratio(border, bg));
+                assert!(outline >= 3.0, "「{name}」の上でチップの輪郭が出ない: {outline:.2}:1");
+            }
+        }
+    }
 
     fn rect_at(y: f32, h: f32) -> Rect {
         Rect { x: 0.0, y, w: 100.0, h }
@@ -1390,20 +1479,32 @@ mod tests {
         // start_beat 順: 0.0 "こんに" → 1.0 "か"。 名前無しなので歌詞を表示。
         assert_eq!(&*clip_display_label(&midi_clip, &song), "こんにか");
 
-        // content 2: Text clip → 本文を表示 (名前 == 本文)。
+        // content 2: Text clip → 窓に見えている本文を表示 (名前 == 本文)。
         song.clip_contents.insert(
             2,
             ClipContent::Text(TextContent {
-                events: vec![TextEvent { text: "Hello".into(), ..TextEvent::default() }],
+                events: vec![TextEvent { text: "Hello".into(), event_length_beats: 4.0, ..TextEvent::default() }],
             }),
         );
-        let text_clip = Clip { id: 2, content_id: 2, ..Clip::default() };
+        let text_clip = Clip { id: 2, content_id: 2, length_beats: 4.0, ..Clip::default() };
         assert_eq!(&*clip_display_label(&text_clip, &song), "Hello");
 
         // Text 本文は content_name より優先される (Text の rename は本文を
         // 編集するので本文が名前。 レガシーで "Title" 等が残っていても本文が出る)。
         song.set_content_name(2, "MyName".into());
         assert_eq!(&*clip_display_label(&text_clip, &song), "Hello");
+        // 同じ content を別の窓で見るクリップ (分割の片) は、それぞれの窓に見えている本文を出す
+        // (本文の編集はそのクリップの窓の片だけに効くので、content の先頭を出すと編集が見えない)。
+        let text = |text: &str, start: f64| TextEvent {
+            text: text.into(),
+            event_start_in_clip_beats: start,
+            event_length_beats: 2.0,
+            ..TextEvent::default()
+        };
+        song.clip_contents.insert(4, ClipContent::Text(TextContent { events: vec![text("前半", 0.0), text("後半", 2.0)] }));
+        let head = Clip { id: 4, content_id: 4, length_beats: 2.0, ..Clip::default() };
+        let tail = Clip { id: 5, content_id: 4, start_beat: 2.0, content_offset_beats: 2.0, length_beats: 2.0, ..Clip::default() };
+        assert_eq!((&*clip_display_label(&head, &song), &*clip_display_label(&tail, &song)), ("前半", "後半"));
         // 明示名優先: 歌詞付き MIDI クリップ (Bell トラックの
         // 「あかねに」 等) でも、 ユーザーが付けた明示名があれば歌詞より優先して
         // それを表示する (DAW 標準挙動)。 名前を付けても歌詞のまま変わらなかった

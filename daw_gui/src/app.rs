@@ -1853,11 +1853,12 @@ impl AppData {
                     let edge = *edge;
                     self.set_clip_event_fade(*target, move |mut f| {
                         // 上限は event 長 (音 / 映像 / 画像 / 字幕が全部 event 長基準で
-                        // fade を適用するため。 r.md #38)。
+                        // fade を適用するため。 r.md #38)。 掴んで掛け直した fade は端から始まる
+                        // (分割の片が持っていたランプの張り出しを捨てる)。
                         let v = beats.clamp(0.0, f.len_beats.max(0.0));
                         match edge {
-                            FadeEdgeKind::In => f.fade_in_beats = v,
-                            FadeEdgeKind::Out => f.fade_out_beats = v,
+                            FadeEdgeKind::In => (f.fade_in_beats, f.fade_in_lead_beats) = (v, 0.0),
+                            FadeEdgeKind::Out => (f.fade_out_beats, f.fade_out_trail_beats) = (v, 0.0),
                         }
                         f
                     });
@@ -2007,6 +2008,7 @@ impl AppData {
             AppEvent::SetClipTalkParam { clip, param, value } => {
                 self.set_clip_talk_param(clip, param, value);
             }
+            AppEvent::SetClipTextReads { clip, reads } => self.set_clip_text_reads(clip, reads),
             AppEvent::SetPianoRollSnapEnabled(b) => {
                 self.cur.view.pianoroll_snap_enabled = b;
             }

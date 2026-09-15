@@ -461,7 +461,7 @@ fn draw_fade_rows(
         app,
         "inspector_image_fade_in_input",
         Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-        app.inspector_fold(|a, t| a.image_first_event(t, |e| e.fade_in_beats)),
+        app.inspector_fold(|a, t| a.image_first_fade(t).map(|f| f.visible_fade_in_beats())),
         0.0,
         ScrubableNumberFormat::Decimal(3),
         &ScrubableNumberStyle {
@@ -503,7 +503,7 @@ fn draw_fade_rows(
         app,
         "inspector_image_fade_out_input",
         Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-        app.inspector_fold(|a, t| a.image_first_event(t, |e| e.fade_out_beats)),
+        app.inspector_fold(|a, t| a.image_first_fade(t).map(|f| f.visible_fade_out_beats())),
         0.0,
         ScrubableNumberFormat::Decimal(3),
         &ScrubableNumberStyle {

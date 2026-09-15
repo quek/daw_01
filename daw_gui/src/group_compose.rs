@@ -831,6 +831,7 @@ mod tests {
                         fade_out_beats: 0.0,
                         fade_in_curve: common::model::FadeCurve::Linear,
                         fade_out_curve: common::model::FadeCurve::Linear,
+                        ..ImageEvent::default()
                     }],
                 }),
             );

@@ -168,8 +168,10 @@ impl PluginStateWriteBack {
             p.state = written.state.clone();
             // (r.md #5 ARA2) Only overwrite the ARA archive when the plug-in actually produced one; a non-ARA
             // device or a not-yet-bound session reports None, and we must not wipe a previously-saved archive.
-            if written.ara_archive.is_some() {
-                p.ara_archive = written.ara_archive.clone();
+            // A fresh archive is written with the current persistent ids, so the legacy-id aliases go with the
+            // replaced one (`set_ara_archive`).
+            if let Some(archive) = &written.ara_archive {
+                p.set_ara_archive(archive.clone());
             }
         });
     }

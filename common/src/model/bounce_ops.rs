@@ -84,6 +84,31 @@ impl Song {
         !(is_group || receives_send || receives_paraout) || instrument_bus
     }
 
+    /// Bounce In Place の置き先: content `content_id` を、窓 `window` (content-local 拍) を見ていたクリップに
+    /// ついて焼いた `content` に置き換える。 content を共有して **同じ窓** を見るクリップ (linked clip) は一緒に
+    /// 置き換わり、**別の窓** を見るクリップ (分割の片) は元の content のまま残る (r.md #132 残件: クリップへの
+    /// 編集はそのクリップの窓に見えている片だけに効く)。 全員が同じ窓なら content id ごと置き換える。
+    /// content が無ければ `None`。
+    pub fn replace_window_content(&mut self, content_id: ContentId, window: (f64, f64), content: ClipContent) -> Option<()> {
+        self.clip_contents.get(&content_id)?;
+        let same_window = move |c: &Clip| {
+            let (lo, hi) = c.content_window();
+            c.content_id == content_id && (lo - window.0).abs() <= 1e-9 && (hi - window.1).abs() <= 1e-9
+        };
+        let shared_elsewhere =
+            self.tracks.iter().flat_map(Track::all_clips).any(|c| c.content_id == content_id && !same_window(c));
+        if !shared_elsewhere {
+            *self.clip_contents.get_mut(&content_id)? = content;
+            return Some(());
+        }
+        let name = self.clip_content_names.get(&content_id).cloned().unwrap_or_default();
+        let baked = self.alloc_content(content, name);
+        for clip in self.tracks.iter_mut().flat_map(Track::all_clips_mut).filter(|c| same_window(c)) {
+            clip.content_id = baked;
+        }
+        Some(())
+    }
+
     /// 焼いた WAV を `media.audio_sources` に登録し、`window` を鳴らす **単一 audio event** の content を返す
     /// (bounce / Glue 共通の SSoT)。置き方 (新しい content / 既存 content の置き換え) は呼び出し側が決める。
     ///

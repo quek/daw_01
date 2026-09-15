@@ -595,7 +595,7 @@ impl ProjectRt {
                 // per-track の input delay line は下の `install_input_delay_lines` が扱う。
                 //
                 // r.md #40: stretch engine の走行ストリームも Song スコープ。
-                // `stream_key = clip.id << 32 | audio event id` は project ごとに
+                // `stream_key` (= audio source id) は project ごとに
                 // 1 から再採番される名前なので、別 project の event が同じキーで
                 // **引き当てに成功してしまう** (= 前 project のスペクトル状態を
                 // 引き継いだ音が頭に混ざる)。 pool の実体は使い回すが、走行状態は
@@ -606,7 +606,7 @@ impl ProjectRt {
                     }
                     // tape 位置 accumulator も同じ理由で無効化する
                     // (添字は track 内 schedule 順 = 位置キー)。
-                    s.repitch_accum.fill((u64::MAX, 0.0));
+                    s.repitch_accum.fill(crate::audio_clip_renderer::TapeCursor::IDLE);
                 }
                 // r.md #129 §18-M: master Limiter の先読みリングも前 project の音を持っている
                 // (schedule の外で生き続ける)。192kHz 換算のリングを 0 で埋めるだけで確保しない。

@@ -4,32 +4,22 @@
 use crate::state::*;
 use crate::app_types::*;
 use crate::event::*;
+use common::model::TimedEvent;
 
 impl AppData {
-    /// `target` clip の first event の `reversed` 値を読む。 audio で
-    /// ない / event が空 / 範囲外なら `false`。 メニューの toggle 用。
+    /// `target` clip の編集が効く最初の片の `reversed` 値を読む (`handler::clip_window`)。 audio で
+    /// ない / 見えている event が無いなら `false`。 メニューの toggle 用。
     pub(crate) fn is_clip_audio_event_reversed(&self, target: ClipKey) -> bool {
-        self.cur.song_doc.song()
-            .track_by_id(target.track_id)
-            .and_then(|t| t.clip_by_id(target.clip_id))
-            .and_then(|c| {
-                if let Some(common::model::ClipContent::Audio(audio)) =
-                    self.cur.song_doc.song().clip_contents.get(&c.content_id)
-                {
-                    audio.events.first().map(|e| e.reversed)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(false)
+        self.audio_edit_targets(target)
+            .and_then(|t| self.clip_edit_anchor(t, common::model::ClipContent::audio_events, None))
+            .is_some_and(|(e, _)| e.reversed)
     }
 
     /// `AudioEvent.reversed` を更新 (`docs/plan_audio_clip.md` §3.8)。
-    /// audio_editor で event を選択中なら当該 event のみ、 さもなくば
-    /// 全 event に broadcast (= multi-event 対応 / 1 clip 1 event 互換、
-    /// PR-D 段階 2)。
+    /// audio_editor で event を選択中ならその event、 さもなくば窓に見えている片
+    /// (ひと続きは 1 つの take として逆にする、`handler::clip_window`)。
     pub(crate) fn set_clip_audio_event_reversed(&mut self, target: ClipKey, reversed: bool) {
-        self.mutate_audio_events_in_clip(target, |e| e.reversed = reversed);
+        self.mutate_audio_event_mapping_in_clip(target, |e| e.reversed != reversed, |e| e.reversed = reversed);
     }
 
     /// `targets` の clip が **全て** muted なら `true` (空なら `false`)。`q` の
@@ -125,7 +115,7 @@ impl AppData {
         target: ClipKey,
         mode: common::model::StretchMode,
     ) {
-        self.mutate_audio_events_in_clip(target, |e| e.stretch_mode = mode);
+        self.mutate_audio_event_mapping_in_clip(target, |e| e.stretch_mode != mode, |e| e.stretch_mode = mode);
         // B1 (r.md #8): Slice へ切替時、 onsets 未検出の event に transient 検出を
         // 走らせ slice の trigger 位置を埋める (検出済 / 非 Slice は何もしない)。
         if mode == common::model::StretchMode::Slice {
@@ -139,91 +129,70 @@ impl AppData {
     /// 該当 event を `Stretch` mode に切替える。 transient が無い event は markers 空
     /// (= uniform stretch のまま)。 OFF-RT。 buffer 未 decode の event は skip。
     pub(crate) fn auto_warp_clip(&mut self, target: ClipKey) {
-        let Some(content_id) = self
-            .cur.song_doc.song()
-            .track_by_id(target.track_id)
-            .and_then(|t| t.clip_by_id(target.clip_id))
-            .map(|c| c.content_id)
-        else {
+        let Some((content_id, targets)) = self.audio_edit_targets(target) else {
             return;
         };
-        let n_events = match self.cur.song_doc.song().clip_contents.get(&content_id) {
-            Some(common::model::ClipContent::Audio(a)) => a.events.len(),
-            _ => return,
-        };
-        let indices = self.audio_event_target_indices(target, n_events);
-
-        // Phase A: 対象 event の source range + 配置 beat 長 (immutable borrow)。
-        let mut jobs: Vec<(usize, common::model::AudioSourceId, u64, u64, f64)> = Vec::new();
-        if let Some(common::model::ClipContent::Audio(a)) =
-            self.cur.song_doc.song().clip_contents.get(&content_id)
-        {
-            for &i in &indices {
-                if let Some(e) = a.events.get(i) {
-                    jobs.push((
-                        i,
-                        e.source_id,
-                        e.source_start_frames,
-                        e.source_end_frames,
-                        e.event_length_beats,
-                    ));
-                }
-            }
-        }
-        if jobs.is_empty() {
+        // Phase A: 窓の中でひと続きの片ごとに、source range + **take** の配置 beat 長 (immutable borrow)。
+        // warp marker の拍は take の座標なので、ひと続きの片には take 全体で 1 組を掛けて片同士で揃える。
+        let Some(runs) = self.audio_runs(content_id, &targets) else {
             return;
-        }
+        };
 
         // Phase B: onset 検出 → grid snap warp markers (OFF-RT)。
-        let mut results: Vec<(usize, Vec<common::model::BeatMarker>)> = Vec::new();
-        for (i, source_id, start, end, length_beats) in jobs {
-            let Some(buf) = self.cur.media.audio_source_cache.get(source_id) else {
+        let mut results: Vec<(Vec<usize>, Vec<common::model::BeatMarker>)> = Vec::new();
+        for (run, e) in runs {
+            let Some(buf) = self.cur.media.audio_source_cache.get(e.source_id) else {
                 continue;
             };
-            let s = start.min(buf.frames) as usize;
-            let e = end.min(buf.frames) as usize;
+            let (start, end, length_beats) = (e.source_start_frames, e.source_end_frames, e.take_length_beats());
             let source_len = end.saturating_sub(start);
-            let mono = buf.downmix_mono(s, e);
+            let mono = buf.downmix_mono(start.min(buf.frames) as usize, end.min(buf.frames) as usize);
             if mono.is_empty() || source_len == 0 || length_beats <= 0.0 {
                 continue;
             }
             let onsets = common::onset::detect_onsets(&mono, buf.sample_rate, 0.5);
-            let markers = common::audio_render::warp_markers_from_onsets(
-                &onsets,
-                start,
-                source_len,
-                length_beats,
-                4,
-            );
+            let markers = common::audio_render::warp_markers_from_onsets(&onsets, start, source_len, length_beats, 4);
             // anchor 2 件のみ = transient 無し → 空で uniform stretch を維持。
-            results.push((i, if markers.len() > 2 { markers } else { Vec::new() }));
+            results.push((run, if markers.len() > 2 { markers } else { Vec::new() }));
+        }
+        if results.is_empty() {
+            return;
         }
 
-        // Phase C: 書き戻し (warp 有効 event は Stretch mode へ) + engine 再 sync。
-        let (warped, changed) = self
-            .edit_song(move |song| {
-                let mut warped = 0usize;
-                let mut changed = false;
-                if let Some(common::model::ClipContent::Audio(a)) =
-                    song.clip_contents.get_mut(&content_id)
-                {
-                    for (i, markers) in results {
-                        if let Some(ev) = a.events.get_mut(i) {
-                            if !markers.is_empty() {
-                                ev.stretch_mode = common::model::StretchMode::Stretch;
-                                warped += 1;
-                            }
-                            ev.beat_markers = markers;
-                            changed = true;
-                        }
+        // Phase C: 書き戻し (warp 有効な take は Stretch mode へ) + engine 再 sync。
+        let warped = results.iter().filter(|(_, m)| !m.is_empty()).count();
+        let changed = self.edit_song(move |song| {
+            let Some(common::model::ClipContent::Audio(a)) = song.clip_contents.get_mut(&content_id) else {
+                return false;
+            };
+            for (run, markers) in results {
+                common::model::edit_run(&mut a.events, &run, |ev| {
+                    if !markers.is_empty() {
+                        ev.stretch_mode = common::model::StretchMode::Stretch;
                     }
-                }
-                (warped, changed)
-            })
-            .unwrap_or((0, false));
-        if changed {
+                    ev.beat_markers = markers;
+                });
+            }
+            true
+        });
+        if changed == Some(true) {
             self.ui_ephemeral.status_message = format!("Auto-Warp: {warped} event を beat grid に整列");
         }
+    }
+
+    /// content `content_id` の audio event `targets` を、窓の中でひと続きの片ごとに (index 列, つないだ event)。
+    fn audio_runs(
+        &self,
+        content_id: common::model::ContentId,
+        targets: &[usize],
+    ) -> Option<Vec<(Vec<usize>, common::model::AudioEvent)>> {
+        let events = self.cur.song_doc.song().clip_contents.get(&content_id)?.audio_events()?;
+        Some(
+            common::model::piece_runs(events, targets)
+                .into_iter()
+                .filter_map(|run| common::model::joined_run(events, &run).map(|e| (run, e)))
+                .collect(),
+        )
     }
 
     /// B1 (r.md #8): Slice 切替時に GUI decoded buffer から transient を検出して
@@ -232,71 +201,41 @@ impl AppData {
     /// event は前回検出 / 将来の user 編集を尊重して skip。 OFF-RT (buffer を 1 回
     /// scan)。 buffer 未 decode の event は skip (= 空 onsets で Raw 等価のまま)。
     pub(crate) fn detect_onsets_for_clip(&mut self, target: ClipKey) {
-        let Some(content_id) = self
-            .cur.song_doc.song()
-            .track_by_id(target.track_id)
-            .and_then(|t| t.clip_by_id(target.clip_id))
-            .map(|c| c.content_id)
-        else {
+        let Some((content_id, targets)) = self.audio_edit_targets(target) else {
             return;
         };
-        let n_events = match self.cur.song_doc.song().clip_contents.get(&content_id) {
-            Some(common::model::ClipContent::Audio(a)) => a.events.len(),
-            _ => return,
-        };
-        let indices = self.audio_event_target_indices(target, n_events);
-
-        // Phase A: 検出対象 (onsets 空) の event index + source range を集める
-        // (immutable borrow)。
-        let mut jobs: Vec<(usize, common::model::AudioSourceId, u64, u64)> = Vec::new();
-        if let Some(common::model::ClipContent::Audio(a)) =
-            self.cur.song_doc.song().clip_contents.get(&content_id)
-        {
-            for &i in &indices {
-                if let Some(e) = a.events.get(i)
-                    && e.onsets.is_empty()
-                {
-                    jobs.push((i, e.source_id, e.source_start_frames, e.source_end_frames));
-                }
-            }
-        }
-        if jobs.is_empty() {
+        // Phase A: 検出対象 (onsets 空) のひと続きの片と source range を集める (immutable borrow)。
+        let Some(runs) = self.audio_runs(content_id, &targets) else {
             return;
-        }
+        };
 
         // Phase B: decoded buffer を mono downmix して OFF-RT 検出。
-        let mut results: Vec<(usize, Vec<u64>)> = Vec::new();
-        for (i, source_id, start, end) in jobs {
-            let Some(buf) = self.cur.media.audio_source_cache.get(source_id) else {
+        let mut results: Vec<(Vec<usize>, Vec<u64>)> = Vec::new();
+        for (run, e) in runs.into_iter().filter(|(_, e)| e.onsets.is_empty()) {
+            let Some(buf) = self.cur.media.audio_source_cache.get(e.source_id) else {
                 continue;
             };
-            let start = start.min(buf.frames) as usize;
-            let end = end.min(buf.frames) as usize;
-            let mono = buf.downmix_mono(start, end);
+            let mono = buf.downmix_mono(
+                e.source_start_frames.min(buf.frames) as usize,
+                e.source_end_frames.min(buf.frames) as usize,
+            );
             if mono.is_empty() {
                 continue;
             }
-            let onsets = common::onset::detect_onsets(&mono, buf.sample_rate, 0.5);
-            results.push((i, onsets));
+            results.push((run, common::onset::detect_onsets(&mono, buf.sample_rate, 0.5)));
+        }
+        if results.is_empty() {
+            return;
         }
 
         // Phase C: onsets を書き戻し audio engine へ再 sync (mutable borrow)。
-        let _ = self
-            .edit_song(move |song| {
-                let mut changed = false;
-                if let Some(common::model::ClipContent::Audio(a)) =
-                    song.clip_contents.get_mut(&content_id)
-                {
-                    for (i, onsets) in results {
-                        if let Some(e) = a.events.get_mut(i) {
-                            e.onsets = onsets;
-                            changed = true;
-                        }
-                    }
+        let _ = self.edit_song(move |song| {
+            if let Some(common::model::ClipContent::Audio(a)) = song.clip_contents.get_mut(&content_id) {
+                for (run, onsets) in results {
+                    common::model::edit_run(&mut a.events, &run, |e| e.onsets = onsets);
                 }
-                changed
-            })
-            .unwrap_or(false);
+            }
+        });
     }
 
     pub(crate) fn set_clip_audio_event_gain_db(&mut self, target: ClipKey, gain_db: f32) {
@@ -316,7 +255,11 @@ impl AppData {
         // (inspector の range / 貼り付け sanitize も同じ定数を引く)。
         let semitones =
             common::model::clamp_semitones(semitones, common::model::PITCH_SEMITONES_LIMIT);
-        self.mutate_audio_events_in_clip(target, |e| e.pitch_semitones = semitones);
+        self.mutate_audio_event_mapping_in_clip(
+            target,
+            |e| e.pitch_semitones != semitones,
+            |e| e.pitch_semitones = semitones,
+        );
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
@@ -349,12 +292,12 @@ impl AppData {
     }
 
 
-    /// r.md #38: clip 内の **1 event** の fade を content 種別に依らず書き換える。
+    /// r.md #38: clip 内の **1 event (を含む窓の中のひと続き)** の fade を content 種別に依らず書き換える。
     ///
     /// アレンジ画面の fade 角 drag はこれを使う。 audio / video / image / text の
     /// 4 種は同じ fade フィールドを持ち、 適用側も同じ curve 式を通るので、
     /// 種別ごとの setter を 4 本用意する必要はない
-    /// (`ClipContent::set_event_fade` が唯一の書き込み口)。
+    /// (`ClipContent::set_window_fade` が唯一の書き込み口。 掴み所はひと続きの外側の端にだけ出る)。
     ///
     /// clamp は caller (`f`) の責務。 `EventFade::len_beats` が上限。
     pub(crate) fn set_clip_event_fade(
@@ -362,20 +305,16 @@ impl AppData {
         target: crate::app_types::ClipEventRef,
         f: impl FnOnce(common::model::EventFade) -> common::model::EventFade,
     ) {
-        let Some(content_id) = self
-            .cur.song_doc
-            .song()
-            .track_by_id(target.clip.track_id)
-            .and_then(|t| t.clip_by_id(target.clip.clip_id))
-            .map(|c| c.content_id)
+        let Some((content_id, window)) =
+            self.cur.song_doc.song().clip_by_key(target.clip).map(|c| (c.content_id, c.content_window()))
         else {
             return;
         };
         let index = target.event as usize;
-        self.edit_song(|song| {
+        self.edit_song_checked(|song| {
             song.clip_contents
                 .get_mut(&content_id)
-                .is_some_and(|c| c.set_event_fade(index, f))
+                .is_some_and(|c| c.set_window_fade(window, index, f))
         });
         // audio の inspector edit buffer はこの clip の値を映すので resync する
         // (他 content 種別の setter は自前の resync を持つが、 fade は arrangement 側
@@ -387,15 +326,16 @@ impl AppData {
         // r.md #38: 上限は **event 長**。 音 (`audio_clip_renderer`) は event 長基準で
         // fade を掛けるので、 clip 長で clamp すると clip より短い event
         // (trim / split 後) で fade がフルゲインに到達せず絵と音がずれる。
+        // 掛け直した fade は左端から始まる (分割の片が持っていたランプの続きは捨てる)。
         self.mutate_audio_events_in_clip(target, |e| {
-            e.fade_in_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+            e.set_edge_fade_in(beats.clamp(0.0, e.event_length_beats.max(0.0)));
         });
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
     pub(crate) fn set_clip_audio_event_fade_out_beats(&mut self, target: ClipKey, beats: f64) {
         self.mutate_audio_events_in_clip(target, |e| {
-            e.fade_out_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+            e.set_edge_fade_out(beats.clamp(0.0, e.event_length_beats.max(0.0)));
         });
         self.resync_clip_audio_event_edit_buffers(target);
     }
@@ -471,34 +411,16 @@ impl AppData {
 
     /// docs/plan_text_overlay.md §4 P6: image と同 idiom の text event
     /// setter 群。 drag / inspector commit / lane override 経由のいずれも
-    /// このパスで TextEvent.field を直接書く。
+    /// このパスで TextEvent.field を直接書く。 書くのは窓に見えている片 (ひと続きは 1 つとして、
+    /// `handler::clip_window`) で、値が変わらなければ履歴にも dirty にも残さない。
     pub(crate) fn mutate_text_events_in_clip<F>(&mut self, target: ClipKey, mut f: F) -> bool
     where
         F: FnMut(&mut common::model::TextEvent),
     {
-        let Some(content_id) = self
-            .cur.song_doc.song()
-            .track_by_id(target.track_id)
-            .and_then(|t| t.clip_by_id(target.clip_id))
-            .map(|c| c.content_id)
-        else {
+        let Some(targets) = self.clip_shown_targets(target, common::model::ClipContent::text_events) else {
             return false;
         };
-        self.edit_song_checked(move |song| {
-            if let Some(common::model::ClipContent::Text(t)) =
-                song.clip_contents.get_mut(&content_id)
-            {
-                if t.events.is_empty() {
-                    return false;
-                }
-                for event in &mut t.events {
-                    f(event);
-                }
-                true
-            } else {
-                false
-            }
-        })
+        self.edit_event_runs(targets, common::model::ClipContent::text_events_mut, &mut f)
     }
 
     pub(crate) fn set_clip_text_event_x(&mut self, target: ClipKey, value: f32) {
@@ -658,13 +580,13 @@ impl AppData {
                 // r.md #38: text_compose も event 長基準で fade を適用するので上限は event 長。
                 let v = f64::from(value);
                 self.mutate_text_events_in_clip(target, |e| {
-                    e.fade_in_beats = v.clamp(0.0, e.event_length_beats.max(0.0));
+                    e.set_edge_fade_in(v.clamp(0.0, e.event_length_beats.max(0.0)));
                 });
             }
             F::FadeOutBeats => {
                 let v = f64::from(value);
                 self.mutate_text_events_in_clip(target, |e| {
-                    e.fade_out_beats = v.clamp(0.0, e.event_length_beats.max(0.0));
+                    e.set_edge_fade_out(v.clamp(0.0, e.event_length_beats.max(0.0)));
                 });
             }
         }
@@ -689,16 +611,10 @@ impl AppData {
 
     // -------- Font picker -------------------------------------
 
-    /// 編集対象 text クリップの現在のフォント名 (先頭 event)。text クリップで
+    /// 編集対象 text クリップの現在のフォント名 (窓に見えている最初の片)。text クリップで
     /// なければ `None`。
     pub(crate) fn clip_text_font_family(&self, target: ClipKey) -> Option<String> {
-        self.cur.song_doc.song()
-            .track_by_id(target.track_id)
-            .and_then(|t| t.clip_by_id(target.clip_id))
-            .and_then(|c| self.cur.song_doc.song().clip_contents.get(&c.content_id))
-            .and_then(|content| content.text_events())
-            .and_then(|events| events.first())
-            .map(|e| e.font_family.clone())
+        self.text_first_event(target, |e| e.font_family.clone())
     }
 
     pub(crate) fn open_font_picker(&mut self) {
@@ -833,22 +749,15 @@ impl AppData {
     /// なった。 target が Text variant でないなら文字列 buffer を空にして
     /// `clip_edit_buffer_target` を `None`。
     pub(crate) fn resync_clip_text_event_edit_buffers(&mut self, target: ClipKey) {
-        let event_snapshot = self
-            .cur.song_doc.song()
-            .track_by_id(target.track_id)
-            .and_then(|t| t.clip_by_id(target.clip_id))
-            .and_then(|c| self.cur.song_doc.song().clip_contents.get(&c.content_id))
-            .and_then(|content| content.text_events())
-            .and_then(|events| events.first())
-            .cloned();
-        let Some(ev) = event_snapshot else {
+        let event_snapshot = self.text_first_event(target, |e| (e.text.clone(), e.font_family.clone()));
+        let Some((text, font_family)) = event_snapshot else {
             self.cur.peph.clip_text_content_edit_text.clear();
             self.cur.peph.clip_text_font_family_edit_text.clear();
             self.cur.peph.clip_edit_buffer_target = None;
             return;
         };
-        self.cur.peph.clip_text_content_edit_text = ev.text.clone();
-        self.cur.peph.clip_text_font_family_edit_text = ev.font_family.clone();
+        self.cur.peph.clip_text_content_edit_text = text;
+        self.cur.peph.clip_text_font_family_edit_text = font_family;
         self.cur.peph.clip_edit_buffer_target = Some(target);
     }
 
@@ -861,12 +770,9 @@ impl AppData {
         let cref = self.selected_clip_ref()?;
         let track = self.cur.song_doc.song().track_by_id(cref.track_id)?;
         let clip = track.clip_by_id(cref.clip_id)?;
-        let common::model::ClipContent::Text(t) =
-            self.cur.song_doc.song().clip_contents.get(&clip.content_id)?
-        else {
-            return None;
-        };
-        let event = t.events.first()?;
+        // 値は窓に見えている最初のひと続きから読む (`handler::clip_window`)。
+        let events_of = common::model::ClipContent::text_events;
+        let (event, fade) = self.clip_edit_anchor(self.clip_shown_targets(cref, events_of)?, events_of, None)?;
         let mut automated = std::collections::HashSet::new();
         for lane in &track.automation_lanes {
             if let common::model::AutomationTarget::TextBuiltin(p) = lane.target {
@@ -878,25 +784,29 @@ impl AppData {
             // "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
             muted: clip.muted,
             align: event.align,
-            fade_in_curve: event.fade_in_curve,
-            fade_out_curve: event.fade_out_curve,
+            fade_in_curve: fade.fade_in_curve,
+            fade_out_curve: fade.fade_out_curve,
             automated,
-            fade_max_beats: event.event_length_beats,
-            event: event.clone(),
+            fade_max_beats: fade.len_beats,
+            event: common::model::TextEvent {
+                fade_in_beats: fade.visible_fade_in_beats(),
+                fade_out_beats: fade.visible_fade_out_beats(),
+                ..event.clone()
+            },
         })
     }
 
     pub(crate) fn set_clip_image_event_fade_in_beats(&mut self, target: ClipKey, beats: f64) {
         // r.md #38: image_compose も event 長基準で fade を適用するので上限は event 長。
         self.mutate_image_events_in_clip(target, |e| {
-            e.fade_in_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+            e.set_edge_fade_in(beats.clamp(0.0, e.event_length_beats.max(0.0)));
         });
         self.resync_clip_image_event_edit_buffers(target);
     }
 
     pub(crate) fn set_clip_image_event_fade_out_beats(&mut self, target: ClipKey, beats: f64) {
         self.mutate_image_events_in_clip(target, |e| {
-            e.fade_out_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+            e.set_edge_fade_out(beats.clamp(0.0, e.event_length_beats.max(0.0)));
         });
         self.resync_clip_image_event_edit_buffers(target);
     }

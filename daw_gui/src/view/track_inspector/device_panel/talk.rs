@@ -64,6 +64,7 @@ pub(super) fn draw_talk(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) 
         p.text,
     );
     y += 18.0;
+    y = draw_reading_start(app, ui, ctx, y, clip_key);
 
     // 字幕デバイス未挿入 = 画面非表示。ワンクリック追加ヘルパ (Q10)。
     if !has_subtitle {
@@ -292,4 +293,22 @@ pub(super) fn draw_talk(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) 
         y += 24.0;
     }
     y
+}
+
+/// r.md #132 残件: 「ここから読む」トグル。 点灯 = このクリップの窓の頭から読み上げる、消灯 = 前の片の
+/// 読み上げの続き (字幕だけを出す、アレンジに「続き」の印)。 押すと普通の読み上げ / 続きの片を入れ替える
+/// (1 undo step、`AppEvent::SetClipTextReads`)。 窓で始まる字幕が無いクリップには出さない。
+fn draw_reading_start(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx, y: f32, clip: common::model::ClipKey) -> f32 {
+    let Some(reads) = app.clip_text_reads(clip) else {
+        return y;
+    };
+    ui.toggle_button_at(
+        ("inspector_talk_reads_here", ctx.device_id),
+        "ここから読む",
+        Rect { x: ctx.x, y, w: ctx.w, h: 24.0 },
+        reads,
+        &toggle_audio_style(&app.theme),
+        move |_| Edit::mutate(move |app: &mut AppData| app.handle_event(AppEvent::SetClipTextReads { clip, reads: !reads })),
+    );
+    y + 28.0
 }

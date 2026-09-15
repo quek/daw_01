@@ -387,8 +387,9 @@ impl AppData {
                     };
                     song.place_bounce_with_fx(source, new_track_name, clip)?;
                 }
-                // 元クリップの content を置換 (= flat 化)。同 content_id を共有する linked clip も追従する。
-                BounceMode::InPlace => *song.clip_contents.get_mut(&source_content_id)? = content,
+                // 元クリップの content を置換 (= flat 化)。同じ窓を見る linked clip も追従し、別の窓を見る
+                // 分割の片は元の content のまま (`Song::replace_window_content`)。
+                BounceMode::InPlace => song.replace_window_content(source_content_id, (offset, offset + length), content)?,
             }
             Some(source_id)
         });

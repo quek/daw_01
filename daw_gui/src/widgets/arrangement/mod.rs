@@ -180,8 +180,9 @@ pub use common::model::ClipKey;
 /// `event_length_beats` / `fade_*_beats` / `fade_*_curve` を同じ意味で持ち、 適用側も
 /// 全部 `common::audio_render::fade_curve_at` を通るため。
 ///
-/// caller は `ClipContent::event_fades()` を **そのまま** 写して渡す。 `event_index` は
-/// clip 内の event 位置で、 drag の commit 先 (`SetClipFadeBeatsBatch` 等) の宛先になる。
+/// caller は `ClipContent::window_fades()` を **そのまま** 写して渡す (窓に見えている片の、ひと続きごとに
+/// 1 つ)。 `event_index` はひと続きの先頭の event 位置で、 drag の commit 先 (`SetClipFadeBeatsBatch` 等)
+/// の宛先になる。
 ///
 /// r.md #68: `fade.start_in_clip_beats` は **content-local 拍** (model の値そのもの)。
 /// r.md #44 で一旦「窓ローカル」 (= `content_offset_beats` を引いた値) に畳んでいたが、
@@ -190,7 +191,7 @@ pub use common::model::ClipKey;
 /// [`geometry::ContentMap`] (content 原点 + ビューのズーム) 1 本に集約した。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipEventFade {
-    /// clip 内の event index。 fade の編集はこの 1 event だけに効く
+    /// clip 内の event index (ひと続きの先頭)。 fade の編集はこの event を含むひと続きの外側の端だけに効く
     /// (r.md #38 以前は clip 内全 event に broadcast されていて、 掴んだ event と
     /// 書き換わる event が一致しなかった)。
     pub event_index: u32,
@@ -2060,8 +2061,8 @@ fn compute_audio_drag_outcome(ad: &AudioDragSession, beat_per_px: f64) -> Option
                     FadeEdge::Out => -raw_delta_beats,
                 };
                 let prev = match edge {
-                    FadeEdge::In => anchor.fade.fade_in_beats,
-                    FadeEdge::Out => anchor.fade.fade_out_beats,
+                    FadeEdge::In => anchor.fade.visible_fade_in_beats(),
+                    FadeEdge::Out => anchor.fade.visible_fade_out_beats(),
                 };
                 // r.md #38: 上限は **event 長**。 音 (`audio_clip_renderer`) / 映像 / 画像 /
                 // 字幕はどれも event 長基準で fade を掛けるので、 clip 長で clamp すると
@@ -2378,20 +2379,21 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             h ^= c.fades.len() as u64;
             h = h.wrapping_mul(PRIME);
             for f in &c.fades {
-                h ^= u64::from(f.event_index);
-                h = h.wrapping_mul(PRIME);
-                h ^= f.fade.start_in_clip_beats.to_bits();
-                h = h.wrapping_mul(PRIME);
-                h ^= f.fade.len_beats.to_bits();
-                h = h.wrapping_mul(PRIME);
-                h ^= f.fade.fade_in_beats.to_bits();
-                h = h.wrapping_mul(PRIME);
-                h ^= f.fade.fade_out_beats.to_bits();
-                h = h.wrapping_mul(PRIME);
-                h ^= curve_code(f.fade.fade_in_curve);
-                h = h.wrapping_mul(PRIME);
-                h ^= curve_code(f.fade.fade_out_curve);
-                h = h.wrapping_mul(PRIME);
+                let fd = &f.fade;
+                for v in [
+                    u64::from(f.event_index),
+                    fd.start_in_clip_beats.to_bits(),
+                    fd.len_beats.to_bits(),
+                    fd.fade_in_beats.to_bits(),
+                    fd.fade_out_beats.to_bits(),
+                    curve_code(fd.fade_in_curve),
+                    curve_code(fd.fade_out_curve),
+                    fd.fade_in_lead_beats.to_bits(),
+                    fd.fade_out_trail_beats.to_bits(),
+                ] {
+                    h ^= v;
+                    h = h.wrapping_mul(PRIME);
+                }
             }
         }
         // M14 Phase 63n-1 (#028): automation lanes も viewport_key に反映 (caller が collapse / lane

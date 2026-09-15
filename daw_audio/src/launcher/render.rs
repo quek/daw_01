@@ -849,7 +849,7 @@ mod rt_assert_tests {
         let mut out = Vec::with_capacity(4096);
         let mut active = NoteLedger::default();
         let renderer = AudioClipRenderer::empty();
-        let mut accum: Vec<(u64, f64)> = Vec::with_capacity(8);
+        let mut accum: Vec<crate::audio_clip_renderer::TapeCursor> = Vec::with_capacity(8);
         let mut engines = Vec::new();
         let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
         let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];

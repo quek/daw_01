@@ -1518,9 +1518,11 @@ pub(super) fn draw_fade_curve<M: ?Sized + 'static>(
     let steps = ((g.width_px / MAX_SEGMENT_PX).ceil() as usize).clamp(1, 512);
     let bottom = g.event_rect.y + g.event_rect.h;
     let mut segments: Vec<LineSegment> = Vec::with_capacity(steps);
-    // t = 0 が無音側 (anchor)、 t = 1 がフル側 (handle)。
+    // t = 0 が anchor (event の端)、 t = 1 が handle。 分割の片ではランプが端の外から続き / 反対の端を
+    // 越えて続くので、両端でのランプの進度 (`anchor_progress` → `handle_progress`) の区間を描く。
     let point_at = |t: f32| -> [f32; 2] {
-        let gain = common::audio_render::fade_curve_at(t, curve);
+        let progress = g.anchor_progress + (g.handle_progress - g.anchor_progress) * t;
+        let gain = common::audio_render::fade_curve_at(progress, curve);
         [
             g.anchor[0] + (g.handle[0] - g.anchor[0]) * t,
             bottom - g.event_rect.h * gain,
@@ -1632,7 +1634,7 @@ pub(super) fn draw_fade_handle_overlay<M: ?Sized + 'static>(
                 // 大きい方**を採るので、 描画も「大きい方を後に (= 手前に) 描く」 に
                 // 揃える (SSoT)。 この規則は正方形にだけ意味がある。
                 let mut edges = [FadeEdge::In, FadeEdge::Out];
-                if f.fade.fade_in_beats > f.fade.fade_out_beats {
+                if f.fade.visible_fade_in_beats() > f.fade.visible_fade_out_beats() {
                     edges.swap(0, 1);
                 }
                 for edge in edges {
@@ -1664,9 +1666,10 @@ pub(super) fn draw_audio_drag_ghost<M: ?Sized + 'static>(
     let label_text: Option<String> = match (ad.kind, outcome) {
         (_, Some(AudioDragOutcome::FadeLength { edge, next_beats })) => {
             if let Some(mut preview) = ad.anchor_fade {
+                // 確定と同じく、掛け直した fade は端から始まる (`SetClipFadeBeatsBatch`)。
                 match edge {
-                    FadeEdge::In => preview.fade.fade_in_beats = next_beats,
-                    FadeEdge::Out => preview.fade.fade_out_beats = next_beats,
+                    FadeEdge::In => (preview.fade.fade_in_beats, preview.fade.fade_in_lead_beats) = (next_beats, 0.0),
+                    FadeEdge::Out => (preview.fade.fade_out_beats, preview.fade.fade_out_trail_beats) = (next_beats, 0.0),
                 }
                 draw_fade_envelope(hctx, r, ad.content_map_anchor, &preview, edge, clip_bg, style);
             }

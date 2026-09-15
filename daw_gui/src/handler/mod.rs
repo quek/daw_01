@@ -9,6 +9,8 @@ pub mod bounce;
 /// r.md #129: `Q` の宛先 (Mixer 帯 / マスターパネルの hover → device / Limiter)。
 pub mod bypass_target;
 pub mod clip_events;
+/// r.md #132 残件: クリップへの編集が効く範囲 = 窓に見えている片 (ひと続きは 1 つとして)。
+pub mod clip_window;
 /// `AppEvent::Clipboard(..)` の入口 (貼り付け / カット / コピー)。
 pub mod clipboard_event;
 pub mod clipboard_media;

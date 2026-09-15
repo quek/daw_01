@@ -41,6 +41,7 @@ mod range_edit;
 mod render_wait;
 mod shutdown_sequence;
 mod song_refs;
+mod split_fidelity;
 mod state_roundtrip_watchdog;
 mod sync_flush;
 mod track_delete;

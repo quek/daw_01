@@ -6,7 +6,7 @@
 use crate::state::*;
 use crate::app_types::*;
 use common::model::{
-    Clip, ClipContent, ClipKey, LaneRef, MidiContent, Note, Song, TimeSelection,
+    Clip, ClipContent, ClipKey, LaneRef, MidiContent, Note, Song, TimeSelection, TimedEvent, join_pieces,
 };
 use std::collections::BTreeMap;
 
@@ -50,48 +50,22 @@ pub(crate) enum GlueKind {
     Text,
 }
 
-/// r.md #44 の audio 版と対になる video 版 (source 軸が micro 秒)。
-/// clip の内容窓 `[win_start, win_end)` (content-local 拍) で event を切り出す。
+/// clip の内容窓 `[win_start, win_end)` (content-local 拍) で event を切り出し、`shift` 拍ずらす
+/// (video / image / text 共通)。
 ///
 /// Glue は複数 clip を **1 つの新しい content へ焼き込む**破壊的操作なので、
 /// 「鳴っている範囲」をそのまま新 event として作り直す必要がある (窓は clip 側に
-/// 残せない)。頭を落とす分は現在の長さ比で source を進める線形近似。
-fn crop_video_event(
-    ev: &common::model::VideoEvent,
-    win_start: f64,
-    win_end: f64,
-) -> Option<common::model::VideoEvent> {
-    let e0 = ev.event_start_in_clip_beats;
-    let e1 = e0 + ev.event_length_beats;
-    let c0 = e0.max(win_start);
-    let c1 = e1.min(win_end);
+/// 残せない)。 切り出しは分割と同じ [`common::model::event_piece`] — 映像の source 時刻 (take の頭)、
+/// 窓の端を跨ぐ fade のランプ、字幕の読み上げ (窓より前で始まった文は読まない) が、窓の中で
+/// 見えていた姿のまま残る。
+fn crop_event<E: TimedEvent>(ev: &E, win_start: f64, win_end: f64, shift: f64) -> Option<E> {
+    let (e0, e1) = (ev.start(), ev.start() + ev.len());
+    let (c0, c1) = (e0.max(win_start), e1.min(win_end));
     if c1 <= c0 {
         return None;
     }
-    let mut out = ev.clone();
-    let span = ev.source_end_micros.saturating_sub(ev.source_start_micros);
-    if c0 > e0 && ev.event_length_beats > 1e-9 && span > 0 {
-        let frac = (c0 - e0) / ev.event_length_beats;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-        let advance = (span as f64 * frac).max(0.0) as u64;
-        out.source_start_micros = ev
-            .source_start_micros
-            .saturating_add(advance)
-            .min(ev.source_end_micros);
-        out.fade_in_beats = (ev.fade_in_beats - (c0 - e0)).max(0.0);
-    }
-    if c1 < e1 && ev.event_length_beats > 1e-9 && span > 0 {
-        let kept = (c1 - c0) / ev.event_length_beats;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-        let keep_micros = (span as f64 * kept).max(0.0) as u64;
-        out.source_end_micros = out
-            .source_start_micros
-            .saturating_add(keep_micros)
-            .min(ev.source_end_micros);
-        out.fade_out_beats = (ev.fade_out_beats - (e1 - c1)).max(0.0);
-    }
-    out.event_start_in_clip_beats = c0;
-    out.event_length_beats = c1 - c0;
+    let mut out = common::model::event_piece(ev, c0, c1);
+    out.set_window(out.start() + shift, out.len());
     Some(out)
 }
 
@@ -153,58 +127,22 @@ fn collect_fragments(song: &Song, refs: &[ClipKey], combined_start: f64) -> Frag
         let shift = clip.content_origin_beat() - combined_start;
         match content {
             ClipContent::Midi(midi) => {
-                for note in &midi.notes {
-                    // sequencer と同じ gate: 発音開始が窓内の note だけ、
-                    // 長さは窓末尾で clamp (= 実際に鳴っている姿)。
-                    if note.start_beat < win_start || note.start_beat >= win_end {
-                        continue;
-                    }
-                    let dur = note.duration_beats.min(win_end - note.start_beat).max(0.0);
-                    frags.midi_notes.push(Note {
-                        start_beat: note.start_beat + shift,
-                        duration_beats: dur,
-                        ..note.clone()
-                    });
-                }
+                // sequencer と同じ gate: 発音開始が窓内の note だけ、長さは窓末尾で clamp
+                // (= 実際に鳴っている姿、`Clip::sounding_note_len`)。
+                frags.midi_notes.extend(midi.notes.iter().filter_map(|note| {
+                    let dur = clip.sounding_note_len(note)?;
+                    Some(Note { start_beat: note.start_beat + shift, duration_beats: dur, ..note.clone() })
+                }));
             }
-            ClipContent::Video(video) => {
-                for ev in &video.events {
-                    let Some(mut cropped) = crop_video_event(ev, win_start, win_end) else {
-                        continue;
-                    };
-                    cropped.event_start_in_clip_beats += shift;
-                    frags.video_events.push(cropped);
-                }
-            }
-            // Image / Text は時間軸 source を持たないので、窓との交差で表示区間を切るだけ。
-            ClipContent::Image(image) => {
-                for ev in &image.events {
-                    let e0 = ev.event_start_in_clip_beats.max(win_start);
-                    let e1 = (ev.event_start_in_clip_beats + ev.event_length_beats).min(win_end);
-                    if e1 <= e0 {
-                        continue;
-                    }
-                    frags.image_events.push(common::model::ImageEvent {
-                        event_start_in_clip_beats: e0 + shift,
-                        event_length_beats: e1 - e0,
-                        ..ev.clone()
-                    });
-                }
-            }
-            ClipContent::Text(text) => {
-                for ev in &text.events {
-                    let e0 = ev.event_start_in_clip_beats.max(win_start);
-                    let e1 = (ev.event_start_in_clip_beats + ev.event_length_beats).min(win_end);
-                    if e1 <= e0 {
-                        continue;
-                    }
-                    frags.text_events.push(common::model::TextEvent {
-                        event_start_in_clip_beats: e0 + shift,
-                        event_length_beats: e1 - e0,
-                        ..ev.clone()
-                    });
-                }
-            }
+            ClipContent::Video(video) => frags
+                .video_events
+                .extend(video.events.iter().filter_map(|ev| crop_event(ev, win_start, win_end, shift))),
+            ClipContent::Image(image) => frags
+                .image_events
+                .extend(image.events.iter().filter_map(|ev| crop_event(ev, win_start, win_end, shift))),
+            ClipContent::Text(text) => frags
+                .text_events
+                .extend(text.events.iter().filter_map(|ev| crop_event(ev, win_start, win_end, shift))),
             // Audio は焼き込み (`place_baked_glue_clip`) が担うのでここには来ない。
             ClipContent::Audio(_) | ClipContent::Automation(_) => {}
         }
@@ -213,16 +151,23 @@ fn collect_fragments(song: &Song, refs: &[ClipKey], combined_start: f64) -> Frag
 }
 
 /// 非 audio kind の結合 content を組む。
+///
+/// 時間軸を持つ event は、分割で切り出したまま隣り合っている片を元の 1 つへつなぐ
+/// ([`join_pieces`]、分割の逆)。 分割した片同士を Glue すると分割前の 1 つに戻る。
 fn merged_content(kind: GlueKind, frags: Fragments) -> ClipContent {
+    fn joined<E: TimedEvent>(mut events: Vec<E>) -> Vec<E> {
+        join_pieces(&mut events);
+        events
+    }
     match kind {
         GlueKind::Video => ClipContent::Video(common::model::VideoContent {
-            events: frags.video_events,
+            events: joined(frags.video_events),
         }),
         GlueKind::Image => ClipContent::Image(common::model::ImageContent {
-            events: frags.image_events,
+            events: joined(frags.image_events),
         }),
         GlueKind::Text => ClipContent::Text(common::model::TextContent {
-            events: frags.text_events,
+            events: joined(frags.text_events),
         }),
         GlueKind::Midi | GlueKind::Audio => {
             let mut notes = frags.midi_notes;

@@ -170,8 +170,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                         // ビューのズーム 1 本で決まる (`geometry::content_map`)。
                         content_offset_beats: c.content_offset_beats,
                         name: labels
-                            .content_labels
-                            .get(&c.content_id)
+                            .clip_labels
+                            .get(&ClipKey { track_id: t.id, clip_id: c.id })
                             .cloned()
                             .unwrap_or_else(|| clip_display_label(c, app.cur.song_doc.song())),
                         color: Some(clip_color_for(
@@ -197,10 +197,11 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                         // 端 drag の preview が「クリップ幅 ÷ クリップ長」 のスケールに頼る
                         // ことになる。 窓の offset は `ClipView::content_offset_beats` が持ち、
                         // 換算は `geometry::content_map` 1 本に集約した。
+                        // r.md #132 残件: 窓に見えている片だけ、ひと続きの片は 1 つとして (掴み所は
+                        // ひと続きの外側の端)。 `event_index` はひと続きの先頭の event。
                         fades: content.map_or_else(Vec::new, |ct| {
-                            ct.event_fades()
+                            ct.window_fades(c.content_window())
                                 .into_iter()
-                                .enumerate()
                                 .map(|(i, fade)| ClipEventFade {
                                     event_index: u32::try_from(i).unwrap_or(u32::MAX),
                                     fade,
@@ -553,12 +554,16 @@ fn content_id_to_hue(content_id: common::model::ContentId) -> f32 {
 }
 
 /// text clip の widget display label (32 文字 cap、非 Text / 空は `None`)。
+///
+/// 本文は **クリップの窓に見えている最初の字幕** から読む — Inspector の本文と rename の確定先
+/// (`handler::clip_window`、窓に見えている片だけに効く) と同じ片。 content の先頭を読むと、分割の片の
+/// クリップで本文を変えてもラベルが別の片の本文のまま残る。
 fn text_clip_label(
     clip: &common::model::Clip,
     contents: &HashMap<common::model::ContentId, common::model::ClipContent>,
 ) -> Option<String> {
     let events = contents.get(&clip.content_id)?.text_events()?;
-    let ev = events.first()?;
+    let ev = events.get(*common::model::shown_indices(events, clip.content_window()).first()?)?;
     if ev.text.is_empty() {
         return None;
     }

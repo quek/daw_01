@@ -96,13 +96,16 @@ pub struct RenderedEvent {
     /// 応じてこの値で選り分ける (旧 `clip_idx` は `track.clips` の positional index で、
     /// 書かれるだけで一度も読まれていなかった = アーキ不変条件 1 の負債)。
     pub cell_clip_id: u32,
-    /// First song-beat this event contributes audio at。
-    ///
-    /// **event 自身の時間写像の起点** (source 読み出し / fade はここが 0 点)。
-    /// clip の窓による crop は [`gate_start_beat`](Self::gate_start_beat) 側で行い、
-    /// この値は動かさない (動かすと warp / slice / spectral の写像がずれる)。
+    /// **event の時間写像の起点** = take の頭の song 拍 (source 読み出し / slice の trigger /
+    /// warp marker / fade のランプはここが 0 点、`AudioEvent::take_head_beats`)。
+    /// 分割の片は同じ起点を共有するので、片を並べると分割前と同じ写像で鳴る。
+    /// clip の窓 / event の窓による crop は `start_beat` / [`gate_start_beat`](Self::gate_start_beat)
+    /// 側で行い、この値は動かさない (動かすと warp / slice / spectral の写像がずれる)。
+    pub origin_beat: f64,
+    /// event の **見えている** 最初の song 拍 (= この event が音を出し始める位置。 分割していない
+    /// event では `origin_beat` と同じ)。
     pub start_beat: f64,
-    /// Exclusive end song-beat。
+    /// Exclusive end song-beat (見えている末尾)。
     pub end_beat: f64,
     /// r.md #44: この event を含む clip の窓 (song-absolute 拍) の開始。
     /// `[gate_start_beat, gate_end_beat)` の外は 1 sample も出力しない。
@@ -136,10 +139,15 @@ pub struct RenderedEvent {
     /// tape / slice の event でもスペクトルエンジンを用意しておく条件で、実際に移調するかは render 時の
     /// 移調量で決まる (0 の間は従来どおり完全バイパス)。
     pub transposable: bool,
-    /// 発音の安定キー (`clip.id` << 32 | `AudioEvent.id`)。 stretch engine が
-    /// 「同じ発音の続きか」 を判定するのに使う (= positional index を使わない、
-    /// アーキ不変条件 #1)。 編集で schedule を組み直しても値が変わらないので、
-    /// 無関係な編集で発音中の clip が re-prime されない。
+    /// 発音の安定キー (= `AudioEvent.source_id`)。 stretch engine が「同じ発音の続きか」 を
+    /// 判定するのに使う (= positional index を使わない、アーキ不変条件 #1)。 編集で schedule を
+    /// 組み直しても値が変わらないので、無関係な編集で発音中の clip が re-prime されない。
+    ///
+    /// clip / event の id を混ぜず素材の id だけなのは、**分割の片が前の片のストリームを引き継ぐ**ため
+    /// (r.md #132 残件: 片ごとに prime し直すと切り口でスペクトル処理の履歴が切れる。 クリップの分割で
+    /// 片が別の clip になっても同じ)。 同じ素材を同じトラックで重ねて鳴らしても (linked clip / 複製)、
+    /// エンジンの引き当て (`acquire_engine`) は出力位置と写像の連続で見分けるので取り違えない
+    /// (pool はトラックごと)。
     pub stream_key: u64,
     /// この event はスペクトルエンジンを要るか (compile 時に確定)。
     /// **どのエンジンを使うかは持たない** — pool は `stream_key` で引く
@@ -163,6 +171,11 @@ pub struct RenderedEvent {
     pub fade_out_beats: f64,
     pub fade_in_curve: FadeCurve,
     pub fade_out_curve: FadeCurve,
+    /// fade-in のランプが始まる take-local 拍 (= `take_head_beats - fade_in_lead_beats`、分割して
+    /// いない event では 0)。
+    pub fade_in_start_beats: f64,
+    /// fade-out のランプが終わる take-local 拍 (= head + length + `fade_out_trail_beats`)。
+    pub fade_out_end_beats: f64,
     pub reversed: bool,
     pub stretch_mode: StretchMode,
     /// Phase 5 follow-up (StretchMode::Slice): source 内の transient sample
@@ -513,28 +526,38 @@ fn push_clip_events(
     // (`start_beat` 起点の source 読み出し / fade) は **一切動かさず**、
     // 出力範囲だけを交差させる (source 窓を切り詰めると warp marker /
     // slice onset / spectral stretch の写像が壊れるため)。
-    let (clip_gate_start, clip_gate_end) = {
-        let (s, e) = clip.song_window();
-        // クリップ同士は重ならないので、境界で音を途切れさせないには **鳴らす範囲だけ**
-        // を隣の側へ伸ばす (`docs/plan_range_selection.md` §6.5)。 伸ばした区間は
-        // event の fade ランプが覆うので、境界を挟んで左が下がり右が上がる。
-        (s - xfade.0, e + xfade.1)
-    };
-    for (event_seq, event) in audio.events.iter().enumerate() {
+    let (window_start, window_end) = clip.song_window();
+    // クリップ同士は重ならないので、境界で音を途切れさせないには **鳴らす範囲だけ**
+    // を隣の側へ伸ばす (`docs/plan_range_selection.md` §6.5)。 伸ばした区間は
+    // event の fade ランプが覆うので、境界を挟んで左が下がり右が上がる。
+    let (clip_gate_start, clip_gate_end) = (window_start - xfade.0, window_end + xfade.1);
+    for event in &audio.events {
         let Some(buffer) = sources.get(&event.source_id) else {
             continue;
         };
-        let event_start_beat =
-            clip.content_to_song_beat(event.event_start_in_clip_beats);
-        let event_end_beat = event_start_beat + event.event_length_beats;
+        let visible_start = clip.content_to_song_beat(event.event_start_in_clip_beats);
+        let visible_end = visible_start + event.event_length_beats;
         // 始点が有限で長さが正の event だけ (NaN の始点・長さは比較を素通りして、描画で位置の無い音になっていた)。
-        if !event_start_beat.is_finite() || event_end_beat.partial_cmp(&event_start_beat) != Some(std::cmp::Ordering::Greater) {
+        if !visible_start.is_finite() || visible_end.partial_cmp(&visible_start) != Some(std::cmp::Ordering::Greater) {
             continue;
         }
-        // 窓と交差しない event は schedule に載せない。
-        if event_end_beat <= clip_gate_start || event_start_beat >= clip_gate_end {
+        // **窓に見えている** event だけを載せる。 張り出し (クロスフェード) の区間に居る別の片は鳴らさない —
+        // content を共有する隣のクリップ (分割の片) がその片を鳴らすので、載せると 2 回鳴る。
+        if visible_end <= window_start || visible_start >= window_end {
             continue;
         }
+        // 張り出しで鳴らすのは、窓の端に接する片の **take の続き** (隠れている頭 / 尻)。 窓の端を跨いで
+        // いる片は元から窓の外に続きがあるので、伸ばすのは take の中に限る (`Song::crossfade_adjacent`)。
+        let event_start_beat = if xfade.0 > 0.0 && visible_start <= window_start + 1e-9 {
+            visible_start.min((window_start - xfade.0).max(visible_start - event.take_head_beats.max(0.0)))
+        } else {
+            visible_start
+        };
+        let event_end_beat = if xfade.1 > 0.0 && visible_end >= window_end - 1e-9 {
+            visible_end.max((window_end + xfade.1).min(visible_end + event.take_tail_beats.max(0.0)))
+        } else {
+            visible_end
+        };
         // 時間軸 (SR 比) と ピッチ軸 (semitone) は直交した 2 量として持ち、
         // どちらをどこに掛けるかは render loop が mode ごとに決める
         // (旧 `pitch_ratio_for` は mode 分岐でピッチ比を捨てており、
@@ -545,14 +568,15 @@ fn push_clip_events(
         let formant_semitones =
             clamp_semitones(event.formant_semitones, FORMANT_SEMITONES_LIMIT);
         let pitch_factor = pitch_factor(pitch_semitones);
-        // clip time-stretch 量 = source native 長 / event 配置長
+        // clip time-stretch 量 = source native 長 / **take** の配置長
         // (秒で比較、 engine SR に依らない)。 nominal bpm 基準で固定し、
         // tempo-follow (current/nominal) とは render loop で乗算合成する。
-        // trim では source 窓と event 長が lockstep するので比 ≈ 1.0。
+        // trim では source 窓と event 長が lockstep するので比 ≈ 1.0。 分割の片は
+        // take の長さを共有するので、片ごとに伸縮率が変わらない。
         let stretch_ratio = stretch_ratio_for(
-            event.source_end_frames.saturating_sub(event.source_start_frames),
+            event.source_window_frames(),
             buffer.sample_rate,
-            event.event_length_beats,
+            event.take_length_beats(),
             song.bpm,
         );
         let gain_lin = common::dsp::db_to_amp(event.gain_db);
@@ -575,6 +599,7 @@ fn push_clip_events(
         schedule.push(RenderedEvent {
             track_idx,
             cell_clip_id,
+            origin_beat: clip.content_to_song_beat(event.take_start_in_clip_beats()),
             start_beat: event_start_beat,
             end_beat: event_end_beat,
             gate_start_beat: clip_gate_start,
@@ -589,17 +614,8 @@ fn push_clip_events(
             pitch_semitones,
             formant_semitones,
             transposable,
-            // 安定 id で発音を識別する。 `AudioEvent.id` が未採番 (0) の
-            // 古い project では content 内の位置で代用する (load 時に
-            // `ensure_*_ids` が採番するので通常は通らない fallback)。 実 id は
-            // 1 から順に採番されるので最上位ビットは常に 0 — fallback をそこに
-            // 逃がして、採番済み event との衝突を構造的に無くす。
-            stream_key: (u64::from(clip.id) << 32)
-                | u64::from(if event.id != 0 {
-                    event.id
-                } else {
-                    0x8000_0000 | u32::try_from(event_seq).unwrap_or(0x7fff_ffff)
-                }),
+            // 素材の安定 id で発音を識別する (`RenderedEvent::stream_key` の doc)。
+            stream_key: u64::from(event.source_id),
             // 判定は schedule 完成後 (`count_engines_per_track`)。
             needs_engine: false,
             stretch_ratio,
@@ -608,6 +624,8 @@ fn push_clip_events(
             fade_out_beats: event.fade_out_beats.max(0.0),
             fade_in_curve: event.fade_in_curve,
             fade_out_curve: event.fade_out_curve,
+            fade_in_start_beats: event.take_head_beats - event.fade_in_lead_beats,
+            fade_out_end_beats: event.take_head_beats + event.event_length_beats + event.fade_out_trail_beats,
             reversed: event.reversed,
             stretch_mode: event.stretch_mode,
             onsets: onsets_sorted,
@@ -681,31 +699,41 @@ fn count_engines_per_track(schedule: &mut [RenderedEvent]) -> Vec<u16> {
     per_track_counts
 }
 
-/// pool から `key` の発音に対応するエンジンを **安定キーで**引き当てる (RT)。
+/// エンジンに頼む出力の位置: 発音キーと、`el_start` (event の take 頭からの sample) で `u` 座標系
+/// (`du` / その位置の `u`) がどこにあるか ([`StretchEngine::continues`] の引数)。
+#[derive(Clone, Copy)]
+struct StreamAt {
+    key: u64,
+    el_start: u64,
+    du: f64,
+    u: f64,
+}
+
+/// pool から `at` の発音に対応するエンジンを **安定キーと出力位置で**引き当てる (RT)。
 ///
-/// 1. 既にその発音を走らせているエンジン (= 継続。無関係な編集で pool の並びが
-///    変わっても同じ実体に戻るので、発音中に prime し直さない)
-/// 2. 空きエンジン (まだどの発音も持っていない)
-/// 3. この buffer で誰にも取られていないエンジン (= 既に鳴り終わった発音の
-///    使い回し。取られたら旧発音側は次に鳴るとき prime し直す)
+/// 1. その発音の **続き** を出せるエンジン (同じキーで出力位置と写像が連続)。 この buffer で既に
+///    使われていても取る — 分割の前の片が buffer の途中で鳴り終えたエンジンを後ろの片がそのまま
+///    引き継ぐ (続きとして連続しているので、同じ buffer で別の発音と取り合っていない)
+/// 2. 同じキーで、直前の buffer に鳴っていなかったエンジン (= この発音の止まっていたストリーム。
+///    今も鳴っている同じ素材の別の発音からは奪わない)
+/// 3. 空きエンジン (まだどの発音も持っていない)
+/// 4. 直前の buffer に鳴っていなかったエンジン (= 鳴り終わった発音の使い回し)
+/// 5. この buffer で誰にも取られていないエンジン (取られた発音は次に鳴るとき prime し直す)
 ///
+/// 無関係な編集で pool の並びが変わっても同じ実体に戻るので、発音中に prime し直さない。
 /// `stamp` は buffer ごとの連番で、同じ buffer 内で 2 つの発音が同じエンジンを
 /// 掴むのを防ぐ。 どれも取れなければ `None` (= degrade)。
 /// RT-safe: 線形探索のみ (pool は最大 32)。
-fn acquire_engine(
-    engines: &mut [StretchEngine],
-    key: u64,
-    stamp: u64,
-) -> Option<&mut StretchEngine> {
+fn acquire_engine(engines: &mut [StretchEngine], at: StreamAt, stamp: u64) -> Option<&mut StretchEngine> {
+    let free = |e: &StretchEngine| !e.is_claimed(stamp);
+    let idle = |e: &StretchEngine| free(e) && !e.was_claimed_before(stamp);
     let pick = engines
         .iter()
-        .position(|e| e.stream_key() == Some(key) && !e.is_claimed(stamp))
-        .or_else(|| {
-            engines
-                .iter()
-                .position(|e| e.stream_key().is_none() && !e.is_claimed(stamp))
-        })
-        .or_else(|| engines.iter().position(|e| !e.is_claimed(stamp)))?;
+        .position(|e| e.continues(at.key, at.el_start, at.du, at.u))
+        .or_else(|| engines.iter().position(|e| e.stream_key() == Some(at.key) && idle(e)))
+        .or_else(|| engines.iter().position(|e| e.stream_key().is_none() && free(e)))
+        .or_else(|| engines.iter().position(idle))
+        .or_else(|| engines.iter().position(free))?;
     let engine = engines.get_mut(pick)?;
     engine.claim(stamp);
     Some(engine)
@@ -756,38 +784,81 @@ fn sources_only_on_disabled_tracks(song: &Song, enabled: &[bool]) -> std::collec
     on_disabled
 }
 
-/// Mix every audio event for `track_idx` into `track_l/track_r` for the
-/// frame range `[playhead .. playhead+frames)`. Called from
-/// `process_track_owned` after the track buffers are zeroed and before
-/// the audio FX chain. Adds (`+=`) to the existing buffer so the
-/// instrument plugin's audio output is preserved (= Bitwig Hybrid Track:
-/// audio clip output bypasses the instrument and joins the FX chain
-/// input alongside it, see §13 Q6).
-/// E5 sibling (r.md #8): Repitch (tape) mode の連続 source 位置を 1 sample ぶん進める。
-/// `state = (last_event_local, accumulated_source_pos)`。 contiguous 再生 (`event_local ==
-/// last + 1`) では `ratio` を積分 (= 位置が連続) し、 tempo automation で ratio が変わっても
-/// 絶対位置が跳ばない。 不連続 (seek / schedule 変化 / 初回 `last == u64::MAX`) では現 ratio で
-/// `event_local × ratio` に再 anchor する。 Raw mode は ratio 一定なので積分値は
-/// `event_local × ratio` に一致し従来挙動と byte 同一。
-fn repitch_source_pos(state: &mut (u64, f64), event_local: u64, ratio: f64) -> f64 {
-    if state.0 != u64::MAX && state.0.wrapping_add(1) == event_local {
-        state.1 += ratio;
-    } else {
-        state.1 = event_local as f64 * ratio;
+/// 1 track が同時に積分できる tape の読み位置の数 (= 同時に鳴る Raw / Repitch の発音の数)。
+/// 溢れた発音は積分無し (= 毎 sample `event_local × ratio` で再計算) に degrade する。
+pub const MAX_TAPE_STREAMS_PER_TRACK: usize = 64;
+
+/// E5 (r.md #8): tape (Raw / Repitch) の **読み位置の積分器** 1 本 = 1 つの発音ぶん。
+///
+/// contiguous 再生では ratio を積分し (tempo automation で ratio が変わっても位置が跳ばない)、
+/// 不連続では再 anchor する ([`repitch_source_pos`])。 track ごとの pool
+/// (`TrackScratch::repitch_accum`) から **発音キーと出力位置の連続** で引き当てる
+/// ([`acquire_tape_cursor`]) — event の並び順の位置で持たないので、track の event 数に上限が無く、
+/// 分割の後ろの片は前の片の積分をそのまま引き継ぐ (切り口で丸め直さない)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TapeCursor {
+    /// 積分している発音の [`RenderedEvent::stream_key`] (`u64::MAX` = 空き)。
+    key: u64,
+    /// 最後に読んだ event-local sample (take の頭から、`u64::MAX` = まだ読んでいない)。
+    last_el: u64,
+    /// 積分した source 位置。
+    pos: f64,
+    /// 最後に使った buffer の連番 (`ClipRenderState::render_seq`)。
+    stamp: u64,
+}
+
+impl TapeCursor {
+    /// 空き。
+    pub const IDLE: Self = Self { key: u64::MAX, last_el: u64::MAX, pos: 0.0, stamp: u64::MAX };
+}
+
+/// pool から、`key` の発音が event-local sample `el_start` から読む積分器を引き当てて位置を返す (RT)。
+///
+/// 1. その発音の **続き** (同じキーで、最後に読んだ次の sample から) — この buffer で既に使われていても
+///    取る (分割の前の片が buffer の途中で鳴り終えた位置から後ろの片が続ける)
+/// 2. 直前の buffer にも使われていない積分器 (鳴り終わった発音の使い回し)
+/// 3. この buffer で使われていない積分器
+///
+/// 続きでなければ空にして渡す (最初の sample で再 anchor)。 取れなければ `None` (= 積分無し)。
+/// RT-safe: 線形探索のみ (pool は `MAX_TAPE_STREAMS_PER_TRACK`)。
+fn acquire_tape_cursor(cursors: &mut [TapeCursor], key: u64, el_start: u64, stamp: u64) -> Option<usize> {
+    let continues = |c: &TapeCursor| c.key == key && c.last_el != u64::MAX && c.last_el.wrapping_add(1) == el_start;
+    let pick = cursors
+        .iter()
+        .position(continues)
+        .or_else(|| cursors.iter().position(|c| c.stamp != stamp && c.stamp != stamp.wrapping_sub(1)))
+        .or_else(|| cursors.iter().position(|c| c.stamp != stamp))?;
+    let cursor = cursors.get_mut(pick)?;
+    if !continues(cursor) {
+        *cursor = TapeCursor { key, ..TapeCursor::IDLE };
     }
-    state.0 = event_local;
-    state.1
+    cursor.stamp = stamp;
+    Some(pick)
+}
+
+/// E5 sibling (r.md #8): Repitch (tape) mode の連続 source 位置を 1 sample ぶん進める。
+/// contiguous 再生 (`event_local == last + 1`) では `ratio` を積分 (= 位置が連続) し、 tempo
+/// automation で ratio が変わっても絶対位置が跳ばない。 不連続 (seek / schedule 変化 / 初回
+/// `last == u64::MAX`) では現 ratio で `event_local × ratio` に再 anchor する。 Raw mode は ratio
+/// 一定なので積分値は `event_local × ratio` に一致し従来挙動と byte 同一。
+fn repitch_source_pos(state: &mut TapeCursor, event_local: u64, ratio: f64) -> f64 {
+    if state.last_el != u64::MAX && state.last_el.wrapping_add(1) == event_local {
+        state.pos += ratio;
+    } else {
+        state.pos = event_local as f64 * ratio;
+    }
+    state.last_el = event_local;
+    state.pos
 }
 
 /// `render_audio_events` が使う per-track の **可変** 状態への参照束。
 /// 実体は `TrackScratch` にあり (= RT で確保しない)、export は自前の
 /// `TrackScratch` 配列を使うので live / offline で同じ経路を通る (不変条件 #6)。
 pub struct ClipRenderState<'a> {
-    /// tape (Raw / Repitch) mode の連続 source 位置 accumulator (event 単位、
-    /// 添字 = track 内 schedule 順)。 `(last_event_local, accumulated_source)`。
-    /// E5 (r.md #8): tempo 変化で `event_local × ratio` の絶対位置が跳ぶ click を
+    /// tape (Raw / Repitch) mode の読み位置の積分器の pool ([`TapeCursor`]、発音キーと出力位置の
+    /// 連続で引き当てる)。 E5 (r.md #8): tempo 変化で `event_local × ratio` の絶対位置が跳ぶ click を
     /// 防ぐため、contiguous 再生では ratio を積分する。
-    pub repitch_accum: &'a mut [(u64, f64)],
+    pub repitch_accum: &'a mut [TapeCursor],
     /// r.md #40: per-track の stretch engine pool (添字 = `RenderedEvent::engine_slot`)。
     /// off-thread で確保され `TrackScratch` に配送される。
     pub engines: &'a mut [StretchEngine],
@@ -800,6 +871,13 @@ pub struct ClipRenderState<'a> {
     pub render_seq: &'a mut u64,
 }
 
+/// Mix every audio event for `track_idx` into `track_l/track_r` for the
+/// frame range `[playhead .. playhead+frames)`. Called from
+/// `process_track_owned` after the track buffers are zeroed and before
+/// the audio FX chain. Adds (`+=`) to the existing buffer so the
+/// instrument plugin's audio output is preserved (= Bitwig Hybrid Track:
+/// audio clip output bypasses the instrument and joins the FX chain
+/// input alongside it, see §13 Q6).
 #[allow(clippy::too_many_arguments)]
 pub fn render_audio_events(
     renderer: &AudioClipRenderer,
@@ -836,15 +914,11 @@ pub fn render_audio_events(
     // この buffer の終端より前に始まり (`start_beat` 昇順の二分探索)、playhead より後に終わる event だけを並び順に
     // 辿る (終点の木。この buffer より前に終わった event は、早い長い event があっても舐めない)。
     let before_end = events.starts.partition_point(|s| *s < buf_end_beats);
-    // E5 (r.md #8): track 内 event を schedule 順に数える安定 index (repitch
-    // accumulator の添字) = `order` の位置。同じ event は buffer を跨いで同じ index になる。
-    for accum_idx in events.ends.reaching(before_end, |end| end > playhead_beats) {
-        let Some(event) = events.order.get(accum_idx).and_then(|&i| renderer.schedule.get(i as usize)) else {
+    for order_idx in events.ends.reaching(before_end, |end| end > playhead_beats) {
+        let Some(event) = events.order.get(order_idx).and_then(|&i| renderer.schedule.get(i as usize)) else {
             continue;
         };
-        // r.md #87: 行の供給元と違う出どころの event は描かない。判定は
-        // `accum_idx` を進めた **後**なので、アレンジ ↔ ランチャーを行き来しても
-        // `repitch_accum` の添字は同じ event に張り付いたままになる。
+        // r.md #87: 行の供給元と違う出どころの event は描かない。
         if event.cell_clip_id != cell_clip_id {
             continue;
         }
@@ -922,26 +996,17 @@ pub fn render_audio_events(
             _ => read_stride,
         };
 
-        // beat-domain fade を per-buffer の current_bpm で sample 換算する。
-        // `event_total_samples` は fade-out の tail (= event 末尾からの距離)
-        // を計算するために必要 (= 旧 sample-domain `event_total_frames` の
-        // beat-domain 同等値)。 event 全長を current_bpm で換算するので、
-        // tempo 変化で fade duration もスケールする。
-        let fade_in_samples =
-            (event.fade_in_beats * samples_per_beat).max(0.0) as u64;
-        let fade_out_samples =
-            (event.fade_out_beats * samples_per_beat).max(0.0) as u64;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let event_total_samples = ((event.end_beat - event.start_beat)
-            * samples_per_beat)
-            .max(0.0) as u64;
-        // event 開始からの absolute sample offset を求めるための起点 (= event
-        // start を sample 単位で表現した値、 playhead_beats 基準)。 通常 |.| <
+        // beat-domain fade を per-buffer の current_bpm で sample 換算する (tempo 変化で
+        // fade duration もスケールする)。 ランプの端は take の頭から数える。
+        let ramps = FadeRamps::new(event, samples_per_beat);
+        // **時間写像の起点** (= take の頭) の buffer 内 sample offset (playhead_beats 基準)。
+        // source の読み出し・slice の trigger・fade は全部ここからの sample 数 (`event_local`) で
+        // 決まるので、分割の片は分割前と同じ `event_local` で同じ音を読む。 通常 |.| <
         // 1 buffer worth of samples (= 数千)、 cast overflow 心配なし。
         // 念のため `clamp` で i64 全範囲に収める (= 異常な beat 値で NaN /
         // Inf になる事故を防ぐ defensive)。
         #[allow(clippy::cast_possible_truncation)]
-        let event_start_offset_in_buf = frame(event.start_beat).clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+        let event_start_offset_in_buf = frame(event.origin_beat).clamp(i64::MIN as f64, i64::MAX as f64) as i64;
         let source_len = event
             .source_end_frames
             .saturating_sub(event.source_start_frames);
@@ -987,8 +1052,18 @@ pub fn render_audio_events(
         // 伸縮率 1.0 近傍 (= 大多数) では正しい出力と一致する。
         // compile 時に移調されうると決まった event だけが移調を受ける (容量計画と食い違う値は捨てる)。
         let transpose = if event.transposable { track_transpose } else { 0 };
+        // この buffer の先頭出力サンプルに対応する take-local beat。 playhead_beats は engine が
+        // 積分した真の拍位置なので、buffer を跨いでも tempo が変わっても連続。
+        let first_beat = playhead_beats + first_i as f64 / samples_per_beat - event.origin_beat;
+        let stretch_map = stretch_u_of(event, buffer.sample_rate, first_beat, el_start, samples_per_beat);
+        // エンジンの `u` 座標系: Stretch は source 位置 (du = SR 比)、tape / slice は出力 sample (du = 1)。
+        let at = if event.stretch_mode == StretchMode::Stretch {
+            StreamAt { key: event.stream_key, el_start, du: time_stride, u: stretch_map(el_start) }
+        } else {
+            StreamAt { key: event.stream_key, el_start, du: 1.0, u: el_start as f64 }
+        };
         let engine = if render_uses_engine(event, transpose) {
-            acquire_engine(state.engines, event.stream_key, render_seq)
+            acquire_engine(state.engines, at, render_seq)
         } else {
             None
         };
@@ -998,37 +1073,6 @@ pub fn render_audio_events(
             let out_r = &mut state.event_r[..count];
             match event.stretch_mode {
                 StretchMode::Stretch => {
-                    // 時間写像は **beat 領域**で持つ。 「1 拍あたり消費する source
-                    // frame 数」 = `source_sr * 60 / nominal_bpm * stretch_ratio` は
-                    // **tempo に依らない**ので、tempo automation でも source 位置が
-                    // 跳ばず (= 旧 granular の grain lock-in ring と LP smoothed bpm が
-                    // 不要になった)、かつ拍にロックしたまま追従する。 波形描画側
-                    // (`audible_source_span` の `source_frames_per_beat * rate`) と
-                    // 同一の量で、「描いた波形 = 鳴る音」 が保たれる。
-                    let src_frames_per_beat = if nominal_bpm > 0.0 {
-                        f64::from(buffer.sample_rate) * 60.0 / nominal_bpm * event.stretch_ratio
-                    } else {
-                        0.0
-                    };
-                    // この buffer の先頭出力サンプルに対応する event-local beat。
-                    // playhead_beats は engine が積分した真の拍位置なので、buffer を
-                    // 跨いでも tempo が変わっても連続。
-                    let first_beat =
-                        playhead_beats + first_i as f64 / samples_per_beat - event.start_beat;
-                    let warped = event.beat_markers.len() >= 2;
-                    let u_of = |el: u64| -> f64 {
-                        let beat = first_beat
-                            + el.saturating_sub(el_start) as f64 / samples_per_beat;
-                        if warped
-                            && let Some(sf) =
-                                common::audio_render::warp_source_frame(beat, &event.beat_markers)
-                        {
-                            // warp marker は source frame を beat に pin するので、
-                            // 戻り値は絶対 source frame。 event 窓の起点へ寄せる。
-                            return sf - event.source_start_frames as f64;
-                        }
-                        beat * src_frames_per_beat
-                    };
                     engine.render(
                         event.stream_key,
                         clamp_semitones(event.pitch_semitones + transpose as f32, PITCH_SEMITONES_LIMIT),
@@ -1039,7 +1083,7 @@ pub fn render_audio_events(
                         true,
                         el_start,
                         time_stride,
-                        u_of,
+                        stretch_map,
                         |u| {
                             source_frame_lerp(
                                 l_plane,
@@ -1062,8 +1106,12 @@ pub fn render_audio_events(
                     // グローバルトランスポーズ (r.md #130) だけを動かす。1:1 なので長さは変わらない。
                     // 移調 0 ならエンジンは `formantMultiplier != 1` で包絡処理だけを走らせ、移調中は
                     // Stretch と同じく包絡を据え置く (チップマンク化させない)。
-                    // accumulator は borrow 衝突を避けるためコピーして使い、後で書き戻す。
-                    let mut accum = state.repitch_accum.get(accum_idx).copied();
+                    // 積分器はエンジンが次に食わせる位置 (先読みの続き) から引き当て、borrow 衝突を
+                    // 避けるためコピーして使い、後で書き戻す。
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let fetch_from = engine.next_fetch_u(at.key, at.el_start, at.du, at.u) as u64;
+                    let cursor = acquire_tape_cursor(state.repitch_accum, event.stream_key, fetch_from, render_seq);
+                    let mut accum = cursor.and_then(|c| state.repitch_accum.get(c).copied());
                     engine.render(
                         event.stream_key,
                         transpose as f32,
@@ -1107,9 +1155,7 @@ pub fn render_audio_events(
                         out_l,
                         out_r,
                     );
-                    if let Some(value) = accum
-                        && let Some(slot) = state.repitch_accum.get_mut(accum_idx)
-                    {
+                    if let (Some(value), Some(slot)) = (accum, cursor.and_then(|c| state.repitch_accum.get_mut(c))) {
                         *slot = value;
                     }
                 }
@@ -1118,11 +1164,7 @@ pub fn render_audio_events(
             // fade / gain / pan は DSP 経路に依らず同じ順序で掛ける
             // (= 従来の per-sample ループと同一の演算)。
             for k in 0..count {
-                let event_local = el_start + k as u64;
-                let fade_in = fade_envelope(event_local, fade_in_samples, event.fade_in_curve);
-                let tail = event_total_samples.saturating_sub(event_local + 1);
-                let fade_out = fade_envelope(tail, fade_out_samples, event.fade_out_curve);
-                let env = fade_in * fade_out * event.gain_lin;
+                let env = ramps.gain(el_start + k as u64) * event.gain_lin;
                 if env == 0.0 {
                     continue;
                 }
@@ -1136,7 +1178,8 @@ pub fn render_audio_events(
         // --- エンジン不要 / 不在: 従来の per-sample テープ経路 ---------------
         // formant 0 の Raw / Repitch / Slice はここを通り、出力は r.md #40 前と
         // **1 サンプルも変わらない**。
-        let mut repitch_state = state.repitch_accum.get_mut(accum_idx);
+        let mut repitch_state = acquire_tape_cursor(state.repitch_accum, event.stream_key, el_start, render_seq)
+            .and_then(|c| state.repitch_accum.get_mut(c));
         // degrade した Stretch は「ピッチ比を掛けない伸縮率」で読む (= 長さと拍
         // 同期は保たれる)。 伸縮率 1.0 (= clip が project tempo と一致) では
         // 正しい出力と一致するので、実用上ほぼ無害。
@@ -1147,9 +1190,8 @@ pub fn render_audio_events(
         };
 
         for i in buf_off_start..buf_off_end {
-            // event_local = sample offset since event.start_beat。 i は buffer
-            // 内 offset、 buffer 開始は playhead_beats、 event 開始は
-            // event.start_beat に対応する buf 内 offset `event_start_offset_in_buf`。
+            // event_local = take の頭からの sample offset。 i は buffer 内 offset、 buffer 開始は
+            // playhead_beats、 take の頭は buf 内 offset `event_start_offset_in_buf`。
             // よって `event_local = i - event_start_offset_in_buf` (= 負 / 範囲外なら skip)。
             let event_local_signed = i as i64 - event_start_offset_in_buf;
             if event_local_signed < 0 {
@@ -1158,12 +1200,8 @@ pub fn render_audio_events(
             #[allow(clippy::cast_sign_loss)]
             let event_local = event_local_signed as u64;
 
-            // Fade envelope (in × out)。 beat-domain fade → samples 換算済の
-            // fade_in_samples / fade_out_samples を per-sample 比較。
-            let fade_in = fade_envelope(event_local, fade_in_samples, event.fade_in_curve);
-            let tail = event_total_samples.saturating_sub(event_local + 1);
-            let fade_out = fade_envelope(tail, fade_out_samples, event.fade_out_curve);
-            let env = fade_in * fade_out * event.gain_lin;
+            // Fade envelope (in × out)。 beat-domain fade → samples 換算済のランプを per-sample 比較。
+            let env = ramps.gain(event_local) * event.gain_lin;
             if env == 0.0 {
                 continue;
             }
@@ -1211,6 +1249,86 @@ pub fn render_audio_events(
     }
 }
 
+/// event の fade を 1 buffer の sample 領域 (current_bpm) に写したランプ。 位置は **take の頭**
+/// からの sample 数で持つ — 分割の片はランプの端を take の座標で共有するので、切り口を跨いだ
+/// ランプも分割前と同じゲインになる (`AudioEvent::fade_in_lead_beats`)。
+struct FadeRamps {
+    /// fade-in のランプが始まる sample (take の頭から)。
+    in_start: i64,
+    in_len: u64,
+    in_curve: FadeCurve,
+    /// fade-out のランプが終わる sample (take の頭から、exclusive)。
+    out_end: i64,
+    out_len: u64,
+    out_curve: FadeCurve,
+}
+
+impl FadeRamps {
+    fn new(event: &RenderedEvent, samples_per_beat: f64) -> Self {
+        // ランプの端は発音の端と同じ規則 (`boundary_frame`) で写す: 浮動小数の誤差で整数のすぐそばに
+        // 来た値を整数へ吸着するので、片ごとに足し直したランプの端 (head + length + trail) が
+        // 分割前の端と同じ sample に落ちる。
+        #[allow(clippy::cast_possible_truncation)]
+        let at = |beats: f64| common::timing::boundary_frame(beats, samples_per_beat).clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let len = |beats: f64| (beats * samples_per_beat).max(0.0) as u64;
+        Self {
+            in_start: at(event.fade_in_start_beats),
+            in_len: len(event.fade_in_beats),
+            in_curve: event.fade_in_curve,
+            out_end: at(event.fade_out_end_beats),
+            out_len: len(event.fade_out_beats),
+            out_curve: event.fade_out_curve,
+        }
+    }
+
+    /// take の頭から `event_local` sample 目の fade ゲイン (in × out)。 RT: 確保・分岐の山なし。
+    #[inline]
+    fn gain(&self, event_local: u64) -> f32 {
+        #[allow(clippy::cast_possible_wrap)]
+        let el = event_local as i64;
+        #[allow(clippy::cast_sign_loss)]
+        let into_in = el.saturating_sub(self.in_start).max(0) as u64;
+        #[allow(clippy::cast_sign_loss)]
+        let tail = self.out_end.saturating_sub(el).saturating_sub(1).max(0) as u64;
+        fade_envelope(into_in, self.in_len, self.in_curve) * fade_envelope(tail, self.out_len, self.out_curve)
+    }
+}
+
+/// Stretch (スペクトル経路) の時間写像: 出力 sample `el` (take の頭から) → source 位置 `u`
+/// (source 窓の頭から)。 `first_beat` は `el_start` に対応する take-local 拍。
+///
+/// 写像は **beat 領域**で持つ。 「1 拍あたり消費する source frame 数」 =
+/// `source_sr * 60 / nominal_bpm * stretch_ratio` は **tempo に依らない**ので、tempo automation でも
+/// source 位置が跳ばず (= 旧 granular の grain lock-in ring と LP smoothed bpm が不要になった)、かつ
+/// 拍にロックしたまま追従する。 波形描画側 (`event_wave_spans` の `nominal_fpb * stretch`) と同一の量で、
+/// 「描いた波形 = 鳴る音」 が保たれる。 warp marker は source frame を take の拍に pin するので、
+/// 戻り値の絶対 source frame を窓の起点へ寄せる。
+fn stretch_u_of(
+    event: &RenderedEvent,
+    source_sample_rate: u32,
+    first_beat: f64,
+    el_start: u64,
+    samples_per_beat: f64,
+) -> impl Fn(u64) -> f64 + '_ {
+    let nominal_bpm = f64::from(event.nominal_bpm);
+    let src_frames_per_beat = if nominal_bpm > 0.0 {
+        f64::from(source_sample_rate) * 60.0 / nominal_bpm * event.stretch_ratio
+    } else {
+        0.0
+    };
+    let warped = event.beat_markers.len() >= 2;
+    move |el: u64| -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let beat = first_beat + el.saturating_sub(el_start) as f64 / samples_per_beat;
+        if warped && let Some(sf) = common::audio_render::warp_source_frame(beat, &event.beat_markers) {
+            #[allow(clippy::cast_precision_loss)]
+            return sf - event.source_start_frames as f64;
+        }
+        beat * src_frames_per_beat
+    }
+}
+
 /// tape 系 (Raw / Repitch、および engine 不在で degrade した Stretch) の
 /// 1 サンプル読み出し。 `ratio` は「出力 1 sample あたり進む source frame 数」。
 ///
@@ -1234,7 +1352,7 @@ fn tape_sample_at(
     buffer_frames: u64,
     source_len: u64,
     reversed: bool,
-    state: Option<&mut (u64, f64)>,
+    state: Option<&mut TapeCursor>,
 ) -> (f32, f32) {
     let source_pos = match state {
         Some(state) => repitch_source_pos(state, event_local, ratio),
@@ -1576,6 +1694,7 @@ mod render_tests {
         let schedule = vec![RenderedEvent {
             track_idx: 0,
             cell_clip_id: 0,
+            origin_beat: 0.0,
             start_beat: 0.0,
             end_beat: LEN_BEATS,
             gate_start_beat: f64::NEG_INFINITY,
@@ -1598,6 +1717,8 @@ mod render_tests {
             fade_out_beats: 0.0,
             fade_in_curve: FadeCurve::Linear,
             fade_out_curve: FadeCurve::Linear,
+            fade_in_start_beats: 0.0,
+            fade_out_end_beats: LEN_BEATS,
             reversed: false,
             stretch_mode: mode,
             onsets,
@@ -1614,7 +1735,7 @@ mod render_tests {
 
         let samples_per_beat = f64::from(ENGINE_SR) * 60.0 / f64::from(BPM);
         let total = (LEN_BEATS * samples_per_beat) as usize;
-        let mut accum = vec![(u64::MAX, 0.0f64); 4];
+        let mut accum = vec![TapeCursor::IDLE; 4];
         let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
         let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
         let mut render_seq = 0u64;
@@ -1666,6 +1787,7 @@ mod render_tests {
             let schedule = vec![RenderedEvent {
                 track_idx: 0,
                 cell_clip_id: 0,
+                origin_beat: 0.0,
                 start_beat: 0.0,
                 end_beat: LEN_BEATS,
                 gate_start_beat: gate.0,
@@ -1688,6 +1810,8 @@ mod render_tests {
                 fade_out_beats: 0.0,
                 fade_in_curve: FadeCurve::Linear,
                 fade_out_curve: FadeCurve::Linear,
+                fade_in_start_beats: 0.0,
+                fade_out_end_beats: LEN_BEATS,
                 reversed: false,
                 stretch_mode: StretchMode::Raw,
                 onsets: Vec::new(),
@@ -1697,7 +1821,7 @@ mod render_tests {
             sources.insert(1u32, Arc::clone(&source));
             let renderer = AudioClipRenderer::new(schedule, sources);
             let total = (LEN_BEATS * samples_per_beat) as usize;
-            let mut accum = vec![(u64::MAX, 0.0f64); 4];
+            let mut accum = vec![TapeCursor::IDLE; 4];
             let mut engines: Vec<StretchEngine> = Vec::new();
             let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
             let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
@@ -1771,6 +1895,7 @@ mod render_tests {
             let schedule = vec![RenderedEvent {
                 track_idx: 0,
                 cell_clip_id: 0,
+                origin_beat: start,
                 start_beat: start,
                 end_beat: start + len,
                 gate_start_beat: f64::NEG_INFINITY,
@@ -1793,6 +1918,8 @@ mod render_tests {
                 fade_out_beats: 0.0,
                 fade_in_curve: FadeCurve::Linear,
                 fade_out_curve: FadeCurve::Linear,
+                fade_in_start_beats: 0.0,
+                fade_out_end_beats: len,
                 reversed: false,
                 stretch_mode: StretchMode::Raw,
                 onsets: Vec::new(),
@@ -1801,7 +1928,7 @@ mod render_tests {
             let mut sources = HashMap::new();
             sources.insert(1u32, Arc::clone(&source));
             let renderer = AudioClipRenderer::new(schedule, sources);
-            let (mut accum, mut engines) = (vec![(u64::MAX, 0.0f64); 4], Vec::<StretchEngine>::new());
+            let (mut accum, mut engines) = (vec![TapeCursor::IDLE; 4], Vec::<StretchEngine>::new());
             let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
             let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
             let mut render_seq = 0u64;
@@ -2081,6 +2208,7 @@ mod render_tests {
         RenderedEvent {
             track_idx: 0,
             cell_clip_id: 0,
+            origin_beat: start,
             start_beat: start,
             end_beat: end,
             gate_start_beat: f64::NEG_INFINITY,
@@ -2103,6 +2231,8 @@ mod render_tests {
             fade_out_beats: 0.0,
             fade_in_curve: FadeCurve::Linear,
             fade_out_curve: FadeCurve::Linear,
+            fade_in_start_beats: 0.0,
+            fade_out_end_beats: end - start,
             reversed: false,
             stretch_mode: mode,
             onsets: Vec::new(),
@@ -2165,9 +2295,10 @@ mod render_tests {
         let mut engines: Vec<StretchEngine> = (0..3)
             .map(|_| StretchEngine::new(ENGINE_SR).expect("stretch engine"))
             .collect();
+        let at = |key: u64, el: u64| StreamAt { key, el_start: el, du: 1.0, u: el as f64 };
         // 3 発音がそれぞれ別エンジンを掴む。
         for (i, key) in [10u64, 20, 30].iter().enumerate() {
-            let e = acquire_engine(&mut engines, *key, 1).expect("engine");
+            let e = acquire_engine(&mut engines, at(*key, 0), 1).expect("engine");
             // 走行中ストリームを作るため 1 サンプルだけ回す。
             let mut l = [0.0f32; 1];
             let mut r = [0.0f32; 1];
@@ -2185,7 +2316,7 @@ mod render_tests {
                 .iter()
                 .position(|e| e.stream_key() == Some(key))
                 .expect("key に対応するエンジン");
-            let e = acquire_engine(&mut engines, key, 2).expect("engine");
+            let e = acquire_engine(&mut engines, at(key, 1), 2).expect("engine");
             assert_eq!(e.stream_key(), Some(key));
             if key == 20 {
                 assert_eq!(picked, addr20, "key 20 は同じエンジン実体に戻る");
@@ -2195,17 +2326,27 @@ mod render_tests {
 
     /// pool が足りないときは degrade する (= 他の発音のエンジンを奪って
     /// 無限に prime し合わない)。 同じ buffer 内で二重取りしないことも固定。
+    /// 例外は **続き** — 同じ buffer で前の発音が鳴り終えた位置からそのまま続く発音 (分割の後ろの片) は、
+    /// 同じエンジンを引き継ぐ (取り合っていない)。 続きでない別の発音は取れない。
     #[test]
     fn engine_acquire_degrades_when_pool_is_exhausted() {
+        let at = |key: u64, el: u64| StreamAt { key, el_start: el, du: 1.0, u: el as f64 };
         let mut engines: Vec<StretchEngine> =
             vec![StretchEngine::new(ENGINE_SR).expect("stretch engine")];
-        assert!(acquire_engine(&mut engines, 1, 7).is_some());
+        let e = acquire_engine(&mut engines, at(1, 0), 7).expect("engine");
+        let (mut l, mut r) = ([0.0f32; 8], [0.0f32; 8]);
+        e.render(1, 0.0, 0.0, false, 0, 1.0, |el| el as f64, |_| (0.0, 0.0), &mut l, &mut r);
         assert!(
-            acquire_engine(&mut engines, 2, 7).is_none(),
+            acquire_engine(&mut engines, at(2, 0), 7).is_none(),
             "同じ buffer で 2 発音が同じエンジンを掴んではいけない"
         );
+        assert!(
+            acquire_engine(&mut engines, at(1, 4_000), 7).is_none(),
+            "同じキーでも続きでなければ (= 同じ素材を重ねた別の発音) 取れない"
+        );
+        assert!(acquire_engine(&mut engines, at(1, 8), 7).is_some(), "鳴り終えた位置からの続きは引き継ぐ");
         // buffer が変われば使い回せる。
-        assert!(acquire_engine(&mut engines, 2, 8).is_some());
+        assert!(acquire_engine(&mut engines, at(2, 0), 8).is_some());
     }
 
     /// フォルマントは **時間軸に効かない**: tape mode で値を入れても鳴る長さは
@@ -2411,6 +2552,7 @@ mod render_tests {
         let schedule = vec![RenderedEvent {
             track_idx: 0,
             cell_clip_id: 0,
+            origin_beat: 0.0,
             start_beat: 0.0,
             end_beat: LEN_BEATS,
             gate_start_beat: f64::NEG_INFINITY,
@@ -2433,6 +2575,8 @@ mod render_tests {
             fade_out_beats: 0.0,
             fade_in_curve: FadeCurve::Linear,
             fade_out_curve: FadeCurve::Linear,
+            fade_in_start_beats: 0.0,
+            fade_out_end_beats: LEN_BEATS,
             reversed: false,
             stretch_mode: mode,
             onsets: Vec::new(),
@@ -2446,7 +2590,7 @@ mod render_tests {
         // エンジンと scratch は off-RT で用意する (= live では publish 側が作って
         // ring で配送、export では walk の頭で積む)。
         let mut engines = vec![StretchEngine::new(48_000).expect("engine")];
-        let mut accum = vec![(u64::MAX, 0.0f64); 4];
+        let mut accum = vec![TapeCursor::IDLE; 4];
         let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
         let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
         let mut l = vec![0.0f32; 512];
@@ -2506,7 +2650,7 @@ mod render_tests {
 
     #[test]
     fn repitch_integrates_position_continuously_across_tempo_change() {
-        let mut state = (u64::MAX, 0.0);
+        let mut state = TapeCursor::IDLE;
         for el in 0..4u64 {
             let p = repitch_source_pos(&mut state, el, 1.0);
             assert!((p - el as f64).abs() < 1e-9, "ratio 1.0 で 位置 == event_local");
@@ -2525,7 +2669,7 @@ mod render_tests {
 
     #[test]
     fn repitch_constant_ratio_matches_legacy_formula() {
-        let mut state = (u64::MAX, 0.0);
+        let mut state = TapeCursor::IDLE;
         for el in 0..10u64 {
             let p = repitch_source_pos(&mut state, el, 1.5);
             assert!(
@@ -2664,6 +2808,7 @@ mod wave_span_binding_tests {
         let schedule = vec![RenderedEvent {
             track_idx: 0,
             cell_clip_id: 0,
+            origin_beat: -event.take_head_beats,
             start_beat: 0.0,
             end_beat: event.event_length_beats,
             gate_start_beat: f64::NEG_INFINITY,
@@ -2681,9 +2826,9 @@ mod wave_span_binding_tests {
             stream_key: 1,
             needs_engine: false,
             stretch_ratio: stretch_ratio_for(
-                event.source_end_frames.saturating_sub(event.source_start_frames),
+                event.source_window_frames(),
                 source_sr,
-                event.event_length_beats,
+                event.take_length_beats(),
                 BPM,
             ),
             nominal_bpm: BPM,
@@ -2691,6 +2836,8 @@ mod wave_span_binding_tests {
             fade_out_beats: 0.0,
             fade_in_curve: FadeCurve::Linear,
             fade_out_curve: FadeCurve::Linear,
+            fade_in_start_beats: 0.0,
+            fade_out_end_beats: event.take_length_beats(),
             reversed: event.reversed,
             stretch_mode: event.stretch_mode,
             onsets,
@@ -2704,7 +2851,7 @@ mod wave_span_binding_tests {
             .map(|_| StretchEngine::new(ENGINE_SR).expect("stretch engine"))
             .collect();
 
-        let mut accum = vec![(u64::MAX, 0.0f64); 4];
+        let mut accum = vec![TapeCursor::IDLE; 4];
         let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
         let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
         let mut render_seq = 0u64;
@@ -3236,7 +3383,45 @@ mod wave_span_binding_tests {
         let ev = AudioEvent { stretch_mode: StretchMode::Raw, ..ev };
         assert_tape_render_matches_spans(&ev, 48_000, Some(&ramping), "raw @tempo ramp");
     }
+
+    /// r.md #132 残件: 分割の片 (take の窓) でも、描いた波形と鳴る音が一致する — `event_wave_spans` が
+    /// take 全体の写像を窓で切り詰めた span 列と、engine が take の頭から読む出力の突き合わせ
+    /// (sample 直読の tape / slice 経路。 スペクトル経路の片は prime 直後の立ち上がりが局所 RMS を乱すので、
+    /// 片の写像は `split_fidelity_tests` が分割前の出力との一致で確かめる)。
+    #[test]
+    fn pieces_spans_match_render() {
+        use common::model::split_pieces;
+        let raw = AudioEvent {
+            source_start_frames: 0,
+            source_end_frames: SOURCE_FRAMES,
+            event_length_beats: 4.0,
+            stretch_mode: StretchMode::Raw,
+            // 下げると 1 秒の素材が 2.67 拍まで鳴る → 最後の片は途中で鳴り終わる (尻が無音)。
+            pitch_semitones: -5.0,
+            ..AudioEvent::default()
+        };
+        let tape = [
+            ("slice gap", slice_event(4.0, 0.0, vec![0, 12_000, 24_000, 36_000])),
+            ("slice reversed pitched", AudioEvent { reversed: true, ..slice_event(3.0, 5.0, vec![0, 9_000, 30_000]) }),
+            ("raw pitched", raw.clone()),
+            ("repitch reversed", AudioEvent { stretch_mode: StretchMode::Repitch, reversed: true, ..raw.clone() }),
+        ];
+        for (label, ev) in tape {
+            for piece in split_pieces(&ev, [0.8, 2.1], 0.0) {
+                let at = piece.event_start_in_clip_beats;
+                assert_tape_render_matches_spans(&piece, 48_000, None, &format!("{label} piece @{at}"));
+            }
+        }
+        let ramping = tempo_song(120.0, 200.0, 8.0);
+        for piece in split_pieces(&AudioEvent { pitch_semitones: 0.0, ..raw }, [1.7], 0.0) {
+            let at = piece.event_start_in_clip_beats;
+            assert_tape_render_matches_spans(&piece, 48_000, Some(&ramping), &format!("raw @tempo ramp piece @{at}"));
+        }
+    }
 }
+
+#[cfg(test)]
+mod split_fidelity_tests;
 
 /// `AudioSourceId` は **Song スコープの名前** (project ごとに 1 から再採番) な
 /// ので、decode 済みバッファの再利用を id 一致だけで判断してはいけない。

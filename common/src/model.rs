@@ -13,6 +13,7 @@ use crate::scale::ScaleChange;
 // (invariant #7: fingerprint handshake の検出網に穴を開けない)。wire に載らない `Song` の
 // ロジックを切り出したファイル (section_ops / load_normalize / source_pools 等) は登録しない
 // (ロジックの変更で fingerprint を動かさない、build.rs 冒頭)。
+mod audio_take;
 mod automation;
 mod bounce_ops;
 mod clip_window;
@@ -20,6 +21,7 @@ mod master_limiter;
 mod media_manifest;
 mod content;
 mod content_split;
+mod event_window;
 mod device;
 mod ids;
 mod lineage;
@@ -40,6 +42,7 @@ mod time_selection;
 mod view_state;
 mod track;
 mod track_enable;
+mod window_edit;
 pub use automation::*;
 pub use bounce_ops::*;
 pub use clip_window::*;
@@ -47,6 +50,7 @@ pub use master_limiter::*;
 pub use media_manifest::*;
 pub use content::*;
 pub use content_split::split_boundaries;
+pub use event_window::{TimedEvent, event_piece, join_pieces, split_pieces};
 pub use device::*;
 pub use ids::*;
 pub use midi_bind::*;
@@ -64,6 +68,7 @@ pub use time_ops::*;
 pub use time_selection::*;
 pub use track::*;
 pub use view_state::{RackPanelKey, ViewState};
+pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, run_fade, shown_in, shown_indices};
 
 /// `28` ビュー状態の保存: `ProjectFile.view: Option<ViewState>` 追加。
 /// ズーム / スクロール / 行高 / スナップ設定等の表示状態を `Song` の **兄弟**として
@@ -303,7 +308,19 @@ pub use view_state::{RackPanelKey, ViewState};
 /// [`Track::follow_transpose`]・[`AutomationTarget::SongTranspose`]・[`BindingTarget::SongTranspose`] を追加。
 /// 旧ファイルは `serde(default)` (移調 0 / 全トラック追従) で読める。新ファイルを旧ビルドで開くと unknown variant で
 /// 落ちるので版で弾く。
-pub const CURRENT_VERSION: u32 = 41;
+///
+/// v42 (r.md #132 残件、分割の忠実度): 分割が「切れ目を入れるだけ」になるよう、時間軸を持つ event に
+/// 窓を持たせた — `AudioEvent` / `VideoEvent` の `take_head_beats` (audio は `take_tail_beats` も、
+/// warp marker の拍は take の座標)、4 種の event の fade ランプの張り出し
+/// (`fade_in_lead_beats` / `fade_out_trail_beats`)、`TextEvent::continuation` (読み上げない続きの片)、
+/// `AudioEvent::take_id` (片が継ぐ take の安定 id = ARA の audio modification の単位)、`Song::content_forked_from`
+/// (共有を解いた content の複製元 = modification の編集を写す元)。 ARA のアーカイブ
+/// は位置由来の旧 persistent id から安定 id へ読み替える表を `PluginInstance::ara_archive_ids` に持つ
+/// (旧ファイルの load で作る、`crate::ara_ids::migrate_legacy_archives`)。
+/// 旧ファイルは `serde(default)` の 0 / `false` (= 分割していない event) で読める (migration 不要)。
+/// 新ファイルを旧ビルドで開くと片が窓を失い、続きの片が同じ文をもう一度読み上げる (未知フィールドを
+/// 捨てる) ので、版を上げて gate で弾く。
+pub const CURRENT_VERSION: u32 = 42;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -545,6 +562,16 @@ pub struct Song {
     /// v19 files forward-migrate to a map backfilled from `Clip.name`.
     #[serde(default)]
     pub clip_content_names: HashMap<ContentId, String>,
+    /// v42 (r.md #132 残件): audio content を複製して共有を解いたとき ([`Song::fork_content`]: Make Unique /
+    /// 共有 content の伸縮 / トラック複製など) の **複製元**。 ARA の audio modification は content と
+    /// take ごとなので (`crate::ara_ids`)、複製した content の modification は、plug-in host の document に
+    /// 初めて現れるとき複製元の編集を写して始める (Melodyne の編集が共有を解いても続く、別々に編集できる
+    /// variation。 一度 document に居た modification は自分の状態から戻る、`daw_plugin_host::ara::graph_plan::
+    /// modification_start`)。 キーの content が消えたら `gc_clip_contents` が落とす (複製元が消えていても、
+    /// そのアーカイブから写せるので値は残す)。 旧 ARA アーカイブの読み込みで分けた content は、クリップごとの
+    /// 編集をアーカイブに持つので記録しない (`crate::ara_ids::migrate_legacy_archives`)。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub content_forked_from: HashMap<ContentId, ContentId>,
     /// §10 bullet 4: imported media source プール (audio / video / image)。旧 .daw は
     /// `audio_sources` / `video_sources` / `image_sources` を Song 直下にフラット保存していたが、
     /// serde `flatten` は `HashMap<u32, _>` の整数キーを content-buffer 経由で復元できない
@@ -725,6 +752,7 @@ impl Default for Song {
             },
             clip_contents: HashMap::new(),
             clip_content_names: HashMap::new(),
+            content_forked_from: HashMap::new(),
             media: MediaPools::default(),
             song_lanes: Vec::new(),
             midi_bindings: Vec::new(),
@@ -1191,6 +1219,10 @@ impl Song {
         let content = self.clip_contents.get(&src).cloned().unwrap_or_default();
         let name = self.clip_content_names.get(&src).cloned();
         let id = self.alloc_content_id();
+        // 複製元を覚えるのは ARA の audio modification を持つ audio content だけ (`content_forked_from`)。
+        if matches!(content, ClipContent::Audio(_)) {
+            self.content_forked_from.insert(id, src);
+        }
         self.clip_contents.insert(id, content);
         if let Some(name) = name {
             self.clip_content_names.insert(id, name);
@@ -1256,6 +1288,10 @@ impl Song {
                 event.event_length_beats *= ratio;
                 event.fade_in_beats *= ratio;
                 event.fade_out_beats *= ratio;
+                event.fade_in_lead_beats *= ratio;
+                event.fade_out_trail_beats *= ratio;
+                // take の隠れている頭と尻も同じ秒で留める (分割の片の時間写像を保つ)。
+                event.scale_take(ratio);
             }
             raw_content_ids.insert(cid);
         }
@@ -1450,6 +1486,7 @@ impl Song {
         // Shared names follow content lifecycle: drop names whose
         // content_id no longer has any referencing clip.
         self.clip_content_names.retain(|id, _| live.contains(id));
+        self.content_forked_from.retain(|id, _| live.contains(id));
     }
 
     /// クリップ (arrangement / launcher セル / track・song automation lane) から
@@ -1537,3 +1574,5 @@ impl Default for TalkParams {
 mod tests;
 #[cfg(test)]
 mod native_tests;
+#[cfg(test)]
+mod window_edit_tests;

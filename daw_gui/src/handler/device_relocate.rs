@@ -262,7 +262,7 @@ impl AppData {
         if blob_bytes(&out) > crate::clipboard::CLIPBOARD_BLOB_BUDGET {
             for d in &mut out {
                 common::model::for_each_plugin_mut(std::slice::from_mut(&mut d.device), &mut |p| {
-                    if p.ara_archive.take().is_some() {
+                    if p.drop_ara_archive() {
                         dropped += 1;
                     }
                 });
@@ -322,9 +322,9 @@ impl AppData {
                 let from_other_track = dc.source_track != dest_track;
                 common::model::for_each_plugin_mut(std::slice::from_mut(&mut dev), &mut |inst| {
                     // 別トラックへ運んだ ARA アーカイブは復元できない (persistent_id が
-                    // 元トラックのクリップを指す) ので落として解析し直させる。
+                    // 元トラックのクリップの content を指す) ので落として解析し直させる。
                     if from_other_track {
-                        inst.ara_archive = None;
+                        inst.drop_ara_archive();
                     }
                 });
                 resolve_aux_refs_after_paste(song, &mut dev);
@@ -486,7 +486,7 @@ fn relocate_in_song(
                 // `state` (= いまのツマミ) は引き継ぐ (`Arc` の clone なのでコストゼロ)。
                 // ARA アーカイブはトラックを跨いだら復元できないので捨てる。
                 if cross {
-                    inst.ara_archive = None;
+                    inst.drop_ara_archive();
                 }
             });
             retarget_self_track_aux(&mut dev, src_track, dest_track);
@@ -542,9 +542,9 @@ fn relocate_in_song(
                     .entry(src_track)
                     .or_default()
                     .push(inst.plugin_id.clone());
-                // ARA アーカイブは元トラックのクリップを指す persistent_id で作られて
-                // いるので、 別トラックへ持ち込むと復元できない (= 解析し直す)。
-                inst.ara_archive = None;
+                // ARA アーカイブは元トラックのクリップの content を指す persistent_id で
+                // 作られているので、 別トラックへ持ち込むと復元できない (= 解析し直す)。
+                inst.drop_ara_archive();
             });
             retarget_self_track_aux(&mut dev, src_track, dest_track);
         }

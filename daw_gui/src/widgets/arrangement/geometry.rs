@@ -223,6 +223,11 @@ pub(super) struct FadeGeometry {
     pub width_px: f32,
     /// 無音側の端点 (event 矩形の下端の角、 fade 長に依らず固定)。
     pub anchor: [f32; 2],
+    /// `anchor` (event の端) でのランプの進度 (0 = 無音、1 = フル)。 通常の fade は 0、分割の片が
+    /// ランプの続きを持つときは途中の値 (線はこの進度のゲインから立ち上がる)。
+    pub anchor_progress: f32,
+    /// `handle` (掴む点) でのランプの進度。 通常は 1、ランプが event の反対の端を越えて続くときは途中。
+    pub handle_progress: f32,
     /// フル側の端点 (event 矩形の上端、 fade 長ぶん内側)。 掴む点。
     pub handle: [f32; 2],
     /// 掴む正方形。 `handle` を基準に event 矩形内へ収める。 `fade = 0` のときは
@@ -266,9 +271,18 @@ pub(super) fn fade_geometry(
     };
     let event_rect = Rect { x: ex, y: ey, w: ew.max(0.0), h: eh.max(0.0) };
 
-    let fade_beats = match edge {
-        FadeEdge::In => fade.fade.fade_in_beats,
-        FadeEdge::Out => fade.fade.fade_out_beats,
+    // 分割の片では、ランプが event の端の外から始まる / 外で終わる (`EventFade::fade_in_lead_beats`)。
+    // 掴む点は **event の中に見えているランプの端**。 event の端 / 掴む点はランプの途中にありうる
+    // (ランプが event より長いときも掴む点で進度 1 に届かない) ので、両端の進度を持つ。
+    let (fade_beats, anchor_progress, handle_progress) = match edge {
+        FadeEdge::In => {
+            let v = fade.fade.visible_fade_in_beats();
+            (v, fade.fade.fade_in_progress(0.0), fade.fade.fade_in_progress(v))
+        }
+        FadeEdge::Out => {
+            let v = fade.fade.visible_fade_out_beats();
+            (v, fade.fade.fade_out_progress(0.0), fade.fade.fade_out_progress(v))
+        }
     };
     let width_px = map.w(fade_beats).clamp(0.0, event_rect.w);
 
@@ -297,6 +311,8 @@ pub(super) fn fade_geometry(
         event_rect,
         width_px,
         anchor,
+        anchor_progress,
+        handle_progress,
         handle,
         handle_rect: Rect { x: handle_x, y: event_rect.y, w: corner, h: corner },
     }

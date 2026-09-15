@@ -16,8 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common::model::{
-    AutomationLane, AutomationTarget, FadeCurve, Song, TextAlign, TextBuiltinParam, TextEvent,
-    Track,
+    AutomationLane, AutomationTarget, Song, TextAlign, TextBuiltinParam, TextEvent, TimedEvent, Track,
 };
 
 use crate::launcher_time::RowTimeline;
@@ -300,40 +299,17 @@ fn resolve_text_fields(
     }
 }
 
-/// Per-event fade envelope at the given clip-local beat. Range
-/// `0.0..=1.0`. Mirrors `image_compose::event_alpha_envelope` exactly
-/// so a text fade crossfading with an image fade stays in step.
+/// Per-event fade envelope at the given clip-local beat. Range `0.0..=1.0`.
+/// 式は映像 / 画像 / 音と共通の [`common::model::EventFade::gain_at`] (分割の片が切り口を跨ぐ
+/// ランプの続きを持つのもそこが扱う)。
 fn event_alpha_envelope(event: &TextEvent, clip_local_beat: f64) -> f32 {
-    let event_local = clip_local_beat - event.event_start_in_clip_beats;
-    if event_local < 0.0 {
-        return 0.0;
-    }
-    let mut alpha = 1.0_f32;
-    if event.fade_in_beats > 0.0 && event_local < event.fade_in_beats {
-        let progress = (event_local / event.fade_in_beats) as f32;
-        alpha *= fade_curve_value(progress, event.fade_in_curve);
-    }
-    let event_remaining = event.event_length_beats - event_local;
-    if event.fade_out_beats > 0.0
-        && event_remaining > 0.0
-        && event_remaining < event.fade_out_beats
-    {
-        let progress = (event_remaining / event.fade_out_beats) as f32;
-        alpha *= fade_curve_value(progress, event.fade_out_curve);
-    }
-    alpha.clamp(0.0, 1.0)
-}
-
-fn fade_curve_value(progress: f32, curve: FadeCurve) -> f32 {
-    // r.md #38: fade カーブの式は `common::audio_render::fade_curve_at` が唯一の SSoT
-    // (音 / 映像 / 画像 / 字幕 / アレンジ画面の描画が全部ここを通る)。
-    common::audio_render::fade_curve_at(progress, curve)
+    event.fade().gain_at(clip_local_beat - event.event_start_in_clip_beats)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::model::{Clip, ClipContent, TextContent, TextEvent};
+    use common::model::{Clip, ClipContent, FadeCurve, TextContent, TextEvent};
 
     #[allow(clippy::too_many_arguments)]
     fn make_song_with_one_text(
@@ -415,6 +391,40 @@ mod tests {
         assert_eq!(f.h, 0.2);
         assert!((f.alpha - 1.0).abs() < 1e-6);
         assert_eq!(f.z_index, 0);
+    }
+
+    /// r.md #132 残件: 字幕を割っても (content の中 / クリップごと)、どの拍でも分割前と同じ字幕を同じ
+    /// 不透明度で出す — 切り口で途切れず、切り口を跨ぐ fade のランプも続く。 続きの片は読み上げない印を
+    /// 持つだけで、字幕は同じ文を出し続ける。
+    #[test]
+    fn 分割した字幕は切れ目なく分割前と同じに出る() {
+        let song = make_song_with_one_text("こんにちは", 0.1, 0.4, 0.8, 0.2, 0.9, 8.0, 2.75, 3.5);
+        let frames = |song: &Song| -> Vec<(String, f32)> {
+            (0..160)
+                .map(|i| 8.0 * (f64::from(i) + 0.5) / 160.0)
+                .map(|beat| {
+                    let f = active_text_sources_at(song, &RowTimeline::preview(beat), common::mod_plane::ModPlaneRef::default());
+                    assert_eq!(f.len(), 1, "拍 {beat} は字幕 1 枚");
+                    (f[0].text.to_string(), f[0].alpha)
+                })
+                .collect()
+        };
+        let whole = frames(&song);
+        let content_id = song.tracks[0].clips[0].content_id;
+        let mut content_split = song.clone();
+        content_split.split_content_at_points(content_id, &[1.0, 2.0, 5.5, 7.0]);
+        let mut clips_split = song.clone();
+        clips_split.split_clips_at(2.25);
+        clips_split.split_clips_at(6.0);
+        for (label, split) in [("content", &content_split), ("clips", &clips_split)] {
+            for (i, (w, s)) in whole.iter().zip(frames(split)).enumerate() {
+                assert_eq!(w.0, s.0, "{label} #{i}");
+                assert!((w.1 - s.1).abs() < 1e-5, "{label} #{i}: 不透明度 {} / {}", w.1, s.1);
+            }
+        }
+        let ClipContent::Text(t) = &content_split.clip_contents[&content_id] else { panic!("text") };
+        let marks: Vec<bool> = t.events.iter().map(|e| e.continuation).collect();
+        assert_eq!(marks, vec![false, true, true, true, true], "読み上げるのは最初の片だけ");
     }
 
     #[test]

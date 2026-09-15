@@ -182,8 +182,8 @@ pub fn cells_from_clips(clips: &[ClipCopy]) -> Vec<LauncherCellCopy> {
 pub struct DeviceCopy {
     pub order: usize,
     /// コピー元の所属トラック。貼り付け先が同じなら ARA アーカイブを引き継ぐ
-    /// (別トラックなら捨てて解析し直す — `handler/sync.rs` の persistent_id が
-    /// 元トラックのクリップを指すため)。
+    /// (別トラックなら捨てて解析し直す — persistent id (`common::ara_ids`) が
+    /// 元トラックのクリップの content を指すため)。
     pub source_track: u32,
     /// plugin か Parallel (中身ごと)。 r.md #110。
     pub device: common::model::Device,
@@ -461,6 +461,15 @@ pub fn sanitize_audio_events(events: Vec<AudioEvent>) -> Vec<AudioEvent> {
             } else {
                 0.0
             };
+            // 窓 (take の頭 / 尻) と fade ランプの張り出しも、非有限・負は分割していない event の 0 へ。
+            for beats in [
+                &mut e.take_head_beats,
+                &mut e.take_tail_beats,
+                &mut e.fade_in_lead_beats,
+                &mut e.fade_out_trail_beats,
+            ] {
+                *beats = if beats.is_finite() { beats.max(0.0) } else { 0.0 };
+            }
             Some(e)
         })
         .collect()

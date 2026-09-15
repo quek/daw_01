@@ -70,6 +70,10 @@ const LOOP_IN_VIEW_STATE_VERSION: u32 = 31;
 /// 持つので [`legacy_hidden_automation_lanes`] が deserialize 前に拾い上げる。
 const LANE_VISIBILITY_IN_VIEW_STATE_VERSION: u32 = 37;
 
+/// v42 (r.md #132 残件) で ARA の persistent id を位置由来から安定 id (`crate::ara_ids`) にした。 この版未満の
+/// ファイルの ARA アーカイブは旧 id で書かれているので、`ara_ids::migrate_legacy_archives` が読み替え表を作る。
+const ARA_STABLE_ID_VERSION: u32 = 42;
+
 /// v30 (§10) で `ClipContent` を `#[serde(untagged)]` から tagged (`type` field) 化した。
 /// この版未満のファイルは content を untagged (flat `{"notes":[...]}` 等) で保存しているので、
 /// `migrate_clip_content_add_tag` で `type` を注入してから deserialize する。
@@ -799,6 +803,9 @@ const SONG_MIGRATIONS: &[Migration<Song>] = &[
     (SUBTITLE_DEVICE_VERSION, migrate_text_overlay_to_subtitle_device),
     // (v27) 旧 per-event mute を `Clip.muted` へ畳み込む (v27+ の `event.muted` は将来 UI 用に温存)。
     (CLIP_MUTE_VERSION, migrate_per_event_mute_to_clip_mute),
+    // (v42) 位置由来の ARA persistent id で書かれたアーカイブに、今の id への読み替え表を持たせる。
+    // 保存時点の並び (clip id / event の位置) で旧 id を作るので、正規化 (重なり解消等) より前に走る。
+    (ARA_STABLE_ID_VERSION, crate::ara_ids::migrate_legacy_archives),
 ];
 
 /// Load a project including optional GUI view state. The returned
@@ -1152,6 +1159,140 @@ mod tests {
         let loaded = load_project(&path).unwrap().song;
         assert_eq!(loaded.transpose, 0);
         assert!(loaded.tracks[0].follow_transpose);
+    }
+
+    /// r.md #132 残件 (v42): 分割の片の窓 (audio の take の頭 / 尻と warp marker、映像の take の頭、
+    /// fade ランプの張り出し、読み上げない続きの片) は保存して開き直すと戻る。 分割していない event は
+    /// 新しいフィールドを書かない (= v41 以前の file と同じ形で、読むと分割していない event)。
+    #[test]
+    fn split_pieces_roundtrip_and_unsplit_events_keep_the_legacy_shape() {
+        use crate::model::{AudioContent, AudioEvent, BeatMarker, StretchMode, VideoContent, VideoEvent};
+        let dir = tempdir().unwrap();
+        let mut song = Song::default();
+        let audio = song.alloc_content(
+            ClipContent::Audio(AudioContent {
+                events: vec![AudioEvent {
+                    id: 1,
+                    source_id: 1,
+                    event_length_beats: 4.0,
+                    source_end_frames: 96_000,
+                    stretch_mode: StretchMode::Stretch,
+                    fade_in_beats: 2.0,
+                    beat_markers: vec![
+                        BeatMarker { source_frame: 0, locked_beat: 0.0 },
+                        BeatMarker { source_frame: 60_000, locked_beat: 2.5 },
+                        BeatMarker { source_frame: 96_000, locked_beat: 4.0 },
+                    ],
+                    ..AudioEvent::default()
+                }],
+                next_event_id: 2,
+            }),
+            String::new(),
+        );
+        let video = song.alloc_content(
+            ClipContent::Video(VideoContent {
+                events: vec![VideoEvent { event_length_beats: 4.0, source_end_micros: 2_000_000, fade_out_beats: 1.5, ..VideoEvent::default() }],
+            }),
+            String::new(),
+        );
+        let text = song.alloc_content(
+            ClipContent::Text(TextContent {
+                events: vec![TextEvent { text: "こんにちは".into(), event_length_beats: 4.0, ..TextEvent::default() }],
+            }),
+            String::new(),
+        );
+        // 参照されない content は読み込みで掃除されるので、それぞれを clip に置く。
+        let clips = [audio, video, text].into_iter().enumerate().map(|(i, content_id)| Clip {
+            id: i as u32 + 1,
+            start_beat: 8.0 * i as f64,
+            length_beats: 4.0,
+            content_id,
+            ..Clip::default()
+        });
+        song.tracks = vec![Track { id: 1, clips: clips.collect(), next_clip_id: 4, ..Track::default() }];
+        let unsplit = song.clone();
+        for content in [audio, video, text] {
+            song.split_content_at_points(content, &[1.0, 3.25]);
+        }
+        let path = dir.path().join("pieces.daw");
+        save(&path, &song).unwrap();
+        let loaded = load_project(&path).unwrap().song;
+        for content in [audio, video, text] {
+            assert_eq!(loaded.clip_contents[&content], song.clip_contents[&content], "content {content}");
+        }
+        let ClipContent::Text(t) = &loaded.clip_contents[&text] else { panic!("text") };
+        assert_eq!(t.events.iter().map(|e| e.continuation).collect::<Vec<_>>(), vec![false, true, true]);
+
+        let raw = serde_json::to_value(&unsplit).unwrap().to_string();
+        for key in ["take_head_beats", "take_tail_beats", "fade_in_lead_beats", "fade_out_trail_beats", "continuation"] {
+            assert!(!raw.contains(key), "分割していない event は {key} を書かない");
+        }
+    }
+
+    /// r.md #132 残件 (v42): v41 以前の ARA アーカイブ (位置由来の persistent id で書かれている) は、開くと
+    /// 旧 id → 今の安定 id の読み替え表を device に持つ。 旧版はクリップごとに modification を持っていたので、
+    /// 1 つのトラックで content を共有する 2 本目のクリップは content を分けて編集を分けたまま開く。 表は保存して
+    /// 開き直しても残り (v42 の file では作り直さない)、v42 のアーカイブには作らない。
+    #[test]
+    fn v41_の_ara_アーカイブは旧_id_から今の_id_への読み替え表を持って開く() {
+        use crate::ara_ids::{AraIdAlias, modification_id, source_id};
+        use crate::model::{AudioContent, AudioEvent, Device, PluginInstance};
+        let dir = tempdir().unwrap();
+        let mut song = Song::default();
+        let event = |id: u32, start: f64| AudioEvent { id, source_id: 7, event_start_in_clip_beats: start, event_length_beats: 2.0, ..AudioEvent::default() };
+        let linked = song.alloc_content(ClipContent::Audio(AudioContent { events: vec![event(1, 0.0)], next_event_id: 2 }), String::new());
+        let pair = song.alloc_content(
+            ClipContent::Audio(AudioContent { events: vec![event(3, 0.0), event(4, 2.0)], next_event_id: 5 }),
+            String::new(),
+        );
+        let clip = |id: u32, start: f64, content_id| Clip { id, start_beat: start, length_beats: 4.0, content_id, ..Clip::default() };
+        let mut melodyne = PluginInstance::new("test.ara".into(), crate::plugin_format::PluginFormat::Vst3);
+        melodyne.id = 50;
+        melodyne.ara_archive = Some(std::sync::Arc::from(&b"archive"[..]));
+        song.tracks = vec![Track {
+            id: 1,
+            clips: vec![clip(10, 0.0, linked), clip(11, 8.0, linked), clip(12, 16.0, pair)],
+            next_clip_id: 13,
+            devices: vec![Device::Plugin(melodyne)],
+            ..Track::default()
+        }];
+        let legacy = dir.path().join("legacy.daw");
+        write_project_with_version(&legacy, &song, 41);
+
+        let loaded = load_project(&legacy).unwrap().song;
+        let clips = &loaded.tracks[0].clips;
+        assert_eq!(clips[0].content_id, linked);
+        let unshared = clips[1].content_id;
+        assert_ne!(unshared, linked, "旧版でクリップごとだった編集を分けるため、2 本目は content を分ける");
+        assert_eq!(loaded.clip_contents[&unshared], loaded.clip_contents[&linked], "音は変わらない");
+        assert!(
+            !loaded.content_forked_from.contains_key(&unshared),
+            "分けた content の編集はアーカイブの自分の旧 id にあるので、複製元の編集を写す元にしない"
+        );
+        let alias = |archived: String, current: String| AraIdAlias { archived, current };
+        let expected = vec![
+            alias("7:10:0".into(), source_id(7)),
+            alias("7:10:0/mod".into(), modification_id(linked, &event(1, 0.0))),
+            alias("7:11:0/mod".into(), modification_id(unshared, &event(1, 0.0))),
+            alias("7:12:0/mod".into(), modification_id(pair, &event(3, 0.0))),
+            alias("7:12:1/mod".into(), modification_id(pair, &event(4, 2.0))),
+        ];
+        let device = |song: &Song| song.plugin_by_id(50).expect("device").clone();
+        assert_eq!(device(&loaded).ara_archive_ids, expected, "素材の source は最初の 1 つ、modification はクリップと take ごと");
+
+        // 保存 (v42) して開き直しても表は残り、content を分け直さない。
+        let resaved = dir.path().join("resaved.daw");
+        save(&resaved, &loaded).unwrap();
+        let reopened = load_project(&resaved).unwrap().song;
+        assert_eq!(device(&reopened).ara_archive_ids, expected);
+        assert_eq!(reopened.tracks[0].clips[1].content_id, unshared);
+
+        // v42 で書いたアーカイブ (今の id) には表を作らない。
+        let current = dir.path().join("current.daw");
+        write_project_with_version(&current, &song, CURRENT_VERSION);
+        let fresh = load_project(&current).unwrap().song;
+        assert!(device(&fresh).ara_archive_ids.is_empty());
+        assert_eq!(fresh.tracks[0].clips[1].content_id, linked, "v42 の linked clip は共有のまま");
     }
 
     /// 旧 `save` (= `save_project(.., None)` への委譲) は view を書かない。
