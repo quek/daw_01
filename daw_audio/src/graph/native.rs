@@ -34,6 +34,9 @@ pub enum ScMode {
     OwnPreFx,
     /// `NodeOp::NativeSidechainTap` が staging した [`ScStage`]。`emit_sidechain_taps` が決める。
     Staged,
+    /// 無音で検出する: 読み元が実効的に無効なトラック (r.md #131)。plugin の aux port が inactive (= 無音) で届くのと
+    /// 同じ。`emit_sidechain_taps` が決める。
+    Silent,
 }
 
 /// bypass の wet 量 (0 = 素通し、1 = 効いている)。[`NATIVE_BYPASS_FADE_MS`] で線形に動かす。
@@ -236,6 +239,8 @@ pub fn run_native(
         ScMode::None => None,
         ScMode::OwnPreFx => ctx.own_pre_fx,
         ScMode::Staged => sc.as_ref().map(|s| s.signal(n)),
+        // 長さ 0 = 全サンプル 0 とみなす (`NativeBlock::sidechain`)。
+        ScMode::Silent => Some((&[][..], &[][..])),
     };
     let listen_out = if active && dsp.kind() == NativeKind::Comp && ctx.native.sc_listen == *device_id {
         listen.as_mut().map(|b| (&mut b.l[..], &mut b.r[..]))

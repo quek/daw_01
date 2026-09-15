@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use common::model::{AudioTap, AutomationLane, Device, ModRouting, Song, TapPoint, TapSource, Track};
+use common::model::{AudioTap, AutomationLane, ChainRef, Device, ModRouting, Song, TapPoint, TapSource, Track};
 use common::routing_deps::{AuxConsumer, aux_consumers};
 
 use super::{ChainMap, tap_bufref_for};
@@ -46,6 +46,8 @@ pub(super) fn consumer_pass(bus: bool, split: Option<u32>, top_index: u32) -> Sc
 
 /// tap の source を解決し、consumer の pass を決めるのに使う表の束。
 pub(super) struct TapCtx<'a> {
+    /// 解決できなかった読み元が無効なトラックのものかを引く ([`TapCtx::source_disabled`])。
+    pub(super) song: &'a Song,
     /// **有効な** track id → song-track index (`Topology::id_to_idx`。無効トラックの tap は解決しない)。
     pub(super) id_to_idx: &'a HashMap<u32, u32>,
     /// song-track index → 実効的に有効か (`Topology::enabled`。無効トラックの consumer は数えない)。
@@ -76,6 +78,16 @@ impl TapCtx<'_> {
             ScPass::Pass1 => self.buffer_frames,
             ScPass::Pass2 => 0,
         }
+    }
+
+    /// r.md #131: tap の読み元が **実効的に無効なトラック** (かその中の chain) か。解決できない読み元のうち、これは
+    /// dangling (Song に居ない) と違って「無音の読み元」。
+    fn source_disabled(&self, tap: &AudioTap) -> bool {
+        let owner = match tap.source {
+            TapSource::Track(t) => Some(t),
+            TapSource::Chain(c) => self.song.chain_owner_track(ChainRef::Chain(c)),
+        };
+        owner.and_then(|t| self.song.track_index_by_id(t)).is_some_and(|i| !self.enabled.get(i).copied().unwrap_or(true))
     }
 }
 
@@ -201,7 +213,8 @@ pub(super) fn bake_snapshot_needs(song: &Song, enabled: &[bool], built: &mut [Bu
 ///
 /// 自トラックの Pre-FX は program が同じ pass の snapshot を直接載せる (plugin の
 /// `own_prefx_ports` / native の `ScMode::OwnPreFx`)。自トラックの他の tap 点は出力の下流
-/// (= feedback) なので staging しない。dangling な source は黙って飛ばす。
+/// (= feedback) なので staging しない。dangling な source は黙って飛ばす。実効的に無効なトラック (r.md #131) の
+/// source は tap を出さず、native は `ScMode::Silent` (plugin は aux port が inactive = 無音で届く)。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_sidechain_taps(
     chain: &[Device],
@@ -220,19 +233,27 @@ pub(super) fn emit_sidechain_taps(
             if route.tap.source == TapSource::Track(owner_track_id) {
                 continue;
             }
-            let Some(src) = tap_bufref_for(&route.tap, taps.id_to_idx, taps.chains) else {
-                continue;
-            };
+            let src = tap_bufref_for(&route.tap, taps.id_to_idx, taps.chains);
             if !c.native {
                 // v29: 宛先 plugin は安定 device id で焼き込む (未採番 0 は engine 側の lookup が外れる)。
-                nodes.push(NodeOp::SidechainTap { src, device_id: c.device_id, aux_in_port: port as u8 });
+                // 解決できなければ tap を出さない = aux port は inactive (無音) で届く。
+                if let Some(src) = src {
+                    nodes.push(NodeOp::SidechainTap { src, device_id: c.device_id, aux_in_port: port as u8 });
+                }
                 continue;
             }
             let Some(&native_slot) = program.native_slots.get(&c.device_id) else { continue };
             let Some(ns) = program.program.natives.get_mut(native_slot as usize) else { continue };
-            ns.sc_mode = ScMode::Staged;
-            ns.sc.get_or_insert_with(ScStage::new);
-            nodes.push(NodeOp::NativeSidechainTap { src, owner: owner_idx, native_slot });
+            match src {
+                Some(src) => {
+                    ns.sc_mode = ScMode::Staged;
+                    ns.sc.get_or_insert_with(ScStage::new);
+                    nodes.push(NodeOp::NativeSidechainTap { src, owner: owner_idx, native_slot });
+                }
+                // r.md #131: 読み元が無効なトラックなら無音で検出する (plugin と同じ)。dangling は自分の入力 (`None`)。
+                None if taps.source_disabled(&route.tap) => ns.sc_mode = ScMode::Silent,
+                None => {}
+            }
         }
     }
 }

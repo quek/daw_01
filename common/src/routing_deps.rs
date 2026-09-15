@@ -370,7 +370,7 @@ impl Song {
     ///
     /// 循環の判定は [`ReparentCheck::would_cycle`] (アレンジのドロップのプレビューと同じ 1 本)。循環すれば何も
     /// 書かずに `Err`。実在しない id は無視し、`parent` が実在しなければ何もしない。
-    /// 戻り値 = 並びか親が実際に変わったか。
+    /// 戻り値 = 並びか親が実際に変わったか。無効な group の中へ入れたトラックは [`Self::settle_disabled_tracks`] で降ろす。
     pub fn move_tracks(
         &mut self,
         track_ids: &[u32],
@@ -400,7 +400,12 @@ impl Song {
             self.tracks.iter().position(|t| t.id == after).map_or(self.tracks.len(), |i| i + 1)
         });
         self.tracks.splice(at..at, moved);
-        Ok(!self.tracks.iter().map(|t| (t.id, t.parent_group_id)).eq(before))
+        let changed = !self.tracks.iter().map(|t| (t.id, t.parent_group_id)).eq(before);
+        // r.md #131: 無効な group の中へ入れたトラックは実効的に無効になる = 無効化と同じく録音待機と鳴っているセルを降ろす。
+        if changed {
+            self.settle_disabled_tracks();
+        }
+        Ok(changed)
     }
 
     /// 親の付け替えの循環判定 ([`ReparentCheck`]) を、いまの Song の依存 graph で組む (graph は 1 回だけ組むので、

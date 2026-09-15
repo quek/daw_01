@@ -365,8 +365,10 @@ impl AppData {
         if moved {
             tracing::info!(?track_ids, ?parent_id, ?anchor_after, "tracks moved");
             // r.md #131: 無効な group へ入れた / 出したトラックの plugin を host に追従させる (engine へ構造を届けてから)。
+            // 待機とセルは `Song::move_tracks` が同じ undo step で降ろしている。
             self.flush_song_sync();
             self.follow_live_devices(&live_before);
+            self.silence_monitor_notes_on_disabled_tracks();
         }
     }
 

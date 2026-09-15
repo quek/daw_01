@@ -100,24 +100,37 @@ impl Song {
         changed
     }
 
-    /// 実効的に無効なトラックの録音待機とランチャーの鳴っているセルを降ろす (冪等)。
-    fn settle_disabled_tracks(&mut self) {
-        let stop = |row: &mut RowPlayback| {
-            if matches!(row, RowPlayback::Launcher { .. }) {
-                *row = RowPlayback::LauncherStopped;
-            }
-        };
+    /// 実効的に無効なトラックの録音待機とランチャーの鳴っているセルを降ろす (冪等)。「実効的に無効になる」編集の口
+    /// ([`Self::set_tracks_enabled`] / 無効な group の中への [`Self::move_tracks`]) が同じ undo step で呼ぶ。
+    pub(crate) fn settle_disabled_tracks(&mut self) {
+        self.for_each_disabled_track(|t| {
+            t.armed = false;
+            stop_launcher_rows(t);
+        });
+    }
+
+    /// 実効的に無効なトラックの行のランチャーの主導権 `Launcher` を停止へ落とす (冪等)。無効トラックの行は engine の
+    /// 行の集合に居ないので、`Launcher` のまま残すと有効に戻した瞬間に撃ち直される。再生状態は undo / redo で
+    /// 履歴の snapshot へ持ち越される ([`Self::carry_playback_state_from`]) ので、[`Self::normalize_session`] が呼ぶ。
+    pub(super) fn stop_launcher_rows_on_disabled_tracks(&mut self) {
+        self.for_each_disabled_track(stop_launcher_rows);
+    }
+
+    fn for_each_disabled_track(&mut self, mut f: impl FnMut(&mut Track)) {
         let mask = self.effectively_enabled_mask();
         for (t, on) in self.tracks.iter_mut().zip(mask) {
-            if on {
-                continue;
-            }
-            t.armed = false;
-            stop(&mut t.launcher);
-            for lane in &mut t.automation_lanes {
-                stop(&mut lane.launcher);
+            if !on {
+                f(t);
             }
         }
+    }
+}
+
+/// トラック行とそのレーン行の `Launcher` を `LauncherStopped` へ落とす。
+fn stop_launcher_rows(t: &mut Track) {
+    let rows = std::iter::once(&mut t.launcher).chain(t.automation_lanes.iter_mut().map(|l| &mut l.launcher));
+    for row in rows.filter(|r| matches!(r, RowPlayback::Launcher { .. })) {
+        *row = RowPlayback::LauncherStopped;
     }
 }
 
@@ -183,6 +196,13 @@ mod tests {
         s.set_tracks_enabled(&[11], true);
         assert!(!s.track_by_id(11).unwrap().armed);
         assert_eq!(s.track_by_id(12).unwrap().launcher, RowPlayback::LauncherStopped);
+
+        // 無効な group の中へ移したトラックも実効的に無効になる = 同じく降ろす (13 は独立で待機 + 鳴っている)。
+        s.set_tracks_enabled(&[10], false);
+        assert_eq!(s.move_tracks(&[13], Some(10), Some(12)).ok(), Some(true));
+        let moved = s.track_by_id(13).unwrap();
+        assert!(!moved.armed, "無効な group の中では待機にしない");
+        assert_eq!(moved.launcher, RowPlayback::LauncherStopped, "有効に戻した瞬間に撃ち直されない");
     }
 
     #[test]

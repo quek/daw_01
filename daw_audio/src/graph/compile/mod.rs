@@ -194,6 +194,7 @@ pub fn compile_schedule(
     // solo の透過規則の表 (「子 / send 元が solo なら bus も透過」と folder solo。RT で配線を歩かない)。
     let solo = topo.solo_tables(song);
     let taps = TapCtx {
+        song,
         id_to_idx: &topo.id_to_idx,
         enabled: &topo.enabled,
         chains: &chain_map,

@@ -91,8 +91,8 @@ impl AppData {
     }
 
     /// 無効になったトラックで鳴らしていた入力モニター音を止める (arm を外したときと同じ理由 — 待機が
-    /// 外れたので note-off がもう届かない)。
-    fn silence_monitor_notes_on_disabled_tracks(&mut self) {
+    /// 外れたので note-off がもう届かない)。無効化と、無効な group の中への移動が呼ぶ。
+    pub(crate) fn silence_monitor_notes_on_disabled_tracks(&mut self) {
         let song = self.cur.song_doc.song();
         let held: Vec<(u32, u8)> = self
             .cur
