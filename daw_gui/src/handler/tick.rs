@@ -244,11 +244,9 @@ impl AppData {
             return 0;
         }
         // 録音 1 回ぶん (レーン / クリップの自動生成 + 打った点) を 1 undo step に畳む。 ツマミを
-        // 掴んでいる間はその drag の bracket に入れ (値の変更と打った点が 1 step)、離した後の
-        // Latch / Write の継続は tick の途切れまでを 1 step にする。
-        if !self.cur.song_doc.gesture_active() {
-            self.cur.song_doc.use_stream_scope(crate::state::StreamGesture::AutomationRecord);
-        }
+        // 掴んでいる間はその drag の bracket に入り (値の変更と打った点が 1 step、`use_stream_scope`)、
+        // 離した後の Latch / Write の継続は tick の途切れまでを 1 step にする。
+        self.cur.song_doc.use_stream_scope(crate::state::StreamGesture::AutomationRecord);
 
         const THIN_INTERVAL_BEATS: f64 = 1.0 / 64.0;
         let mut inserted = 0usize;

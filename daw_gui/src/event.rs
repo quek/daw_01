@@ -703,10 +703,6 @@ pub enum AppEvent {
         length: f64,
         stretch: bool,
     },
-    /// `(source_ref, to_track_id, next_start_beat)` のタプル列。
-    /// to_track_id == source の track id なら同 track 内 move、 違えば
-    /// track 跨ぎ move (clip 自体を別 track の `clips: Vec<Clip>` に移す)。
-    SetClipPositions(Vec<(ClipKey, u32, f64)>),
     CreateClip { track: u32, start_beat: f64 },
     /// ランチャーのセル削除 (`AppData::delete_selected_clip` →
     /// `AppData::delete_launcher_cells`)。名前に反してアレンジのクリップは
@@ -715,13 +711,6 @@ pub enum AppEvent {
     /// 範囲がアクティブなときの Delete: 範囲の境界で分割し、範囲部分だけを消す
     /// (`docs/plan_range_selection.md` §8)。時間は詰めない。
     DeleteTimeSelection,
-    /// arrangement Ctrl+drag → release の結果。 各 entry は `(source ClipKey,
-    /// to_track_id, drop_start_beat)` (snap 済み)、 元 clip は残し、 drop 位置に
-    /// 共有コピー を to_track 上で生成。 (§3.4)
-    CloneClipsLinked(Vec<(ClipKey, u32, f64)>),
-    /// arrangement Ctrl+Shift+drag → release。 同上だが content は deep clone
-    /// + 新 ContentId 採番で独立化。 (§3.5)
-    CloneClipsIndependent(Vec<(ClipKey, u32, f64)>),
     /// 右クリック「Make Unique」 — 共有 clip を独立化。 refcount==1 の場合は
     /// no-op (§3.6)。
     MakeClipUnique(ClipKey),
@@ -1784,11 +1773,9 @@ impl AppEvent {
             // ---- クリップ ----
             E::CreateClip { .. } => "クリップ作成",
             E::AddTextClipAt { .. } => "テキストクリップ追加",
-            E::SetClipPositions(..) => "クリップ移動",
             E::ResizeClip { .. } => "クリップ長さ変更",
             E::DeleteSelectedClip => "セル削除",
             E::DeleteTimeSelection => "範囲の削除",
-            E::CloneClipsLinked(..) | E::CloneClipsIndependent(..) => "クリップ複製",
             E::MakeClipUnique(..) => "クリップを独立化",
             E::CommitRenameClip => "クリップ名変更",
             // ラベルの SSoT はサブ enum 側 (`Launcher` と同じ)。

@@ -62,8 +62,17 @@ pub struct GestureSave {
     label: &'static str,
 }
 
+/// [`SongDoc::begin_event`] が返す、[`SongDoc::end_event`] で閉じるための控え。
+#[derive(Debug, Clone, Copy)]
+#[must_use]
+pub struct EventSave {
+    /// 入れ子の event なら、外側の event の履歴ラベル (閉じたときに戻す)。外側の event が
+    /// 無い (dispatch の一番外) なら `None`。
+    outer_label: Option<&'static str>,
+}
+
 /// Begin/End bracket を持たない連続編集源の識別子
-/// ([`SongDoc::stream_scope`] のキー)。
+/// ([`SongDoc::use_stream_scope`] のキー)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamGesture {
     /// Transport bar の BPM scrubable_number ドラッグ。
@@ -154,6 +163,10 @@ pub struct SongDoc {
     /// ([`SongDoc::begin_event`] が設定)。 1 event 内の複数 edit_song 呼び出し
     /// (ループ / helper 連鎖) が 1 undo step に squash されることを保証する。
     event_scope: EditScope,
+    /// AppEvent の dispatch 中か ([`SongDoc::begin_event`] 〜 [`SongDoc::end_event`])。
+    /// dispatch 中に始まった event は入れ子 (handler が中で `handle_event` を呼んだ) で、
+    /// 外側の操作の scope に入る。
+    in_event: bool,
     /// 連続 stream 編集源ごとの (gesture id, 最終使用時刻)。
     /// [`STREAM_GESTURE_GAP`] 以上空いたら新 id を割り当てる。
     stream_gestures: HashMap<StreamGesture, (u64, Instant)>,
@@ -203,6 +216,7 @@ impl SongDoc {
             next_gesture_id: 1,
             active_gesture: None,
             event_scope: EditScope::Discrete,
+            in_event: false,
             stream_gestures: HashMap::new(),
             export_lock: false,
             rejection: None,
@@ -668,7 +682,19 @@ impl SongDoc {
     /// interaction gesture 中はその id、 それ以外は fresh id (= 1 event 内の
     /// 複数 edit は squash、 event 間は独立)。 `label` は この event が edit() で
     /// snapshot を積んだときの履歴リスト用ラベル (r.md #29)。
-    pub fn begin_event(&mut self, label: &'static str) {
+    ///
+    /// **dispatch 中に呼ばれたら入れ子** (handler が中で `handle_event` を呼んだ): ユーザーの
+    /// 操作は外側の 1 回なので scope を開き直さず外側の step に入れ、名前は外側が持っていない
+    /// ときだけ入れ子のものを使う。 戻り値は必ず [`Self::end_event`] へ渡す。
+    pub fn begin_event(&mut self, label: &'static str) -> EventSave {
+        if self.in_event {
+            let save = EventSave { outer_label: Some(self.pending_label) };
+            if self.pending_label == GENERIC_UNDO_LABEL {
+                self.pending_label = label;
+            }
+            return save;
+        }
+        self.in_event = true;
         let id = match self.active_gesture {
             Some(id) => id,
             None => self.alloc_gesture(),
@@ -677,16 +703,25 @@ impl SongDoc {
         // この event が edit() で snapshot を積んだら、 この label が新 step の
         // 名前になる。 編集しない event では未使用のまま [`Self::end_event`] で汎用へ戻る。
         self.pending_label = label;
+        EventSave { outer_label: None }
     }
 
-    /// AppEvent dispatch の末尾で呼ぶ: この event の scope とラベルを閉じる。
+    /// AppEvent dispatch の末尾で呼ぶ: [`Self::begin_event`] で開いた event を閉じる。
     ///
-    /// 閉じないと、dispatch の **外** で走った編集 (view が handler を直接呼ぶ等) が
-    /// 直前の event の scope とラベルを引き継ぎ、その event の undo step に黙って
+    /// 一番外の event を閉じないと、dispatch の **外** で走った編集 (view が handler を直接
+    /// 呼ぶ等) が直前の event の scope とラベルを引き継ぎ、その event の undo step に黙って
     /// 吸収される (1 操作 = 1 undo が崩れ、undo 1 回で 2 つの操作が戻る)。閉じた後の
     /// 編集は独立した step ([`GENERIC_UNDO_LABEL`]) になる。Begin/End bracket の最中なら
     /// その bracket に入る (bracket は event を跨いで続くもの)。
-    pub fn end_event(&mut self) {
+    ///
+    /// 入れ子の event は外側の名前だけ戻し、scope は触らない (外側の handler の続きの編集も
+    /// 同じ step。入れ子の中で始まった / 終わった bracket はそのまま効く)。
+    pub fn end_event(&mut self, save: EventSave) {
+        if let Some(label) = save.outer_label {
+            self.pending_label = label;
+            return;
+        }
+        self.in_event = false;
         self.event_scope = self.active_gesture.map_or(EditScope::Discrete, EditScope::Gesture);
         self.pending_label = GENERIC_UNDO_LABEL;
     }
@@ -750,7 +785,7 @@ impl SongDoc {
     /// Begin/End bracket を持たない連続編集源 (MIDI CC / BPM scrub /
     /// automation 録音) 用の scope。 同一 key の編集が [`STREAM_GESTURE_GAP`]
     /// 以内に連続する間は同じ gesture id を返す (= 1 burst = 1 undo step)。
-    pub fn stream_scope(&mut self, key: StreamGesture) -> EditScope {
+    fn stream_scope(&mut self, key: StreamGesture) -> EditScope {
         let now = Instant::now();
         let fresh = !matches!(
             self.stream_gestures.get(&key),
@@ -765,15 +800,23 @@ impl SongDoc {
         EditScope::Gesture(self.stream_gestures[&key].0)
     }
 
-    /// 現在 dispatch 中 event の ambient scope を [`Self::stream_scope`] に差し替える。
+    /// 現在 dispatch 中 event の ambient scope を連続入力 `key` の gesture に差し替える。
     ///
     /// `begin_event` が張った「1 event = 1 undo step」 の scope を、 連続入力用の
     /// gesture へ **上書き** する。 handler 冒頭で 1 度呼べば、 その event 内の
     /// `edit_song` の入れ子もすべて同じ gesture に入るので、 同じ key の編集が
     /// [`STREAM_GESTURE_GAP`] 以内に続く限り 1 undo step に畳まれる (r.md #67 の
-    /// カーソルキー nudge)。 1 秒空けば次は新しい step。
+    /// カーソルキー nudge)。 1 秒空けば次は新しい step。 **scope は編集ごとに渡さず必ずこれで
+    /// 張る** — 1 本の編集だけを stream に入れると、同じ event の helper の編集 (Raw クリップの
+    /// 追従 / レーンの自動生成) と step が交互に割れる。
+    ///
+    /// Begin/End bracket の最中 (録音 take / ツマミのドラッグ …) は bracket に入る — bracket は
+    /// event を跨いで続く 1 操作なので、途中の連続入力 (take 中に回した CC など) で割らない。
     pub fn use_stream_scope(&mut self, key: StreamGesture) {
-        self.event_scope = self.stream_scope(key);
+        self.event_scope = match self.active_gesture {
+            Some(id) => EditScope::Gesture(id),
+            None => self.stream_scope(key),
+        };
     }
 
     fn alloc_gesture(&mut self) -> u64 {
@@ -878,6 +921,14 @@ mod tests {
 
     // -------- r.md #29: ラベル付き履歴 + jump ---------------------------------
 
+    /// `label` の 1 event の中で `f` を走らせる (dispatch の `begin_event` / `end_event` と同じ対)。
+    fn in_event<R>(doc: &mut SongDoc, label: &'static str, f: impl FnOnce(&mut SongDoc) -> R) -> R {
+        let event = doc.begin_event(label);
+        let r = f(doc);
+        doc.end_event(event);
+        r
+    }
+
     /// discrete edit を積むと、 各 state に begin_event で渡したラベルが付き、
     /// history_labels() が baseline → 最新の順で返す。
     #[test]
@@ -886,13 +937,11 @@ mod tests {
         assert_eq!(doc.history_labels(), vec![BASELINE_LABEL]);
         assert_eq!(doc.history_current(), 0);
 
-        doc.begin_event("テンポ変更");
-        doc.edit(EditScope::Discrete, |s| s.bpm = 140.0);
+        in_event(&mut doc, "テンポ変更", |doc| doc.edit(EditScope::Discrete, |s| s.bpm = 140.0));
         assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "テンポ変更"]);
         assert_eq!(doc.history_current(), 1);
 
-        doc.begin_event("音量変更");
-        doc.edit(EditScope::Discrete, |s| s.bpm = 150.0);
+        in_event(&mut doc, "音量変更", |doc| doc.edit(EditScope::Discrete, |s| s.bpm = 150.0));
         assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "テンポ変更", "音量変更"]);
         assert_eq!(doc.history_current(), 2);
     }
@@ -901,35 +950,61 @@ mod tests {
     #[test]
     fn gesture_squash_is_one_labeled_step() {
         let mut doc = SongDoc::new(Song::default());
-        doc.begin_event("音量変更");
-        doc.edit(EditScope::Gesture(7), |s| s.bpm = 130.0);
-        doc.edit(EditScope::Gesture(7), |s| s.bpm = 131.0);
-        doc.edit(EditScope::Gesture(7), |s| s.bpm = 132.0);
+        in_event(&mut doc, "音量変更", |doc| {
+            doc.edit(EditScope::Gesture(7), |s| s.bpm = 130.0);
+            doc.edit(EditScope::Gesture(7), |s| s.bpm = 131.0);
+            doc.edit(EditScope::Gesture(7), |s| s.bpm = 132.0);
+        });
         assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "音量変更"]);
         assert_eq!(doc.history_current(), 1);
     }
 
     /// event を閉じた後の編集 (dispatch の外) は、直前の event の step に吸収されない。
     /// Begin/End bracket の最中は bracket に入り、step の名前は最初に名前を持った event のまま。
+    /// bracket の最中の連続入力 (録音 take 中に回した CC) も bracket を割らない。
     #[test]
     fn edit_after_end_event_is_its_own_step() {
         let mut doc = SongDoc::new(Song::default());
-        doc.begin_event("テンポ変更");
-        doc.edit(doc.event_scope(), |s| s.bpm = 140.0);
-        doc.end_event();
+        in_event(&mut doc, "テンポ変更", |doc| doc.edit(doc.event_scope(), |s| s.bpm = 140.0));
         doc.edit(doc.event_scope(), |s| s.bpm = 150.0);
         assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "テンポ変更", GENERIC_UNDO_LABEL]);
 
-        doc.begin_event("MIDI 入力");
-        doc.begin_gesture();
-        doc.edit(doc.event_scope(), |s| s.bpm = 160.0);
-        doc.end_event();
+        in_event(&mut doc, "MIDI 入力", |doc| {
+            doc.begin_gesture();
+            doc.edit(doc.event_scope(), |s| s.bpm = 160.0);
+        });
         doc.edit(doc.event_scope(), |s| s.bpm = 161.0);
-        doc.begin_event("オートメーション録音");
-        doc.edit(doc.event_scope(), |s| s.bpm = 162.0);
-        doc.end_gesture();
+        in_event(&mut doc, "MIDI コントロール", |doc| {
+            doc.use_stream_scope(StreamGesture::MidiCc);
+            doc.edit(doc.event_scope(), |s| s.bpm = 162.0);
+        });
+        in_event(&mut doc, "オートメーション録音", |doc| {
+            doc.edit(doc.event_scope(), |s| s.bpm = 163.0);
+            doc.end_gesture();
+        });
         assert_eq!(doc.history_current(), 3, "bracket の中は 1 step");
         assert_eq!(doc.history_labels()[3], "MIDI 入力");
+    }
+
+    /// handler の中で始まった event (入れ子) は外側の event の step に入り、閉じた後の外側の
+    /// 編集も同じ step。名前は外側が持っていなければ入れ子のもの。
+    #[test]
+    fn nested_event_joins_the_outer_step() {
+        let mut doc = SongDoc::new(Song::default());
+        in_event(&mut doc, "テンポ変更", |doc| {
+            doc.edit(doc.event_scope(), |s| s.bpm = 140.0);
+            in_event(doc, "音量変更", |doc| doc.edit(doc.event_scope(), |s| s.bpm = 141.0));
+            doc.edit(doc.event_scope(), |s| s.bpm = 142.0);
+        });
+        assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "テンポ変更"]);
+
+        in_event(&mut doc, GENERIC_UNDO_LABEL, |doc| {
+            in_event(doc, "モジュレーション接続", |doc| doc.edit(doc.event_scope(), |s| s.bpm = 150.0));
+            doc.edit(doc.event_scope(), |s| s.bpm = 151.0);
+        });
+        assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "テンポ変更", "モジュレーション接続"]);
+        doc.edit(doc.event_scope(), |s| s.bpm = 152.0);
+        assert_eq!(doc.history_current(), 3, "一番外を閉じた後は別 step");
     }
 
     /// undo/redo は current index とラベル対応を保ちつつ live state を戻す。
@@ -937,10 +1012,8 @@ mod tests {
     fn undo_redo_preserve_labels_and_state() {
         let mut doc = SongDoc::new(Song::default());
         let base_bpm = doc.song().bpm;
-        doc.begin_event("A");
-        doc.edit(EditScope::Discrete, |s| s.bpm = 140.0);
-        doc.begin_event("B");
-        doc.edit(EditScope::Discrete, |s| s.bpm = 150.0);
+        in_event(&mut doc, "A", |doc| doc.edit(EditScope::Discrete, |s| s.bpm = 140.0));
+        in_event(&mut doc, "B", |doc| doc.edit(EditScope::Discrete, |s| s.bpm = 150.0));
 
         assert!(doc.undo());
         assert_eq!(doc.song().bpm, 140.0);
@@ -964,8 +1037,7 @@ mod tests {
         let mut doc = SongDoc::new(Song::default());
         let base_bpm = doc.song().bpm;
         for (label, bpm) in [("A", 140.0), ("B", 150.0), ("C", 160.0)] {
-            doc.begin_event(label);
-            doc.edit(EditScope::Discrete, |s| s.bpm = bpm);
+            in_event(&mut doc, label, |doc| doc.edit(EditScope::Discrete, |s| s.bpm = bpm));
         }
         assert_eq!(doc.history_current(), 3);
 
@@ -995,12 +1067,10 @@ mod tests {
     fn edit_after_jump_truncates_future() {
         let mut doc = SongDoc::new(Song::default());
         for (label, bpm) in [("A", 140.0), ("B", 150.0)] {
-            doc.begin_event(label);
-            doc.edit(EditScope::Discrete, |s| s.bpm = bpm);
+            in_event(&mut doc, label, |doc| doc.edit(EditScope::Discrete, |s| s.bpm = bpm));
         }
         doc.jump_to(1); // A の直後、 B は redo 待ち。
-        doc.begin_event("C");
-        doc.edit(EditScope::Discrete, |s| s.bpm = 170.0);
+        in_event(&mut doc, "C", |doc| doc.edit(EditScope::Discrete, |s| s.bpm = 170.0));
         // B は捨てられ、 A → C の直線履歴になる。
         assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "A", "C"]);
         assert_eq!(doc.history_current(), 2);
@@ -1201,11 +1271,9 @@ mod tests {
     #[test]
     fn noop_edit_adds_no_labeled_step() {
         let mut doc = SongDoc::new(Song::default());
-        doc.begin_event("A");
-        doc.edit(EditScope::Discrete, |s| s.bpm = 140.0);
+        in_event(&mut doc, "A", |doc| doc.edit(EditScope::Discrete, |s| s.bpm = 140.0));
         let before = doc.history_labels();
-        doc.begin_event("no-op");
-        doc.edit_checked(EditScope::Discrete, |_s| false);
+        in_event(&mut doc, "no-op", |doc| doc.edit_checked(EditScope::Discrete, |_s| false));
         assert_eq!(doc.history_labels(), before, "no-op は履歴を汚さない");
         assert_eq!(doc.history_current(), 1);
     }
