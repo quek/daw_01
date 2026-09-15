@@ -701,8 +701,8 @@ impl AppData {
         self.cur.recording.requested = true;
         // 録音 take 全体を 1 undo step に bracket する (r.md #51)。 これが無いと
         // note-on / note-off の song 編集が別々の step になり、8 音録ると
-        // Ctrl+Z を 16 回押すことになる。
-        self.cur.song_doc.begin_gesture();
+        // Ctrl+Z を 16 回押すことになる。 take の最中に触ったツマミ / 数値欄 / 色の bracket は take の step に入る。
+        self.cur.song_doc.begin_gesture(crate::state::GestureOwner::RecordingTake);
     }
 
     /// count-in の長さ (samples)。 0 = count-in 無し。
@@ -773,6 +773,6 @@ impl AppData {
         // engine 側の count-in と曲末 auto-stop の抑止を解除する。
         self.send_audio(AudioCommand::StopRecording { project: self.pk() });
         // 録音 take の undo bracket を閉じる。
-        self.cur.song_doc.end_gesture();
+        self.cur.song_doc.end_gesture(crate::state::GestureOwner::RecordingTake);
     }
 }

@@ -21,9 +21,10 @@
 //!    を立てる。
 //! 3. フレーム末に [`sweep`] が印を見て、立っていなければ gesture を閉じる。
 //!
-//! **所有者は 1 度に 1 つ**。`SongDoc` の bracket
-//! ([`SongDoc::begin_gesture`](crate::state::SongDoc::begin_gesture)) が 1 本しか
-//! 無いので、追跡側を面ごとに分けると「A が開けたまま B が閉じる」が黙って作れる。
+//! **所有者は 1 度に 1 つ**。欄はどれも `SongDoc` の同じ bracket 所有者
+//! ([`GestureOwner::InspectorScrub`](crate::state::GestureOwner::InspectorScrub)、
+//! group transform は `GroupTransformDrag`) を使うので、追跡側を面ごとに分けると
+//! 「A が開けたまま B が閉じる」が黙って作れる。
 //!
 //! ## 開くのは同じフレームの値より先 (prelude キュー)
 //!
@@ -187,7 +188,7 @@ mod tests {
     }
 
     /// 所有者は 1 度に 1 つ。別の欄が掴んだら前の bracket は畳まれる
-    /// (`SongDoc` の bracket が 1 本しか無いので、2 つ開いた気になれない)。
+    /// (欄は `SongDoc` の同じ bracket 所有者を共有するので、2 つ開いた気になれない)。
     #[test]
     fn 別の欄が掴むと前の所有者は降りる() {
         let mut app = build_app();

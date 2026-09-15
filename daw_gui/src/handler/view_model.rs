@@ -980,7 +980,7 @@ impl AppData {
         self.cur.peph.color_picker_target = Some(target);
         self.cur.peph.color_picker_anchor = Some(anchor);
         // picker session 全体を 1 undo step に bracket する (`close_color_picker` で end)。
-        self.cur.song_doc.begin_gesture();
+        self.cur.song_doc.begin_gesture(GestureOwner::ColorPicker);
     }
 
     /// color_picker を閉じる唯一の口 (dismiss / 対象消失の両方)。`open_color_picker` の
@@ -989,7 +989,7 @@ impl AppData {
     pub fn close_color_picker(&mut self) {
         self.cur.peph.color_picker_target = None;
         self.cur.peph.color_picker_anchor = None;
-        self.cur.song_doc.end_gesture();
+        self.cur.song_doc.end_gesture(GestureOwner::ColorPicker);
     }
 
     // -------- Undo/Redo ----------------------------------------------------

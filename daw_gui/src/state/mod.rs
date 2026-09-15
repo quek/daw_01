@@ -34,7 +34,7 @@ pub mod virtual_keyboard;
 pub use loudness::{LoudnessPhase, LoudnessState};
 pub use project::{ProjectEphemeral, ProjectIpc, ProjectState, ProjectView, ProjectVoicevox};
 pub use tabs::Tabs;
-pub use song_doc::{EditScope, SongDoc, StreamGesture};
+pub use song_doc::{EditScope, GestureOwner, HistoryJump, SongDoc, StreamGesture};
 pub use plugin_params::PluginParamTable;
 pub use activity::ActivityState;
 pub use transport::{LoadPlayback, PlayFrom, TransportState};

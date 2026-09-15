@@ -54,12 +54,54 @@ pub enum EditScope {
     Gesture(u64),
 }
 
-/// [`SongDoc::enter_own_gesture`] が退避した bracket 状態 (と、その間だけ差し替えた履歴ラベル)。
+/// [`SongDoc::enter_own_gesture`] が退避した独立 step と scope (と、その間だけ差し替えた履歴ラベル)。
 #[derive(Debug, Clone, Copy)]
 pub struct GestureSave {
-    gesture: Option<u64>,
+    own_step: Option<u64>,
     scope: EditScope,
     label: &'static str,
+}
+
+/// Begin/End bracket ([`SongDoc::begin_gesture`]) の所有者。bracket は所有者ごとに開いて閉じ、**所有者が 1 つでも
+/// 残っている間は 1 つの undo step** になる。進行中の bracket の中で始まった bracket は外側の step に入り、内側の
+/// End は外側を閉じない (録音 take の最中に回したツマミ / 数値欄 / 色で take が割れない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GestureOwner {
+    /// 録音 take (r.md #51)。
+    RecordingTake,
+    /// パラメーターのジェスチャー (`RecordingState::active_param_gestures` が空でない間)。
+    ParamGestures,
+    /// スクラブ欄の drag / text 編集 (`BeginInspectorScrub`、`view::scrub_gesture`)。
+    InspectorScrub,
+    /// group transform の scrub / preview drag (`BeginGroupTransformDrag`)。
+    GroupTransformDrag,
+    /// preview canvas 上の image PiP drag。
+    ImagePipDrag,
+    /// preview canvas 上の text PiP drag。
+    TextPipDrag,
+    /// フォントピッカーの session (開いてから確定 / 取り消しまで)。
+    FontPicker,
+    /// カラーピッカーの session (開いてから閉じるまで)。
+    ColorPicker,
+}
+
+/// 開いている Begin/End bracket: 1 つの undo step (`id`) と、それを開いている所有者 (開いた順)。
+#[derive(Debug, Clone)]
+struct GestureBracket {
+    id: u64,
+    owners: Vec<GestureOwner>,
+}
+
+/// 履歴の動かし方 ([`SongDoc::jump`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryJump {
+    /// 1 段戻る。
+    Undo,
+    /// 1 段進む。
+    Redo,
+    /// 履歴リストの行へ一気に遡る / 進む。行は **その state の識別子** ([`SongDoc::history_state_id`]) で指す — 位置は、
+    /// 発注から実行までの間 (plugin state の往復待ち) に積まれた編集で詰まって別の state を指す。
+    ToState(u64),
 }
 
 /// [`SongDoc::begin_event`] が返す、[`SongDoc::end_event`] で閉じるための控え。
@@ -157,10 +199,11 @@ pub struct SongDoc {
 
     /// gesture id の単調 allocator (event / interaction / stream 共用)。
     next_gesture_id: u64,
-    /// Begin*/End* イベントで bracket される interaction gesture (pointer
-    /// drag / scrub / color picker session)。 `Some` の間、 ambient scope は
-    /// この id を使い、 drag 全体が 1 undo step に squash される。
-    active_gesture: Option<u64>,
+    /// Begin*/End* で bracket される interaction gesture (録音 take / pointer drag / scrub / picker session)。
+    /// `Some` の間、 ambient scope はこの id を使い、所有者が全員閉じるまでの編集が 1 undo step に squash される。
+    bracket: Option<GestureBracket>,
+    /// 非同期の完了ハンドラが開いた独立 step ([`SongDoc::enter_own_gesture`])。`Some` の間は bracket より優先する。
+    own_step: Option<u64>,
     /// 現在 dispatch 中の AppEvent に割り当てた ambient scope
     /// ([`SongDoc::begin_event`] が設定)。 1 event 内の複数 edit_song 呼び出し
     /// (ループ / helper 連鎖) が 1 undo step に squash されることを保証する。
@@ -216,7 +259,8 @@ impl SongDoc {
             pending_label: GENERIC_UNDO_LABEL,
             last_gesture: None,
             next_gesture_id: 1,
-            active_gesture: None,
+            bracket: None,
+            own_step: None,
             event_scope: EditScope::Discrete,
             in_event: false,
             stream_gestures: HashMap::new(),
@@ -482,12 +526,17 @@ impl SongDoc {
         id
     }
 
-    /// plugin state blob の write-back (`RequestAllStates` 応答) **専用**。
+    /// plugin state blob の write-back (`RequestAllStates` 応答) **専用**。live と、undo / redo に積んである **全** Song
+    /// へ同じ `f` を掛ける — plugin state は履歴に属さない (host が持つ最新が正で、undo でツマミは戻らない) ので、
+    /// どの経路 (undo / redo / 履歴ジャンプ / 再有効化) で device を host へ載せ直しても最新の値で載るようにする。
     /// blob は host が真実源で wire (LoadSong) からも構造的に除外されているため、
     /// undo / epoch / dirty / 子プロセス sync のどれにも影響しない。
     /// ユーザー編集には決して使わないこと。
-    pub fn write_back_plugin_state<R>(&mut self, f: impl FnOnce(&mut Song) -> R) -> R {
-        f(&mut self.song)
+    pub fn write_back_plugin_state(&mut self, mut f: impl FnMut(&mut Song)) {
+        f(&mut self.song);
+        for e in self.undo_stack.iter_mut().chain(self.redo_stack.iter_mut()) {
+            f(&mut e.song);
+        }
     }
 
     pub fn edit_epoch(&self) -> u64 {
@@ -529,21 +578,77 @@ impl SongDoc {
     }
 
     pub fn undo(&mut self) -> bool {
-        if self.undo_stack.is_empty() {
+        self.jump(HistoryJump::Undo)
+    }
+
+    pub fn redo(&mut self) -> bool {
+        self.jump(HistoryJump::Redo)
+    }
+
+    /// 履歴を `jump` の行き先へ動かす。undo / redo を必要段数ぶん繰り返すのと等価だが、中間 state を経由した
+    /// 副作用 (epoch bump / 構造の観測) は出さず **1 回だけ** 出す (caller が 1 度 reconcile する)。行き先が無い
+    /// (端 / 今の state / 履歴に居ない state) ときは `false` (no-op)。
+    ///
+    /// export 中は [`Self::edit`] と同じく **拒否** する (`false` + status message 予約) — 履歴ジャンプも live の
+    /// Song を差し替えるので、ここを素通しにすると render 中の song が入れ替わる (song 凍結の単一保証点)。
+    pub fn jump(&mut self, jump: HistoryJump) -> bool {
+        if self.export_lock {
+            self.rejection = Some("書き出し中は編集できません");
             return false;
         }
-        self.step_backward();
+        let Some(depth) = self.jump_depth(jump) else {
+            return false;
+        };
+        while self.undo_stack.len() > depth {
+            self.step_backward();
+        }
+        while self.undo_stack.len() < depth {
+            self.step_forward();
+        }
         self.after_history_jump();
         true
     }
 
-    pub fn redo(&mut self) -> bool {
-        if self.redo_stack.is_empty() {
-            return false;
+    /// `jump` の行き先の Song を、動かさずに覗く。行き先が無ければ `None`。履歴ジャンプで plugin host から降りる
+    /// device を、動かす **前** に求めるために読む (降ろす前に plugin state を取り寄せる)。
+    pub fn history_target(&self, jump: HistoryJump) -> Option<&Song> {
+        self.jump_entry(jump).map(|e| &e.song)
+    }
+
+    /// `jump` の **今の** 行き先を state の識別子で固定した形 ([`HistoryJump::ToState`])。行き先が無ければ `None`。
+    /// 発注から実行まで待つジャンプを、待つ間に入った編集で「1 段前」がずれないように固定する。
+    pub fn pin_jump(&self, jump: HistoryJump) -> Option<HistoryJump> {
+        self.jump_entry(jump).map(|e| HistoryJump::ToState(e.state_id))
+    }
+
+    fn jump_entry(&self, jump: HistoryJump) -> Option<&HistoryEntry> {
+        let depth = self.jump_depth(jump)?;
+        let undo = self.undo_stack.len();
+        Some(if depth < undo { &self.undo_stack[depth] } else { &self.redo_stack[undo + self.redo_stack.len() - depth] })
+    }
+
+    /// [`Self::history_labels`] の `index` 番目の state の識別子 ([`HistoryJump::ToState`] に渡す)。範囲外は `None`。
+    pub fn history_state_id(&self, index: usize) -> Option<u64> {
+        let (undo, redo) = (self.undo_stack.len(), self.redo_stack.len());
+        match index.cmp(&undo) {
+            std::cmp::Ordering::Less => Some(self.undo_stack[index].state_id),
+            std::cmp::Ordering::Equal => Some(self.state_id),
+            // redo_stack は back が次の redo 先 (履歴リストでは現在行の直後)。
+            std::cmp::Ordering::Greater => (index <= undo + redo).then(|| self.redo_stack[undo + redo - index].state_id),
         }
-        self.step_forward();
-        self.after_history_jump();
-        true
+    }
+
+    /// `jump` の行き先で undo stack が何段になるか ([`Self::history_current`] の行き先)。行き先が無ければ `None`。
+    fn jump_depth(&self, jump: HistoryJump) -> Option<usize> {
+        let (undo, redo) = (self.undo_stack.len(), self.redo_stack.len());
+        match jump {
+            HistoryJump::Undo => undo.checked_sub(1),
+            HistoryJump::Redo => (redo > 0).then_some(undo + 1),
+            // 今の state は stack に居ないので `None` (= no-op)。redo_stack の `q` 番目へは `redo - q` 段進む。
+            HistoryJump::ToState(id) => self.undo_stack.iter().position(|e| e.state_id == id).or_else(|| {
+                self.redo_stack.iter().position(|e| e.state_id == id).map(|q| undo + redo - q)
+            }),
+        }
     }
 
     /// undo 1 段: undo_stack から 1 state を pop して live に、 元 live を
@@ -581,26 +686,6 @@ impl SongDoc {
         self.state_id = next.state_id;
     }
 
-    /// 履歴リスト click 用: `target` 番目の state (0 = baseline、
-    /// [`SongDoc::history_current`] = 現在) へ一気に遡る / 進む。 undo/redo を
-    /// 必要段数ぶん繰り返すのと等価だが、 中間 state の reconcile を避けて
-    /// **1 回だけ** 履歴 jump 副作用を出す (caller が 1 度 reconcile する)。
-    /// `target` が範囲外、 または既に current のときは `false` (no-op)。
-    pub fn jump_to(&mut self, target: usize) -> bool {
-        let total = self.undo_stack.len() + self.redo_stack.len();
-        if target > total || target == self.undo_stack.len() {
-            return false;
-        }
-        while self.undo_stack.len() > target {
-            self.step_backward();
-        }
-        while self.undo_stack.len() < target {
-            self.step_forward();
-        }
-        self.after_history_jump();
-        true
-    }
-
     pub fn can_undo(&self) -> bool {
         !self.undo_stack.is_empty()
     }
@@ -619,7 +704,7 @@ impl SongDoc {
 
     /// 履歴リスト全 state のラベルを **古い順** (baseline → 最新) で返す。
     /// 長さ = undo 段数 + 1 (current) + redo 段数。 履歴パネルがそのまま
-    /// 各行に描く。 index は [`SongDoc::jump_to`] にそのまま渡せる。
+    /// 各行に描く。 index の行の state は [`SongDoc::history_state_id`] で引く。
     pub fn history_labels(&self) -> Vec<&'static str> {
         let mut labels = Vec::with_capacity(self.undo_stack.len() + 1 + self.redo_stack.len());
         labels.extend(self.undo_stack.iter().map(|e| e.label));
@@ -697,7 +782,7 @@ impl SongDoc {
             return save;
         }
         self.in_event = true;
-        let id = match self.active_gesture {
+        let id = match self.ambient_gesture() {
             Some(id) => id,
             None => self.alloc_gesture(),
         };
@@ -724,7 +809,7 @@ impl SongDoc {
             return;
         }
         self.in_event = false;
-        self.event_scope = self.active_gesture.map_or(EditScope::Discrete, EditScope::Gesture);
+        self.event_scope = self.ambient_gesture().map_or(EditScope::Discrete, EditScope::Gesture);
         self.pending_label = GENERIC_UNDO_LABEL;
     }
 
@@ -740,23 +825,53 @@ impl SongDoc {
         self.event_scope
     }
 
-    /// Begin* (scrub / drag / picker session) ハンドラが呼ぶ: 以後 End まで
-    /// の全 event の編集を 1 undo step に bracket する。
-    pub fn begin_gesture(&mut self) {
-        let id = self.alloc_gesture();
-        self.active_gesture = Some(id);
-        // Begin と同一 event 内の後続 edit も gesture に含める。
-        self.event_scope = EditScope::Gesture(id);
+    /// Begin* (録音 take / scrub / drag / picker session) ハンドラが呼ぶ: `owner` が
+    /// [`Self::end_gesture`] するまでの全 event の編集を 1 undo step に bracket する。
+    ///
+    /// **進行中の bracket の中で始まったら外側の step に入る** (入れ子の `handle_event` / `use_stream_scope` と同じ
+    /// 規則)。bracket は所有者が全員閉じるまで続くので、内側の End は外側を閉じない。同じ所有者が閉じずに開き直した
+    /// (ピッカーを開いたまま別の対象で開く) ときは前の session を閉じてから開く — 他に所有者が居なければ新しい step、
+    /// 居ればその step のまま。
+    pub fn begin_gesture(&mut self, owner: GestureOwner) {
+        self.end_gesture(owner);
+        match &mut self.bracket {
+            Some(bracket) => bracket.owners.push(owner),
+            None => {
+                let id = self.alloc_gesture();
+                self.bracket = Some(GestureBracket { id, owners: vec![owner] });
+            }
+        }
+        // Begin と同一 event 内の後続 edit も gesture に含める (非同期完了の独立 step の中ならそちらが優先)。
+        if let Some(id) = self.ambient_gesture() {
+            self.event_scope = EditScope::Gesture(id);
+        }
     }
 
-    /// End* ハンドラが呼ぶ。
-    pub fn end_gesture(&mut self) {
-        self.active_gesture = None;
+    /// End* ハンドラが呼ぶ: `owner` の bracket を閉じる。他の所有者が残っていれば step は続く。`owner` が開いて
+    /// いなければ何もしない (確定と取り消しの両方が閉じる口でも、他の所有者の bracket に触れない)。
+    pub fn end_gesture(&mut self, owner: GestureOwner) {
+        let Some(bracket) = &mut self.bracket else {
+            return;
+        };
+        bracket.owners.retain(|&o| o != owner);
+        if bracket.owners.is_empty() {
+            self.bracket = None;
+        }
     }
 
-    /// interaction gesture (Begin/End bracket) が進行中か。
+    /// interaction gesture (Begin/End bracket) が進行中か (所有者を問わない)。
     pub fn gesture_active(&self) -> bool {
-        self.active_gesture.is_some()
+        self.bracket.is_some()
+    }
+
+    /// `owner` の bracket が開いているか。
+    pub fn gesture_open(&self, owner: GestureOwner) -> bool {
+        self.bracket.as_ref().is_some_and(|b| b.owners.contains(&owner))
+    }
+
+    /// いま編集が入る gesture: 非同期完了の独立 step が最優先、次に開いている bracket。
+    fn ambient_gesture(&self) -> Option<u64> {
+        self.own_step.or(self.bracket.as_ref().map(|b| b.id))
     }
 
     /// **進行中の Begin/End bracket を壊さずに**、以後の編集を `label` の名前の
@@ -764,22 +879,22 @@ impl SongDoc {
     ///
     /// `begin_gesture` / `end_gesture` を直に使うと、**非同期の完了ハンドラ**
     /// (Glue の焼き込み適用など、ユーザー操作と無関係な時点で走るもの) が
-    /// ユーザーのドラッグ中の bracket を横取りして閉じてしまい、以降のドラッグが
-    /// 1 フレーム 1 undo step に割れる。ここは前の状態を退避して必ず戻す。
+    /// ユーザーのドラッグ中の bracket に入ってしまう。独立 step は bracket より優先する別の層なので、
+    /// 中で bracket が開閉してもそれは bracket 側に残る。
     /// `label` は発注した操作の名前 ([`Self::event_label`] で控えたもの)。
     #[must_use]
     pub fn enter_own_gesture(&mut self, label: &'static str) -> GestureSave {
-        let save = GestureSave { gesture: self.active_gesture, scope: self.event_scope, label: self.pending_label };
+        let save = GestureSave { own_step: self.own_step, scope: self.event_scope, label: self.pending_label };
         let id = self.alloc_gesture();
-        self.active_gesture = Some(id);
+        self.own_step = Some(id);
         self.event_scope = EditScope::Gesture(id);
         self.pending_label = label;
         save
     }
 
-    /// [`Self::enter_own_gesture`] の対。退避しておいた bracket とラベルを戻す。
+    /// [`Self::enter_own_gesture`] の対。退避しておいた独立 step / scope とラベルを戻す。
     pub fn leave_own_gesture(&mut self, save: GestureSave) {
-        self.active_gesture = save.gesture;
+        self.own_step = save.own_step;
         self.event_scope = save.scope;
         self.pending_label = save.label;
     }
@@ -815,7 +930,7 @@ impl SongDoc {
     /// Begin/End bracket の最中 (録音 take / ツマミのドラッグ …) は bracket に入る — bracket は
     /// event を跨いで続く 1 操作なので、途中の連続入力 (take 中に回した CC など) で割らない。
     pub fn use_stream_scope(&mut self, key: StreamGesture) {
-        self.event_scope = match self.active_gesture {
+        self.event_scope = match self.ambient_gesture() {
             Some(id) => EditScope::Gesture(id),
             None => self.stream_scope(key),
         };
@@ -972,7 +1087,7 @@ mod tests {
         assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "テンポ変更", GENERIC_UNDO_LABEL]);
 
         in_event(&mut doc, "MIDI 入力", |doc| {
-            doc.begin_gesture();
+            doc.begin_gesture(GestureOwner::RecordingTake);
             doc.edit(doc.event_scope(), |s| s.bpm = 160.0);
         });
         doc.edit(doc.event_scope(), |s| s.bpm = 161.0);
@@ -982,10 +1097,54 @@ mod tests {
         });
         in_event(&mut doc, "オートメーション録音", |doc| {
             doc.edit(doc.event_scope(), |s| s.bpm = 163.0);
-            doc.end_gesture();
+            doc.end_gesture(GestureOwner::RecordingTake);
         });
         assert_eq!(doc.history_current(), 3, "bracket の中は 1 step");
         assert_eq!(doc.history_labels()[3], "MIDI 入力");
+    }
+
+    /// 進行中の bracket の中で始まった bracket は外側の step に入り、内側の End は外側を閉じない。所有者が全員
+    /// 閉じるまで 1 step (開いた順と閉じた順が交差しても)。開いていない所有者の End は何も閉じない。
+    #[test]
+    fn nested_bracket_joins_the_outer_step_until_every_owner_closes() {
+        let mut doc = SongDoc::new(Song::default());
+        in_event(&mut doc, "MIDI 入力", |doc| {
+            doc.begin_gesture(GestureOwner::RecordingTake);
+            doc.edit(doc.event_scope(), |s| s.bpm = 140.0);
+        });
+        in_event(&mut doc, "音量変更", |doc| {
+            doc.begin_gesture(GestureOwner::ParamGestures);
+            doc.edit(doc.event_scope(), |s| s.bpm = 141.0);
+        });
+        in_event(&mut doc, "音量変更", |doc| doc.end_gesture(GestureOwner::ParamGestures));
+        // 確定と取り消しの両方が閉じる口 (フォントピッカー) の 2 回目は、開いていない所有者の End。
+        in_event(&mut doc, "フォント", |doc| doc.end_gesture(GestureOwner::FontPicker));
+        assert!(doc.gesture_open(GestureOwner::RecordingTake), "内側の End で外側は閉じない");
+        in_event(&mut doc, "MIDI 入力", |doc| doc.edit(doc.event_scope(), |s| s.bpm = 142.0));
+        in_event(&mut doc, "色", |doc| {
+            doc.begin_gesture(GestureOwner::ColorPicker);
+            doc.edit(doc.event_scope(), |s| s.bpm = 143.0);
+        });
+        // 外側が先に閉じても、残った内側が閉じるまでは同じ step。
+        in_event(&mut doc, "停止", |doc| doc.end_gesture(GestureOwner::RecordingTake));
+        in_event(&mut doc, "色", |doc| doc.edit(doc.event_scope(), |s| s.bpm = 144.0));
+        in_event(&mut doc, "色", |doc| doc.end_gesture(GestureOwner::ColorPicker));
+        assert!(!doc.gesture_active());
+        assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "MIDI 入力"], "take の間は 1 step");
+
+        in_event(&mut doc, "テンポ変更", |doc| doc.edit(doc.event_scope(), |s| s.bpm = 150.0));
+        assert_eq!(doc.history_current(), 2, "全員閉じた後の編集は別 step");
+
+        // 同じ所有者が閉じずに開き直すと、他に所有者が居なければ新しい step。
+        in_event(&mut doc, "色", |doc| {
+            doc.begin_gesture(GestureOwner::ColorPicker);
+            doc.edit(doc.event_scope(), |s| s.bpm = 151.0);
+        });
+        in_event(&mut doc, "色", |doc| {
+            doc.begin_gesture(GestureOwner::ColorPicker);
+            doc.edit(doc.event_scope(), |s| s.bpm = 152.0);
+        });
+        assert_eq!(doc.history_current(), 4);
     }
 
     /// handler の中で始まった event (入れ子) は外側の event の step に入り、閉じた後の外側の
@@ -1032,8 +1191,13 @@ mod tests {
         assert_eq!(doc.history_current(), 1);
     }
 
-    /// jump_to は 1 発で任意 index の state へ遷移する (undo/redo を必要段数
-    /// 繰り返したのと同じ結果)。
+    /// 履歴リストの `index` 行へ飛ぶ (view の行 click と同じ: その場で行を state の識別子に直す)。
+    fn jump_to(doc: &mut SongDoc, index: usize) -> bool {
+        doc.history_state_id(index).is_some_and(|id| doc.jump(HistoryJump::ToState(id)))
+    }
+
+    /// 行へのジャンプは 1 発で任意 index の state へ遷移する (undo/redo を必要段数
+    /// 繰り返したのと同じ結果)。行き先の Song は動かす前に覗ける。
     #[test]
     fn jump_to_reaches_any_index() {
         let mut doc = SongDoc::new(Song::default());
@@ -1044,39 +1208,81 @@ mod tests {
         assert_eq!(doc.history_current(), 3);
 
         // 一気に baseline へ。
-        assert!(doc.jump_to(0));
+        let baseline = doc.history_state_id(0).expect("baseline");
+        assert_eq!(doc.history_target(HistoryJump::ToState(baseline)).map(|s| s.bpm), Some(base_bpm));
+        assert!(jump_to(&mut doc, 0));
         assert_eq!(doc.history_current(), 0);
         assert_eq!(doc.song().bpm, base_bpm);
 
-        // 一気に途中 (A の直後) へ。
-        assert!(doc.jump_to(1));
+        // 一気に途中 (A の直後) へ。redo 側の行き先も覗ける。
+        assert_eq!(doc.history_target(HistoryJump::Redo).map(|s| s.bpm), Some(140.0));
+        let latest = doc.history_state_id(3).expect("C");
+        assert_eq!(doc.history_target(HistoryJump::ToState(latest)).map(|s| s.bpm), Some(160.0));
+        assert!(jump_to(&mut doc, 1));
         assert_eq!(doc.history_current(), 1);
         assert_eq!(doc.song().bpm, 140.0);
 
         // 一気に最新へ。
-        assert!(doc.jump_to(3));
+        assert!(doc.jump(HistoryJump::ToState(latest)));
         assert_eq!(doc.history_current(), 3);
         assert_eq!(doc.song().bpm, 160.0);
 
-        // current / 範囲外 は no-op。
-        assert!(!doc.jump_to(3), "current へは no-op");
-        assert!(!doc.jump_to(4), "範囲外は no-op");
+        // current / 範囲外 / 端 は no-op。
+        assert!(!jump_to(&mut doc, 3), "current へは no-op");
+        assert!(!jump_to(&mut doc, 4), "範囲外は no-op");
+        assert!(doc.history_target(HistoryJump::Redo).is_none());
+        assert!(!doc.redo());
         assert_eq!(doc.song().bpm, 160.0);
     }
 
-    /// jump 後に新規編集すると redo 分岐は破棄される (linear undo の一貫性)。
+    /// jump 後に新規編集すると redo 分岐は破棄される (linear undo の一貫性)。捨てた state の識別子へは飛べない。
     #[test]
     fn edit_after_jump_truncates_future() {
         let mut doc = SongDoc::new(Song::default());
         for (label, bpm) in [("A", 140.0), ("B", 150.0)] {
             in_event(&mut doc, label, |doc| doc.edit(EditScope::Discrete, |s| s.bpm = bpm));
         }
-        doc.jump_to(1); // A の直後、 B は redo 待ち。
+        let b = doc.history_state_id(2).expect("B");
+        jump_to(&mut doc, 1); // A の直後、 B は redo 待ち。
         in_event(&mut doc, "C", |doc| doc.edit(EditScope::Discrete, |s| s.bpm = 170.0));
         // B は捨てられ、 A → C の直線履歴になる。
         assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "A", "C"]);
         assert_eq!(doc.history_current(), 2);
         assert!(!doc.can_redo());
+        assert!(!doc.jump(HistoryJump::ToState(b)), "捨てた state へは飛べない");
+    }
+
+    /// plugin state の書き戻しは live と undo / redo の全 Song の同じ device へ届き、履歴も epoch も dirty も動かさない。
+    #[test]
+    fn plugin_state_write_back_reaches_every_history_song() {
+        use common::model::Track;
+        let mut doc = SongDoc::new(Song::default());
+        let device = doc
+            .edit(EditScope::Discrete, |s| {
+                let id = s.alloc_device_id();
+                let plugin = PluginInstance { id, ..PluginInstance::new("p".into(), common::plugin_format::PluginFormat::Clap) };
+                let track_id = s.alloc_track_id();
+                s.tracks.push(Track { id: track_id, devices: vec![Device::Plugin(plugin)], ..Track::default() });
+                id
+            })
+            .expect("edit");
+        doc.edit(EditScope::Discrete, |s| s.bpm = 140.0);
+        doc.edit(EditScope::Discrete, |s| s.bpm = 150.0);
+        assert!(doc.undo());
+        doc.mark_saved();
+        let (epoch, depth) = (doc.edit_epoch(), doc.undo_depth());
+
+        let blob: std::sync::Arc<[u8]> = std::sync::Arc::from(&[9_u8][..]);
+        doc.write_back_plugin_state(|song| {
+            if let Some(p) = song.plugin_by_id_mut(device) {
+                p.state = Some(blob.clone());
+            }
+        });
+        let state = |song: &Song| song.plugin_by_id(device).and_then(|p| p.state.as_deref().map(<[u8]>::to_vec));
+        assert_eq!(state(doc.song()), Some(vec![9]));
+        assert!(doc.history_songs().filter(|s| s.plugin_by_id(device).is_some()).all(|s| state(s) == Some(vec![9])));
+        assert_eq!(doc.history_songs().filter(|s| s.plugin_by_id(device).is_some()).count(), 2, "undo 1 本 + redo 1 本");
+        assert_eq!((doc.edit_epoch(), doc.undo_depth(), doc.is_dirty()), (epoch, depth, false));
     }
 
     /// 構造の世代: 値だけの編集では進まず、id 構造 (トラック / device / lane …) が変わった編集と、

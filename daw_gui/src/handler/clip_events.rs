@@ -720,7 +720,7 @@ impl AppData {
         // プレビュー/commit は squash されて **1 undo で元に戻る**。 bracket が無いと
         // hover ごとに fresh gesture id → プレビュー 1 回ごとに undo step が積まれ、
         // commit も元を復元しない (M3)。 commit / cancel で end_gesture する。
-        self.cur.song_doc.begin_gesture();
+        self.cur.song_doc.begin_gesture(GestureOwner::FontPicker);
         self.refresh_font_picker_visible();
         // システムフォント列挙は重い (~20-860ms) ので background で 1 度だけ。
         if self.ui_ephemeral.font_picker_families.is_empty() && !self.ui_ephemeral.font_picker_loading {
@@ -810,7 +810,7 @@ impl AppData {
         self.ui_ephemeral.font_picker_target = None;
         self.ui_ephemeral.is_font_picker_open = false;
         // session gesture を閉じる (open_font_picker の begin_gesture と対)。
-        self.cur.song_doc.end_gesture();
+        self.cur.song_doc.end_gesture(GestureOwner::FontPicker);
     }
 
     pub(crate) fn close_font_picker(&mut self) {
@@ -822,8 +822,8 @@ impl AppData {
         self.ui_ephemeral.is_font_picker_open = false;
         self.ui_ephemeral.font_picker_target = None;
         // session gesture を閉じる (open_font_picker の begin_gesture と対)。
-        // commit 済み (target 既に None) でも呼ぶ: begin/end を必ず対にする。
-        self.cur.song_doc.end_gesture();
+        // commit 済み (target 既に None) でも呼ぶ: begin/end を必ず対にする (閉じ済みの所有者の End は何も閉じない)。
+        self.cur.song_doc.end_gesture(GestureOwner::FontPicker);
     }
 
     /// docs/plan_text_overlay.md §4 P5: clip 切替 / Undo / Redo / lane

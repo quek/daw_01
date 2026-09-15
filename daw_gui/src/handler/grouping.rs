@@ -374,7 +374,17 @@ impl AppData {
         }
     }
 
+    /// `AppEvent::RemoveLastTrack` の dispatcher。末尾トラックの plugin を host から降ろすので、削除系と同じく最新の
+    /// state を Song に書き戻してから消す (`DeferredEdit::RemoveLastTrack`、undo で state 付きで戻る)。
     pub(crate) fn action_remove_last_track(&mut self) {
+        if self.song_has_plugin() {
+            self.enqueue_deferred_edit(DeferredEdit::RemoveLastTrack);
+        } else {
+            self.action_remove_last_track_inner();
+        }
+    }
+
+    pub(crate) fn action_remove_last_track_inner(&mut self) {
         let len = self.cur.song_doc.song().tracks.len();
         if len == 0 {
             return;

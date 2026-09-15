@@ -4,6 +4,7 @@
 use crate::state::*;
 use crate::app_types::*;
 use crate::handler::device_guard::{self, DeviceOp};
+use crate::handler::history::PluginStateWriteBack;
 use common::model::InstrumentSource;
 use common::plugin_format::PluginFormat;
 use common::protocol::{AudioCommand, PlatformWindowHandle, PluginCommand, SlotState};
@@ -1011,21 +1012,22 @@ impl AppData {
     pub(crate) fn cleanup_slot_gui(&mut self, _device_id: u64) {}
 
     /// `plugin_host` から `AllPluginStates` 受信。 全 plugin の最新
-    /// state を Song に書き戻したあと、 [`AppData::pending_state_queue`]
-    /// の front を取り出して完了処理 (save または deferred edit) を実行する。
+    /// state を live と履歴の Song に書き戻したあと、 [`AppData::pending_state_queue`]
+    /// の front を取り出して完了処理 (save / deferred edit / 履歴ジャンプ / copy) を実行する。
     /// queue に後続がある場合は次の `RequestAllStates` を改めて発行し、
     /// 連続 deferred edit が個別に最新 state を捕まえられるようにする。
     pub(crate) fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
         // in-flight だった round-trip の応答が来た。 watchdog の deadline を
         // 解除する。 この後 queue に後続があれば dispatch_front_state_request が再武装する。
         self.cur.pipc.state_request_sent_at = None;
-        // live song の plugin state を最新化する (= dirty 判定の整合と、
-        // Deferred の Undo snapshot が最新 knob を捕まえるため)。 queue が空
-        // だった場合 (= 想定外タイミングの応答) でも害はない。 Save の serialize
+        // live song と undo / redo の全 Song の plugin state を最新化する (= Deferred の Undo snapshot が最新 knob を
+        // 捕まえ、履歴ジャンプでどの state から載せ直しても最新の値で載るため — `SongDoc::write_back_plugin_state`)。
+        // queue が空だった場合 (= 想定外タイミングの応答) でも害はない。 Save の serialize
         // 対象は live ではなく凍結 snapshot なので、 下の match 内で snapshot 側に
         // も別途適用する。
-        self.cur.song_doc
-            .write_back_plugin_state(|song| Self::apply_plugin_states_to(song, &states));
+        let write_back = PluginStateWriteBack::new(&states);
+        self.cur.song_doc.write_back_plugin_state(|song| write_back.apply(song));
+        write_back.warn_missing(self.cur.song_doc.song());
         // Phase 6 review (silent corruption fix): plugin_host 側で
         // `state_save()` が `Err` を返したエントリは `SlotState.error`
         // 経由で報告される。 旧コードはこれを `.ok().flatten()` で握り
@@ -1083,9 +1085,11 @@ impl AppData {
                 };
                 let mut snapshot =
                     snapshot.unwrap_or_else(|| Box::new(self.cur.song_doc.song().clone()));
-                Self::apply_plugin_states_to(&mut snapshot, &states);
+                write_back.apply(&mut snapshot);
                 self.finish_save(snapshot, path, snap_epoch);
             }
+            // 降ろす device の最新 state は上で live と履歴の全 Song に書き戻した。ここで動かす。
+            PendingStateRequest::HistoryJump(jump) => self.execute_history_jump(jump),
             PendingStateRequest::Deferred { edit, label } => {
                 // ここで初めて Undo snapshot を push する。 Song に
                 // 最新 state が入った状態を捕まえるため (plugin が
@@ -1108,22 +1112,8 @@ impl AppData {
                 }
             }
         }
-        // 後続の request が積まれていれば、 改めて `RequestAllStates` を発行して
-        // 次の応答待ちに入る。 ここで「直前の edit が走ったあとの最新 state」 を
-        // 再取得することで、 各 deferred edit が自前の knob snapshot を持つ。 さらに
-        // 新たな front が Save なら、 dispatch_front_state_request が **この瞬間**
-        // (= 先行 Deferred が live layout を確定させた直後) に live を凍結するので、
-        // その Save の snapshot は返ってくる state と同じ layout になる。
-        if !self.cur.pipc.pending_state_queue.is_empty() {
-            self.dispatch_front_state_request();
-        } else if let Some(action) = self.cur.pipc.guard_pending_action.take() {
-            // round-trip が全て drain した。 in-flight 中に保留していた
-            // ガード操作 (New/Open/Open Recent/終了) を、 deferred edit / save 反映後の
-            // **最新 dirty 状態で再評価** する (= clean なら実行、 dirty なら確認モーダル)。
-            // dirty は edit_epoch 由来の O(1) 派生なので明示的な recompute は不要。
-            // queue は空なので破壊操作も安全に走る。
-            self.request_guarded_action(action);
-        }
+        // 後続があれば次の往復へ、空になったら保留していたガード操作の再評価へ (`advance_state_queue`)。
+        self.advance_state_queue();
         // 「保存して終了」 の完了判定は `finish_save` (save 成否が分かる場所) が行う。
     }
 
@@ -1134,6 +1124,7 @@ impl AppData {
     pub(crate) fn execute_deferred_edit(&mut self, edit: DeferredEdit) {
         match edit {
             DeferredEdit::DeleteTracks { track_ids } => self.delete_tracks_inner(&track_ids),
+            DeferredEdit::RemoveLastTrack => self.action_remove_last_track_inner(),
             DeferredEdit::DisableTracks { track_ids } => self.set_tracks_enabled_inner(&track_ids, false),
             DeferredEdit::MoveTracks { track_ids, parent_id, anchor_after } => {
                 self.action_move_tracks_inner(&track_ids, parent_id, anchor_after)

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use common::model::Song;
 use common::plugin_format::PluginFormat;
-use common::protocol::{AudioCommand, PluginCommand, SlotState};
+use common::protocol::{AudioCommand, PluginCommand};
 
 impl AppData {
     /// **Song スコープ状態の破棄チョークポイント。**
@@ -211,38 +211,6 @@ impl AppData {
         // 編集面の last-wins タグ (r.md #43) を含む Song スコープの参照系は、
         // 冒頭の `reset_song_scoped_state` が一括で捨てている。 個別に消し直さない
         // (破棄の口を 2 つにすると、また片方だけ更新される)。
-    }
-
-    pub(crate) fn undo(&mut self) {
-        // audio editor の対象は song を差し替えると消えている可能性があるので、
-        // **前** に key を退避して `after_undo_redo` で引き直す。
-        let key = self.audio_editor_target_key();
-        let disabled_before = self.disabled_track_ids();
-        if !self.cur.song_doc.undo() {
-            return;
-        }
-        self.after_undo_redo(key, &disabled_before);
-    }
-
-    pub(crate) fn redo(&mut self) {
-        let key = self.audio_editor_target_key();
-        let disabled_before = self.disabled_track_ids();
-        if !self.cur.song_doc.redo() {
-            return;
-        }
-        self.after_undo_redo(key, &disabled_before);
-    }
-
-    /// r.md #29: 履歴リストの行 click → `index` 番目の state へ一気に遡る /
-    /// 進む。 undo/redo を必要段数ぶん繰り返すのと等価だが、 reconcile
-    /// (`after_undo_redo`) は最終 state に対して 1 度だけ走らせる。
-    pub(crate) fn jump_history_to(&mut self, index: usize) {
-        let key = self.audio_editor_target_key();
-        let disabled_before = self.disabled_track_ids();
-        if !self.cur.song_doc.jump_to(index) {
-            return;
-        }
-        self.after_undo_redo(key, &disabled_before);
     }
 
     /// プロジェクト非依存の UI 設定 (resource monitor on/off・編集履歴 window の
@@ -917,9 +885,9 @@ impl AppData {
     /// (`SlotPluginLoaded` を再 emit するだけ)。
     ///
     /// plugin の **state** は `Song.PluginInstance::state` を
-    /// `initial_state` として渡す。 直前 commit で push_undo_snapshot 前に
-    /// `RequestAllStates` で最新 state を Song に書き戻しているので、
-    /// 削除直前の knob 値も Undo で復元される。
+    /// `initial_state` として渡す。 host から降ろす編集 (削除 / 無効化 / 移動の deferred) と
+    /// 履歴ジャンプ (`handler::history`) は降ろす前に `RequestAllStates` で最新 state を
+    /// live と履歴の全 Song に書き戻しているので、 降ろす直前の knob 値でどの経路からも載る。
     ///
     /// `disabled_before` = 差し替える **前** の Song で実効的に無効だったトラック (r.md #131)。undo / redo で有効に
     /// 戻ったトラックの読み込みは再生を止めない ([`LoadPlayback::KeepPlaying`])。
@@ -1400,44 +1368,6 @@ impl AppData {
         self.cur.song_doc.song().all_plugins().next().is_some()
     }
 
-    /// `AllPluginStates` で受け取った各 plugin の state を `Song` の
-    /// 対応する `PluginInstance::state` に書き戻す。 save flow と Undo
-    /// snapshot deferred path の両方で呼ばれる共通 helper。
-    ///
-    /// v29: SlotState は安定 `device_id` keyed。 track/master のどの位置に
-    /// 居ても id 一致で書き戻すので、 deferred path で並びが変わっていても
-    /// 壊れない (`docs/plan_arch_refactor.md` §1)。
-    pub(crate) fn apply_plugin_states_to(song: &mut Song, states: &[SlotState]) {
-        for s in states {
-            // Phase 6 review (silent corruption fix): plugin_host が
-            // `state_save()` で `Err` を返したエントリは `error` 付きで
-            // 来る。 そのとき `s.data` は None なので、 既存 state を
-            // 上書きすると **過去 save 時に保存された state が消える**
-            // (= 旧バグ: save 失敗 → 次 save で空 state 確定)。 error あり
-            // のエントリは skip して既存 state を保つ。
-            if s.error.is_some() {
-                tracing::warn!(
-                    device_id = s.device_id,
-                    error = s.error.as_deref(),
-                    "apply_plugin_states: state save errored, preserving previous state",
-                );
-                continue;
-            }
-            let Some(p) = song.plugin_by_id_mut(s.device_id) else {
-                tracing::warn!(device_id = s.device_id, "apply_plugin_states: device id not found");
-                continue;
-            };
-            p.state = s.data.clone().map(std::sync::Arc::from);
-            // (r.md #5 ARA2) Only overwrite the ARA archive when the plug-in
-            // actually produced one; a non-ARA device or a not-yet-bound
-            // session reports None, and we must not wipe a previously-saved
-            // archive in that case.
-            if s.ara_archive.is_some() {
-                p.ara_archive = s.ara_archive.clone().map(std::sync::Arc::from);
-            }
-        }
-    }
-
     /// `RequestAllStates` 待ちの request を [`AppData::pending_state_queue`]
     /// に積む。 queue が空 (= 現在 in-flight なし) なら同時に
     /// `RequestAllStates` を 1 発送る。 既に in-flight なら積むだけで
@@ -1483,6 +1413,12 @@ impl AppData {
                     .into();
             return;
         }
+        if !self.pin_front_history_jump() {
+            // 行き先の無い履歴ジャンプは往復を始めずに取り除き、次へ進む。
+            self.cur.pipc.pending_state_queue.pop_front();
+            self.advance_state_queue();
+            return;
+        }
         let needs_snapshot = matches!(
             self.cur.pipc.pending_state_queue.front(),
             Some(PendingStateRequest::Save { snapshot: None, .. })
@@ -1504,6 +1440,23 @@ impl AppData {
         // この瞬間から応答 (AllStatesReceived) までを on_tick の watchdog
         // が監視する。 host が hang して応答が来ないと永久ロックになるため。
         self.cur.pipc.state_request_sent_at = Some(std::time::Instant::now());
+    }
+
+    /// 待ち行列の先頭を済ませた (または往復を始めずに取り除いた) 後: 後続が積まれていれば、改めて `RequestAllStates` を
+    /// 発行して次の応答待ちに入る。ここで「直前の要求が走ったあとの最新 state」を再取得することで、各 deferred edit が
+    /// 自前の knob snapshot を持つ。さらに新たな先頭が Save なら、[`Self::dispatch_front_state_request`] が **この瞬間**
+    /// (= 先行 Deferred が live layout を確定させた直後) に live を凍結するので、その Save の snapshot は返ってくる state と
+    /// 同じ layout になる。
+    ///
+    /// 空になったら、round-trip 中に保留していたガード操作 (New / Open / Open Recent / 終了) を deferred edit / save 反映後の
+    /// **最新 dirty 状態で再評価** する (= clean なら実行、dirty なら確認モーダル)。dirty は edit_epoch 由来の O(1) 派生なので
+    /// 明示的な recompute は不要。queue は空なので破壊操作も安全に走る。
+    pub(crate) fn advance_state_queue(&mut self) {
+        if !self.cur.pipc.pending_state_queue.is_empty() {
+            self.dispatch_front_state_request();
+        } else if let Some(action) = self.cur.pipc.guard_pending_action.take() {
+            self.request_guarded_action(action);
+        }
     }
 
     /// in-flight な plugin-state round-trip を強制的に破棄する。 plugin host が

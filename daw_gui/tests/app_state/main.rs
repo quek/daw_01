@@ -22,6 +22,7 @@ mod device_relocate;
 mod dirty_guard;
 mod grid_split;
 mod group_track_lifecycle;
+mod history_plugin_state;
 mod linked_clip_bounds;
 mod make_unique;
 mod modulation_arm;

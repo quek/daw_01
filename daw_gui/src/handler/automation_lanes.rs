@@ -188,6 +188,7 @@ impl AppData {
             }
         }
         if !seeded.is_empty() {
+            self.sync_param_gesture_bracket();
             self.sync_recording_lanes_with_audio();
         }
     }
@@ -215,6 +216,7 @@ impl AppData {
             }
         }
         if any {
+            self.sync_param_gesture_bracket();
             self.sync_recording_lanes_with_audio();
         }
     }
@@ -263,6 +265,7 @@ impl AppData {
             }
         }
         if seeded {
+            self.sync_param_gesture_bracket();
             self.sync_recording_lanes_with_audio();
         }
     }
@@ -288,6 +291,7 @@ impl AppData {
             }
         }
         if any {
+            self.sync_param_gesture_bracket();
             self.sync_recording_lanes_with_audio();
         }
     }
@@ -885,6 +889,7 @@ impl AppData {
             app.close_recording_session();
             app.silence_monitor_notes();
             app.cur.recording.active_param_gestures.clear();
+            app.sync_param_gesture_bracket();
             app.cur.recording.latched_param_gestures.clear();
         });
         // r.md #54: 走査中の解析も畳む。子が落ちた以上 `LoudnessAnalysisComplete` は
