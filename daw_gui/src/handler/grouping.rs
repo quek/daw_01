@@ -183,6 +183,9 @@ impl AppData {
         plan: &[TrackRemovalIpc],
         audio_editor_key: Option<common::model::ClipKey>,
     ) {
+        // トラックを外した構造 (LoadSong) を plugin を降ろすより先に engine へ届ける (各経路の doc の「song update →
+        // LoadSong → plugin destroy」)。後だと、まだトラックが居る古い構造の上で登録を失った device が素通しで鳴る。
+        self.flush_song_sync();
         self.reap_orphan_lipsync();
         // ClosePluginShmem → RemoveSlotPlugin の順序は plan が持つ (audio worker が destroyed plugin を
         // dispatch しないよう、audio 側の mapping を先に落とす)。
@@ -266,7 +269,7 @@ impl AppData {
         // plan が空になり IPC が 1 通も出ない = 無言で壊れる)。
         let removal_plan =
             Self::plan_track_removal_ipc(self.cur.song_doc.song(), &groups_to_ungroup);
-        let live_before = self.hosted_device_ids();
+        let live_before = self.live_before();
         // group がクリップを持つこともある (group は「子を持つトラック」の暗黙の役割)。
         let audio_editor_key = self.audio_editor_target_key();
 
@@ -348,7 +351,7 @@ impl AppData {
         anchor_after: Option<u32>,
     ) {
         let mut rejected = false;
-        let live_before = self.hosted_device_ids();
+        let live_before = self.live_before();
         let moved = self.edit_song_checked(|song| match song.move_tracks(track_ids, parent_id, anchor_after) {
             Ok(changed) => changed,
             Err(common::routing_deps::DependencyCycle) => {
@@ -363,9 +366,8 @@ impl AppData {
         }
         if moved {
             tracing::info!(?track_ids, ?parent_id, ?anchor_after, "tracks moved");
-            // r.md #131: 無効な group へ入れた / 出したトラックの plugin を host に追従させる (engine へ構造を届けてから)。
-            // 待機とセルは `Song::move_tracks` が同じ undo step で降ろしている。
-            self.flush_song_sync();
+            // r.md #131: 無効な group へ入れた / 出したトラックの plugin を host に追従させる (engine への構造の同期も
+            // `follow_live_devices` が音の決まる順に流す)。待機とセルは `Song::move_tracks` が同じ undo step で降ろしている。
             self.follow_live_devices(&live_before);
             self.silence_monitor_notes_on_disabled_tracks();
         }

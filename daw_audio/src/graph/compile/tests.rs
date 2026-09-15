@@ -65,7 +65,7 @@ fn bypassed_device_is_excluded_from_pdc_and_sidechain_taps() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap();
     assert_eq!(sched.master_latency_samples, 0, "bypass 中の 2048 sample は数えない");
     assert!(
         !sched
@@ -80,7 +80,7 @@ fn bypassed_device_is_excluded_from_pdc_and_sidechain_taps() {
     let mut live = song;
     live.tracks[1].devices[0].set_bypassed(false);
     live.tracks[2].devices[0].set_bypassed(false);
-    let sched = compile_schedule(&live, &lat, 48_000, 0, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&live, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap();
     assert_eq!(sched.master_latency_samples, 2048);
     assert!(sched
         .nodes
@@ -516,7 +516,7 @@ fn master_latency_samples_is_the_max_path_latency_reaching_master() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&latent, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
+        compile_schedule(&latent, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         2048
     );
 
@@ -535,7 +535,7 @@ fn master_latency_samples_is_the_max_path_latency_reaching_master() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&grouped, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
+        compile_schedule(&grouped, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         512
     );
 
@@ -608,7 +608,7 @@ fn render_scope_shapes_the_master_stage_and_track_faders() {
     song.master_limiter.on = true;
     let look = common::model::limiter_lookahead_samples(48_000);
     let shape = |scope| {
-        let s = compile_schedule(&song, &lat, 48_000, 0, scope).unwrap();
+        let s = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, scope).unwrap();
         (s.master_stage, s.master_program.ops.len(), s.master_limiter_latency, s.master_latency_samples, s.track_programs[0].fader)
     };
     assert_eq!(shape(RenderScope::Mix), (true, 1, true, 512 + 2048 + look, true));
@@ -647,7 +647,7 @@ fn master_latency_samples_covers_send_paraout_and_master_fx() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&sends, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
+        compile_schedule(&sends, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         100,
         "send 先 (return) の latency も master 合流に効く"
     );
@@ -679,7 +679,7 @@ fn master_latency_samples_covers_send_paraout_and_master_fx() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&paraout, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
+        compile_schedule(&paraout, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         64 + 256,
         "paraout dest は source の path latency を取り込む"
     );
@@ -693,7 +693,7 @@ fn master_latency_samples_covers_send_paraout_and_master_fx() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&master_fx, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
+        compile_schedule(&master_fx, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         2048,
         "master fx chain の latency も master 出力の遅延"
     );
@@ -712,7 +712,7 @@ fn master_latency_samples_covers_send_paraout_and_master_fx() {
         ..Song::default()
     };
     assert_eq!(
-        compile_schedule(&both, &lat, 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
+        compile_schedule(&both, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap().master_latency_samples,
         512 + 2048
     );
 }
@@ -743,7 +743,7 @@ fn pdc_parallel_tracks_emit_compensating_delay_for_lower_latency_path() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap();
 
     // (a) DelayLine が 1 本以上、 capacity ≥ 100 で確保されている。
     assert!(
@@ -848,7 +848,7 @@ fn pdc_two_track_impulse_aligns_at_master_with_loaded_latency_plugin() {
         ],
         ..Song::default()
     };
-    let mut sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
+    let mut sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap();
 
     // Track ごとに「ロードされた plugin」 を持たせる。 production の
     // CLAP/VST3 と違って format-agnostic な test stub だが、
@@ -1218,7 +1218,7 @@ fn pdc_sidechain_source_path_latency_propagates_to_dest_for(kind: ScConsumer) {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap();
 
     // Master Mix の input は (TrackScratch(0), TrackScratch(1)) の 2 本。
     // path_latency(A=0) = 100, path_latency(B=1) = 100 + 50 = 150 になっている
@@ -1321,7 +1321,7 @@ fn pdc_sidechain_input_delay_recorded_for_dest_fx_chain_track_for(kind: ScConsum
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap();
 
     assert_eq!(
         sched.input_delay_per_track.len(),
@@ -1390,7 +1390,7 @@ fn pdc_leaf_sidechain_tap_adds_one_buffer_of_lag_for(kind: ScConsumer) {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, BUF, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, BUF, RenderScope::Mix).unwrap();
 
     // leaf 宛: source path latency (100) + 1 buffer (512)。
     assert_eq!(
@@ -1443,7 +1443,7 @@ fn pdc_sidechain_instrument_input_delay_skipped_in_mvp() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap();
 
     // path_latency は instrument の sidechain も拾う (= 100 + 0 = 100)
     // ので master mix の sibling alignment は機能する。
@@ -1806,7 +1806,7 @@ fn send_source_latency_aligns_return_with_dry_at_master() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).unwrap();
 
     let master_mix = sched
         .nodes
@@ -2098,7 +2098,7 @@ fn paraout_instrument_bus_pdc_aligns_main_and_children() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).expect("must compile");
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).expect("must compile");
 
     let add_mix = sched
         .nodes
@@ -2173,7 +2173,7 @@ fn paraout_independent_dest_pdc_fans_in_source_latency() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, 0, RenderScope::Mix).expect("must compile");
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, RenderScope::Mix).expect("must compile");
 
     let master_mix = sched
         .nodes
@@ -2244,7 +2244,7 @@ fn sidechain_from_own_track_prefx_is_staged_in_program_not_schedule() {
         tap: AudioTap::new(TapSource::Track(1), TapPoint::PreFx),
     })];
     song.tracks.push(Track { id: 1, devices: vec![Device::Plugin(comp)], ..Track::default() });
-    let schedule = compile_schedule(&song, &DeviceLatencies::new(), 48_000, 256, RenderScope::Mix).expect("no cycle");
+    let schedule = compile_schedule(&song, &DeviceLatencies::new(), &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).expect("no cycle");
     assert!(!schedule.nodes.iter().any(|op| matches!(op, NodeOp::SidechainTap { .. })));
     assert!(schedule.track_programs[0].ops.iter().any(|op| matches!(
         op,
@@ -2449,7 +2449,7 @@ fn a_return_native_comp_aligns_its_bus_input_to_the_sidechain_with_bus_sc_align(
     };
     let n = 256usize;
     let render = |listen: bool| {
-        let mut sched = compile_schedule(&song, &lat, 48_000, n as u32, RenderScope::Mix).unwrap();
+        let mut sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, n as u32, RenderScope::Mix).unwrap();
         let fx = sched.nodes.iter().position(|op| matches!(op, NodeOp::ProcessGroupFx { track_idx: 2, .. })).unwrap();
         assert!(
             matches!(sched.nodes[fx - 1], NodeOp::ApplyDelay { buf: BufRef::TrackScratch(2), frames: L, .. }),
@@ -2508,7 +2508,7 @@ fn a_group_with_instrument_prefix_consumer_takes_the_pass_one_lag() {
         ],
         ..Song::default()
     };
-    let sched = compile_schedule(&song, &lat, 48_000, BUF, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, BUF, RenderScope::Mix).unwrap();
     assert!(matches!(sched.track_programs[1].pass1_role, crate::graph::program::Pass1Role::GroupWithInstrument { .. }));
     assert_eq!(sched.input_delay_per_track[1], L + BUF);
     assert!(!sched.delay_keys.iter().any(|k| matches!(k, DelayKey::BusScAlign { .. })), "{:?}", sched.delay_keys);
@@ -2637,11 +2637,11 @@ fn 無効トラックと無効_group_の子孫はグラフに居ない() {
         ],
         ..Song::default()
     };
-    let live = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    let live = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).unwrap();
     assert_eq!(live.master_latency_samples, 800, "対照: 全部有効なら group の経路 300 + 500");
 
     song.set_tracks_enabled(&[1], false);
-    let sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).unwrap();
     assert_eq!(sched.graph.trace.iter().filter(|s| matches!(s, Step::Process(_))).collect::<Vec<_>>(), vec![&Step::Process(2)]);
     for (i, p) in sched.track_programs.iter().enumerate() {
         let off = i < 2;
@@ -2654,9 +2654,52 @@ fn 無効トラックと無効_group_の子孫はグラフに居ない() {
     assert_eq!(sched.master_latency_samples, 40, "無効な経路の latency は数えない");
 
     song.set_tracks_enabled(&[1], true);
-    let back = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    let back = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).unwrap();
     assert_eq!(format!("{:?}", back.nodes), format!("{:?}", live.nodes), "戻すと同じ schedule");
     assert_eq!(back.master_latency_samples, 800);
+}
+
+/// 有効なトラックでも host への読み込みが確定していない plugin を持つ間は、engine からは **無効と同じ** に見える
+/// (group の plugin なら子孫も)。読み込み中の表から外れると元の schedule に戻る。
+#[test]
+fn 読み込み中の_plugin_を持つトラックは無効と同じ_schedule_になる() {
+    use crate::graph::program::Pass1Role;
+
+    let mut lat = DeviceLatencies::new();
+    let mut song = Song {
+        tracks: vec![
+            track(|t| {
+                t.id = 1;
+                t.devices = latency_chain(&mut lat, 10, 500);
+            }),
+            track(|t| {
+                t.id = 2;
+                t.parent_group_id = Some(1);
+                t.devices = latency_chain(&mut lat, 11, 300);
+                t.sends = vec![common::model::Send { id: 1, dest_track_id: 3, gain: 1.0, mode: common::model::SendMode::PostFader, enabled: true }];
+            }),
+            track(|t| {
+                t.id = 3;
+                t.devices = latency_chain(&mut lat, 12, 40);
+            }),
+        ],
+        ..Song::default()
+    };
+    let compile = |song: &Song, loading: &[u64]| {
+        let loading: LoadingDevices = loading.iter().copied().collect();
+        let s = compile_schedule(song, &lat, &loading, 48_000, 256, RenderScope::Mix).unwrap();
+        (format!("{:?}", s.nodes), format!("{:?}", s.graph.trace), s.track_programs.iter().map(|p| p.pass1_role).collect::<Vec<_>>(), s.master_latency_samples)
+    };
+    let settled = compile(&song, &[]);
+    let mut held = song.clone();
+    for (loading, disabled) in [(10u64, 1u32), (11, 2), (12, 3)] {
+        held.set_tracks_enabled(&[disabled], false);
+        assert_eq!(compile(&song, &[loading]), compile(&held, &[]), "device {loading} の読み込み中 = track {disabled} の無効");
+        held.set_tracks_enabled(&[disabled], true);
+    }
+    assert_eq!(compile(&song, &[99]), settled, "Song に居ない device の読み込みは関係ない");
+    song.set_tracks_enabled(&[3], false);
+    assert_eq!(compile(&song, &[10]).2, vec![Pass1Role::Disabled; 3], "無効と読み込み中は独立に効く");
 }
 
 /// 無効トラックを読む側 / 無効トラックへ送る側は **無音 / 変調なし**: send (無効な送り元 / 無効な return)、
@@ -2714,12 +2757,12 @@ fn 無効トラックへの送りとそこを読む_tap_は出ない() {
     let is_route = |op: &NodeOp| {
         matches!(op, NodeOp::MixSend { .. } | NodeOp::SidechainTap { .. } | NodeOp::ParallelOutTap { .. } | NodeOp::EnvelopeFollow { .. })
     };
-    let live = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    let live = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).unwrap();
     assert_eq!(live.nodes.iter().filter(|op| is_route(op)).count(), 6, "対照: send 2 / SC 1 / パラアウト 1 / follower 2");
     assert_eq!(live.follower_keys, vec![21, 22]);
 
     song.set_tracks_enabled(&[1, 4, 6], false);
-    let sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).unwrap();
     assert!(!sched.nodes.iter().any(is_route), "無効トラックに触れる経路が残っている: {:?}", sched.nodes);
     assert_eq!(sched.follower_keys, vec![0, 0], "進まない follower は状態を引き継がない (固まった変調を残さない)");
     let roles: Vec<Pass1Role> = sched.track_programs.iter().map(|p| p.pass1_role).collect();
@@ -2747,13 +2790,13 @@ fn 無効トラックの_solo_は数えない() {
         ..Song::default()
     };
     let lat = DeviceLatencies::new();
-    let mut sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    let mut sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).unwrap();
     assert!(sched.solo.any_solo(&song));
     sched.solo.resolve(&song);
     assert!(sched.solo.of(0).0, "対照: solo の子から group へ透過が流れ込む");
 
     song.set_tracks_enabled(&[2], false);
-    let mut sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    let mut sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).unwrap();
     assert!(!sched.solo.any_solo(&song), "無効な子の solo は数えない");
     sched.solo.resolve(&song);
     assert!(!sched.solo.of(0).0, "無効な子からは透過が流れ込まない");

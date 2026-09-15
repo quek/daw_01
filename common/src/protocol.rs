@@ -418,6 +418,17 @@ pub enum AudioCommand {
     /// `compile_schedule` で chain から導出するので、 GUI は集計しない。
     /// device が消えたときは `samples = 0` を送って entry を畳む。
     SetDeviceLatency { project: ProjectKey, device_id: u64, samples: u32 },
+    /// r.md #131: **host への読み込みがまだ確定していない device** の全集合 (置き換え、空 = 無し)。
+    ///
+    /// engine はこれを compile の入力にし、読み込み中の plugin を持つトラック (と group の子孫) をグラフに入れない
+    /// (`Song::executable_mask`) — 有効に戻した / 開いた直後のトラックが、登録の無い device を素通しにした
+    /// 「FX の掛かっていない音」を鳴らさず、読み込みが確定した瞬間から鳴る。読み込みに失敗した device は集合から
+    /// 外れるので従来どおり素通しになる。
+    ///
+    /// これも `Song` に載らない実行時の状態。所有者は daw_gui の `pending_plugin_loads` で、engine は写しを持つだけ
+    /// (project が切り替わっても engine からは捨てない — GUI は新しい曲の集合を `LoadSong` の前に送ってくる)。
+    /// 順序は GUI が守る: 増える分は構造 (`LoadSong`) より前、減る分は `OpenPluginShmem` / `LoadSong` より後。
+    SetLoadingDevices { project: ProjectKey, device_ids: Vec<u64> },
     /// Offline-render the song to a WAV file. daw_audio freewheels through
     /// the song using its existing AudioWorker pool + plugin handshake, then
     /// replies with `AudioEvent::ExportWavComplete`.
@@ -717,6 +728,7 @@ impl AudioCommand {
             | SetLoop { project, .. }
             | SetMasterGain { project, .. }
             | SetDeviceLatency { project, .. }
+            | SetLoadingDevices { project, .. }
             | ExportWav { project, .. }
             | AnalyzeLoudness { project, .. }
             | BounceClipFxOnline { project, .. }

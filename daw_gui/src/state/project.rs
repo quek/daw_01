@@ -114,6 +114,10 @@ pub struct ProjectIpc {
     /// (A→B 連続差し替えの stale 応答 race 対策、
     /// `docs/plan_arch_refactor.md` §7 世代 guard)。
     pub pending_plugin_loads: std::collections::HashMap<u64, u64>,
+    /// r.md #131: engine へ最後に送った「読み込み中の device」(`AudioCommand::SetLoadingDevices`)。所有者は
+    /// `pending_plugin_loads` で、これは送信の差分を取るための写し (`AppData::sync_loading_devices`)。engine は
+    /// これを持つトラックをグラフに入れない。audio の respawn で新しいプロセスは空から始まるので捨てる。
+    pub last_sent_loading_devices: std::collections::BTreeSet<u64>,
     /// `device_id → 直近の load 失敗理由`。 `SlotPluginLoadFailed` を受けた
     /// device は plugin_host に instance が無い (= そのセッション中ずっと
     /// 無音) 状態で song には残る。 ここに残すことでインスペクタが
@@ -884,6 +888,7 @@ impl ProjectState {
                 pending_vocal_synth_export: std::collections::HashSet::new(),
                 open_plugin_guis: std::collections::HashMap::new(),
                 pending_plugin_loads: std::collections::HashMap::new(),
+                last_sent_loading_devices: std::collections::BTreeSet::new(),
                 failed_plugin_loads: std::collections::HashMap::new(),
                 pending_added_plugin_finalize: std::collections::HashMap::new(),
                 gui_open_requests: Vec::new(),

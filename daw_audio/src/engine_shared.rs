@@ -493,6 +493,11 @@ pub struct ProjectShared {
     /// master の合計は compile 側が device chain から導出するので、 GUI は集計しない。
     /// 読むのは off-RT (recv loop / export thread) のみ。
     pub device_latencies: ArcSwap<crate::graph::DeviceLatencies>,
+    /// r.md #131: host への読み込みが確定していない device (`AudioCommand::SetLoadingDevices` で recv loop が差し替え)。
+    /// `compile_schedule` (live publish / export の両方) が読み、これを持つトラックをグラフに入れない。
+    /// 所有者は daw_gui (`pending_plugin_loads`) で、engine は project が切り替わっても自分では捨てない
+    /// (GUI が新しい曲の集合を `LoadSong` より先に送ってくる)。読むのは off-RT のみ。
+    pub loading_devices: ArcSwap<crate::graph::LoadingDevices>,
     /// `AudioBridge` の telemetry slot (claim 時に確定、RT はこの index で書く)。
     pub telemetry_slot: usize,
     /// r.md #129 §8.7: SC Listen する Comp の device id (`0` = 無し)。IPC スレッドが
@@ -548,6 +553,7 @@ impl ProjectShared {
             recording_requested: AtomicBool::new(false),
             master_gain: AtomicU32::new(1.0_f32.to_bits()),
             device_latencies: ArcSwap::from_pointee(HashMap::new()),
+            loading_devices: ArcSwap::from_pointee(crate::graph::LoadingDevices::new()),
             telemetry_slot,
             sc_listen_device: AtomicU64::new(0),
         }

@@ -1790,7 +1790,15 @@ mod bundle_install_tests {
 
     /// `reset_song_scoped_state` を明示する版 (project 切替相当)。
     fn make_bundle_with_reset(song: &Arc<Song>, reset: bool) -> RtBundle {
-        let schedule = compile_schedule(song, &test_latencies(), 48_000, 0, common::protocol::RenderScope::Mix).unwrap();
+        let schedule = compile_schedule(
+            song,
+            &test_latencies(),
+            &crate::graph::LoadingDevices::new(),
+            48_000,
+            0,
+            common::protocol::RenderScope::Mix,
+        )
+        .unwrap();
         RtBundle {
             song: Some(Arc::clone(song)),
             song_index: Arc::new(SongIndex::build(song)),
@@ -2489,8 +2497,15 @@ mod multi_project_tests {
             song_bounds: SongBounds::of(Some(song), 48_000),
             tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(song)),
             schedule: Some(
-                crate::graph::compile_schedule(song, &HashMap::new(), 48_000, 256, common::protocol::RenderScope::Mix)
-                    .unwrap(),
+                crate::graph::compile_schedule(
+                    song,
+                    &HashMap::new(),
+                    &crate::graph::LoadingDevices::new(),
+                    48_000,
+                    256,
+                    common::protocol::RenderScope::Mix,
+                )
+                .unwrap(),
             ),
             reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),

@@ -262,13 +262,18 @@ impl AppData {
     /// v29: 要求 generation を採番して返す (呼び出し側は `SetSlotPlugin`
     /// に載せる)。 応答 (`SlotPluginLoaded` / `SlotPluginLoadFailed`) は
     /// この generation と一致するものだけ受理される (stale 応答 race guard)。
-    pub(crate) fn track_pending_load(&mut self, device_id: u64) -> u64 {
+    ///
+    /// r.md #131: 止めるかは `playback` ([`LoadPlayback`])。有効に戻したトラックの読み込みは止めない。
+    pub(crate) fn track_pending_load(&mut self, device_id: u64, playback: LoadPlayback) -> u64 {
         // r.md #51: **録音中は止めない**。 テイクを切らないことの方が、
         // 足したプラグインが数バッファ遅れて鳴り出すことより重い
         // (REAPER も走行中のトラック arm 追加を明示的に許可している)。
         // 止めてしまうと録音セッションが閉じ、録り直しになる。
         let recording = self.cur.recording.requested;
-        if self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.is_playing && !recording {
+        // 「まだ止めていない」は再開の予約 (`pending_play`) が無いこと。止めない読み込み (`KeepPlaying`) が応答待ちでも、
+        // 後から足した plugin の読み込みは止める (応答待ちの有無で判定すると、その読み込みが再生を止めなくなる)。
+        let paused_already = self.cur.transport.pending_play.is_some();
+        if playback == LoadPlayback::Pause && !paused_already && self.cur.transport.is_playing && !recording {
             self.send_audio(AudioCommand::Stop { project: self.pk() });
             // 読み込みが済んだら **止まった位置から** 続ける (ホームへは戻さない —
             // ユーザーが止めたのではなく、 こちらの都合で一瞬止めただけ)。

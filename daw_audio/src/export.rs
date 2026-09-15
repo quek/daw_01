@@ -584,11 +584,14 @@ fn render_loop(
     // (`ApplyDelay`), group buses, SidechainTap and master fx all flow from
     // it via `render_master_buffer`. `buffer_frames` = このループの処理単位
     // `max_frames` (leaf 宛 sidechain tap の 1-buffer 補償量、 live と同規則)。
-    // PDC の入力 (device 単位の報告 latency) は live publish と同じ表を読む
-    // (`compile_schedule` は live / export 共通なので入力も共通)。
+    // PDC の入力 (device 単位の報告 latency) と読み込み中の device (r.md #131) は live publish と同じ表を読む
+    // (`compile_schedule` は live / export 共通なので入力も共通)。書き出しは plugin の再初期化の往復を待ってから
+    // 始まり、それより前に頼んだ読み込みの応答はその往復より先に届く (host は命令を順に処理する) ので、ここで
+    // 読み込み中の device が残っているのは書き出しの最中に頼んだ読み込みだけ。
     let mut schedule = compile_schedule(
         song,
         &project.device_latencies.load(), // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
+        &project.loading_devices.load(), // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         sample_rate,
         max_frames as u32,
         scope,
@@ -1091,12 +1094,17 @@ mod tests {
     ) -> StereoCapture {
         let project = ProjectShared::new(common::protocol::ProjectKey(1), 0);
         project.device_latencies.store(Arc::new(latencies.clone()));
+        render_mix_in(engine, &project, song, start_beat, end_beat)
+    }
+
+    /// compile の入力 (報告 latency / 読み込み中の device) を載せた `project` で書き出す。
+    fn render_mix_in(engine: &EngineShared, project: &ProjectShared, song: &Song, start_beat: f64, end_beat: f64) -> StereoCapture {
         let span = RenderSpan::RangeWarm { start_beat, end_beat };
         let win = RenderWindow::resolve(song, BOUNCE_SR, span, false).expect("window");
         let mut sink = StereoCapture::default();
         let outcome = render_loop(
             engine,
-            &project,
+            project,
             song,
             RenderScope::Mix,
             BOUNCE_SR,
@@ -1528,7 +1536,8 @@ mod tests {
         let mut latencies = crate::graph::DeviceLatencies::new();
         latencies.insert(9004, 300);
 
-        let sched = compile_schedule(&song, &latencies, BOUNCE_SR, common::process_data::MAX_FRAMES as u32, RenderScope::Mix)
+        let loading = crate::graph::LoadingDevices::new();
+        let sched = compile_schedule(&song, &latencies, &loading, BOUNCE_SR, common::process_data::MAX_FRAMES as u32, RenderScope::Mix)
             .expect("compile");
         let has = |pred: fn(&crate::graph::NodeOp) -> bool| sched.nodes.iter().any(pred);
         use crate::graph::NodeOp as Op;
@@ -1547,6 +1556,46 @@ mod tests {
                 assert_bit_identical(&serial, &pooled, &format!("runner {sync_slots} 本の {round} 回目が直列と違う"));
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// r.md #131: host への読み込みが確定していない plugin を持つトラックは **鳴らない** (FX の掛かっていない音を
+    /// 出さない)。group の plugin の読み込みは子も待たせ、子の plugin の読み込みはその子だけを待たせる。読み込みが
+    /// 確定して表から外れると鳴る — 失敗 (host に登録が無いまま) なら従来どおりその device は素通し。
+    #[test]
+    fn 読み込み中の_plugin_を持つトラックは鳴らず_確定すると鳴る() {
+        use common::model::{Clip, Device, PluginInstance, Track};
+        let dir = bounce_temp_dir("loading_devices");
+        let (mut song, content) = source_only_song(&dir);
+        let fx = |id: u64| {
+            Device::Plugin(PluginInstance {
+                id,
+                ..PluginInstance::with_ports(
+                    format!("test.fx{id}"),
+                    common::plugin_format::PluginFormat::Clap,
+                    common::port_config::PortConfig { has_audio_input: true, has_audio_output: true, ..Default::default() },
+                )
+            })
+        };
+        // group (FX 910) の子 2 本: 子 1 は FX 920 を持ち、子 2 は plugin を持たない。どちらも同じクリップ。
+        let group = Track { id: song.alloc_track_id(), devices: vec![fx(910)], ..Track::default() };
+        let group_id = group.id;
+        song.tracks.push(group);
+        for devices in [vec![fx(920)], Vec::new()] {
+            let mut t = Track { id: song.alloc_track_id(), parent_group_id: Some(group_id), devices, ..Track::default() };
+            t.place_clip(Clip { start_beat: 0.0, length_beats: 2.0, content_id: content, ..Clip::default() });
+            song.tracks.push(t);
+        }
+        song.enforce_edit_invariants();
+        let render = |loading: &[u64]| {
+            let project = ProjectShared::new(common::protocol::ProjectKey(1), 0);
+            project.loading_devices.store(Arc::new(loading.iter().copied().collect()));
+            peak(&render_mix_in(&EngineShared::new(), &project, &song, 0.0, 2.0))
+        };
+        let (settled, child_loading, group_loading) = (render(&[]), render(&[920]), render(&[910]));
+        assert!(child_loading > 0.3, "plugin を持たない子は子 1 の読み込みを待たない: peak {child_loading}");
+        assert!(settled > child_loading * 1.5, "確定すると子 1 も (登録の無い FX は素通しで) 鳴る: {settled} / {child_loading}");
+        assert_eq!(group_loading, 0.0, "group の plugin が読み込み中なら子も鳴らない");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
