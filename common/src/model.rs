@@ -44,6 +44,7 @@ pub use clip_window::*;
 pub use master_limiter::*;
 pub use media_manifest::*;
 pub use content::*;
+pub use content_split::split_boundaries;
 pub use device::*;
 pub use ids::*;
 pub use midi_bind::*;

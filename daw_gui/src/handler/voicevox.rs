@@ -208,8 +208,8 @@ fn arrangement_synth_end_beat(song: &common::model::Song, clip: &Clip, bpm: f32)
 ///
 /// `note_id` は **安定 id** (アーキ不変条件 1): `(clip.id, note.id)` から
 /// [`common::plugin_metadata::sing_note_id`] で決定論的に導出する。daw_audio の
-/// sequencer が **同じ関数**で同じ値を作るので、「クリップ先頭に 1 音足すと以降の
-/// 全 note_id がずれる」が起きない。
+/// sequencer が **同じ関数**で note-on の既定 id を作るので、「クリップ先頭に 1 音足すと
+/// 以降の全 note_id がずれる」が起きない (同時に鳴る音と重なるときの扱いは `sing_note_id`)。
 ///
 /// `start_beat` は content-local → song-absolute (r.md #44: note は content 原点基準)、
 /// さらに `base_beat` (= [`synth_clips_with_base`] が割り当てた区間の原点) を足す。

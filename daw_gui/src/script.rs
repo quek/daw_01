@@ -1271,8 +1271,10 @@ fn daw_set_hover_beat(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> J
 fn daw_dispatch_split(_this: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     let snap = args.get_or_undefined(0).to_boolean();
     with_host(|host| {
-        host.app
-            .handle_event(AppEvent::SplitClipAtPlayhead { snap });
+        host.app.handle_event(AppEvent::SplitJoin(crate::event_split::SplitJoinEvent::Split {
+            surface: crate::event_split::SplitSurface::Clips,
+            at: crate::event_split::SplitAt::Cursor { snap },
+        }));
     });
     Ok(JsValue::undefined())
 }
@@ -1283,7 +1285,9 @@ fn daw_dispatch_glue(
     _ctx: &mut Context,
 ) -> JsResult<JsValue> {
     with_host(|host| {
-        host.app.handle_event(AppEvent::GlueSelectedClips);
+        host.app.handle_event(AppEvent::SplitJoin(crate::event_split::SplitJoinEvent::Join {
+            surface: crate::event_split::SplitSurface::Clips,
+        }));
     });
     Ok(JsValue::undefined())
 }

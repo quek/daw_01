@@ -16,6 +16,7 @@ use common::song_index::{LaneView, SongIndex};
 
 use super::{RowPhase, RowTimeSource, for_each_segment};
 use crate::audio_clip_renderer::{AudioClipRenderer, ClipRenderState, render_audio_events};
+use crate::note_ledger::NoteLedger;
 use crate::sequencer::{TimedNoteEvent, collect_events_for_buffer};
 
 /// この行の MIDI イベントを 1 buffer 分集める。
@@ -35,7 +36,7 @@ pub fn collect_row_midi(
     current_bpm: f32,
     frames: u32,
     out: &mut Vec<TimedNoteEvent>,
-    active_notes: &mut Vec<(u32, u8)>,
+    active_notes: &mut NoteLedger,
 ) {
     let Some(song) = song else { return };
     let Some(track) = song.tracks.get(track_idx as usize) else { return };
@@ -143,17 +144,17 @@ pub fn render_row_audio(
 
 /// 鳴っている note を `at` frame で全部止める (区間の切れ目の始末)。
 ///
-/// Off は note-on と同じ `note_id` を運ぶ (CLAP / VST3 は id 一致で voice を探す。
+/// Off は note-on で振った voice id と送った鍵盤を運ぶ (CLAP / VST3 は id 一致で voice を探す。
 /// `process_track_owned` の `pending_offs` と同じ約束)。 RT 安全: `out` の容量を超える分は
 /// 捨てる (再確保しない。 `copy_midi` と同じ規約)。
-fn flush_active(out: &mut Vec<TimedNoteEvent>, active_notes: &mut Vec<(u32, u8)>, at: u32) {
-    for &(note_id, key) in active_notes.iter() {
+fn flush_active(out: &mut Vec<TimedNoteEvent>, active_notes: &mut NoteLedger, at: u32) {
+    for s in active_notes.iter() {
         if out.len() >= out.capacity() {
             break;
         }
         out.push(TimedNoteEvent {
             time: at,
-            event: crate::sequencer::NoteTransition::Off { note_id, key },
+            event: crate::sequencer::NoteTransition::Off { note_id: s.voice_id, key: s.key },
         });
     }
     active_notes.clear();
@@ -384,7 +385,7 @@ mod tests {
         // playhead 3.99 の buffer は 3.99..4.0113 で、4 拍セルのループ端 (4.0) を跨ぐ。
         let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
         let mut out = Vec::with_capacity(256);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
         collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 3.99, 120.0, 512, &mut out, &mut active);
 
         let ons: Vec<u32> = out
@@ -427,7 +428,7 @@ mod tests {
         let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
         // 撃った直後の buffer: On が出る。
         let mut out = Vec::with_capacity(256);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
         collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
         assert!(
             out.iter().any(|e| matches!(
@@ -476,7 +477,7 @@ mod tests {
         // 120 BPM / 48 kHz / 512 frame = 0.0213333… 拍。
         let bpf = 512.0 * 120.0 / (60.0 * 48_000.0);
         let index = SongIndex::build(&song);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
         let mut ons = 0usize;
         let mut beat = launch;
         // 3 周ぶん (原点は 0 / 4 / 8 拍の 3 回) 刻む。11 拍で止めるのは、
@@ -523,13 +524,13 @@ mod tests {
             }),
         );
         let mut out = Vec::with_capacity(256);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
 
         // 1 buffer 目: セルが鳴り出す。
         let playing = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
         collect_row_midi(Some(&song), &SongIndex::build(&song), 0,playing, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
         assert_eq!(active.len(), 1, "セルの note が鳴っていない: {out:?}");
-        assert_eq!(active[0].1, 60, "セルの note が鳴っていない: {out:?}");
+        assert_eq!(active.iter().next().map(|s| s.key), Some(60), "セルの note が鳴っていない: {out:?}");
 
         // 2 buffer 目: 先頭ちょうどでアレンジへ返す (`switch_frame == 0`)。
         out.clear();
@@ -557,7 +558,7 @@ mod tests {
         let song = song_with_cell();
         let src = RowTimeSource::uniform(RowKey::track(1), RowPhase::Arranger);
         let mut out = Vec::with_capacity(256);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
         collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
         assert!(out.is_empty(), "アレンジには clip が無いのに鳴った: {out:?}");
     }
@@ -567,7 +568,7 @@ mod tests {
         let song = song_with_cell();
         let src = RowTimeSource::uniform(RowKey::track(1), RowPhase::Silent);
         let mut out = Vec::with_capacity(256);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
         collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
         assert!(out.is_empty());
     }
@@ -671,7 +672,7 @@ mod tests {
             let mut rt = LauncherRuntime::for_song(&song);
             let mut trace: Vec<(usize, u32, u8, bool)> = Vec::new();
             let mut out = Vec::with_capacity(256);
-            let mut active = Vec::with_capacity(256);
+            let mut active = NoteLedger::default();
             let mut beat = 0.0_f64;
             for buf in 0..400usize {
                 let span = BufferSpan::new(beat, 120.0, 48_000, 512);
@@ -785,7 +786,7 @@ mod rt_assert_tests {
         let mut rt = LauncherRuntime::for_song(&song);
         // 事前確保は off-RT (live では publish 側 / export では walk の頭)。
         let mut out = Vec::with_capacity(4096);
-        let mut active = Vec::with_capacity(1024);
+        let mut active = NoteLedger::default();
         let renderer = AudioClipRenderer::empty();
         let mut accum: Vec<(u64, f64)> = Vec::with_capacity(8);
         let mut engines = Vec::new();

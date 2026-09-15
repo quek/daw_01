@@ -1408,27 +1408,10 @@ pub enum AppEvent {
     /// フラグを立てる（render loop が次フレームで中断）。非 undoable。
     CancelExport,
 
-    // -------- Split / Glue (Phase 1 PR7) -----------------------------------
-    /// Split clip(s) at the **mouse cursor** (= `AppData
-    /// .arrangement_hover_beat` snapped, or `_raw` when `snap == false`
-    /// for the Alt+E variant). Falls back to the playhead when the
-    /// cursor is outside the arrangement canvas. Operates on the clip
-    /// the cursor is hovering over; if there is no hovered clip,
-    /// falls back to `selected_clips`. Works on MIDI / Audio / Vocal
-    /// clips alike (`docs/plan_audio_clip.md` §3.3.1): the back half
-    /// gets a freshly-allocated `ContentId` and `notes` / `events` are
-    /// partitioned by the split beat. Bound to `E` (snap on) and
-    /// `Alt+E` (snap off).
-    SplitClipAtPlayhead { snap: bool },
-
-    /// Glue (Consolidate) the currently selected clips into a single
-    /// clip per track. All clips must be the same kind (MIDI / Audio
-    /// / Vocal) — mixed-kind selections are rejected with a status
-    /// message (§3.3.2). Result clip spans `min(start_beat) .. max(end
-    /// _beat)` and inherits a fresh `ContentId` carrying every event /
-    /// note from the source clips with offsets re-aligned to the new
-    /// clip start. Gaps between clips become silent ranges. Bound to `J`.
-    GlueSelectedClips,
+    // -------- Split / Glue -------------------------------------------------
+    /// r.md #132: 分割 (`E` / `Alt+E` / `Shift+E`) と結合 (`J`)。 ノート / クリップ /
+    /// オーディオ event の全部をこの 1 本で運ぶ (「1 arm = 1 サブ enum」)。
+    SplitJoin(crate::event_split::SplitJoinEvent),
 
     // -------- Audio event field edits (Phase 2 PR1) ------------------------
     /// Toggle `AudioEvent.reversed` for every event in the selected
@@ -1788,8 +1771,8 @@ impl AppEvent {
             E::CloneClipsLinked(..) | E::CloneClipsIndependent(..) => "クリップ複製",
             E::MakeClipUnique(..) => "クリップを独立化",
             E::CommitRenameClip => "クリップ名変更",
-            E::SplitClipAtPlayhead { .. } => "クリップ分割",
-            E::GlueSelectedClips => "クリップ結合",
+            // ラベルの SSoT はサブ enum 側 (`Launcher` と同じ)。
+            E::SplitJoin(ev) => ev.undo_label(),
             E::SetClipColor { .. } => "クリップ色変更",
             E::SetAutomationClipColor { .. } => "オートメーションクリップ色変更",
             E::SetAutomationLaneColor { .. } => "レーン色変更",

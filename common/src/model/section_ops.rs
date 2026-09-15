@@ -441,8 +441,11 @@ impl Song {
                     right.start_beat = beat;
                     right.length_beats = len - cut;
                     right.content_offset_beats = off + cut;
+                    // 切り口の両側は新しい端 (張り出しを継がない、`ClipWindow::clear_overhang`)。
+                    right.clear_overhang(true, false);
                     self.tracks[ti].clips[i].content_id = cid;
                     self.tracks[ti].clips[i].length_beats = cut;
+                    self.tracks[ti].clips[i].clear_overhang(false, true);
                     self.tracks[ti].clips.insert(i + 1, right);
                     i += 2;
                 } else {

@@ -332,9 +332,14 @@ pub fn carry_vowel_after(notes: &[Note], carry_in: Option<char>) -> Option<char>
     carried
 }
 
+/// 長音符 (prolonged sound mark、全角 U+30FC)。 歌詞に置くと「直前の母音を伸ばす」
+/// (`resolve_sing_lyric`)。 ノートを割ったときの後ろの片の歌詞もこれ
+/// (`MidiContent::split_notes`)。
+pub const PROLONGED_SOUND_MARK: char = 'ー';
+
 /// 長音符 (prolonged sound mark)。全角 `ー` (U+30FC) と半角 `ｰ` (U+FF70)。
 fn is_prolongation(ch: char) -> bool {
-    matches!(ch, 'ー' | 'ｰ')
+    matches!(ch, PROLONGED_SOUND_MARK | 'ｰ')
 }
 
 /// 仮名 1 文字の母音を **ひらがな母音** (あ/い/う/え/お) で返す。母音を持たない

@@ -11,7 +11,54 @@
 //! なのと同じ形。
 
 use crate::state::*;
-use common::model::{ClipKey, LaneRef};
+use common::model::{ClipKey, ContentId, LaneRef};
+
+/// ピアノロールの packed note id を解決した 1 件 ([`AppData::resolve_note_entries`])。
+pub(crate) struct NoteEntry<T> {
+    /// 所属 content の代表 slot (その content を見せている entry のうち最小の slot)。
+    pub rep_slot: usize,
+    /// この entry を表示していた slot (座標系 = そのクリップの content 原点)。
+    pub slot: usize,
+    /// content 内の index。
+    pub local: usize,
+    pub payload: T,
+}
+
+impl AppData {
+    /// packed note id の `entries` を [`NoteEntry`] (所属 content の代表 slot / 表示していた slot /
+    /// content 内 index / payload) に解決する。 範囲外 slot / ロック中クリップの entry は落とす。
+    ///
+    /// **同じノートが複数の packed id を持ちうる**のが要点 — 同じ content を linked clip 2 本で
+    /// 同時に表示すると、ノートは slot ごとに別の id で出る (矩形選択は表示中の全クリップに
+    /// 鍵盤行を足す)。 content を編集する側は代表 slot でまとめて content ごとに 1 回だけ
+    /// 触る ([`Self::for_each_note_clip_group`]、表示していた slot ごとの座標系が要る分割は
+    /// `handler::split`)。 代表 slot = その content を見せている entry のうち最小の slot。
+    pub(crate) fn resolve_note_entries<T>(
+        &self,
+        shown: &[ClipKey],
+        entries: impl IntoIterator<Item = (u32, T)>,
+    ) -> Vec<NoteEntry<T>> {
+        let song = self.cur.song_doc.song();
+        let mut out: Vec<(ContentId, NoteEntry<T>)> = Vec::new();
+        for (id, payload) in entries {
+            let slot = Self::note_id_clip_slot(id);
+            let Some(&r) = shown.get(slot) else { continue };
+            if self.is_pianoroll_clip_locked_in(shown, r) {
+                continue;
+            }
+            let Some(content) = song.clip_by_key(r).map(|c| c.content_id) else {
+                continue;
+            };
+            let local = Self::note_id_local_index(id);
+            out.push((content, NoteEntry { rep_slot: slot, slot, local, payload }));
+        }
+        let mut rep: std::collections::HashMap<ContentId, usize> = std::collections::HashMap::new();
+        for (content, e) in &out {
+            rep.entry(*content).and_modify(|s| *s = (*s).min(e.slot)).or_insert(e.slot);
+        }
+        out.into_iter().map(|(content, e)| NoteEntry { rep_slot: rep[&content], ..e }).collect()
+    }
+}
 
 impl AppData {
     /// 選択されているノート (packed note id)。 **範囲からの導出**。

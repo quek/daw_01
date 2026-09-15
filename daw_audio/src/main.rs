@@ -41,6 +41,7 @@ mod mixer;
 mod mod_plan_publish;
 mod mod_tick;
 mod native_dsp;
+mod note_ledger;
 mod offline_jobs;
 mod project_ctl;
 mod sampler;

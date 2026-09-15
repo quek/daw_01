@@ -647,6 +647,8 @@ impl crate::model::ClipWindow for AutomationClip {
     fn set_window_offset(&mut self, v: f64) {
         self.content_offset_beats = v;
     }
+    /// オートメーションクリップは窓の外へ張り出さない。
+    fn clear_overhang(&mut self, _lead: bool, _tail: bool) {}
 }
 
 impl AutomationLane {
