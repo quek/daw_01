@@ -94,8 +94,13 @@ fn 無効化は_state_を書き戻してから降ろし_有効化と_undo_redo_�
     let msgs = drain(&mut plugin_rx);
     assert_eq!(set_slot_states(&msgs, device_id), vec![Some(vec![7, 7, 7])], "{msgs:?}");
 
-    // undo (= 無効へ戻る): 応答待ちの load も居るべきでないので降ろす。
+    // undo (= 無効へ戻る): 応答待ちの load も居るべきでないので降ろす — 降ろす前に state の往復を挟む。
     app.handle_event(AppEvent::Undo);
+    let msgs = drain(&mut plugin_rx);
+    assert!(msgs.iter().any(|m| matches!(m, PluginCommand::RequestAllStates { .. })), "{msgs:?}");
+    assert_eq!(removes(&msgs, device_id), 0, "state を取り寄せる前に降ろさない: {msgs:?}");
+    assert!(app.cur.song_doc.song().track_effectively_enabled(track_id), "取り寄せの間は動かさない");
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
     let msgs = drain(&mut plugin_rx);
     assert!(!app.cur.song_doc.song().track_effectively_enabled(track_id));
     assert_eq!(removes(&msgs, device_id), 1, "{msgs:?}");
@@ -278,7 +283,10 @@ fn undo_redo_で有効へ戻るときも読み込み中を構造より先に届�
     assert!(loading_sets(&msgs).iter().any(|&(i, ref ids)| i < enabled && ids.contains(&device_id)), "{msgs:?}");
     assert!(position(&msgs, |m| matches!(m, AudioCommand::Stop { .. })).is_none(), "{msgs:?}");
 
+    // 無効へ戻る redo は plugin を降ろすので、state の往復の後に動く。
     app.handle_event(AppEvent::Redo);
+    assert!(app.cur.song_doc.song().track_effectively_enabled(track_id), "取り寄せの間は動かさない");
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
     let msgs = drain(&mut audio_rx);
     let disabled = load_song_at(&msgs, track_id, false).expect("構造");
     let close = position(&msgs, |m| matches!(m, AudioCommand::ClosePluginShmem { device_id: d, .. } if *d == device_id));

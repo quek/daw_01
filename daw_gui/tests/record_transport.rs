@@ -371,6 +371,52 @@ fn 押しっぱなしのノートは録音終了で長さが確定する() {
     );
 }
 
+/// 録音 take の最中に触ったツマミ / インスペクタの数値欄 / カラーピッカーの bracket は take の step に入り、
+/// それらを閉じても take は割れない (以後のノートも同じ step)。take を閉じた後の操作は別 step。
+#[test]
+fn take_の最中のツマミと数値欄は_take_を割らない() {
+    use common::model::{AutomationTarget, TrackBuiltinParam};
+    use daw_gui::app::{ColorPickerTarget, ParamSurface};
+    let (mut app, _a, _p) = build_app();
+    let track_id = arm_first_track(&mut app);
+    let before = app.cur.song_doc.history_current();
+    let base_volume = app.cur.song_doc.song().tracks[0].volume;
+    let note = |app: &mut AppData, pitch: u8, from: f64, to: f64| {
+        tick(app, true, true, samples_at_beat(from));
+        app.handle_event(AppEvent::MidiNoteOn { channel: 0, pitch, velocity: 100 });
+        tick(app, true, true, samples_at_beat(to));
+        app.handle_event(AppEvent::MidiNoteOff { channel: 0, pitch });
+    };
+    let volume = AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume);
+
+    app.handle_event(AppEvent::ToggleMidiRecording);
+    note(&mut app, 60, 0.0, 1.0);
+    let surface = ParamSurface::MixerStrip;
+    app.handle_event(AppEvent::ParamGestureBegin { surface, track_id, target: volume.clone() });
+    app.handle_event(AppEvent::SetTrackVolume { track: track_id, amp: 0.5 });
+    app.handle_event(AppEvent::ParamGestureEnd { surface, track_id, target: volume });
+    note(&mut app, 62, 1.0, 2.0);
+    app.handle_event(AppEvent::BeginInspectorScrub);
+    app.handle_event(AppEvent::SetTrackVolume { track: track_id, amp: 0.25 });
+    app.handle_event(AppEvent::EndInspectorScrub);
+    let rect = daw_ui_renderer::Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+    app.open_color_picker(ColorPickerTarget::Track(track_id), rect);
+    app.close_color_picker();
+    note(&mut app, 64, 2.0, 3.0);
+    assert!(app.cur.song_doc.gesture_active(), "内側の bracket を閉じても take は開いたまま");
+    app.handle_event(AppEvent::ToggleMidiRecording);
+
+    assert_eq!(recorded_notes(&app).len(), 3);
+    assert_eq!(app.cur.song_doc.history_current(), before + 1, "take は 1 step: {:?}", app.cur.song_doc.history_labels());
+    app.handle_event(AppEvent::SetTrackVolume { track: track_id, amp: 0.75 });
+    assert_eq!(app.cur.song_doc.history_current(), before + 2, "take の後の操作は別 step");
+    app.handle_event(AppEvent::Undo);
+    assert_eq!(recorded_notes(&app).len(), 3, "take の後の操作だけ戻る");
+    app.handle_event(AppEvent::Undo);
+    assert!(recorded_notes(&app).is_empty(), "もう 1 回で take がノートもツマミも数値欄もまとめて戻る");
+    assert_eq!(app.cur.song_doc.song().tracks[0].volume, base_volume);
+}
+
 /// 録音待機トラックは transport 状態に関わらず入力を発音する
 /// (インプットモニター)。旧実装はこの経路が無く、弾いても音が鳴らなかった。
 #[test]

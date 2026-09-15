@@ -90,7 +90,7 @@ pub use crate::event::{
 };
 
 pub use crate::state::{
-    AppData, DeviceParamKey, EditScope, IpcState, MediaState, ParamSurface, RecordingState, ScrubGesture,
+    AppData, DeviceParamKey, EditScope, GestureOwner, IpcState, MediaState, ParamSurface, RecordingState, ScrubGesture,
     SelectionState, SongDoc, StreamGesture, TransportState, UiEphemeral, UiPrefs, VoicevoxState,
 };
 
@@ -808,7 +808,7 @@ impl AppData {
                 // bracket する (= ParamGestureBegin と同 idiom)。これが無いと per-frame の
                 // `SetGroupTransformField` が各々 fresh な event_scope で snapshot を積み、
                 // 1 回の drag が undo 履歴を大量の step で埋める。group lane recording は未対応。
-                self.cur.song_doc.begin_gesture();
+                self.cur.song_doc.begin_gesture(GestureOwner::GroupTransformDrag);
             }
             AppEvent::SetGroupTransformField { track_id, param, value } => {
                 // scrubable_number / preview drag からの live 設定。inspector は
@@ -816,23 +816,23 @@ impl AppData {
                 self.set_group_transform_field(track_id, param, value);
             }
             AppEvent::EndGroupTransformDrag => {
-                self.cur.song_doc.end_gesture();
+                self.cur.song_doc.end_gesture(GestureOwner::GroupTransformDrag);
             }
             // r.md #28: inspector scrubable_number の drag / text 編集 stroke を 1 undo step に
             // bracket する。arch refactor で `is_undoable` whitelist を撤去した際、この Begin/End
             // が no-op のまま残り、per-frame の Set* 編集が各々 undo step を積んでいた (= 1 drag で
             // 履歴が溢れる)。ParamGestureBegin/End と同じ begin_gesture/end_gesture で塞ぐ。
             AppEvent::BeginInspectorScrub => {
-                self.cur.song_doc.begin_gesture();
+                self.cur.song_doc.begin_gesture(GestureOwner::InspectorScrub);
             }
             AppEvent::EndInspectorScrub => {
-                self.cur.song_doc.end_gesture();
+                self.cur.song_doc.end_gesture(GestureOwner::InspectorScrub);
             }
             AppEvent::BeginImagePiPDrag => {
                 // r.md #28: preview canvas 上の image PiP drag 全体を 1 undo step に bracket
                 // する (per-frame の `SetClipImageX/Y/W/H/Rotation` が各々 snapshot を積んで
                 // undo 履歴を溢れさせない = group transform / inspector scrub と同 idiom)。
-                self.cur.song_doc.begin_gesture();
+                self.cur.song_doc.begin_gesture(GestureOwner::ImagePipDrag);
                 // lane recording seed: selected_clip が指す image track に対し、lane を持つ
                 // field を `active_param_gestures` に登録する。record_automation_points_for
                 // _tick が再生中に 1/64 beat 刻みで point を打ち続ける。drag end (= MouseInput
@@ -841,7 +841,7 @@ impl AppData {
             }
             AppEvent::EndImagePiPDrag => {
                 self.end_image_pip_drag_recording();
-                self.cur.song_doc.end_gesture();
+                self.cur.song_doc.end_gesture(GestureOwner::ImagePipDrag);
             }
             AppEvent::SetRecordingMode(mode) => {
                 self.cur.recording.recording_mode = mode;
@@ -1730,12 +1730,12 @@ impl AppData {
             AppEvent::BeginTextPiPDrag => {
                 // r.md #28: preview canvas 上の text PiP drag 全体を 1 undo step に bracket
                 // する (image PiP と同 idiom)。
-                self.cur.song_doc.begin_gesture();
+                self.cur.song_doc.begin_gesture(GestureOwner::TextPipDrag);
                 self.begin_text_pip_drag_recording();
             }
             AppEvent::EndTextPiPDrag => {
                 self.end_text_pip_drag_recording();
-                self.cur.song_doc.end_gesture();
+                self.cur.song_doc.end_gesture(GestureOwner::TextPipDrag);
             }
             AppEvent::SetClipTextMuted { target, muted } => {
                 // 字幕 clip mute も clip-level `Clip.muted` に一本化。

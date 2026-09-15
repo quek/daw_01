@@ -175,48 +175,47 @@ pub fn compute_slot_reconcile_actions(
     loaded_devices: &HashMap<u64, LoadedDeviceInfo>,
     pending_loads: &HashMap<u64, u64>,
 ) -> Vec<SlotReconcileAction> {
-    // Song 側で host slot を持つ device (= 映像でない device) の id 集合。
-    // 内蔵映像効果は plugin_host に載らない device なので、 ここに混ぜると
-    // 毎回 `LoadDevice` が出て「load 応答が来ない device」 が永久に溜まる。
-    let mut song_host_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut actions = Vec::new();
-
-    for inst in song.live_plugins() {
-        if inst.ports.is_video() {
-            continue;
-        }
-        song_host_ids.insert(inst.id);
-        // 応答待ちの load がある device は送り直さない (編集の直後に実体化した device をここで二重に load しない)。
-        let need_load = !pending_loads.contains_key(&inst.id)
-            && match loaded_devices.get(&inst.id) {
-                None => true,
-                Some(info) => info.plugin_id_str != inst.plugin_id,
-            };
-        if !need_load {
-            continue;
-        }
-        actions.push(SlotReconcileAction::LoadDevice {
-            device_id: inst.id,
-            plugin_id_str: inst.plugin_id.clone(),
-            initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
-        });
-    }
-
     // (1) host にあるが Song に無い device → RemoveDevice。 **余剰を落として
-    //     から load する** 順序は現行仕様なので、 先頭へ差し込む。
-    let mut host_extra: Vec<u64> = loaded_devices
-        .keys()
-        .chain(pending_loads.keys())
-        .copied()
-        .filter(|id| !song_host_ids.contains(id))
-        .collect();
-    host_extra.sort_unstable();
-    host_extra.dedup();
-    let removals: Vec<SlotReconcileAction> = host_extra
+    //     から load する** 順序は現行仕様なので、 先頭に置く。
+    let mut out: Vec<SlotReconcileAction> = compute_slot_removals(song, loaded_devices, pending_loads)
         .into_iter()
         .map(|device_id| SlotReconcileAction::RemoveDevice { device_id })
         .collect();
-    let mut out = removals;
-    out.append(&mut actions);
+    for inst in host_plugins(song) {
+        // 応答待ちの load がある device は送り直さない (編集の直後に実体化した device をここで二重に load しない)。
+        let need_load = !pending_loads.contains_key(&inst.id)
+            && loaded_devices.get(&inst.id).is_none_or(|info| info.plugin_id_str != inst.plugin_id);
+        if need_load {
+            out.push(SlotReconcileAction::LoadDevice {
+                device_id: inst.id,
+                plugin_id_str: inst.plugin_id.clone(),
+                initial_state: inst.state.as_deref().map(<[u8]>::to_vec),
+            });
+        }
+    }
     out
+}
+
+/// host に載っている / 読み込み応答待ちの device のうち、`song` では host に居るべきでないもの (id 昇順 = host 側 map の
+/// iteration 順に依存しない)。[`compute_slot_reconcile_actions`] の `RemoveDevice` と同じ集合で、履歴ジャンプが
+/// **動かす前に**「このジャンプで host から降りる device があるか」(= 降ろす前に plugin state を取り寄せるか) を
+/// 行き先の Song から求めるのにも使う。
+#[must_use]
+pub fn compute_slot_removals(
+    song: &common::model::Song,
+    loaded_devices: &HashMap<u64, LoadedDeviceInfo>,
+    pending_loads: &HashMap<u64, u64>,
+) -> Vec<u64> {
+    let host: std::collections::HashSet<u64> = host_plugins(song).map(|p| p.id).collect();
+    let mut extra: Vec<u64> =
+        loaded_devices.keys().chain(pending_loads.keys()).copied().filter(|id| !host.contains(id)).collect();
+    extra.sort_unstable();
+    extra.dedup();
+    extra
+}
+
+/// `song` で plugin host に居るべき plugin (`Song::live_plugins` のうち映像でないもの)。内蔵映像効果は plugin_host に
+/// 載らない device なので、ここに混ぜると毎回 `LoadDevice` が出て「load 応答が来ない device」が永久に溜まる。
+fn host_plugins(song: &common::model::Song) -> impl Iterator<Item = &common::model::PluginInstance> {
+    song.live_plugins().filter(|p| !p.ports.is_video())
 }

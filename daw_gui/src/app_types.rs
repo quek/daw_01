@@ -11,7 +11,7 @@ use common::plugin_db::PluginDatabase;
 /// 名前を引けるよう、ここで再輸出する。
 pub use crate::device_addr::{
     DEVICE_DRAG_KIND, DeviceDragPayload, InsertAt, LoadedDeviceInfo, RelocateDevices,
-    SlotReconcileAction, compute_slot_reconcile_actions, device_id_at, device_owner_track,
+    SlotReconcileAction, compute_slot_reconcile_actions, compute_slot_removals, device_id_at, device_owner_track,
     find_device_by_id,
 };
 /// インスペクタの chain list の行モデルは [`crate::chain_rows`] が持つ (同じく不変条件 9 で
@@ -1482,7 +1482,7 @@ pub(crate) fn midi_content_in_clip_mut(
 
 /// `RequestAllStates` の発行理由。 plugin_host から `AllPluginStates`
 /// が返ってくるまで [`AppData::pending_state_queue`] に保持し、 応答時に
-/// 対応する完了処理 (save または deferred edit) を実行する。
+/// 対応する完了処理 (save / deferred edit / 履歴ジャンプ / copy) を実行する。
 ///
 /// 連続した編集 (例: 2 連続 delete_track) は queue に積まれ、 各々が
 /// 自前の `RequestAllStates` 応答を待ってから順次実行される。 これで
@@ -1513,6 +1513,9 @@ pub enum PendingStateRequest {
     /// `label` は発注した操作の履歴ラベル (完了を運ぶ `AllPluginStates` の名前で積まない)。
     /// 積むのは [`AppData::enqueue_deferred_edit`](crate::state::AppData::enqueue_deferred_edit)。
     Deferred { edit: DeferredEdit, label: &'static str },
+    /// plugin を host から降ろす履歴ジャンプ (undo / redo / 履歴リストの行) と、往復待ちの要求の後に来た履歴ジャンプ。
+    /// 最新の state を live と履歴の全 Song に書き戻してから動かす (`handler::history`)。
+    HistoryJump(crate::state::HistoryJump),
     /// copy (Ctrl+C)。state 書き戻し後の live song から対象を最新 plugin state
     /// 込みで serialize して `pending_clipboard_write` に積むだけ (Song 不変)。
     /// **undo snapshot は積まない** (copy は履歴を汚さない) ので `Deferred` とは
@@ -1538,6 +1541,8 @@ pub enum DeferredEdit {
     /// トラック削除 (r.md #43)。 選択集合を **1 件にまとめて** 持つ — id ごとに
     /// enqueue すると round-trip が分かれて undo が N ステップに割れる。
     DeleteTracks { track_ids: Vec<u32> },
+    /// 末尾トラックの削除 (`AppEvent::RemoveLastTrack`)。どれが末尾かは実行時の Song で決める。
+    RemoveLastTrack,
     /// r.md #131: トラックの無効化 (plugin を host から降ろすので state を書き戻してから)。
     DisableTracks { track_ids: Vec<u32> },
     /// r.md #131: 無効な group の中へのトラック移動 (同上)。

@@ -152,8 +152,8 @@ pub enum AppEvent {
     /// (毎フレーム確定すると掴んでいる間ずっと engine を叩き、設定ファイルも書き続ける)。
     SetVoicevoxChunkSecs { secs: f32, commit: bool },
     /// r.md #29: 履歴リストの行 click。 `index` = [`crate::state::SongDoc::history_labels`]
-    /// の 0 始まり index。 その state まで一気に Undo / Redo する
-    /// ([`crate::state::SongDoc::jump_to`])。 履歴操作自体は Undo 対象外。
+    /// の 0 始まり index。 その state まで一気に Undo / Redo する (受けた瞬間に行を state の識別子へ直す、
+    /// [`crate::state::HistoryJump::ToState`])。 履歴操作自体は Undo 対象外。
     JumpHistory(usize),
     QuantizeSelectedNotes(u8),
     /// 鍵盤レーン click のピッチプレビュー (gui_01 #055,
