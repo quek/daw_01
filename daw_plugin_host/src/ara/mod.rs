@@ -23,7 +23,7 @@ pub mod vst3_ara;
 
 use anyhow::Result;
 
-use crate::ara::session::{AraSession, Retired, StartTable};
+use crate::ara::session::{AraSession, Retired, Starts};
 pub use crate::ara::session::SavedArchive;
 
 /// One `SetupAraDocument` edit handed to a plug-in's ARA session ([`AraSession::set_clips`]).
@@ -32,8 +32,8 @@ pub struct AraEdit<'a> {
     pub bpm: f64,
     pub time_sig: (u16, u16),
     pub archive: Option<SavedArchive<'a>>,
-    /// How each created modification starts ([`states::AraStates::resolve_starts`]).
-    pub starts: &'a StartTable,
+    /// How each created object starts ([`states::AraStates::resolve_starts`]).
+    pub starts: &'a Starts,
 }
 
 /// Backend hooks for the shared ARA lifecycle dance ([`run_setup_ara`] /

@@ -229,36 +229,36 @@ impl AraDocumentController {
         (ok != 0).then_some(writer.data)
     }
 
-    /// Serialise **only** the state of `modification` into a partial archive
-    /// (`ARAStoreObjectsFilter`, no document data, no audio sources) — the
-    /// host's copy of an object it is about to destroy, restored if the object
-    /// comes back (ARAInterface.h "Partial Document Persistency": ARA 2 plug-ins
-    /// "are required to fully support it"). Call outside an editing session
-    /// ("Archives may only be created from documents that are not being
-    /// currently edited"). `None` if unsupported or the store failed.
-    pub fn store_modification_to_archive(&self, modification: ARAAudioModificationRef) -> Option<Vec<u8>> {
-        self.store_modifications_to_archive(&[modification])
-    }
-
-    /// [`Self::store_modification_to_archive`] for several modifications in one partial archive (no document data:
-    /// ARAInterface.h `ARAStoreObjectsFilter::documentData` "should be set to kARAFalse if the archive is intended
-    /// for copy/paste or other means of data import/export between documents").
-    pub fn store_modifications_to_archive(&self, refs: &[ARAAudioModificationRef]) -> Option<Vec<u8>> {
+    /// Serialise **only** the state of `sources` and `modifications` into one partial archive
+    /// (`ARAStoreObjectsFilter`, no document data) — the host's copy of objects it is about to destroy, or of
+    /// objects copied into another document (ARAInterface.h "Partial Document Persistency": ARA 2 plug-ins "are
+    /// required to fully support it"; `documentData` "should be set to kARAFalse if the archive is intended for
+    /// copy/paste or other means of data import/export between documents"). A modification copied into a
+    /// document whose audio source has no state yet travels with its source's state ("Restoring an audio
+    /// modification without restoring its underlying audio source may not succeed if the audio source state has
+    /// changed since storing the audio modification"). Call outside an editing session ("Archives may only be
+    /// created from documents that are not being currently edited"). `None` if unsupported, nothing to store, or
+    /// the store failed.
+    pub fn store_partial_archive(
+        &self,
+        sources: &[ARAAudioSourceRef],
+        modifications: &[ARAAudioModificationRef],
+    ) -> Option<Vec<u8>> {
         let store = self.interface.storeObjectsToArchive?;
-        if refs.is_empty() {
+        if sources.is_empty() && modifications.is_empty() {
             return None;
         }
         let filter = ara_sys::ARAStoreObjectsFilter {
             structSize: core::mem::size_of::<ara_sys::ARAStoreObjectsFilter>(),
             documentData: ARABool::from(false),
-            audioSourceRefsCount: 0,
-            audioSourceRefs: ptr::null(),
-            audioModificationRefsCount: refs.len(),
-            audioModificationRefs: refs.as_ptr(),
+            audioSourceRefsCount: sources.len(),
+            audioSourceRefs: if sources.is_empty() { ptr::null() } else { sources.as_ptr() },
+            audioModificationRefsCount: modifications.len(),
+            audioModificationRefs: if modifications.is_empty() { ptr::null() } else { modifications.as_ptr() },
         };
         let mut writer = host_controllers::AraArchiveWriter::default();
         let writer_ref = ptr::from_mut(&mut writer) as ara_sys::ARAArchiveWriterHostRef;
-        // SAFETY: `filter` and `refs` outlive the call; ARA only reads them during it.
+        // SAFETY: `filter` and the ref arrays outlive the call; ARA only reads them during it.
         let ok = unsafe { store(self.controller_ref, writer_ref, &filter) };
         (ok != 0 && !writer.data.is_empty()).then_some(writer.data)
     }

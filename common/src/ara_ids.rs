@@ -69,6 +69,13 @@ pub fn take_modification_id(content: ContentId, take: u32, source: AudioSourceId
     format!("{TAKE_PREFIX}{content}.{take}.{source}")
 }
 
+/// modification の persistent id `modification` ([`take_modification_id`] の形) が乗る audio source の persistent id
+/// (同じ id の空間)。 安定 id の形でなければ `None`。
+#[must_use]
+pub fn modification_source_id(modification: &str) -> Option<String> {
+    parse_modification_id(modification).map(|(_, _, source)| source_id(source))
+}
+
 /// 写した元の take ([`TakeOrigin`]) の modification の persistent id (元のプロジェクトの id の空間)。
 #[must_use]
 pub fn origin_modification_id(origin: &TakeOrigin) -> String {
@@ -290,5 +297,7 @@ mod tests {
         assert_eq!(remapped, expected);
         assert_eq!(archived_id(&remapped, &take_modification_id(20, 1, 30)), Some(take_modification_id(10, 1, 3).as_str()));
         assert_eq!(archived_id(&remapped, &take_modification_id(10, 1, 3)), None, "移った後の目次に元の今の id は無い");
+        assert_eq!(modification_source_id(&take_modification_id(10, 1, 3)), Some(source_id(3)));
+        assert_eq!(modification_source_id("4:7:0/mod"), None, "旧い位置由来の id は安定 id の形でない");
     }
 }

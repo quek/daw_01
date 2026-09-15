@@ -60,6 +60,14 @@ pub struct SavedArchive<'a> {
     pub ids: &'a [AraArchiveEntry],
 }
 
+/// A partial archive kept outside this edit (another document's live state, a destroyed modification's
+/// state, a closed document, the clipboard's copy), holding an object's state under `archived`.
+#[derive(Debug, Clone)]
+pub struct KeptArchive {
+    pub bytes: Arc<[u8]>,
+    pub archived: String,
+}
+
 /// Where a created audio modification's state comes from, as resolved by the host
 /// ([`crate::ara::graph_plan::modification_start`], materialised by
 /// [`crate::ara::states::AraStates::resolve_starts`]). A modification with no entry starts empty.
@@ -69,17 +77,34 @@ pub enum Start {
     Saved(String),
     /// `cloneAudioModification` of this modification, which was in the document before the edit and survives it.
     Clone(String),
-    /// A partial archive kept outside this edit (another document's live state, a destroyed modification's
-    /// state, the clipboard's copy), holding the state under `archived`.
-    Restore { bytes: Arc<[u8]>, archived: String },
+    /// A partial archive kept outside this edit.
+    Restore(KeptArchive),
 }
 
-/// [`Start`] per created modification id.
-pub type StartTable = HashMap<String, Start>;
+/// How the objects an edit creates start ([`crate::ara::states::AraStates::resolve_starts`]).
+#[derive(Debug, Default)]
+pub struct Starts {
+    /// Per created audio modification id.
+    pub modifications: HashMap<String, Start>,
+    /// Per created audio source id the saved archive does not hold: a partial archive holding its state (it
+    /// travels with the modifications copied onto it from another document). A source with no entry is restored
+    /// from the saved archive if that holds it, else starts unanalysed.
+    pub sources: HashMap<String, KeptArchive>,
+}
 
-/// The state of each audio modification an edit destroyed, taken just before destroying it
-/// (`(persistent id, partial archive)`). ARAInterface.h "Partial Document Persistency".
-pub type Retired = Vec<(String, Vec<u8>)>;
+/// One partial archive of audio modifications together with their audio sources' state
+/// ([`AraSession::store_modifications`]): the bytes and the `(modification id, source id)` it holds.
+pub type ModificationsArchive = (Vec<u8>, Vec<(String, String)>);
+
+/// The state of the audio modifications an edit destroyed, taken just before destroying them into one partial
+/// archive (ARAInterface.h "Partial Document Persistency"), together with the state of the audio sources destroyed
+/// with them (so a copy into another document still has the source's state once this document no longer holds it).
+/// `modifications` = `(modification id, its source's id, whether the archive holds the source's state)`.
+#[derive(Debug, Default)]
+pub struct Retired {
+    pub bytes: Vec<u8>,
+    pub modifications: Vec<(String, String, bool)>,
+}
 
 /// A host model audio source + its plug-in-side ref, owned for the session's life.
 struct OwnedSource {
@@ -102,8 +127,8 @@ struct OwnedModification {
 enum RestoreFrom {
     /// The saved archive, the state written under this id.
     Saved(String),
-    /// A partial archive holding the state under `archived`.
-    Kept { bytes: Arc<[u8]>, archived: String },
+    /// A partial archive kept outside this edit.
+    Kept(KeptArchive),
 }
 
 /// A playback region on one modification.
@@ -244,24 +269,45 @@ impl AraSession {
         self.modifications.iter().any(|m| m.persistent_id == id)
     }
 
-    /// A partial archive of the audio modification `id`'s state (`None` if it is not in the document or the store
-    /// failed). Outside an editing cycle.
-    pub fn store_modification(&self, id: &str) -> Option<Vec<u8>> {
-        let m = self.modifications.iter().find(|m| m.persistent_id == id)?;
-        self.controller.store_modification_to_archive(m.modification_ref)
+    /// Whether the audio source `id` is in the document now.
+    pub fn has_source(&self, id: &str) -> bool {
+        self.sources.iter().any(|s| s.persistent_id == id)
     }
 
-    /// Partial archives of the audio modifications `ids` in one archive (the ones in the document; `None` if none
-    /// is, or the store failed) and the ids it holds. Outside an editing cycle.
-    pub fn store_modifications(&self, ids: &HashSet<&str>) -> Option<(Vec<u8>, Vec<String>)> {
+    /// A partial archive of the audio modification `id`'s state together with its audio source's state (for a
+    /// copy into another document), and the source's id. `None` if it is not in the document or the store failed.
+    /// Outside an editing cycle.
+    pub fn store_modification(&self, id: &str) -> Option<(Vec<u8>, String)> {
+        let (bytes, mut held) = self.store_modifications(&HashSet::from([id]))?;
+        Some((bytes, held.pop()?.1))
+    }
+
+    /// One partial archive of the audio modifications `ids` (the ones in the document) with their audio sources'
+    /// state, and the `(modification id, source id)` it holds. `None` if none is in the document or the store
+    /// failed. Outside an editing cycle.
+    pub fn store_modifications(&self, ids: &HashSet<&str>) -> Option<ModificationsArchive> {
         let held: Vec<&OwnedModification> =
             self.modifications.iter().filter(|m| ids.contains(m.persistent_id.as_str())).collect();
         if held.is_empty() {
             return None;
         }
-        let refs: Vec<ARAAudioModificationRef> = held.iter().map(|m| m.modification_ref).collect();
-        let bytes = self.controller.store_modifications_to_archive(&refs)?;
-        Some((bytes, held.iter().map(|m| m.persistent_id.clone()).collect()))
+        let modification_refs: Vec<ARAAudioModificationRef> = held.iter().map(|m| m.modification_ref).collect();
+        let source_refs = self.source_refs(held.iter().map(|m| m.source_id.as_str()));
+        let bytes = self.controller.store_partial_archive(&source_refs, &modification_refs)?;
+        Some((bytes, held.iter().map(|m| (m.persistent_id.clone(), m.source_id.clone())).collect()))
+    }
+
+    /// A partial archive of only the audio source `id`'s state. `None` if it is not in the document or the store
+    /// failed. Outside an editing cycle.
+    pub fn store_source(&self, id: &str) -> Option<Vec<u8>> {
+        let source = self.sources.iter().find(|s| s.persistent_id == id)?;
+        self.controller.store_partial_archive(&[source.source_ref], &[])
+    }
+
+    /// The refs of the audio sources `ids` in the document (each once).
+    fn source_refs<'a>(&self, ids: impl Iterator<Item = &'a str>) -> Vec<ARAAudioSourceRef> {
+        let ids: HashSet<&str> = ids.collect();
+        self.sources.iter().filter(|s| ids.contains(s.persistent_id.as_str())).map(|s| s.source_ref).collect()
     }
 
     /// Edit the document's model graph in place to match `clips`
@@ -272,7 +318,7 @@ impl AraSession {
     /// leaves its state behind first (the returned [`Retired`]). Only **the objects
     /// created here** are restored ([`Self::restore_created`]), inside the same
     /// editing cycle, as ARA's unarchiving session prescribes, each created
-    /// modification from its [`Start`] in `starts`. Best-effort: a clip whose
+    /// object from its start in `starts`. Best-effort: a clip whose
     /// source can't be decoded is skipped (logged) so one bad source doesn't drop
     /// the rest.
     ///
@@ -285,15 +331,15 @@ impl AraSession {
         bpm: f64,
         time_sig: (u16, u16),
         archive: Option<SavedArchive<'_>>,
-        starts: &StartTable,
+        starts: &Starts,
     ) -> Retired {
         let plan = graph_plan::plan(&self.graph_now(), clips);
         let first_build = !self.built;
         // ARA stores archives only outside an editing session, so keep the state of the
         // modifications about to go (and of clone origins a plug-in without
         // `cloneAudioModification` must copy through an archive) before the edit begins.
-        let retired = self.retire_modifications(&plan.destroy_modifications);
-        let clone_copies = self.clone_copies(starts);
+        let retired = self.retire_modifications(&plan);
+        let clone_copies = self.clone_copies(&starts.modifications);
         for owned in self.regions.iter().filter(|r| plan.remove_regions.contains(&r.key)) {
             self.extension.remove_playback_region(owned.region_ref);
         }
@@ -302,12 +348,15 @@ impl AraSession {
         self.destroy_planned(&plan);
 
         let created_sources = self.create_sources(clips, &plan.create_sources);
-        let restores = self.create_modifications(clips, &plan.create_modifications, starts, &clone_copies);
+        let restores = self.create_modifications(clips, &plan.create_modifications, &starts.modifications, &clone_copies);
         let created_regions = self.create_regions(clips, &plan.create_regions);
         for &i in &plan.update_regions {
             self.update_region(&clips[i].region_key, &clips[i].placement);
         }
-        self.restore_created(archive, first_build, &created_sources, &restores);
+        // The edit that first builds the graph (with at least one modification) restores the saved archive's
+        // document data; an edit that creates no modification leaves that to the next one.
+        let building = first_build && !self.modifications.is_empty();
+        self.restore_created(archive, building, &created_sources, &restores, &starts.sources);
         self.controller.end_editing();
         self.built |= !self.modifications.is_empty();
 
@@ -393,25 +442,42 @@ impl AraSession {
         created
     }
 
-    /// The plug-in state of the audio modifications `ids` (about to be destroyed). Outside an editing cycle.
-    fn retire_modifications(&self, ids: &HashSet<String>) -> Retired {
-        self.modifications
-            .iter()
-            .filter(|m| ids.contains(&m.persistent_id))
-            .filter_map(|m| Some((m.persistent_id.clone(), self.controller.store_modification_to_archive(m.modification_ref)?)))
-            .collect()
+    /// The plug-in state of the audio modifications `plan` destroys, in one partial archive with the audio sources it
+    /// destroys along with them ([`Retired`]). Outside an editing cycle.
+    fn retire_modifications(&self, plan: &graph_plan::GraphPlan) -> Retired {
+        let doomed: Vec<&OwnedModification> =
+            self.modifications.iter().filter(|m| plan.destroy_modifications.contains(&m.persistent_id)).collect();
+        if doomed.is_empty() {
+            return Retired::default();
+        }
+        let with_source = |m: &OwnedModification| plan.destroy_sources.contains(&m.source_id);
+        let modification_refs: Vec<ARAAudioModificationRef> = doomed.iter().map(|m| m.modification_ref).collect();
+        let source_refs = self.source_refs(doomed.iter().filter(|m| with_source(m)).map(|m| m.source_id.as_str()));
+        let Some(bytes) = self.controller.store_partial_archive(&source_refs, &modification_refs) else {
+            tracing::warn!(n = doomed.len(), "ARA: storing the destroyed modifications' state failed; undo / copies start without it");
+            return Retired::default();
+        };
+        let modifications = doomed.iter().map(|m| (m.persistent_id.clone(), m.source_id.clone(), with_source(m))).collect();
+        Retired { bytes, modifications }
     }
 
     /// For a plug-in without `cloneAudioModification`: a partial archive of each clone origin in `starts` (ARA:
     /// "hosts can achieve the same effect by creating an archive of the modification that should be cloned and
-    /// unarchiving that state into a new modification"). Outside an editing cycle.
-    fn clone_copies(&self, starts: &StartTable) -> HashMap<String, Arc<[u8]>> {
+    /// unarchiving that state into a new modification"). The origin stays on the same audio source in this
+    /// document, so only the modification is archived. Outside an editing cycle.
+    fn clone_copies(&self, starts: &HashMap<String, Start>) -> HashMap<String, Arc<[u8]>> {
         if self.controller.can_clone_audio_modification() {
             return HashMap::new();
         }
         let origins: HashSet<&str> =
             starts.values().filter_map(|s| if let Start::Clone(origin) = s { Some(origin.as_str()) } else { None }).collect();
-        origins.into_iter().filter_map(|o| Some((o.to_owned(), Arc::from(self.store_modification(o)?)))).collect()
+        origins
+            .into_iter()
+            .filter_map(|o| {
+                let m = self.modifications.iter().find(|m| m.persistent_id == o)?;
+                Some((o.to_owned(), Arc::from(self.controller.store_partial_archive(&[], &[m.modification_ref])?)))
+            })
+            .collect()
     }
 
     /// Create the audio modifications for `clips[i]` on their (existing or just created) sources, each from its
@@ -422,7 +488,7 @@ impl AraSession {
         &mut self,
         clips: &[AraClipSpec],
         indices: &[usize],
-        starts: &StartTable,
+        starts: &HashMap<String, Start>,
         clone_copies: &HashMap<String, Arc<[u8]>>,
     ) -> Vec<(String, RestoreFrom)> {
         let mut restore = Vec::new();
@@ -466,7 +532,7 @@ impl AraSession {
             None => None,
             Some(Start::Clone(origin)) => {
                 if let Some(bytes) = clone_copies.get(origin) {
-                    Some(RestoreFrom::Kept { bytes: Arc::clone(bytes), archived: origin.clone() })
+                    Some(RestoreFrom::Kept(KeptArchive { bytes: Arc::clone(bytes), archived: origin.clone() }))
                 } else {
                     // The origin survives the edit, on the same audio source (its id names the source).
                     let original = self.modifications.iter().find(|m| m.persistent_id == *origin && m.source_id == clip.source_id);
@@ -479,69 +545,66 @@ impl AraSession {
                 }
             }
             Some(Start::Saved(archived)) => Some(RestoreFrom::Saved(archived.clone())),
-            Some(Start::Restore { bytes, archived }) => Some(RestoreFrom::Kept { bytes: Arc::clone(bytes), archived: archived.clone() }),
+            Some(Start::Restore(kept)) => Some(RestoreFrom::Kept(kept.clone())),
         };
         (self.controller.create_audio_modification(source_ref, std::ptr::null_mut(), id), from)
     }
 
-    /// Restore the state of the objects this edit created (inside its editing cycle), in the order ARA's partial
-    /// persistency requires (ARAInterface.h "Document Persistency"):
-    /// 1. the saved `archive`: the created audio sources its table of contents lists and the modifications that
-    ///    start from it ("each call that restores some audio source state must either include or precede restoring
-    ///    the state of any audio modification associated with the affected audio source");
-    /// 2. each modification that starts from a partial archive kept elsewhere (grouped per archive);
-    /// 3. on the first build, the saved archive's document data **last** ("the partial archive which was saved with
-    ///    documentData == kARATrue is restored as last archive in the restore cycle") — folded into call 1 when
-    ///    there is no call 2.
+    /// Restore the state of the objects this edit created (inside its editing cycle): the created audio sources
+    /// the saved `archive` lists or `source_starts` carries, and each created modification from its
+    /// [`RestoreFrom`], one call per archive in the order [`graph_plan::restore_calls`] derives from ARA's partial
+    /// persistency rules. `building` = the edit that first builds the graph, which also restores the saved
+    /// archive's document data (last).
     fn restore_created(
         &self,
         archive: Option<SavedArchive<'_>>,
-        first_build: bool,
+        building: bool,
         created_sources: &[String],
         restores: &[(String, RestoreFrom)],
+        source_starts: &HashMap<String, KeptArchive>,
     ) {
-        let kept: Vec<(&Arc<[u8]>, &str, &str)> = restores
-            .iter()
-            .filter_map(|(id, from)| match from {
-                RestoreFrom::Kept { bytes, archived } => Some((bytes, archived.as_str(), id.as_str())),
-                RestoreFrom::Saved(_) => None,
+        /// The index of `bytes` among the edit's kept archives (the same archive once).
+        fn index_of<'b>(kept: &mut Vec<&'b Arc<[u8]>>, bytes: &'b Arc<[u8]>) -> usize {
+            kept.iter().position(|k| Arc::ptr_eq(k, bytes)).unwrap_or_else(|| {
+                kept.push(bytes);
+                kept.len() - 1
             })
-            .collect();
+        }
         let saved = archive.filter(|a| !a.bytes.is_empty());
-        let mut saved_objects = false;
-        if let Some(saved) = saved {
-            let sources: Vec<(&str, &str)> =
-                created_sources.iter().filter_map(|id| Some((archived_id(saved.ids, id)?, id.as_str()))).collect();
-            let modifications: Vec<(&str, &str)> = restores
-                .iter()
-                .filter_map(|(id, from)| match from {
-                    RestoreFrom::Saved(archived) => Some((archived.as_str(), id.as_str())),
-                    RestoreFrom::Kept { .. } => None,
-                })
-                .collect();
-            saved_objects = !sources.is_empty() || !modifications.is_empty();
-            let document_data = first_build && kept.is_empty();
-            if saved_objects && !self.controller.restore_objects_from_archive(saved.bytes, document_data, &sources, &modifications) {
-                tracing::warn!(n_sources = sources.len(), n_modifications = modifications.len(), "ARA: restoring the archive failed");
+        let mut kept: Vec<&Arc<[u8]>> = Vec::new();
+        let mut plan = graph_plan::Restores::default();
+        for id in created_sources {
+            if let Some(archived) = saved.and_then(|s| archived_id(s.ids, id)) {
+                plan.sources.push((None, archived, id));
+            } else if let Some(start) = source_starts.get(id) {
+                plan.sources.push((Some(index_of(&mut kept, &start.bytes)), &start.archived, id));
             }
         }
-        let mut archives: Vec<&Arc<[u8]>> = Vec::new();
-        for (bytes, _, _) in &kept {
-            if !archives.iter().any(|a| Arc::ptr_eq(a, bytes)) {
-                archives.push(bytes);
+        for (id, from) in restores {
+            let Some(source) = self.modifications.iter().find(|m| m.persistent_id == *id).map(|m| m.source_id.as_str()) else {
+                continue;
+            };
+            match from {
+                RestoreFrom::Saved(archived) if saved.is_some() => plan.modifications.push((None, archived, id, source)),
+                RestoreFrom::Saved(_) => {}
+                RestoreFrom::Kept(k) => plan.modifications.push((Some(index_of(&mut kept, &k.bytes)), &k.archived, id, source)),
             }
         }
-        for bytes in archives {
-            let pairs: Vec<(&str, &str)> =
-                kept.iter().filter(|(b, _, _)| Arc::ptr_eq(b, bytes)).map(|&(_, archived, id)| (archived, id)).collect();
-            if !self.controller.restore_objects_from_archive(bytes, false, &[], &pairs) {
-                tracing::warn!(n_modifications = pairs.len(), "ARA: restoring a kept modification state failed");
+        for call in graph_plan::restore_calls(&plan, building && saved.is_some()) {
+            let bytes: &[u8] = match (call.archive, saved) {
+                (Some(i), _) => &kept[i][..],
+                (None, Some(saved)) => saved.bytes,
+                (None, None) => continue,
+            };
+            if !self.controller.restore_objects_from_archive(bytes, call.document_data, &call.sources, &call.modifications) {
+                tracing::warn!(
+                    saved = call.archive.is_none(),
+                    document_data = call.document_data,
+                    n_sources = call.sources.len(),
+                    n_modifications = call.modifications.len(),
+                    "ARA: restoring an archive failed"
+                );
             }
-        }
-        if let Some(saved) = saved.filter(|_| first_build && saved_objects && !kept.is_empty())
-            && !self.controller.restore_objects_from_archive(saved.bytes, true, &[], &[])
-        {
-            tracing::warn!("ARA: restoring the archive's document data failed");
         }
     }
 
@@ -626,9 +689,9 @@ impl AraSession {
         Some(AraArchive { bytes, ids })
     }
 
-    /// The persistent ids of the audio modifications in the document.
-    pub fn modification_ids(&self) -> impl Iterator<Item = &str> {
-        self.modifications.iter().map(|m| m.persistent_id.as_str())
+    /// The `(persistent id, audio source's persistent id)` of the audio modifications in the document.
+    pub fn modifications(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.modifications.iter().map(|m| (m.persistent_id.as_str(), m.source_id.as_str()))
     }
 
     /// Update the placement / stretch of already-present regions in place,

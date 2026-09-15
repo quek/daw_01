@@ -23,8 +23,12 @@ impl AppData {
 
     /// OS クリップボードへ書いた envelope `json` が運ぶ audio の take の Melodyne の編集を、**写した時点の状態** で
     /// plug-in host に取っておかせる (`PluginCommand::SnapshotAraClipboard`)。 元のプロジェクトを閉じた後に貼っても、
-    /// 貼った take は写した元の編集から始まる。 写しの event は先頭の `take_origins` が写した元 (このプロジェクトの
-    /// take) を指している (写す側が付ける、`ClipContent::copied_from`)。 audio の take を運ばない写しでは何も送らない。
+    /// 貼った take は写した元の編集から始まる。 写しの event の `take_origins` は先頭が写した元 (このプロジェクトの
+    /// take、写す側が付ける `ClipContent::copied_from`)、続きがその祖先。 貼った take は近い元から順に状態を探すので
+    /// (`daw_plugin_host::ara::graph_plan::modification_start`)、写した元が document に居ない (ARA トラックに載って
+    /// いない複製) ときに祖先の状態で始まれるよう、このプロジェクトの祖先も全部取っておかせる (host は状態のあるものだけを
+    /// 持つ)。 無効のトラック (host に document が無い) の take は、その device の保存したアーカイブを先に預ける。 audio の
+    /// take を運ばない写しでは何も送らない。
     pub fn snapshot_ara_for_clipboard(&self, json: &str) {
         let Some(envelope) = crate::clipboard::ClipboardEnvelope::from_json(json) else {
             return;
@@ -34,13 +38,17 @@ impl AppData {
             .payload
             .audio_events()
             .into_iter()
-            .filter_map(|e| e.take_origins.first())
+            .flat_map(|e| &e.take_origins)
             .filter(|o| o.project_id == project_id)
             .map(common::ara_ids::origin_modification_id)
             .collect();
         modifications.sort_unstable();
         modifications.dedup();
         if !modifications.is_empty() {
+            let wanted: Vec<_> = modifications.iter().map(|id| (self.pk(), id.as_str())).collect();
+            for command in self.dormant_ara_archive_commands(&wanted, None) {
+                self.send_plugin(command);
+            }
             self.send_plugin(common::protocol::PluginCommand::SnapshotAraClipboard {
                 project: self.pk(),
                 project_id,

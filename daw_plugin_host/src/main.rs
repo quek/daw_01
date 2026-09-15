@@ -455,7 +455,7 @@ fn ara_selftest(path: &std::path::Path, target_id: &str, wav: Option<&str>) -> R
             None => Vec::new(),
         };
         step(&format!("calling setup_ara with {} clip(s)", clips.len()));
-        let starts = crate::ara::session::StartTable::new();
+        let starts = crate::ara::session::Starts::default();
         let _ = plugin.setup_ara(crate::ara::AraEdit { clips: &clips, bpm: 120.0, time_sig: (4, 4), archive: None, starts: &starts });
         step("setup_ara returned");
 
@@ -926,6 +926,8 @@ impl PluginHost {
                 );
             }
             PluginCommand::RemoveSlotPlugin { device } => {
+                // 降ろす ARA document の状態を取っておく (そこに居たクリップを後で別のトラックへ写せる)。
+                self.keep_ara_document(device);
                 self.teardown_device(device, true);
             }
             // (r.md #61) 終了要求は `pipe_loop` が read ループを抜けるために
@@ -944,10 +946,12 @@ impl PluginHost {
                     .collect();
                 ids.sort_unstable();
                 tracing::info!(?project, count = ids.len(), "UnloadProject");
-                self.ara_states.close_project(project);
+                // 閉じるプロジェクトの document の状態は取っておかない (もう引かれない)。 同じ key のタブへ次に開く
+                // プロジェクトは、また取っておく。
                 for id in ids {
                     self.teardown_device(id, true);
                 }
+                self.ara_states.close_project(project);
                 self.projects.remove(&project);
             }
             PluginCommand::RequestSlotState { device } => {
@@ -1060,6 +1064,9 @@ impl PluginHost {
             PluginCommand::SnapshotAraClipboard { project, project_id, modifications } => {
                 self.snapshot_ara_clipboard(project, project_id, &modifications);
             }
+            PluginCommand::KeepDormantAraArchive { device, plugin_id, archive, archive_ids } => {
+                self.ara_states.keep_dormant(device, &plugin_id, archive, archive_ids);
+            }
             PluginCommand::UpdateAraRegions { device, regions } => {
                 match self.instances.get(&device) {
                     Some(rec) => {
@@ -1160,7 +1167,8 @@ impl PluginHost {
         //     SlotPluginLoaded が同 device を上書きする)。ただし
         //     `SlotPluginShmemReleased` は teardown_device が必ず送るので、
         //     daw_audio は下の (4) で作る新 mapping を開く前に旧 mapping を
-        //     落とす (= 旧へ書いて新を読む窓が閉じる)。
+        //     落とす (= 旧へ書いて新を読む窓が閉じる)。 差し替える ARA document の状態は取っておく。
+        self.keep_ara_document(device);
         self.teardown_device(device, false);
 
         // (3) activate + start_processing。v29: 失敗した plugin は registry
@@ -1298,8 +1306,6 @@ impl PluginHost {
     /// 事実で、daw_audio が旧 mapping を掴んだまま新 instance と食い違うのを
     /// 防ぐのはこちらの責務 (protocol の doc 参照)。
     fn teardown_device(&mut self, device: DeviceAddr, emit_unloaded: bool) {
-        // 降ろす ARA document の状態を取っておく (そこに居たクリップを後で別のトラックへ写せる)。
-        self.keep_ara_document(device);
         let Some(mut rec) = self.instances.remove(&device) else {
             return;
         };
@@ -2012,9 +2018,6 @@ impl PluginHost {
         //     daw_gui も同時に畳まれている。
         let ids: Vec<DeviceAddr> = self.instances.keys().copied().collect();
         tracing::info!(count = ids.len(), "shutdown: tearing down all devices");
-        for project in ids.iter().map(|d| d.project) {
-            self.ara_states.close_project(project);
-        }
         for id in ids {
             self.teardown_device(id, false);
         }

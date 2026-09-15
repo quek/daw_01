@@ -9,7 +9,7 @@ use common::ara_ids::AraArchiveEntry;
 use common::protocol::{AraClipSpec, DeviceAddr, ProjectKey};
 
 use crate::PluginHost;
-use crate::ara::session::{AraSession, StartTable};
+use crate::ara::session::{AraSession, Starts};
 
 impl PluginHost {
     /// `SetupAraDocument`: `device` の document を `clips` に合わせる。 作る modification の始め方をほかの document と
@@ -38,10 +38,18 @@ impl PluginHost {
         }
         match rec.plugin.setup_ara(edit) {
             Some(retired) => {
-                tracing::info!(?device, n = clips.len(), restored = starts.len(), "ARA document set up");
+                tracing::info!(
+                    ?device,
+                    n = clips.len(),
+                    modification_starts = starts.modifications.len(),
+                    source_starts = starts.sources.len(),
+                    "ARA document set up"
+                );
                 if let Some(format) = rec.plugin.ara_session().map(|s| s.archive_format().to_owned()) {
                     self.ara_states.retire(device.project, &format, retired);
                 }
+                // この device の document ができたので、預かっていた保存したアーカイブは要らない。
+                self.ara_states.forget_dormant(device);
             }
             None => tracing::warn!(?device, "SetupAraDocument: plugin is not ARA-capable, ignoring"),
         }
@@ -90,12 +98,12 @@ impl PluginHost {
     }
 
     /// `device` の document を `clips` に合わせる編集で作る modification の始め方。
-    fn resolve_ara_starts(&self, device: DeviceAddr, clips: &[AraClipSpec], saved: &[AraArchiveEntry]) -> StartTable {
-        let Some(session) = self.instances.get(&device).and_then(|rec| rec.plugin.ara_session()) else {
-            return StartTable::new();
+    fn resolve_ara_starts(&self, device: DeviceAddr, clips: &[AraClipSpec], saved: &[AraArchiveEntry]) -> Starts {
+        let Some((rec, session)) = self.instances.get(&device).and_then(|rec| Some((rec, rec.plugin.ara_session()?))) else {
+            return Starts::default();
         };
         let sessions = ara_sessions(&self.instances);
-        self.ara_states.resolve_starts(device, session, &sessions, clips, saved)
+        self.ara_states.resolve_starts(device, &rec.requested_id, session, &sessions, clips, saved)
     }
 }
 

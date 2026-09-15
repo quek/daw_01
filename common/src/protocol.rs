@@ -1142,6 +1142,17 @@ pub enum PluginCommand {
     /// プロジェクトを閉じた後に貼っても、貼った take は写した元の編集から始まる
     /// ([`AraModificationOrigin::project_id`] で引く)。
     SnapshotAraClipboard { project: ProjectKey, project_id: u64, modifications: Vec<String> },
+    /// (r.md #132 残件) plug-in host に document の無い ARA device `device` (無効のトラックに居る / まだ組んでいない) の
+    /// 保存したアーカイブ (`PluginInstance.ara_archive` と目次) を、そこから移す / 写す take の状態の元として預ける
+    /// (daw_gui が、組み直す document に新しく現れる modification の状態をこのアーカイブが持つときだけ送る)。
+    /// `plugin_id` の同じ device の document にだけ restore する。 同じ device の document を組むか、プロジェクトを
+    /// 閉じると捨てる。
+    KeepDormantAraArchive {
+        device: DeviceAddr,
+        plugin_id: String,
+        archive: Vec<u8>,
+        archive_ids: Vec<crate::ara_ids::AraArchiveEntry>,
+    },
     /// (r.md #7 ARA2) Update only the playback-region placements of an
     /// existing ARA document (matched by `region_key`).
     UpdateAraRegions {

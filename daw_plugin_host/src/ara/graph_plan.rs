@@ -103,6 +103,8 @@ pub enum KeptAt {
     Retired(ProjectKey),
     /// クリップボードへ写した時点の状態。
     Clipboard,
+    /// plug-in host に document の無い device (無効のトラック / まだ組んでいない) の保存したアーカイブ。
+    Dormant(DeviceAddr),
 }
 
 /// 新しく作る modification の中身をどこから始めるか。
@@ -136,6 +138,9 @@ pub trait KeptStates {
     fn in_project(&self, project: ProjectKey, id: &str) -> Option<KeptAt>;
     /// クリップボードの写し (元のプロジェクト `project_id`) が modification `id` の状態を持っているか。
     fn in_clipboard(&self, project_id: u64, id: &str) -> bool;
+    /// プロジェクト `project` の、plug-in host に document の無い device の保存したアーカイブのうち modification `id` の
+    /// 状態を持つもの。
+    fn in_dormant(&self, project: ProjectKey, id: &str) -> Option<KeptAt>;
 }
 
 /// `spec` の modification の始め方。 **自分の状態が先、写した元は自分の状態がどこにも無いときだけ**:
@@ -146,25 +151,26 @@ pub trait KeptStates {
 ///    clip) を先に、無ければ plug-in host が取っておいた最新の状態 (undo / redo で戻る、無効にしたトラックから移した)。
 ///    生きている方を先にするのは、取っておいた状態がその後に別の document で続けた編集より古いことがあるから
 ///    (移動の undo)。
-/// 3. 保存したアーカイブの目次にあれば保存した自分の状態 (最後に保存した時点)。
+/// 3. 保存したアーカイブの目次にあれば保存した自分の状態 (最後に保存した時点)、無ければ document の無い device (無効の
+///    トラック) の保存したアーカイブ (そこから移したクリップ)。
 /// 4. 写した元 (近い順) の状態: 同じプロジェクトの元は、この document に残るなら `cloneAudioModification`、無ければ
-///    プロジェクトの中 (2 と同じ順)、クリップボードの写し、保存したアーカイブの目次。 別のプロジェクトの元は
-///    クリップボードの写し (写した時点 = 貼った中身と同じ時点) を先に、そのプロジェクトが開いていればその中。
-///    別のプロジェクトの id は自分のプロジェクトの id と同じ文字列になり得るので、この document とアーカイブの
-///    目次では引かない。
+///    プロジェクトの中 (2 と同じ順)、クリップボードの写し、保存したアーカイブの目次、document の無い device の保存した
+///    アーカイブ。 別のプロジェクトの元はクリップボードの写し (写した時点 = 貼った中身と同じ時点) を先に、そのプロジェクトが
+///    開いていればその中 (2 と同じ順、その後に document の無い device の保存したアーカイブ)。 別のプロジェクトの id は自分の
+///    プロジェクトの id と同じ文字列になり得るので、この document とアーカイブの目次では引かない。
 /// 5. どこにも無ければ空。
 #[must_use]
 pub fn modification_start(spec: &AraClipSpec, doc: DocumentNow<'_>, kept: &impl KeptStates) -> ModificationStart {
     let own = spec.modification_id.as_str();
     let saved = |id: &str| archived_id(doc.saved, id).map(|a| ModificationStart::Saved(a.to_owned()));
-    let in_project = |project: ProjectKey, id: &str| kept.in_project(project, id).map(|at| ModificationStart::Kept { at, id: id.to_owned() });
-    let in_clipboard = |project_id: u64, id: &str| {
-        kept.in_clipboard(project_id, id).then(|| ModificationStart::Kept { at: KeptAt::Clipboard, id: id.to_owned() })
-    };
+    let kept_at = |at: KeptAt, id: &str| ModificationStart::Kept { at, id: id.to_owned() };
+    let in_project = |project: ProjectKey, id: &str| kept.in_project(project, id).map(|at| kept_at(at, id));
+    let in_clipboard = |project_id: u64, id: &str| kept.in_clipboard(project_id, id).then(|| kept_at(KeptAt::Clipboard, id));
+    let in_dormant = |project: ProjectKey, id: &str| kept.in_dormant(project, id).map(|at| kept_at(at, id));
     if let Some(start) = saved(own).filter(|_| doc.first_build) {
         return start;
     }
-    if let Some(start) = in_project(doc.project, own).or_else(|| saved(own)) {
+    if let Some(start) = in_project(doc.project, own).or_else(|| saved(own)).or_else(|| in_dormant(doc.project, own)) {
         return start;
     }
     for origin in &spec.modification_origins {
@@ -173,15 +179,97 @@ pub fn modification_start(spec: &AraClipSpec, doc: DocumentNow<'_>, kept: &impl 
             if doc.surviving.contains(id) {
                 return ModificationStart::Clone(id.to_owned());
             }
-            in_project(doc.project, id).or_else(|| in_clipboard(origin.project_id, id)).or_else(|| saved(id))
+            in_project(doc.project, id)
+                .or_else(|| in_clipboard(origin.project_id, id))
+                .or_else(|| saved(id))
+                .or_else(|| in_dormant(doc.project, id))
         } else {
-            in_clipboard(origin.project_id, id).or_else(|| origin.project.and_then(|p| in_project(p, id)))
+            let open = |find: &dyn Fn(ProjectKey) -> Option<ModificationStart>| origin.project.and_then(find);
+            in_clipboard(origin.project_id, id).or_else(|| open(&|p| in_project(p, id))).or_else(|| open(&|p| in_dormant(p, id)))
         };
         if let Some(start) = found {
             return start;
         }
     }
     ModificationStart::Empty
+}
+
+/// 編集で作った object の状態をどのアーカイブから restore するか ([`restore_calls`] の入力)。 アーカイブは
+/// `None` = document の保存したアーカイブ、`Some(i)` = この編集が document の外から持ってきた `i` 番目の partial
+/// archive。 `sources` の要素は `(アーカイブ, アーカイブに書かれている id, document の id)`、`modifications` はそれに
+/// document の中の audio source の id を足したもの。
+#[derive(Debug, Default)]
+pub struct Restores<'a> {
+    pub sources: Vec<(Option<usize>, &'a str, &'a str)>,
+    pub modifications: Vec<(Option<usize>, &'a str, &'a str, &'a str)>,
+}
+
+/// `restoreObjectsFromArchive` の 1 回 ([`restore_calls`])。
+#[derive(Debug, PartialEq, Eq)]
+pub struct RestoreCall<'a> {
+    /// [`Restores`] と同じアーカイブの指し方。
+    pub archive: Option<usize>,
+    /// 保存したアーカイブの document data も restore する。
+    pub document_data: bool,
+    /// `(アーカイブに書かれている id, document の id)`。
+    pub sources: Vec<(&'a str, &'a str)>,
+    pub modifications: Vec<(&'a str, &'a str)>,
+}
+
+/// 1 回の編集の restore の呼び方 (アーカイブごとに 1 回)。 順番は ARA の partial persistency の規約
+/// (`ARAInterface.h` "Document Persistency" / `ARAStoreObjectsFilter::documentData`):
+///
+/// 1. 保存したアーカイブの object。
+/// 2. audio source を restore する外のアーカイブ ("each call that restores some audio source state must either
+///    include or precede restoring the state of any audio modification associated with the affected audio source")。
+/// 3. 残りの外のアーカイブ。 2 のアーカイブの modification でも、その source を restore するのが後の呼び出しなら、
+///    ここへ回す (source の後に restore する)。
+/// 4. `document_data` (保存したアーカイブから document を組む編集) なら最後に保存したアーカイブの document data
+///    ("the partial archive which was saved with documentData == kARATrue is restored as last archive in the restore
+///    cycle, where the graph has its final structure and all object states are available")。 呼び出しが 1 の 1 回
+///    だけならそこへ畳む。 restore する object が無くても呼ぶ (document の private な状態は object と別)。
+#[must_use]
+pub fn restore_calls<'a>(restores: &Restores<'a>, document_data: bool) -> Vec<RestoreCall<'a>> {
+    let mut order: Vec<Option<usize>> = Vec::new();
+    let saved_sources = restores.sources.iter().filter(|s| s.0.is_none()).map(|s| s.0);
+    let saved_modifications = restores.modifications.iter().filter(|m| m.0.is_none()).map(|m| m.0);
+    let kept_sources = restores.sources.iter().filter(|s| s.0.is_some()).map(|s| s.0);
+    for archive in saved_sources.chain(saved_modifications).chain(kept_sources) {
+        if !order.contains(&archive) {
+            order.push(archive);
+        }
+    }
+    // 各 source を restore する呼び出しの位置 (無ければ document に既に居るか、状態を restore しない source)。
+    let source_call = |source: &str| {
+        restores.sources.iter().find(|s| s.2 == source).and_then(|s| order.iter().position(|&a| a == s.0))
+    };
+    let mut calls: Vec<RestoreCall<'a>> = order
+        .iter()
+        .map(|&archive| RestoreCall {
+            archive,
+            document_data: false,
+            sources: restores.sources.iter().filter(|s| s.0 == archive).map(|s| (s.1, s.2)).collect(),
+            modifications: Vec::new(),
+        })
+        .collect();
+    let source_calls = calls.len();
+    for &(archive, archived, current, source) in &restores.modifications {
+        let at = order.iter().position(|&a| a == archive).filter(|&i| source_call(source).is_none_or(|s| s <= i));
+        let at = at.unwrap_or_else(|| {
+            calls[source_calls..].iter().position(|c| c.archive == archive).map(|i| source_calls + i).unwrap_or_else(|| {
+                calls.push(RestoreCall { archive, document_data: false, sources: Vec::new(), modifications: Vec::new() });
+                calls.len() - 1
+            })
+        });
+        calls[at].modifications.push((archived, current));
+    }
+    if document_data {
+        match calls.as_mut_slice() {
+            [only] if only.archive.is_none() => only.document_data = true,
+            _ => calls.push(RestoreCall { archive: None, document_data: true, sources: Vec::new(), modifications: Vec::new() }),
+        }
+    }
+    calls
 }
 
 fn first_with(specs: &[AraClipSpec], pred: impl Fn(&AraClipSpec) -> bool) -> Option<&AraClipSpec> {
@@ -261,6 +349,8 @@ mod tests {
     struct Kept {
         project: Vec<(ProjectKey, &'static str, KeptAt)>,
         clipboard: Vec<(u64, &'static str)>,
+        /// document の無い device の保存したアーカイブにある `(device, id)`。
+        dormant: Vec<(DeviceAddr, &'static str)>,
     }
 
     impl KeptStates for Kept {
@@ -269,6 +359,9 @@ mod tests {
         }
         fn in_clipboard(&self, project_id: u64, id: &str) -> bool {
             self.clipboard.iter().any(|(p, i)| *p == project_id && *i == id)
+        }
+        fn in_dormant(&self, project: ProjectKey, id: &str) -> Option<KeptAt> {
+            self.dormant.iter().find(|(d, i)| d.project == project && *i == id).map(|(d, _)| KeptAt::Dormant(*d))
         }
     }
 
@@ -297,7 +390,7 @@ mod tests {
         let none = HashSet::new();
         let unique = copied("m2", &[(Some(HERE), HERE_ID, "m")]);
         assert_eq!(modification_start(&unique, doc(false, &[], &set(&["m"])), &Kept::default()), ModificationStart::Clone("m".into()));
-        let elsewhere = Kept { project: vec![(HERE, "m", LIVE_B)], clipboard: vec![(HERE_ID, "m")] };
+        let elsewhere = Kept { project: vec![(HERE, "m", LIVE_B)], clipboard: vec![(HERE_ID, "m")], ..Kept::default() };
         assert_eq!(modification_start(&unique, doc(false, &[], &none), &elsewhere), kept(LIVE_B, "m"), "別のトラックの document");
         let clipboard = Kept { clipboard: vec![(HERE_ID, "m")], ..Kept::default() };
         assert_eq!(modification_start(&unique, doc(false, &[], &none), &clipboard), kept(KeptAt::Clipboard, "m"));
@@ -364,11 +457,100 @@ mod tests {
         assert_eq!(modification_start(&pasted, doc(false, &saved, &same_string), &here_has_m), ModificationStart::Empty);
 
         let other_live = KeptAt::Live(DeviceAddr { project: OTHER, device_id: 3 });
-        let both = Kept { project: vec![(OTHER, "m", other_live)], clipboard: vec![(OTHER_ID, "m")] };
+        let both = Kept { project: vec![(OTHER, "m", other_live)], clipboard: vec![(OTHER_ID, "m")], ..Kept::default() };
         assert_eq!(modification_start(&pasted, doc(false, &[], &HashSet::new()), &both), kept(KeptAt::Clipboard, "m"));
         let open = Kept { project: vec![(OTHER, "m", other_live)], ..Kept::default() };
         assert_eq!(modification_start(&pasted, doc(false, &[], &HashSet::new()), &open), kept(other_live, "m"));
         let closed = copied("m9", &[(None, OTHER_ID, "m")]);
         assert_eq!(modification_start(&closed, doc(false, &[], &HashSet::new()), &open), ModificationStart::Empty, "閉じたプロジェクトはクリップボードだけ");
+        let dormant_there = Kept { dormant: vec![(DeviceAddr { project: OTHER, device_id: 3 }, "m")], ..Kept::default() };
+        assert_eq!(
+            modification_start(&pasted, doc(false, &[], &HashSet::new()), &dormant_there),
+            kept(KeptAt::Dormant(DeviceAddr { project: OTHER, device_id: 3 }), "m"),
+            "開いているタブの無効のトラックから"
+        );
+        assert_eq!(modification_start(&closed, doc(false, &[], &HashSet::new()), &dormant_there), ModificationStart::Empty);
+        let dormant_here = Kept { dormant: vec![(DeviceAddr { project: HERE, device_id: 3 }, "m")], ..Kept::default() };
+        assert_eq!(modification_start(&pasted, doc(false, &[], &HashSet::new()), &dormant_here), ModificationStart::Empty, "同じ文字列の自分のプロジェクトの id は引かない");
+    }
+
+    /// document の無い device (無効のトラック) の保存したアーカイブは、プロジェクトの中の今の状態・保存した自分の状態・
+    /// クリップボードより後に引く: そこから移したクリップ (自分の id) と、そこから写した take (写した元の id)。
+    #[test]
+    fn document_の無い_device_の保存したアーカイブは今の状態と自分の保存より後に引く() {
+        let none = HashSet::new();
+        let disabled = KeptAt::Dormant(DeviceAddr { project: HERE, device_id: 5 });
+        let moved = spec("s", "m", "1.1");
+        let dormant = Kept { dormant: vec![(DeviceAddr { project: HERE, device_id: 5 }, "m")], ..Kept::default() };
+        assert_eq!(modification_start(&moved, doc(false, &[], &none), &dormant), kept(disabled, "m"), "無効のトラックから移したクリップ");
+        let saved = [AraArchiveEntry::stored("m".into())];
+        assert_eq!(modification_start(&moved, doc(false, &saved, &none), &dormant), ModificationStart::Saved("m".into()));
+        let live_too = Kept { project: vec![(HERE, "m", LIVE_B)], ..dormant };
+        assert_eq!(modification_start(&moved, doc(false, &[], &none), &live_too), kept(LIVE_B, "m"));
+
+        let copy = copied("m2", &[(Some(HERE), HERE_ID, "m")]);
+        let dormant = Kept { dormant: vec![(DeviceAddr { project: HERE, device_id: 5 }, "m")], ..Kept::default() };
+        assert_eq!(modification_start(&copy, doc(false, &[], &none), &dormant), kept(disabled, "m"), "無効のトラックから写した take");
+        let clipboard_too = Kept { clipboard: vec![(HERE_ID, "m")], ..dormant };
+        assert_eq!(modification_start(&copy, doc(false, &[], &none), &clipboard_too), kept(KeptAt::Clipboard, "m"));
+    }
+
+    fn call<'a>(archive: Option<usize>, document_data: bool, sources: &[(&'a str, &'a str)], modifications: &[(&'a str, &'a str)]) -> RestoreCall<'a> {
+        RestoreCall { archive, document_data, sources: sources.to_vec(), modifications: modifications.to_vec() }
+    }
+
+    /// 保存したアーカイブの object → audio source を運ぶ外のアーカイブ (その source の modification より先) → 残りの外の
+    /// アーカイブ → 保存したアーカイブの document data の順。 同じアーカイブの object は 1 回にまとめる。
+    #[test]
+    fn restore_は保存したアーカイブ_source_を運ぶアーカイブ_残り_document_data_の順() {
+        let restores = Restores {
+            sources: vec![(None, "s", "s"), (Some(1), "a.src", "t")],
+            modifications: vec![
+                (Some(0), "m0", "x", "s"),
+                (None, "legacy/mod", "m", "s"),
+                (Some(1), "a.mod", "y", "t"),
+                (Some(0), "m1", "z", "old"),
+            ],
+        };
+        assert_eq!(
+            restore_calls(&restores, true),
+            vec![
+                call(None, false, &[("s", "s")], &[("legacy/mod", "m")]),
+                call(Some(1), false, &[("a.src", "t")], &[("a.mod", "y")]),
+                call(Some(0), false, &[], &[("m0", "x"), ("m1", "z")]),
+                call(None, true, &[], &[]),
+            ]
+        );
+        assert_eq!(restore_calls(&restores, false).len(), 3, "document を組む編集でなければ document data は読まない");
+    }
+
+    /// source を運ぶアーカイブが、後の呼び出しで source を restore する別の source の modification も持つなら、その
+    /// modification は source の後の呼び出しへ回す。
+    #[test]
+    fn source_より先に_modification_を_restore_しない() {
+        let restores = Restores {
+            sources: vec![(Some(0), "v", "v"), (Some(1), "u", "u")],
+            modifications: vec![(Some(0), "on-v", "a", "v"), (Some(0), "on-u", "b", "u"), (Some(1), "also-u", "c", "u")],
+        };
+        assert_eq!(
+            restore_calls(&restores, false),
+            vec![
+                call(Some(0), false, &[("v", "v")], &[("on-v", "a")]),
+                call(Some(1), false, &[("u", "u")], &[("also-u", "c")]),
+                call(Some(0), false, &[], &[("on-u", "b")]),
+            ]
+        );
+    }
+
+    /// document data は、保存したアーカイブの呼び出しだけならそこへ畳み、restore する object が無くても組む編集では読む
+    /// (空の document で保存したアーカイブにも plug-in の private な状態がある)。
+    #[test]
+    fn document_data_は畳めるときは畳み_object_が無くても読む() {
+        let saved_only = Restores { sources: vec![(None, "s", "s")], modifications: Vec::new() };
+        assert_eq!(restore_calls(&saved_only, true), vec![call(None, true, &[("s", "s")], &[])]);
+        assert_eq!(restore_calls(&Restores::default(), true), vec![call(None, true, &[], &[])]);
+        assert!(restore_calls(&Restores::default(), false).is_empty());
+        let kept_only = Restores { sources: Vec::new(), modifications: vec![(Some(0), "m", "m2", "s")] };
+        assert_eq!(restore_calls(&kept_only, true), vec![call(Some(0), false, &[], &[("m", "m2")]), call(None, true, &[], &[])]);
     }
 }

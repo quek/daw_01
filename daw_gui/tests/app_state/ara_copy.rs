@@ -171,6 +171,120 @@ fn 別のトラックへ貼ったクリップは元と同じ_modification_で写
     assert!(!docs.contains_key(&DEVICE_A), "元の document は作り直さない");
 }
 
+/// 写したクリップの take が複製 (元の take を指す) なら、クリップボードへ写すときその祖先の状態も取っておかせる — 複製が
+/// ARA トラックに載っていない (document に状態が無い) とき、元のプロジェクトを閉じてから貼っても祖先の編集から始まる。
+#[test]
+fn クリップボードへ写すと写した_take_の祖先の状態も取っておく() {
+    let (mut app, mut rx, content) = ara_app();
+    let project_id = app.cur.song_doc.song().project_id;
+    app.edit_song(|song| song.tracks[1].devices.clear()).expect("B を ARA でないトラックにする");
+    app.copy_time_range(0.0, 8.0, 8.0, &[(TRACK_A, TRACK_B)], true);
+    let copy = clip_on(&app, TRACK_B);
+    let _ = drain(&mut rx);
+
+    let (envelope, _, _) = app.clips_copy_envelope(&[ClipKey { track_id: TRACK_B, clip_id: copy.id }]).expect("copy");
+    app.snapshot_ara_for_clipboard(&envelope.to_json().expect("json"));
+    let snapshot = drain(&mut rx).into_iter().find_map(|m| match m {
+        PluginCommand::SnapshotAraClipboard { project_id: p, mut modifications, .. } if p == project_id => {
+            modifications.sort();
+            Some(modifications)
+        }
+        _ => None,
+    });
+    let mut expected = vec![take_modification_id(copy.content_id, 1, 1), take_modification_id(content, 1, 1)];
+    expected.sort();
+    assert_eq!(snapshot, Some(expected), "写した take (ARA トラックに居ない) と、その元の take");
+}
+
+/// 無効のトラック (plug-in host に document が無い) から有効な Melodyne トラックへ移したクリップは、無効のトラックの
+/// device の保存したアーカイブにしか編集が無いので、組み直す document より先にそのアーカイブを host へ預ける。 移し元の
+/// document が host に居る (有効なトラック) なら預けない (host が生きている document から引く)。
+#[test]
+fn 無効のトラックから移したクリップは移し元の保存したアーカイブを先に預ける() {
+    let setup = |enabled: bool| {
+        let (mut app, mut rx, content) = ara_app();
+        let modification = take_modification_id(content, 1, 1);
+        app.edit_song(|song| {
+            song.tracks[0].enabled = enabled;
+            let Some(Device::Plugin(melodyne)) = song.tracks[0].devices.first_mut() else { panic!("device") };
+            melodyne.set_ara_archive(Arc::from(&b"track-a"[..]), vec![source_id(1), modification.clone()]);
+        })
+        .expect("A の保存したアーカイブ");
+        let mut other = Vec::new();
+        sync(&mut app, &mut rx, &mut other);
+        let (envelope, _, _) = app.clips_copy_envelope(&[CLIP_A]).expect("copy");
+        let ClipboardPayload::Clips(clips) = envelope.payload.clone() else { panic!("clips") };
+        let project_id = app.cur.song_doc.song().project_id;
+        assert_eq!(app.paste_clips_at(clips, project_id, TRACK_B, 16.0, &envelope.media), 1);
+        app.flush_song_sync();
+        (drain(&mut rx), modification, app)
+    };
+
+    let (sent, modification, app) = setup(false);
+    let order: Vec<&str> = sent
+        .iter()
+        .filter_map(|m| match m {
+            PluginCommand::KeepDormantAraArchive { device, plugin_id, archive, archive_ids } => {
+                assert_eq!((device.device_id, plugin_id.as_str(), archive.as_slice()), (DEVICE_A, ARA_PLUGIN, &b"track-a"[..]));
+                assert_eq!(common::ara_ids::archived_id(archive_ids, &modification), Some(modification.as_str()));
+                assert_eq!(device.project, app.pk());
+                Some("dormant")
+            }
+            PluginCommand::SetupAraDocument { device, clips, .. } if device.device_id == DEVICE_B => {
+                assert_eq!(clips[0].modification_id, modification, "移したクリップは同じ modification");
+                Some("setup")
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, vec!["dormant", "setup"], "移し元のアーカイブを先に預ける");
+
+    let (sent, _, _) = setup(true);
+    assert!(
+        !sent.iter().any(|m| matches!(m, PluginCommand::KeepDormantAraArchive { .. })),
+        "移し元の document が host に居れば預けない"
+    );
+}
+
+/// 無効のトラックのクリップを別のタブへ貼る / クリップボードへ写すときも、そのトラックの device の保存したアーカイブを先に
+/// 預ける (host は元のタブの device として持ち、貼った take / クリップボードの写しがそこから始まる)。
+#[test]
+fn 無効のトラックのクリップを別のタブへ貼る_写すときも保存したアーカイブを預ける() {
+    let (mut app, mut rx, content) = ara_app();
+    let source_tab = app.pk();
+    let modification = take_modification_id(content, 1, 1);
+    app.edit_song(|song| {
+        song.tracks[0].enabled = false;
+        let Some(Device::Plugin(melodyne)) = song.tracks[0].devices.first_mut() else { panic!("device") };
+        melodyne.set_ara_archive(Arc::from(&b"track-a"[..]), vec![source_id(1), modification.clone()]);
+    })
+    .expect("A を無効にして保存したアーカイブを持たせる");
+    let mut other = Vec::new();
+    sync(&mut app, &mut rx, &mut other);
+    let dormant_devices = |sent: &[PluginCommand]| -> Vec<(ProjectKey, u64)> {
+        sent.iter()
+            .filter_map(|m| match m {
+                PluginCommand::KeepDormantAraArchive { device, .. } => Some((device.project, device.device_id)),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let (envelope, _, _) = app.clips_copy_envelope(&[CLIP_A]).expect("copy");
+    app.snapshot_ara_for_clipboard(&envelope.to_json().expect("json"));
+    let sent = drain(&mut rx);
+    assert_eq!(dormant_devices(&sent), vec![(source_tab, DEVICE_A)], "写す take の状態はそのアーカイブにしか無い");
+    assert!(matches!(sent.last(), Some(PluginCommand::SnapshotAraClipboard { .. })), "預けてから写しを取っておかせる");
+
+    app.handle_event(AppEvent::Tab(TabEvent::New));
+    setup_ara_tracks(&mut app);
+    let _ = drain(&mut rx);
+    let ClipboardPayload::Clips(clips) = envelope.payload.clone() else { panic!("clips") };
+    assert_eq!(app.paste_clips_at(clips, envelope.source_project_id, TRACK_B, 0.0, &envelope.media), 1);
+    app.flush_song_sync();
+    assert_eq!(dormant_devices(&drain(&mut rx)), vec![(source_tab, DEVICE_A)], "元のタブの無効のトラックの device として預ける");
+}
+
 /// 範囲を別のトラックへ **独立に** 複製すると、写した take は別の modification になり、元の modification (同じタブ) から
 /// 始める。 リンクの複製は同じ modification のまま。
 #[test]
