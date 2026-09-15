@@ -1144,6 +1144,8 @@ fn daw_device_chain(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
 /// script mode には `AllPluginStates` を pump する口が無く、待たせると永久に
 /// 完了しないため。 round-trip 込みの経路は headless test
 /// (`daw_gui/tests/app_state/device_relocate.rs`) が応答を fake して押さえている。
+/// undo step は round-trip の完了 (`on_all_states_from_child`) と同じく、操作名の付いた
+/// 独立した 1 step で積む。
 fn daw_relocate_devices(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let src_track = u32::try_from_js(args.get_or_undefined(0), ctx)?;
     let indices_json = arg_to_string(args, 1, ctx)?;
@@ -1162,13 +1164,16 @@ fn daw_relocate_devices(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
             };
             device_ids.push(id);
         }
-        h.app
-            .relocate_devices_inner(&crate::app::RelocateDevices {
-                device_ids,
-                dest: common::model::ChainRef::Track(dest_track),
-                dest_index: crate::app::InsertAt::Index(dest_index),
-                copy,
-            });
+        let req = crate::app::RelocateDevices {
+            device_ids,
+            dest: common::model::ChainRef::Track(dest_track),
+            dest_index: crate::app::InsertAt::Index(dest_index),
+            copy,
+        };
+        let label = crate::event_device::DeviceEvent::RelocateDevices(req.clone()).undo_label();
+        let gesture = h.app.cur.song_doc.enter_own_gesture(label);
+        h.app.relocate_devices_inner(&req);
+        h.app.cur.song_doc.leave_own_gesture(gesture);
         Ok(())
     })?;
     Ok(JsValue::undefined())

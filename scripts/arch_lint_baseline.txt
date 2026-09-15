@@ -147,7 +147,7 @@ FN-BUDGET | daw_gui/src/widgets/arrangement/render.rs::render_arrangement_heavy 
 #    いつ消えるか: **未起票**。
 # handle_event も #74 の arm で +5 だが、#71 が -7 していたので **#71 統合後の実測は
 # 1621** (旧天井 1623 より低い)。締まる方向なので実測値へ下げる。
-FN-BUDGET | daw_gui/src/app.rs::AppData::handle_event                                 | 1605 | 巨大 draw / match。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で +1。 2026-09-06: ParamGestureBegin/End を handler/param_gesture.rs へ移して 1601 (実測値へ下げた)。 同日: Alt+A (全レーン表示切替) と時間範囲操作の dispatch arm (各 1 行) で +2。 r.md #113 で `VirtualKeyboard(ev)` の委譲 arm +1。 r.md #117 で `TrackVoicesTick` の 1 行 arm +1。
+FN-BUDGET | daw_gui/src/app.rs::AppData::dispatch_app_event                           | 1605 | 巨大 draw / match。未起票 r.md #110 (Parallel、docs/plan_parallel.md) で +1。 2026-09-06: ParamGestureBegin/End を handler/param_gesture.rs へ移して 1601 (実測値へ下げた)。 同日: Alt+A (全レーン表示切替) と時間範囲操作の dispatch arm (各 1 行) で +2。 r.md #113 で `VirtualKeyboard(ev)` の委譲 arm +1。 r.md #117 で `TrackVoicesTick` の 1 行 arm +1。 2026-09-15 (undo の event 経路): 旧 `handle_event` の match 本体をこの名前へ移し、`handle_event` は event の undo scope を開いて閉じる入口だけにした (arm の途中 return でも閉じるため)。天井は据え置き。
 FN-BUDGET | daw_gui/src/view/audio_editor.rs::draw                                    |  781 | 巨大 draw / match。未起票
 FN-BUDGET | daw_gui/src/view/arrangement_view.rs::draw                                |  577 | #71 が足したのは dispatch 1 行だけ (本体 57 行は関数外の `device_drag_over_headers`)。未起票
 FN-BUDGET | daw_gui/src/view/root.rs::dispatch_shortcuts                              |  530 | 巨大 draw / match。未起票。 r.md #113 (仮想鍵盤) で `K` の dispatch と Esc の分岐 +5。
@@ -201,7 +201,7 @@ FN-NESTING | daw_gui/src/view/recovery_modal.rs::draw                           
 #    `loop` → `match メッセージ` → `if 状態` → `for 対象` と下がる。variant ごとの
 #    ハンドラ関数へ切り出せばほどけるが、ハンドラ数が多いので機械的な一括作業になる。
 #    いつ消えるか: **未起票**。
-FN-NESTING | daw_gui/src/app.rs::AppData::handle_event                        | 9/112 | 巨大 match。未起票
+FN-NESTING | daw_gui/src/app.rs::AppData::dispatch_app_event                  | 9/112 | 巨大 match。未起票 (2026-09-15: 旧 `handle_event` の match 本体、上の FN-BUDGET と同じ改名)
 FN-NESTING | daw_audio/src/main.rs::recv_loop                                 | 10/249 | 巨大 match。Global Sampler の 6 variant を `sampler::handle_command` へ委譲する 1 arm (再 publish の閉包込み) で +7。未起票
 FN-NESTING | daw_gui/src/view/runner/preview_events.rs::Runner::handle_preview_window_event | 9/89 | 巨大 match (r.md #107 で runner.rs から切り出し、負債は同一)。未起票
 FN-NESTING | daw_plugin_host/src/main.rs::PluginHost::handle_command          | 9/39  | 巨大 match。未起票

@@ -1360,3 +1360,49 @@ mod image_flip_tests {
         assert_eq!(flips(&app, key), vec![(false, false), (false, false)]);
     }
 }
+
+/// 1 操作 = 1 undo step が、event の入れ子 / 連続入力の stream / Begin-End の bracket が
+/// 重なっても崩れないこと (`AppData::handle_event` と `SongDoc` の scope の規則)。
+#[cfg(test)]
+mod undo_scope_tests {
+    use crate::app::{AppData, AppEvent};
+    use crate::state::ParamSurface;
+    use common::model::{AutomationTarget, MASTER_TRACK_ID};
+
+    /// handler が中で `handle_event` を呼んでも (入れ子の event)、ユーザーの操作は外側の 1 回。
+    /// 入れ子の event を閉じた後に外側の handler が書いた編集も、同じ step に入る。
+    #[test]
+    fn edits_after_a_nested_event_stay_in_the_outer_step() {
+        let mut app: AppData = crate::test_support::headless_app();
+        let before = app.cur.song_doc.history_current();
+        let outer = app.cur.song_doc.begin_event("テンポ変更");
+        app.edit_song(|song| song.bpm = 130.0);
+        app.handle_event(AppEvent::SetMetronomeEnabled(true));
+        app.edit_song(|song| song.bpm = 131.0);
+        app.edit_song(|song| song.bpm = 132.0);
+        app.cur.song_doc.end_event(outer);
+
+        let doc = &app.cur.song_doc;
+        assert_eq!(doc.history_current(), before + 1, "外側の 1 event = 1 step");
+        assert_eq!(doc.history_labels()[doc.history_current()], "テンポ変更");
+    }
+
+    /// トランスポートの BPM をドラッグする (掴んでいる間は `ParamGesture` の bracket): テンポの
+    /// 書き換えと Raw クリップの追従が毎フレーム別の step に割れず、ドラッグ全体で 1 step。
+    #[test]
+    fn dragging_the_bpm_is_one_step() {
+        let mut app: AppData = crate::test_support::headless_app();
+        let before = app.cur.song_doc.history_current();
+        let (surface, track_id, target) = (ParamSurface::Transport, MASTER_TRACK_ID, AutomationTarget::SongTempo);
+        app.handle_event(AppEvent::ParamGestureBegin { surface, track_id, target: target.clone() });
+        for bpm in [121.0, 122.0, 123.0] {
+            app.handle_event(AppEvent::SetSongBpmFromScrub(bpm));
+        }
+        app.handle_event(AppEvent::ParamGestureEnd { surface, track_id, target });
+
+        let doc = &app.cur.song_doc;
+        assert_eq!(doc.song().bpm, 123.0);
+        assert_eq!(doc.history_current(), before + 1, "1 ドラッグ = 1 step");
+        assert_eq!(doc.history_labels()[doc.history_current()], "テンポ変更");
+    }
+}

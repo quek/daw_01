@@ -1,4 +1,4 @@
-//! handler::bounce — clip 位置設定 + bounce (in-place / with-fx / 分離 render)
+//! handler::bounce — bounce (in-place / with-fx / 分離 render)
 //!
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
@@ -9,86 +9,6 @@ use common::protocol::{AudioCommand, PluginCommand, RenderScope};
 use crate::import_audio;
 
 impl AppData {
-    pub(crate) fn set_clip_positions(&mut self, entries: &[(ClipKey, u32, f64)]) {
-        // track 跨ぎ move: source track と to_track が異なれば clip を remove +
-        // 別 track に再 push。 同 track 内なら start_beat だけ update。
-        // 同 track 内で複数 entry がある場合、 高い clip_idx から処理しないと
-        // 配列インデックスが先に変動してしまうので、 source.track 同一 group
-        // ごとに clip_idx 降順で sort してから処理する。
-        let mut entries: Vec<(ClipKey, u32, f64)> = entries.to_vec();
-        entries.sort_by(|a, b| {
-            a.0.track_id
-                .cmp(&b.0.track_id)
-                .then_with(|| b.0.clip_id.cmp(&a.0.clip_id))
-        });
-
-        let follow_automation = self.ui_prefs.automation_follows_clips;
-        let Some(new_refs) = self.edit_song(move |song| {
-            // **まず動かすクリップを全部外し、外し終えてから置く。** 1 つずつ
-            // 「外して置く」 を繰り返すと、先に置いたクリップが *まだ動いていない仲間* を
-            // 非重なり規則で削ってしまう (ブロック選択をまとめてドラッグすると多発する)。
-            let mut moving: Vec<(u32, bool, common::model::Clip)> =
-                Vec::with_capacity(entries.len());
-            for (source, to_track_id, new_start_beat) in entries {
-                let same_track = source.track_id == to_track_id;
-                let old_window = song.clip_by_key(source).map(common::model::Clip::song_window);
-                let Some((mut removed, _)) = song
-                    .track_by_id_mut(source.track_id)
-                    .and_then(|t| t.remove_clip_by_id(source.clip_id))
-                else {
-                    continue;
-                };
-                let new_start = new_start_beat.max(0.0);
-                // **オートメーション追従** (`docs/plan_range_selection.md` §5)。
-                // 同じトラック内の移動だけが対象 — トラックを跨ぐと、移動先の
-                // どのレーンへ移すかが一意に決まらない。
-                if follow_automation
-                    && same_track
-                    && let Some((old_start, old_end)) = old_window
-                {
-                    move_track_automation(song, source.track_id, old_start, old_end, new_start - old_start);
-                }
-                removed.start_beat = new_start;
-                moving.push((to_track_id, same_track, removed));
-            }
-            let mut new_refs: Vec<(u32, u32)> = Vec::with_capacity(moving.len());
-            for (to_track_id, same_track, mut clip) in moving {
-                let Some(to_track_idx) = song.track_index_by_id(to_track_id) else {
-                    continue;
-                };
-                // トラックを跨ぐときは id を採り直す (移動先の別クリップと
-                // 衝突しうるため)。同トラック内なら id を保って選択を安定させる。
-                if !same_track {
-                    clip.id = 0;
-                }
-                let Some(to_track) = song.tracks.get_mut(to_track_idx) else {
-                    continue;
-                };
-                let new_clip_id = to_track.place_clip(clip);
-                new_refs.push((to_track_idx as u32, new_clip_id));
-            }
-            new_refs
-        }) else {
-            return;
-        };
-        // 新 clip 群を包む範囲を選択にする (stable ClipKey で解決)。
-        let keys: Vec<common::model::ClipKey> = new_refs
-            .iter()
-            .filter_map(|(t_idx, c_id)| {
-                let track = self.cur.song_doc.song().tracks.get(*t_idx as usize)?;
-                track
-                    .clips
-                    .iter()
-                    .any(|c| c.id == *c_id)
-                    .then_some(common::model::ClipKey {
-                        track_id: track.id,
-                        clip_id: *c_id,
-                    })
-            })
-            .collect();
-        self.select_new_clips(&keys);
-    }
-
     /// render 出力 WAV の path と `AudioSourcePath` を決める。保存済み
     /// project は `<dir>/bounce/<name><infix>_<ts>.wav`、未保存は bounce_cache (save 時に
     /// `finish_save` が project へ移動 + ProjectRelative 化)。
@@ -178,7 +98,8 @@ impl AppData {
     /// 「新トラック + 元クリップのミュート」([`common::model::Song::place_bounce_with_fx`]) する。
     /// Audio / MIDI / 歌唱クリップが対象 (= 旧 is-Audio guard を撤去し「全く無反応」 を解消)。完了通知の `flush_song_sync` が full song を再
     /// LoadSong して engine state を復元する。歌唱の合成待ちは `request_bounce` が前段で行う。
-    pub(crate) fn start_clip_bounce(&mut self, target: ClipKey, mode: BounceMode) {
+    /// `label` = 発注した操作の履歴ラベル (完了時の 1 undo step の名前)。
+    pub(crate) fn start_clip_bounce(&mut self, target: ClipKey, mode: BounceMode, label: &'static str) {
         // Glue の焼き込みも同じ offline render を使う (engine は同時 1 本)。
         if self.cur.pipc.pending_clip_fx_bounce.is_some() || self.cur.pipc.pending_glue_bake.is_some() {
             self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
@@ -240,6 +161,7 @@ impl AppData {
             clip_length_beats: clip.length_beats,
             start_beat: clip.start_beat,
             content_offset_beats: clip.content_offset_beats,
+            label,
         });
         // SetRenderMode(Offline) → LoadSong(isolated) → BounceClipFxOnline。完了通知で
         // Realtime に戻し、restore_engine_song_after_bounce が full song を再 LoadSong
@@ -323,9 +245,10 @@ impl AppData {
                 let clip_id = t.clip_by_id(target.clip_id)?.id;
                 Some((plugin_id, t.id, clip_id))
             });
+        let label = self.cur.song_doc.event_label();
         if let Some((device_id, track_id, clip_id)) = vocal {
             self.cur.pipc.pending_vocal_synth_bounce =
-                Some(PendingVocalSynthBounce { track_id, clip_id, mode });
+                Some(PendingVocalSynthBounce { track_id, clip_id, mode, label });
             // r.md #27: bounce は合成完了 (`VocalSynthReady`) を待つので、metadata が
             // 前回送信と不変でも必ず再送して synth 世代を進める。差分キャッシュを迂回
             // するため該当 device の entry を落としてから flush する (= 直前の合成が
@@ -336,7 +259,7 @@ impl AppData {
             self.ui_ephemeral.status_message = "Bounce: 歌唱を合成中...".into();
             return;
         }
-        self.start_clip_bounce(target, mode);
+        self.start_clip_bounce(target, mode, label);
     }
 
     /// PR-C: plugin chain 込みで render し、 結果を **新 track + 新 Clip**
@@ -461,6 +384,8 @@ impl AppData {
         let source_content_id = pending.source_content_id;
         let track_name = format!("{} (FX)", pending.clip_name);
         let (content_name, new_track_name) = (format!("{} (bounced FX)", pending.clip_name), track_name.clone());
+        // 発注した操作の名前で独立した 1 step (進行中のドラッグの bracket には入れない)。
+        let gesture = self.cur.song_doc.enter_own_gesture(pending.label);
         let placed = self.edit_song(move |song| {
             let (source_id, content) = song.add_baked_audio(wav, window, offset);
             let content = common::model::ClipContent::Audio(content);
@@ -481,6 +406,7 @@ impl AppData {
             }
             Some(source_id)
         });
+        self.cur.song_doc.leave_own_gesture(gesture);
         let Some(Some(source_id)) = placed else {
             return;
         };
@@ -509,45 +435,4 @@ impl AppData {
         };
     }
 
-}
-
-/// **オートメーション追従**: `[start, end)` に居た automation を `delta` 拍ずらす。
-///
-/// 境界でクリップを割ってから、区間に完全に入るものだけを動かす。 移動先は上書き規則で
-/// 削ってから置く (automation クリップも `Track.clips` と同じ非重なり不変条件を持つ)。
-/// **閉じているレーンも含めて**そのトラックの全レーンに効く (設定が ON のときだけ呼ばれる)。
-fn move_track_automation(
-    song: &mut common::model::Song,
-    track_id: u32,
-    start: f64,
-    end: f64,
-    delta: f64,
-) {
-    const EPS: f64 = 1e-9;
-    if delta.abs() <= EPS || end <= start + EPS {
-        return;
-    }
-    let Some(track) = song.track_by_id_mut(track_id) else {
-        return;
-    };
-    for lane in &mut track.automation_lanes {
-        lane.split_at(start);
-        lane.split_at(end);
-        let mut moving: Vec<common::model::AutomationClip> = Vec::new();
-        lane.clips.retain(|c| {
-            let inside = c.start_beat >= start - EPS && c.start_beat + c.length_beats <= end + EPS;
-            if inside {
-                moving.push(c.clone());
-            }
-            !inside
-        });
-        if moving.is_empty() {
-            continue;
-        }
-        lane.carve_clip_range(start + delta, end + delta, None);
-        for mut c in moving {
-            c.start_beat += delta;
-            lane.clips.push(c);
-        }
-    }
 }

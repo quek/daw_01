@@ -1667,8 +1667,8 @@ struct SectionDragSession {
     last_mouse: (f32, f32),
     /// drag 中の最終 alt (snap 一時無効、 overlay と commit が同一値を読む)。
     last_alt: bool,
-    /// drag 中の最終 ctrl。 `Move + last_ctrl` で `DuplicateSection` に分岐 (clip の `CloneClipsLinked` と
-    /// 同じ Ctrl+drag idiom)。 Alt は snap 無効に予約済なので複製には使わない。
+    /// drag 中の最終 ctrl。 `Move + last_ctrl` で `SectionEvent::Duplicate` に分岐 (クリップの Ctrl+drag
+    /// = リンクコピーと同じ idiom)。 Alt は snap 無効に予約済なので複製には使わない。
     last_ctrl: bool,
     /// M14 Phase 128 (daw_01 #106): drag 中の最終 shift。 短 click 時の `SelectSection` modifier を
     /// Shift = `RangeFromAnchor` に分岐するため track。 `last_ctrl` と同じ仕組み (continuation で update、
@@ -1976,7 +1976,7 @@ pub(crate) struct ArrangementState {
     /// `preview_curve` を毎フレーム逆算して live preview (cached 外で overlay 描画)。
     automation_segment_bend: Option<AutomationSegmentBendSession>,
     /// M14 Phase 127 (daw_01 #105): Arranger section の Move/Resize/Duplicate/範囲作成 drag session
-    /// (release で `MoveSection` / `ResizeSection` / `DuplicateSection` / `CreateSection` のいずれか
+    /// (release で `SectionEvent` の `Move` / `Resize` / `Duplicate` / `Create` のいずれか
     /// 1 件発火、 短 drag の Move は `SetPlayheadBeat` (帯ジャンプ) に demote)。
     section_drag: Option<SectionDragSession>,
     // (r.md #35) track の選択アンカーは widget state から `SelectionState.track_anchor` へ移設。

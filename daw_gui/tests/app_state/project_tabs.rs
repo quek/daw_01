@@ -274,7 +274,7 @@ fn quit_asks_each_dirty_tab_in_display_order() {
     app.handle_event(AppEvent::Tab(TabEvent::New));
     let c = app.pk(); // C: clean, active
 
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
 
     assert_eq!(app.pk(), a, "first dirty tab is brought forward");
     assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::Quit(QuitRequest::USER)));
@@ -306,7 +306,7 @@ fn quit_discard_on_an_exporting_tab_does_not_loop() {
     // 書き出し中 (= 閉じるのを拒否されるタブ)。
     app.cur.transport.export_stage = Some(daw_gui::app::ExportStage::AudioRender { done: 0, total: 1 });
 
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
     assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::Quit(QuitRequest::USER)));
 
     app.handle_event(AppEvent::DirtyGuardDiscard);
@@ -325,7 +325,7 @@ fn quit_cancel_on_the_second_tab_keeps_everything() {
     let b = app.pk();
     app.cur.song_doc.normalize(|_| {});
 
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
     assert_eq!(app.pk(), a);
     app.handle_event(AppEvent::DirtyGuardDiscard); // A の変更は捨てる
     assert_eq!(app.pk(), b);

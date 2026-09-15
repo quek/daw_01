@@ -514,9 +514,9 @@ impl AppData {
         if selected.is_empty() || offset <= f64::EPSILON {
             return;
         }
-        // クリップごとの `edit_song` + 窓伸ばしで snapshot が何段も積まれるので、
-        // 1 回の D を **1 undo step** に畳む (`J` と同じ扱い)。
-        self.cur.song_doc.begin_gesture();
+        // クリップごとの `edit_song` + 窓伸ばしは、 1 回の D (`DuplicateSelectedNotes` の 1 event) の
+        // scope で **1 undo step** に入る。 ここで bracket を張り直すと、 進行中の bracket (録音 take /
+        // ピッカーの session) を閉じてしまい、 以後その操作の編集が 1 回ずつ別 step に割れる。
         self.for_each_note_clip_group(
             selected.into_iter().map(|id| (id, ())),
             |app, _slot, r, items| {
@@ -532,7 +532,6 @@ impl AppData {
             },
         );
         self.extend_clips_to_cover(&sel, offset);
-        self.cur.song_doc.end_gesture();
         // 範囲を 1 つ後ろへ送る。 選択されたノートは範囲から導出されるので、
         // これだけで「複製が新しい選択」になる。
         if let Some(t) = self.cur.selection.time.as_mut() {

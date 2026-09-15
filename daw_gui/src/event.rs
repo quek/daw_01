@@ -41,9 +41,8 @@ pub enum AppEvent {
     /// 操作を取りやめてアプリに戻る。
     DirtyGuardCancel,
     /// r.md #61: **アプリ終了要求の唯一の event**。File > 終了 / `Ctrl+Q` /
-    /// `--smoke-test` の判定完了 / Windows のセッション終了がここに合流する
-    /// (✕ / Alt+F4 は `WindowEvent::CloseRequested` → `AppData::request_close`
-    /// から同じ `request_quit` に入る)。
+    /// `--smoke-test` の判定完了 / Windows のセッション終了 / ✕ / Alt+F4
+    /// (`WindowEvent::CloseRequested`) がここに合流する。
     ///
     /// 未保存なら確認モーダルを挟み、通れば子プロセスの graceful teardown を
     /// 待つシーケンス (`crate::shutdown`) に入る。
@@ -711,10 +710,6 @@ pub enum AppEvent {
         length: f64,
         stretch: bool,
     },
-    /// `(source_ref, to_track_id, next_start_beat)` のタプル列。
-    /// to_track_id == source の track id なら同 track 内 move、 違えば
-    /// track 跨ぎ move (clip 自体を別 track の `clips: Vec<Clip>` に移す)。
-    SetClipPositions(Vec<(ClipKey, u32, f64)>),
     CreateClip { track: u32, start_beat: f64 },
     /// ランチャーのセル削除 (`AppData::delete_selected_clip` →
     /// `AppData::delete_launcher_cells`)。名前に反してアレンジのクリップは
@@ -723,13 +718,6 @@ pub enum AppEvent {
     /// 範囲がアクティブなときの Delete: 範囲の境界で分割し、範囲部分だけを消す
     /// (`docs/plan_range_selection.md` §8)。時間は詰めない。
     DeleteTimeSelection,
-    /// arrangement Ctrl+drag → release の結果。 各 entry は `(source ClipKey,
-    /// to_track_id, drop_start_beat)` (snap 済み)、 元 clip は残し、 drop 位置に
-    /// 共有コピー を to_track 上で生成。 (§3.4)
-    CloneClipsLinked(Vec<(ClipKey, u32, f64)>),
-    /// arrangement Ctrl+Shift+drag → release。 同上だが content は deep clone
-    /// + 新 ContentId 採番で独立化。 (§3.5)
-    CloneClipsIndependent(Vec<(ClipKey, u32, f64)>),
     /// 右クリック「Make Unique」 — 共有 clip を独立化。 refcount==1 の場合は
     /// no-op (§3.6)。
     MakeClipUnique(ClipKey),
@@ -867,6 +855,13 @@ pub enum AppEvent {
         track_id: u32,
         target: common::model::AutomationTarget,
         source_id: u32,
+    },
+    /// r.md #78: 待受中 (◉) のモジュレーターを `target` に繋いで待受を解く
+    /// (`AppData::connect_armed_mod_source_to`)。プラグイン窓の中で触った param と、
+    /// daw_gui のツマミの深さドラッグの立ち下がりから。
+    ConnectArmedModSource {
+        track_id: u32,
+        target: common::model::AutomationTarget,
     },
     /// set a routing's modulation depth (normalized-domain amount, clamped
     /// to `-1..=1`).
@@ -1424,6 +1419,16 @@ pub enum AppEvent {
     /// オーディオ event の全部をこの 1 本で運ぶ (「1 arm = 1 サブ enum」)。
     SplitJoin(crate::event_split::SplitJoinEvent),
 
+    // -------- 貼り付け / 範囲 / セクション ------------------------------------
+    // view が handler を直に呼ぶと undo 履歴に操作名が付かず、1 操作 = 1 undo step も
+    // 保てない (`AppData::handle_event` の doc)。サブ enum で束ねる (「1 arm = 1 サブ enum」)。
+    /// 貼り付け / カット / コピー (`Ctrl+V` / `Ctrl+X` / `Ctrl+C`、タブ間のドラッグ)。
+    Clipboard(crate::event_clipboard::ClipboardEvent),
+    /// 範囲選択の中身のミュート / ナッジ / 複製 / ドラッグ移動。
+    Range(crate::event_range::RangeEvent),
+    /// Arranger セクション帯の作成 / 移動 / 伸縮 / 複製 / 削除。
+    Section(crate::event_section::SectionEvent),
+
     // -------- Audio event field edits (Phase 2 PR1) ------------------------
     /// Toggle `AudioEvent.reversed` for every event in the selected
     /// audio clip. Non-audio clips no-op. `docs/plan_audio_clip.md`
@@ -1777,15 +1782,16 @@ impl AppEvent {
             // ---- クリップ ----
             E::CreateClip { .. } => "クリップ作成",
             E::AddTextClipAt { .. } => "テキストクリップ追加",
-            E::SetClipPositions(..) => "クリップ移動",
             E::ResizeClip { .. } => "クリップ長さ変更",
             E::DeleteSelectedClip => "セル削除",
             E::DeleteTimeSelection => "範囲の削除",
-            E::CloneClipsLinked(..) | E::CloneClipsIndependent(..) => "クリップ複製",
             E::MakeClipUnique(..) => "クリップを独立化",
             E::CommitRenameClip => "クリップ名変更",
             // ラベルの SSoT はサブ enum 側 (`Launcher` と同じ)。
             E::SplitJoin(ev) => ev.undo_label(),
+            E::Clipboard(ev) => ev.undo_label(),
+            E::Range(ev) => ev.undo_label(),
+            E::Section(ev) => ev.undo_label(),
             E::SetClipColor { .. } => "クリップ色変更",
             E::SetAutomationClipColor { .. } => "オートメーションクリップ色変更",
             E::SetAutomationLaneColor { .. } => "レーン色変更",
@@ -1823,7 +1829,12 @@ impl AppEvent {
             | E::SetClipTextW { .. }
             | E::SetClipTextH { .. }
             | E::SetClipTextRotation { .. } => "テキスト編集",
-            E::CommitFontFromPicker(..) => "フォント変更",
+            // ピッカーのカーソル移動 / hover はフォントをライブ適用し、閉じる (キャンセル) は
+            // 元へ戻す。どれもピッカーの session gesture に入る 1 step。
+            E::CommitFontFromPicker(..)
+            | E::MoveFontPickerCursor(..)
+            | E::HoverFontInPicker(..)
+            | E::CloseFontPicker => "フォント変更",
             E::SetClipImageX { .. }
             | E::SetClipImageY { .. }
             | E::SetClipImageW { .. }
@@ -1855,8 +1866,17 @@ impl AppEvent {
             // ここに並べると「巨大 match」 が 2 か所に増える)。
             E::Launcher(ev) => ev.undo_label(),
             E::Sampler(ev) => ev.undo_label(),
-            // r.md #113 `VirtualKeyboard(..)` は `MidiNoteOn` と同じ録音経路なので、
-            // ラベルも同じ既定 (`_ => "編集"`) に落とす。
+
+            // ---- MIDI 入力 / 録音 ----
+            // ノートは録音 (take の bracket) / ステップ入力 / ランチャーの Learn のどれか。
+            // r.md #113 の仮想鍵盤は MIDI 入力と同じ経路。
+            E::MidiNoteOn { .. } | E::MidiNoteOff { .. } | E::VirtualKeyboard(..) => "MIDI 入力",
+            // Learn の割り当て / 割り当て済み param への値 (連続 CC は 1 step に畳む)。
+            E::MidiControlChange { .. } => "MIDI コントロール",
+            E::RemoveMidiBinding(..) => "MIDI 割り当て削除",
+            E::ToggleTrackArmed(..) => "録音待機切替",
+            // 再生中の Touch / Latch / Write 録音 (tick がポイントを打つ)。
+            E::Tick { .. } => "オートメーション録音",
 
             // ---- ミキサー / センド ----
             E::SetTrackVolume { .. } => "音量変更",
@@ -1887,7 +1907,9 @@ impl AppEvent {
             | E::SetModSourceBand { .. }
             | E::SetModSourceTapPoint { .. }
             | E::SetModSourceTap { .. } => "モジュレーション編集",
-            E::AddModRouting { .. } | E::RemoveModRouting { .. } => "モジュレーション接続",
+            E::AddModRouting { .. } | E::RemoveModRouting { .. } | E::ConnectArmedModSource { .. } => {
+                "モジュレーション接続"
+            }
             E::SetModRoutingDepth { .. } => "モジュレーション深度変更",
             E::SetModRoutingPolarity { .. } => "モジュレーション極性変更",
             E::SetModRoutingEnabled { .. } => "モジュレーション接続のバイパス切替",
@@ -1954,14 +1976,23 @@ impl AppEvent {
             }
 
             // ---- メディア読み込み ----
-            E::ImportAudio { .. } => "オーディオ読み込み",
-            E::ImportVideo { .. } => "動画読み込み",
-            E::ImportImage { .. } => "画像読み込み",
-            E::ImportMidi { .. } => "MIDI 読み込み",
+            // ファイルダイアログから選んだときも同じ読み込み (`handle_file_dialog_result`)。
+            E::ImportAudio { .. } | E::FileDialogResult { kind: FileDialogKind::ImportAudio, .. } => {
+                "オーディオ読み込み"
+            }
+            E::ImportVideo { .. } | E::FileDialogResult { kind: FileDialogKind::ImportVideo, .. } => {
+                "動画読み込み"
+            }
+            E::ImportImage { .. } | E::FileDialogResult { kind: FileDialogKind::ImportImage, .. } => {
+                "画像読み込み"
+            }
+            E::ImportMidi { .. } | E::FileDialogResult { kind: FileDialogKind::ImportMidi, .. } => {
+                "MIDI 読み込み"
+            }
 
             // 非編集 event (snapshot を積まない) はここに落ちてラベルは記録
             // されない。 編集 event のラベル漏れも "編集" で名前を保証する。
-            _ => "編集",
+            _ => crate::state::song_doc::GENERIC_UNDO_LABEL,
         }
     }
 }

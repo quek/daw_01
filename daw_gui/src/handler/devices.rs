@@ -879,9 +879,7 @@ impl AppData {
             self.remove_devices_inner(&device_ids);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::RemoveDevices {
-            device_ids,
-        }));
+        self.enqueue_deferred_edit(DeferredEdit::RemoveDevices { device_ids });
     }
 
     /// 単一デバイスチェーン: 指定 device を所属チェーンから `Vec::remove` する。
@@ -1079,11 +1077,14 @@ impl AppData {
                 Self::apply_plugin_states_to(&mut snapshot, &states);
                 self.finish_save(snapshot, path, snap_epoch);
             }
-            PendingStateRequest::Deferred(edit) => {
+            PendingStateRequest::Deferred { edit, label } => {
                 // ここで初めて Undo snapshot を push する。 Song に
                 // 最新 state が入った状態を捕まえるため (plugin が
                 // 削除される編集を Undo すると knob 値が復元される)。
+                // 発注した操作の名前で独立した 1 step (進行中のドラッグの bracket には入れない)。
+                let gesture = self.cur.song_doc.enter_own_gesture(label);
                 self.execute_deferred_edit(edit);
+                self.cur.song_doc.leave_own_gesture(gesture);
             }
             PendingStateRequest::CopyToClipboard(req) => {
                 // copy は Song 不変なので undo を積まない。最新 state

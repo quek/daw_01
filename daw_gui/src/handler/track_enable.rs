@@ -33,7 +33,7 @@ impl AppData {
             self.set_tracks_enabled_inner(&ids, enabled);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::DisableTracks { track_ids: ids }));
+        self.enqueue_deferred_edit(DeferredEdit::DisableTracks { track_ids: ids });
     }
 
     /// 無効化 / 有効化の本体 (deferred の完了か即時)。`Song::set_tracks_enabled` が録音待機とランチャーの
