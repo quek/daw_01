@@ -2380,6 +2380,32 @@ mod render_tests {
     #[cfg(feature = "rt-assert")]
     #[test]
     fn spectral_render_does_not_allocate_on_the_audio_thread() {
+        assert_render_does_not_allocate(StretchMode::Stretch, 5.0, -3.0, false, |_| 0, 4);
+    }
+
+    /// r.md #130: グローバルトランスポーズで **tape / slice の event もスペクトルエンジンを通る** 経路と、
+    /// 再生中の移調の変化 (0 → +3 = 発音の途中で prime / +3 → -2 = ストリームの途中で音程を変える / -2 → 0 =
+    /// バイパスへ戻る / 0 → +5 = もう一度 prime) が、どの mode でも audio thread で確保しない。
+    #[cfg(feature = "rt-assert")]
+    #[test]
+    fn transposed_render_does_not_allocate_on_the_audio_thread() {
+        const STEPS: [i32; 8] = [0, 3, 3, -2, 0, 0, 5, 5];
+        for mode in [StretchMode::Raw, StretchMode::Repitch, StretchMode::Slice, StretchMode::Stretch] {
+            assert_render_does_not_allocate(mode, 0.0, 0.0, true, |buf| STEPS[buf as usize % STEPS.len()], 16);
+        }
+    }
+
+    /// 1 本の event を `buffers` 回 (512 frame ずつ) `assert_no_alloc` の中で描き、Rust / C++ の確保が 0 回か検査する
+    /// (上の 2 本の本体)。`transposable` / `transpose_at(buf)` は r.md #130 の移調 (buffer ごとの値)。
+    #[cfg(feature = "rt-assert")]
+    fn assert_render_does_not_allocate(
+        mode: StretchMode,
+        pitch: f32,
+        formant: f32,
+        transposable: bool,
+        transpose_at: impl Fn(u64) -> i32,
+        buffers: u64,
+    ) {
         let buffer = ramped_sine_source(48_000);
         let source_frames = buffer.frames;
         let schedule = vec![RenderedEvent {
@@ -2396,9 +2422,9 @@ mod render_tests {
             pan: 0.0,
             sr_ratio: 1.0,
             pitch_factor: 1.0,
-            pitch_semitones: 5.0,
-            formant_semitones: -3.0,
-            transposable: false,
+            pitch_semitones: pitch,
+            formant_semitones: formant,
+            transposable,
             stream_key: 1,
             needs_engine: false,
             stretch_ratio: stretch_ratio_for(source_frames, 48_000, LEN_BEATS, BPM),
@@ -2408,13 +2434,14 @@ mod render_tests {
             fade_in_curve: FadeCurve::Linear,
             fade_out_curve: FadeCurve::Linear,
             reversed: false,
-            stretch_mode: StretchMode::Stretch,
+            stretch_mode: mode,
             onsets: Vec::new(),
             beat_markers: Vec::new(),
         }];
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));
         let renderer = AudioClipRenderer::new(schedule, sources);
+        assert_eq!(renderer.engines_per_track.first().copied(), Some(1), "{mode:?}: 前提: エンジンを 1 基使う event");
 
         // エンジンと scratch は off-RT で用意する (= live では publish 側が作って
         // ring で配送、export では walk の頭で積む)。
@@ -2441,7 +2468,7 @@ mod render_tests {
         // 1 回目は prime (= `sms_output_seek`) を含む発音開始、2 回目以降は定常。
         // どちらも RT で走るのでまとめて検査する。
         assert_no_alloc::assert_no_alloc(|| {
-            for buf in 0..4u64 {
+            for buf in 0..buffers {
                 render_audio_events(
                     &renderer,
                     0,
@@ -2452,7 +2479,7 @@ mod render_tests {
                     BPM,
                     ENGINE_SR,
                     512,
-                    0,
+                    transpose_at(buf),
                     &mut ClipRenderState {
                         repitch_accum: &mut accum,
                         engines: &mut engines,
@@ -2468,9 +2495,11 @@ mod render_tests {
         let cxx_after = unsafe { signalsmith_sys::sms_alloc_count() };
         assert_eq!(
             cxx_after, cxx_before,
-            "vendored C++ エンジンが RT で {} 回ヒープ確保した              (warm-up がカバーしない resize が増えている)",
+            "{mode:?}: vendored C++ エンジンが RT で {} 回ヒープ確保した              (warm-up がカバーしない resize が増えている)",
             cxx_after - cxx_before
         );
+        // 検査した区間で実際にエンジンを通っている (素通しだけを測って緑にならない)。
+        assert_eq!(engines[0].stream_key(), Some(1), "{mode:?}: エンジンで描いた buffer がある");
     }
 
     // ---- tape 位置積分 (E5 / r.md #8) --------------------------------------

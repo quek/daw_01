@@ -150,6 +150,8 @@ impl Song {
     ///   (トラック複製と同じ規則)。複製した変調の深さを指すレーン / 変調も連れていく。
     /// - send: 同じ id のまま複製する。pre-fader の send は PostFx 点 = 焼いた音を読むので同じ量が出る。
     /// - 行き先: 同じ親 group の、元トラックの subtree の直後に置く。
+    /// - 移調への追従 (r.md #130 確定仕様 Q8): 元トラックの `follow_transpose` を写す。焼いた音は移調 0 なので、
+    ///   元が追従しない (ドラム等) なら新しいトラックも追従しない — 写さないと既定の「追従」で焼いた音だけが移調される。
     /// - 元トラックを読む配線 (SC / follower) は付け替えない — 元トラックは鳴り続けるので、付け替えると残りの音を
     ///   失う。
     pub fn place_bounce_with_fx(&mut self, source: ClipKey, name: String, clip: Clip) -> Option<u32> {
@@ -172,6 +174,7 @@ impl Song {
             automation_lanes,
             next_lane_id: src.next_lane_id,
             mod_routings,
+            follow_transpose: src.follow_transpose,
             ..Track::default()
         };
         track.place_clip(clip);
@@ -330,8 +333,8 @@ mod tests {
     }
 
     /// Bounce with FX の置き方 = PostFx 点から後ろを写す規則: フェーダー (値 / レーン / 変調とその深さ) / send /
-    /// 親 group が新しいトラックへ写り、元トラックは焼いたクリップの mute だけ (他のクリップ・中身・読む配線は
-    /// そのまま)。写したものは編集後の不変条件でも消えない (= dangling を作らない)。
+    /// 親 group / 移調への追従 (r.md #130 Q8) が新しいトラックへ写り、元トラックは焼いたクリップの mute だけ
+    /// (他のクリップ・中身・読む配線はそのまま)。写したものは編集後の不変条件でも消えない (= dangling を作らない)。
     #[test]
     fn bounce_with_fx_moves_what_follows_the_post_fx_point_to_the_new_track() {
         use TrackBuiltinParam as B;
@@ -366,7 +369,7 @@ mod tests {
         let t = song.track_by_id_mut(src).expect("src");
         let source_clip = t.place_clip(Clip { start_beat: 1.0, length_beats: 2.0, content_id: source_content, ..Clip::default() });
         let other_clip = t.place_clip(Clip { start_beat: 4.0, length_beats: 2.0, content_id: source_content, ..Clip::default() });
-        (t.volume, t.pan, t.solo) = (0.5, -0.4, true);
+        (t.volume, t.pan, t.solo, t.follow_transpose) = (0.5, -0.4, true, false);
         t.sends.push(Send { id: 3, dest_track_id: ret, gain: 0.7, mode: SendMode::PreFader, enabled: true });
         t.next_send_id = 4;
         let mut volume_lane = AutomationLane::new(AutomationTarget::TrackBuiltin(B::Volume), 0.5);
@@ -394,6 +397,7 @@ mod tests {
         let new = song.track_by_id(id).expect("new track");
         assert_eq!((new.volume, new.pan, new.muted, new.solo), (0.5, -0.4, false, true), "フェーダーは写す");
         assert_eq!(new.parent_group_id, Some(group), "行き先は同じ親 group");
+        assert!(!new.follow_transpose, "移調に追従しない元から焼いた音は、新しいトラックでも追従しない");
         assert_eq!(new.sends, before.sends, "send は同じ id のまま");
         assert_eq!(new.clips.len(), 1);
         let lane_targets: Vec<_> = new.automation_lanes.iter().map(|l| (l.id, l.target.clone())).collect();
