@@ -20,13 +20,12 @@ impl AppData {
     /// のときだけこれを呼んで return する。
     ///
     /// 書き出し / 解析 ([`PendingRender::blocks_screen`]) は押した時点で始まっている扱い — 走り出すときと同じく再生を
-    /// 止め、止めた再生を読み込み後に戻す予約 (A7) も捨てる (戻した直後に描画の開始が止めることになる)。待っている
-    /// 間の見え方は、書き出しは進捗オーバーレイ、解析はレポート窓、Bounce / Glue はステータスバーが同じ状態から出す。
+    /// 止め、止めた再生を読み込み後に戻す予約 (A7) も捨てる (`stop` が捨てる。戻した直後に描画の開始が止めることに
+    /// なる)。待っている間の見え方は、書き出しは進捗オーバーレイ、解析はレポート窓、Bounce / Glue はステータスバーが
+    /// 同じ状態から出す。
     pub(crate) fn defer_render(&mut self, render: PendingRender) {
         if render.blocks_screen() {
             self.stop();
-            self.cur.transport.pending_play = None;
-            self.cur.transport.pending_play_record = None;
         }
         tracing::info!(
             render = render.name(),

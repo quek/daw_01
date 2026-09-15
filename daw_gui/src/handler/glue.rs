@@ -261,10 +261,11 @@ impl AppData {
     /// `sel` を結合する本体 (`J` と、読み込み待ちからの再開の共通の口)。`label` = `J` の履歴ラベル。
     /// audio を焼くときは plugin の読み込みが残っていれば確定を待つ (`PendingRender::Glue`) — 再開時はそのときの
     /// Song で `sel` の中身を集め直す。
+    ///
+    /// ほかの描画との排他 (`refuse_render_while_another`) は **焼くときだけ**。audio の無い結合は engine を使わない
+    /// ただの編集なので、ほかの編集と同じ規則に従う — 描画が走っている間は `edit_song` の書き出しロックが断り、
+    /// 読み込み待ちで開始を待っている (まだ何も占有していない) 間はそのまま結合する。
     pub(crate) fn glue_selection(&mut self, sel: TimeSelection, label: &'static str) {
-        if self.refuse_render_while_another("Glue") {
-            return;
-        }
         let refs_by_track = self.glue_refs_by_track(&sel, false);
         if refs_by_track.is_empty() {
             tracing::warn!("Glue: 範囲内にクリップが無い");
@@ -278,6 +279,10 @@ impl AppData {
             .collect();
         if audio_tracks.is_empty() {
             self.apply_glue(&sel, &BTreeMap::new(), label);
+            return;
+        }
+        // engine の offline render は同時に 1 本 (書き出し / 解析 / Bounce / Glue の焼き込み、読み込み待ちの開始待ちを含む)。
+        if self.refuse_render_while_another("Glue") {
             return;
         }
         // r.md #131: audio の結合は offline render で焼く。無効なトラックは実行系に居ないので焼けない。

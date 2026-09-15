@@ -298,7 +298,13 @@ impl AppData {
     /// 録音セッションだけはここでも即座に閉じる。ユーザーが明示的に止めた以上、
     /// 観測が届くまでの数十 ms に鍵盤を叩いたぶんが録音に混ざってはいけない。
     /// クローズは冪等なので二重に呼ばれても害はない。
+    ///
+    /// 読み込み待ちで預かった再生 (A7 の `pending_play`、読み込みで一時停止した再生の再開を含む) も取り消す —
+    /// 止めた後に読み込みが確定して (応答 / 失敗 / 読み込み中の device を消す undo) 勝手に走り出さないように。
+    /// 読み込みのための一時停止は `track_pending_load` が `Stop` を直に送るのでここを通らない。
     pub(crate) fn stop(&mut self) {
+        self.cur.transport.pending_play = None;
+        self.cur.transport.pending_play_record = None;
         self.send_audio(AudioCommand::Stop { project: self.pk() });
         self.close_recording_session();
     }

@@ -5,11 +5,12 @@
 //! 無音で焼かれる。待っている間に何を止め何を通すか (再生 / ほかの描画 / キャンセル) と、読み込みが「応答以外」
 //! (読み込み中の plugin を消す undo) で空になっても始まることをここで留める。
 
-use common::model::{Clip, ClipContent, ClipKey, MidiContent, Note};
+use common::model::{Clip, ClipContent, ClipKey, LaneRef, MidiContent, Note};
 use common::protocol::{AudioCommand, PluginCommand, PluginEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{AppData, AppEvent, ExportStage, FileDialogKind};
+use daw_gui::event_split::{SplitJoinEvent, SplitSurface};
 use daw_gui::state::{LoudnessPhase, PendingRender};
 
 use super::support::{build_app, drain, fake_plugin_loaded, select_track_single};
@@ -115,15 +116,7 @@ fn 読み込み待ちの_bounce_は再生を妨げず_読み込み中の_plugin_
     let dir = tempfile::tempdir().expect("tempdir");
     app.cur.song_doc.file_path = Some(dir.path().join("proj.daw"));
     let track_id = app.cur.song_doc.song().tracks[0].id;
-    let clip_id = app
-        .edit_song(|song| {
-            let note = Note { id: 1, start_beat: 0.0, duration_beats: 1.0, pitch: 60, velocity: 100, lyric: None, muted: false };
-            let content_id =
-                song.alloc_content(ClipContent::Midi(MidiContent { notes: vec![note], next_note_id: 2 }), "phrase".into());
-            let track = song.track_by_id_mut(track_id).expect("track");
-            track.place_clip(Clip { start_beat: 0.0, length_beats: 4.0, content_id, ..Clip::default() })
-        })
-        .expect("clip");
+    let clip_id = midi_clip(&mut app, track_id, 0.0);
     loading_plugin(&mut app, "test.fx");
     drain(&mut audio_rx);
 
@@ -143,4 +136,53 @@ fn 読み込み待ちの_bounce_は再生を妨げず_読み込み中の_plugin_
     assert!(app.cur.transport.pending_render.is_none());
     let pending = app.cur.pipc.pending_clip_fx_bounce.as_ref().expect("焼いている");
     assert_eq!(pending.label, "バウンス", "完了は Bounce を押した操作の名前で積む");
+}
+
+/// 読み込み待ちで預かった再生は、停止を押したら取り消す — 読み込みが後から確定しても (ここでは読み込み中の plugin を
+/// 消す undo) 勝手に走り出さない。
+#[test]
+fn 読み込み待ちの再生は停止で取り消され_読み込みが確定しても走らない() {
+    let (mut app, mut audio_rx, _plugin_rx, _d) = build_app();
+    loading_plugin(&mut app, "test.fx");
+    app.handle_event(AppEvent::Play);
+    assert!(app.cur.transport.pending_play.is_some(), "前提: 読み込み待ちで再生を予約");
+    app.handle_event(AppEvent::Stop);
+    assert_eq!(app.cur.transport.pending_play, None, "停止しても再生の予約が残った");
+    drain(&mut audio_rx);
+
+    app.handle_event(AppEvent::Undo);
+    assert!(app.cur.pipc.pending_plugin_loads.is_empty(), "前提: undo で読み込み中の plugin が消えた");
+    assert!(!drain(&mut audio_rx).iter().any(|m| matches!(m, AudioCommand::Play { .. })), "停止した再生が走った");
+}
+
+/// Bounce / Glue が読み込み待ちで開始を待っている間も編集は続けられる。audio の無い `J` は engine を使わない編集
+/// なので、待っている描画があっても断らずに結合する。
+#[test]
+fn bounce_の開始待ちでも_audio_の無い結合は断らない() {
+    let (mut app, _audio_rx, _plugin_rx, _d) = build_app();
+    let track_id = app.cur.song_doc.song().tracks[0].id;
+    midi_clip(&mut app, track_id, 0.0);
+    midi_clip(&mut app, track_id, 4.0);
+    let bounced = midi_clip(&mut app, track_id, 12.0);
+    loading_plugin(&mut app, "test.fx");
+    app.handle_event(AppEvent::BounceClipInPlace(ClipKey { track_id, clip_id: bounced }));
+    assert!(matches!(app.cur.transport.pending_render, Some(PendingRender::Bounce { .. })), "前提: Bounce を預かる");
+
+    app.handle_event(AppEvent::SetTimeSelection { start_beat: 0.0, end_beat: 8.0, lanes: vec![LaneRef::Track(track_id)] });
+    app.handle_event(AppEvent::SplitJoin(SplitJoinEvent::Join { surface: SplitSurface::Clips }));
+    let clips = app.cur.song_doc.song().track_by_id(track_id).expect("track").clips.len();
+    assert_eq!(clips, 2, "Bounce の開始待ちで MIDI の結合を断った: {}", app.ui_ephemeral.status_message);
+    assert!(matches!(app.cur.transport.pending_render, Some(PendingRender::Bounce { .. })), "Bounce の開始待ちは残る");
+}
+
+/// `track_id` の `start` 拍に 4 拍の MIDI クリップ (音 1 つ) を置く。clip id を返す。
+fn midi_clip(app: &mut AppData, track_id: u32, start: f64) -> u32 {
+    app.edit_song(|song| {
+        let note = Note { id: 1, start_beat: 0.0, duration_beats: 1.0, pitch: 60, velocity: 100, lyric: None, muted: false };
+        let content_id =
+            song.alloc_content(ClipContent::Midi(MidiContent { notes: vec![note], next_note_id: 2 }), "phrase".into());
+        let track = song.track_by_id_mut(track_id).expect("track");
+        track.place_clip(Clip { start_beat: start, length_beats: 4.0, content_id, ..Clip::default() })
+    })
+    .expect("clip")
 }

@@ -239,14 +239,6 @@ impl AppData {
         }
     }
 
-    /// 子プロセス切断時に、進行中の bounce / 書き出しを畳む脱出口。中止したら `true`。
-    ///
-    /// bounce 進行中の crash では `BounceClipFxComplete` / `VocalSynthReady` が永遠に
-    /// 来ない。pending を放置すると以後の bounce が全て「既に bounce 中」で拒否され、
-    /// audio 側は isolated song のまま残る。`abort_audio_export` と同型の脱出口
-    /// (どちらの子の crash でも安全に解除できる)。
-    ///
-    /// r.md #75 の合成完了ゲート (`pending_vocal_synth_export`) も同じ理由で畳む。
     /// 走っている **映像** 書き出し (in-process の render スレッド) に中断を伝える。
     /// engine 側の freewheel は `AudioCommand::CancelExport` の担当なので触らない。
     /// 終了シーケンスが全タブぶん呼ぶ (`docs/plan_project_tabs.md` §5.4)。
@@ -256,6 +248,14 @@ impl AppData {
         }
     }
 
+    /// 子プロセス切断時に、進行中の bounce / 書き出しを畳む脱出口。中止したら `true`。
+    ///
+    /// bounce 進行中の crash では `BounceClipFxComplete` / `VocalSynthReady` が永遠に
+    /// 来ない。pending を放置すると以後の bounce が全て「Bounce の実行中」で拒否され、
+    /// audio 側は isolated song のまま残る。`abort_audio_export` と同型の脱出口
+    /// (どちらの子の crash でも安全に解除できる)。
+    ///
+    /// r.md #75 の合成完了ゲート (`pending_vocal_synth_export`) も同じ理由で畳む。
     pub(crate) fn abort_inflight_renders_on_disconnect(&mut self) -> bool {
         // 読み込み待ちで預かった描画も畳む: plugin host が落ちると読み込みの帳簿ごと消え、この event の終わりに
         // (読み込みが空に見えて) 走り出してしまう。走っている描画を中止するのと同じ規則。
