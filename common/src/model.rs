@@ -13,6 +13,7 @@ use crate::scale::ScaleChange;
 // (invariant #7: fingerprint handshake の検出網に穴を開けない)。wire に載らない `Song` の
 // ロジックを切り出したファイル (section_ops / load_normalize / source_pools 等) は登録しない
 // (ロジックの変更で fingerprint を動かさない、build.rs 冒頭)。
+mod audio_take;
 mod automation;
 mod bounce_ops;
 mod clip_window;
@@ -20,6 +21,7 @@ mod master_limiter;
 mod media_manifest;
 mod content;
 mod content_split;
+mod event_window;
 mod device;
 mod ids;
 mod lineage;
@@ -47,6 +49,7 @@ pub use master_limiter::*;
 pub use media_manifest::*;
 pub use content::*;
 pub use content_split::split_boundaries;
+pub use event_window::{TimedEvent, event_piece, join_pieces, split_pieces};
 pub use device::*;
 pub use ids::*;
 pub use midi_bind::*;
@@ -303,7 +306,15 @@ pub use view_state::{RackPanelKey, ViewState};
 /// [`Track::follow_transpose`]・[`AutomationTarget::SongTranspose`]・[`BindingTarget::SongTranspose`] を追加。
 /// 旧ファイルは `serde(default)` (移調 0 / 全トラック追従) で読める。新ファイルを旧ビルドで開くと unknown variant で
 /// 落ちるので版で弾く。
-pub const CURRENT_VERSION: u32 = 41;
+///
+/// v42 (r.md #132 残件、分割の忠実度): 分割が「切れ目を入れるだけ」になるよう、時間軸を持つ event に
+/// 窓を持たせた — `AudioEvent` / `VideoEvent` の `take_head_beats` (audio は `take_tail_beats` も、
+/// warp marker の拍は take の座標)、4 種の event の fade ランプの張り出し
+/// (`fade_in_lead_beats` / `fade_out_trail_beats`)、`TextEvent::continuation` (読み上げない続きの片)。
+/// 旧ファイルは `serde(default)` の 0 / `false` (= 分割していない event) で読める (migration 不要)。
+/// 新ファイルを旧ビルドで開くと片が窓を失い、続きの片が同じ文をもう一度読み上げる (未知フィールドを
+/// 捨てる) ので、版を上げて gate で弾く。
+pub const CURRENT_VERSION: u32 = 42;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -1256,6 +1267,10 @@ impl Song {
                 event.event_length_beats *= ratio;
                 event.fade_in_beats *= ratio;
                 event.fade_out_beats *= ratio;
+                event.fade_in_lead_beats *= ratio;
+                event.fade_out_trail_beats *= ratio;
+                // take の隠れている頭と尻も同じ秒で留める (分割の片の時間写像を保つ)。
+                event.scale_take(ratio);
             }
             raw_content_ids.insert(cid);
         }

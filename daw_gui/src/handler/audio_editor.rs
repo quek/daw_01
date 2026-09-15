@@ -5,7 +5,7 @@ use crate::state::*;
 use crate::app_types::*;
 use crate::event::*;
 use std::path::{Path, PathBuf};
-use common::model::{AudioEvent};
+use common::model::{AudioEvent, TimedEvent};
 use crate::import_audio;
 
 impl AppData {
@@ -243,12 +243,12 @@ impl AppData {
     }
 
     /// PR-D 段階 3: Audio Editor で event 端 trim (= 左右端 drag)。
-    /// `side == Left` で左端 trim (= event_start_in_clip_beats +
-    /// event_length_beats + source_start_frames を delta で連動)、
-    /// `side == Right` で右端 trim (= event_length_beats +
-    /// source_end_frames を連動)。 source の sample_rate で
-    /// delta_beats → frames 変換 (bpm = self.cur.song_doc.song().bpm)。 source 境界
-    /// (0..total_frames) と event_length_beats > 0 を保つ clamp 込み。
+    ///
+    /// **窓を動かすだけ** (`AudioEvent::trim_left` / `trim_right`): 見えている音は 1 frame も
+    /// 動かず、隠れていた take の頭 / 尻が現れる / 隠れる (分割の片を伸ばし戻すと切った先の音が
+    /// そのまま戻る)。 take の外まで伸ばすときだけ、take の伸縮率のまま source を伸ばす (source
+    /// ファイルの範囲 0..total_frames まで)。 伸縮率が決まらない退化した take は source の native
+    /// rate (bpm = song.bpm) で換算する。 event_length_beats > 0 を保つ clamp 込み。
     pub(crate) fn set_audio_event_trim(
         &mut self,
         target: ClipKey,
@@ -278,7 +278,7 @@ impl AppData {
             };
             (audio_source.sample_rate as f64, audio_source.frames)
         };
-        let delta_frames = (delta_beats * 60.0 / bpm * sr_hz).round() as i64;
+        let native_frames_per_beat = 60.0 / bpm * sr_hz;
 
         let changed = self.edit_song_checked(|song| {
             let Some(track) = song.track_by_id_mut(target.track_id) else {
@@ -298,44 +298,13 @@ impl AppData {
             };
 
             const MIN_LEN_BEATS: f64 = 1e-4;
+            // delta_beats > 0 で右へ、 < 0 で左へ (左端は右へ = 縮める、右端は右へ = 伸ばす)。
             match side {
                 AudioEventTrimSide::Left => {
-                    // delta_beats > 0 で右に縮める (= start を遅らせる)、
-                    // < 0 で左に伸ばす。 ただし event_length が MIN_LEN を
-                    // 切らないよう先に clamp。
-                    let max_inset = (event.event_length_beats - MIN_LEN_BEATS).max(0.0);
-                    let dbeats = delta_beats.clamp(
-                        -event.event_start_in_clip_beats,
-                        max_inset,
-                    );
-                    let dframes = (dbeats * 60.0 / bpm * sr_hz).round() as i64;
-                    let new_start_in_clip = event.event_start_in_clip_beats + dbeats;
-                    let new_length = event.event_length_beats - dbeats;
-                    let new_source_start = (event.source_start_frames as i64 + dframes)
-                        .max(0)
-                        .min(event.source_end_frames as i64) as u64;
-                    event.event_start_in_clip_beats = new_start_in_clip;
-                    event.event_length_beats = new_length.max(MIN_LEN_BEATS);
-                    event.source_start_frames = new_source_start;
-                    let _ = delta_frames;
+                    event.trim_left(delta_beats, native_frames_per_beat, total_frames, MIN_LEN_BEATS);
                 }
                 AudioEventTrimSide::Right => {
-                    // delta_beats > 0 で右に伸ばす、 < 0 で縮める。 縮める
-                    // 側は event_length が MIN_LEN を切らないよう clamp、
-                    // 伸ばす側は source_end_frames が total_frames を超え
-                    // ないよう clamp。
-                    let max_grow_frames = total_frames as i64 - event.source_end_frames as i64;
-                    let max_grow_beats =
-                        (max_grow_frames as f64) / sr_hz * bpm / 60.0;
-                    let min_shrink_beats = -(event.event_length_beats - MIN_LEN_BEATS).max(0.0);
-                    let dbeats = delta_beats.clamp(min_shrink_beats, max_grow_beats);
-                    let dframes = (dbeats * 60.0 / bpm * sr_hz).round() as i64;
-                    let new_length = event.event_length_beats + dbeats;
-                    let new_source_end = ((event.source_end_frames as i64 + dframes)
-                        .max(event.source_start_frames as i64)
-                        .min(total_frames as i64)) as u64;
-                    event.event_length_beats = new_length.max(MIN_LEN_BEATS);
-                    event.source_end_frames = new_source_end;
+                    event.trim_right(delta_beats, native_frames_per_beat, total_frames, MIN_LEN_BEATS);
                 }
             }
 
@@ -521,8 +490,8 @@ impl AppData {
                         // (`auto_crossfade_selected_clips`) と同じ基準。
                         let fade_beats =
                             auto_fade_beats.min(event.event_length_beats.max(0.0));
-                        event.fade_in_beats = fade_beats;
-                        event.fade_out_beats = fade_beats;
+                        event.set_edge_fade_in(fade_beats);
+                        event.set_edge_fade_out(fade_beats);
                     }
                     true
                 } else {
@@ -630,7 +599,7 @@ impl AppData {
                             .total_cmp(&(b.event_start_in_clip_beats + b.event_length_beats))
                     })
                 {
-                    last.fade_out_beats = xfade_beats;
+                    last.set_edge_fade_out(xfade_beats);
                 }
                 if let Some(common::model::ClipContent::Audio(audio)) =
                     song.clip_contents.get_mut(&next_content)
@@ -638,7 +607,7 @@ impl AppData {
                         a.event_start_in_clip_beats.total_cmp(&b.event_start_in_clip_beats)
                     })
                 {
-                    first.fade_in_beats = xfade_beats;
+                    first.set_edge_fade_in(xfade_beats);
                 }
             }
         });

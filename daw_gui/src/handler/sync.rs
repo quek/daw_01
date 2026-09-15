@@ -359,39 +359,11 @@ impl AppData {
                         }
                     }
                 };
-                let sample_rate = f64::from(source.sample_rate).max(1.0);
-                let start_in_modification = event.source_start_frames as f64 / sample_rate;
-                let duration_in_modification = event
-                    .source_end_frames
-                    .saturating_sub(event.source_start_frames)
-                    as f64
-                    / sample_rate;
-                // r.md #44: event の song 位置は content 原点基準。
-                let start_in_playback =
-                    clip.content_to_song_beat(event.event_start_in_clip_beats) * 60.0 / bpm;
-                // Raw plays the slice natively (no stretch): playback duration ==
-                // modification duration. Every other mode follows the clip's
-                // timeline length, so the playback duration is the event's beat
-                // span in seconds (event_length_beats × 60/bpm) and the plug-in
-                // pitch-preservingly time-stretches the slice onto it. Manual
-                // edge-drag changes event_length_beats; a tempo change changes
-                // bpm — both flow through here (mirrors #6 for non-ARA audio).
-                let time_stretch = event.stretch_mode != common::model::StretchMode::Raw;
-                let duration_in_playback = if time_stretch {
-                    event.event_length_beats * 60.0 / bpm
-                } else {
-                    duration_in_modification
-                };
+                let placement = ara_region_placement(clip, event, f64::from(source.sample_rate).max(1.0), bpm);
                 out.push(common::protocol::AraClipSpec {
                     source_wav: abs,
                     persistent_id: format!("{}:{}:{event_index}", event.source_id, clip.id),
-                    placement: common::protocol::AraRegionPlacement {
-                        start_in_playback_seconds: start_in_playback,
-                        duration_in_playback_seconds: duration_in_playback,
-                        start_in_modification_seconds: start_in_modification,
-                        duration_in_modification_seconds: duration_in_modification,
-                        time_stretch,
-                    },
+                    placement,
                 });
             }
         }
@@ -439,4 +411,41 @@ impl AppData {
         });
     }
 
+}
+
+/// (r.md #5 ARA2) audio event 1 つの ARA region の置き方 (秒)。
+///
+/// 見せるのは event の **窓** (r.md #132 残件: 分割の片は take の一部): modification の範囲は take の
+/// 写像で窓に当たる source の区間、playback は窓の song 位置と長さ。 Raw は source を native rate で
+/// そのまま鳴らす (playback 長 = modification 長、窓の長さで打ち切る)。 それ以外の mode は take の伸縮率で
+/// 窓の source 区間を窓の拍の長さへ time-stretch する (手の端 drag / テンポ変更も同じ式に流れる。 #6 と対)。
+fn ara_region_placement(
+    clip: &common::model::Clip,
+    event: &common::model::AudioEvent,
+    sample_rate: f64,
+    bpm: f64,
+) -> common::protocol::AraRegionPlacement {
+    let secs_per_beat = 60.0 / bpm;
+    let time_stretch = event.stretch_mode != common::model::StretchMode::Raw;
+    let window_start = event.source_start_frames as f64 / sample_rate;
+    let playback_secs = event.event_length_beats * secs_per_beat;
+    let (start_in_modification, duration_in_modification) = if time_stretch {
+        let frames_per_beat = event.take_frames_per_beat(sample_rate * secs_per_beat);
+        (
+            window_start + event.take_head_beats * frames_per_beat / sample_rate,
+            event.event_length_beats * frames_per_beat / sample_rate,
+        )
+    } else {
+        let head_secs = event.take_head_beats * secs_per_beat;
+        let remaining = event.source_window_frames() as f64 / sample_rate - head_secs;
+        (window_start + head_secs, remaining.min(playback_secs).max(0.0))
+    };
+    common::protocol::AraRegionPlacement {
+        // r.md #44: event の song 位置は content 原点基準。
+        start_in_playback_seconds: clip.content_to_song_beat(event.event_start_in_clip_beats) * secs_per_beat,
+        duration_in_playback_seconds: if time_stretch { playback_secs } else { duration_in_modification },
+        start_in_modification_seconds: start_in_modification,
+        duration_in_modification_seconds: duration_in_modification,
+        time_stretch,
+    }
 }

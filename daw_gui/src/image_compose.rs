@@ -12,8 +12,8 @@
 //!   from `video_playback::active_sources_at` by `z_index`.
 
 use common::model::{
-    AutomationLane, AutomationTarget, FadeCurve, ImageBuiltinParam, ImageEvent, ImageSourceId,
-    Song, Track,
+    AutomationLane, AutomationTarget, ImageBuiltinParam, ImageEvent, ImageSourceId, Song, TimedEvent,
+    Track,
 };
 
 use crate::launcher_time::RowTimeline;
@@ -284,41 +284,18 @@ fn resolve_image_fields(
     (x, y, w, h, opacity, rotation)
 }
 
-/// Per-event fade envelope at the given clip-local beat. Range
-/// `0.0..=1.0`. Mirrors `video_playback::event_alpha` exactly so
-/// crossfade visuals between an image and a video stay in step.
+/// Per-event fade envelope at the given clip-local beat. Range `0.0..=1.0`.
+/// 式は映像 / 字幕 / 音と共通の [`common::model::EventFade::gain_at`] (分割の片が切り口を跨ぐ
+/// ランプの続きを持つのもそこが扱う)。
 fn event_alpha_envelope(event: &ImageEvent, clip_local_beat: f64) -> f32 {
-    let event_local = clip_local_beat - event.event_start_in_clip_beats;
-    if event_local < 0.0 {
-        return 0.0;
-    }
-    let mut alpha = 1.0_f32;
-    if event.fade_in_beats > 0.0 && event_local < event.fade_in_beats {
-        let progress = (event_local / event.fade_in_beats) as f32;
-        alpha *= fade_curve_value(progress, event.fade_in_curve);
-    }
-    let event_remaining = event.event_length_beats - event_local;
-    if event.fade_out_beats > 0.0
-        && event_remaining > 0.0
-        && event_remaining < event.fade_out_beats
-    {
-        let progress = (event_remaining / event.fade_out_beats) as f32;
-        alpha *= fade_curve_value(progress, event.fade_out_curve);
-    }
-    alpha.clamp(0.0, 1.0)
-}
-
-fn fade_curve_value(progress: f32, curve: FadeCurve) -> f32 {
-    // r.md #38: fade カーブの式は `common::audio_render::fade_curve_at` が唯一の SSoT
-    // (音 / 映像 / 画像 / 字幕 / アレンジ画面の描画が全部ここを通る)。
-    common::audio_render::fade_curve_at(progress, curve)
+    event.fade().gain_at(clip_local_beat - event.event_start_in_clip_beats)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use common::model::{
-        Clip, ClipContent, ImageContent, ImageEvent, ImageSource, ImageSourcePath,
+        Clip, ClipContent, FadeCurve, ImageContent, ImageEvent, ImageSource, ImageSourcePath,
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -369,6 +346,7 @@ mod tests {
                     fade_out_beats: fade_out,
                     fade_in_curve: FadeCurve::Linear,
                     fade_out_curve: FadeCurve::Linear,
+                    ..ImageEvent::default()
                 }],
             }),
         );
@@ -476,6 +454,7 @@ mod tests {
                     fade_out_beats: 0.0,
                     fade_in_curve: FadeCurve::Linear,
                     fade_out_curve: FadeCurve::Linear,
+                    ..ImageEvent::default()
                 }],
             }),
         );

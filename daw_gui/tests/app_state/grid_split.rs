@@ -231,7 +231,8 @@ fn アレンジの_shift_e_はクリップをグリッド線で割る() {
 }
 
 /// オーディオエディタの `Shift+E`: ポインタが乗っている event をアレンジのグリッド線で割る。
-/// source の範囲は隙間なく配られ、片は全部選択される。
+/// 片は元の event の take の窓 (source の範囲は全片が継ぎ、take の頭 / 尻で見せる区間を持つ)、
+/// 片は全部選択される。
 #[test]
 fn オーディオエディタの_shift_e_は_event_をグリッド線で割る() {
     let (mut app, _a, _p, _d) = support::build_app();
@@ -268,7 +269,7 @@ fn オーディオエディタの_shift_e_は_event_をグリッド線で割る(
     let Some(ClipContent::Audio(audio)) = song.clip_contents.get(&clip.content_id) else {
         panic!("audio content");
     };
-    let got: Vec<(f64, f64, u64, u64, f64, f64)> = audio
+    let got: Vec<(f64, f64, u64, u64, f64, f64, f64, f64)> = audio
         .events
         .iter()
         .map(|e| {
@@ -277,6 +278,8 @@ fn オーディオエディタの_shift_e_は_event_をグリッド線で割る(
                 e.event_length_beats,
                 e.source_start_frames,
                 e.source_end_frames,
+                e.take_head_beats,
+                e.take_tail_beats,
                 e.fade_in_beats,
                 e.fade_out_beats,
             )
@@ -284,8 +287,8 @@ fn オーディオエディタの_shift_e_は_event_をグリッド線で割る(
         .collect();
     assert_eq!(
         got,
-        vec![(0.0, 2.0, 0, 48_000, 0.25, 0.0), (2.0, 2.0, 48_000, 96_000, 0.0, 0.5)],
-        "外側の端の fade だけが残り、source は隙間なく配られる"
+        vec![(0.0, 2.0, 0, 96_000, 0.0, 2.0, 0.25, 0.0), (2.0, 2.0, 0, 96_000, 2.0, 0.0, 0.0, 0.5)],
+        "外側の端の fade だけが残り、片は take を隙間なく並べる窓になる"
     );
     assert_eq!(audio.events[0].id, 1, "先頭の片が元の id");
     assert_eq!(app.selected_audio_event_indices(), vec![0, 1], "片は全部選択される");

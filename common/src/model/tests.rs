@@ -1483,7 +1483,9 @@ fn current_version_is_pinned() {
     // v40 (r.md #131): `Track.enabled` (serde default true で読める)。
     // v41 (r.md #130): `Song.transpose` / `Track.follow_transpose` / `SongTranspose` の target と binding
     // (serde default で読める)。
-    assert_eq!(CURRENT_VERSION, 41);
+    // v42 (r.md #132 残件): 時間軸を持つ event の窓 (take の頭 / 尻、fade ランプの張り出し) と
+    // `TextEvent::continuation` (serde default の 0 / false = 分割していない event で読める)。
+    assert_eq!(CURRENT_VERSION, 42);
 }
 
 #[test]
@@ -2236,6 +2238,7 @@ fn video_track_with_clip_content_roundtrip() {
                 fade_out_beats: 0.5,
                 fade_in_curve: FadeCurve::Linear,
                 fade_out_curve: FadeCurve::SCurve,
+                ..VideoEvent::default()
             }],
         }),
     );
@@ -2940,10 +2943,12 @@ fn split_content_at_は跨ぐノートを二つに割る() {
     assert_eq!(m.notes.len(), 3);
 }
 
-/// r.md #132: 逆再生の audio event を複数の切り口で割ると、event の頭から順に source の
-/// **末尾側**から隙間なく配られ、切り口側の fade だけが 0 になる。
+/// r.md #132 残件: audio event を複数の切り口で割っても、片は **元の take の窓** になるだけで写像
+/// (source の範囲・逆再生) は全片が継ぐ。 片の窓は take を隙間なく並べ、切り口に掛からない fade は
+/// 外側の端の片だけが持つ。 音が分割前と一致することは `daw_audio` の `split_fidelity_tests` が
+/// engine の render で確かめる。
 #[test]
-fn 逆再生の_audio_event_は末尾側から隙間なく配られる() {
+fn audio_event_の分割は_take_の窓を切り出すだけで写像を継ぐ() {
     let mut audio = AudioContent {
         events: vec![AudioEvent {
             id: 1,
@@ -2960,14 +2965,20 @@ fn 逆再生の_audio_event_は末尾側から隙間なく配られる() {
     };
     let ids = audio.split_events(|_| vec![3.0, 1.0], 0.0);
     assert_eq!(ids.len(), 3, "3 片 (元 id + 新 id 2 つ)");
-    let got: Vec<(f64, u64, u64, f64, f64)> = audio
+    for e in &audio.events {
+        assert_eq!((e.source_start_frames, e.source_end_frames, e.reversed), (1_000, 5_000, true), "写像は全片が継ぐ");
+    }
+    // (開始, 長さ, take の頭, take の尻, fade in, fade out)
+    let got: Vec<(f64, f64, f64, f64, f64, f64)> = audio
         .events
         .iter()
-        .map(|e| (e.event_start_in_clip_beats, e.source_start_frames, e.source_end_frames, e.fade_in_beats, e.fade_out_beats))
+        .map(|e| {
+            (e.event_start_in_clip_beats, e.event_length_beats, e.take_head_beats, e.take_tail_beats, e.fade_in_beats, e.fade_out_beats)
+        })
         .collect();
     assert_eq!(
         got,
-        vec![(0.0, 4_000, 5_000, 0.5, 0.0), (1.0, 2_000, 4_000, 0.0, 0.0), (3.0, 1_000, 2_000, 0.0, 0.25)]
+        vec![(0.0, 1.0, 0.0, 3.0, 0.5, 0.0), (1.0, 2.0, 1.0, 1.0, 0.0, 0.0), (3.0, 1.0, 3.0, 0.0, 0.0, 0.25)]
     );
     assert_eq!(audio.events[0].id, 1);
 }

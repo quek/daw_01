@@ -4,6 +4,7 @@
 use crate::state::*;
 use crate::app_types::*;
 use crate::event::*;
+use common::model::TimedEvent;
 
 impl AppData {
     /// `target` clip の first event の `reversed` 値を読む。 audio で
@@ -29,7 +30,7 @@ impl AppData {
     /// 全 event に broadcast (= multi-event 対応 / 1 clip 1 event 互換、
     /// PR-D 段階 2)。
     pub(crate) fn set_clip_audio_event_reversed(&mut self, target: ClipKey, reversed: bool) {
-        self.mutate_audio_events_in_clip(target, |e| e.reversed = reversed);
+        self.mutate_audio_event_mapping_in_clip(target, |e| e.reversed != reversed, |e| e.reversed = reversed);
     }
 
     /// `targets` の clip が **全て** muted なら `true` (空なら `false`)。`q` の
@@ -125,7 +126,7 @@ impl AppData {
         target: ClipKey,
         mode: common::model::StretchMode,
     ) {
-        self.mutate_audio_events_in_clip(target, |e| e.stretch_mode = mode);
+        self.mutate_audio_event_mapping_in_clip(target, |e| e.stretch_mode != mode, |e| e.stretch_mode = mode);
         // B1 (r.md #8): Slice へ切替時、 onsets 未検出の event に transient 検出を
         // 走らせ slice の trigger 位置を埋める (検出済 / 非 Slice は何もしない)。
         if mode == common::model::StretchMode::Slice {
@@ -153,7 +154,8 @@ impl AppData {
         };
         let indices = self.audio_event_target_indices(target, n_events);
 
-        // Phase A: 対象 event の source range + 配置 beat 長 (immutable borrow)。
+        // Phase A: 対象 event の source range + **take** の配置 beat 長 (immutable borrow)。
+        // warp marker の拍は take の座標なので、分割の片では take 全体に掛けて片同士で揃える。
         let mut jobs: Vec<(usize, common::model::AudioSourceId, u64, u64, f64)> = Vec::new();
         if let Some(common::model::ClipContent::Audio(a)) =
             self.cur.song_doc.song().clip_contents.get(&content_id)
@@ -165,7 +167,7 @@ impl AppData {
                         e.source_id,
                         e.source_start_frames,
                         e.source_end_frames,
-                        e.event_length_beats,
+                        e.take_length_beats(),
                     ));
                 }
             }
@@ -316,7 +318,11 @@ impl AppData {
         // (inspector の range / 貼り付け sanitize も同じ定数を引く)。
         let semitones =
             common::model::clamp_semitones(semitones, common::model::PITCH_SEMITONES_LIMIT);
-        self.mutate_audio_events_in_clip(target, |e| e.pitch_semitones = semitones);
+        self.mutate_audio_event_mapping_in_clip(
+            target,
+            |e| e.pitch_semitones != semitones,
+            |e| e.pitch_semitones = semitones,
+        );
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
@@ -387,15 +393,16 @@ impl AppData {
         // r.md #38: 上限は **event 長**。 音 (`audio_clip_renderer`) は event 長基準で
         // fade を掛けるので、 clip 長で clamp すると clip より短い event
         // (trim / split 後) で fade がフルゲインに到達せず絵と音がずれる。
+        // 掛け直した fade は左端から始まる (分割の片が持っていたランプの続きは捨てる)。
         self.mutate_audio_events_in_clip(target, |e| {
-            e.fade_in_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+            e.set_edge_fade_in(beats.clamp(0.0, e.event_length_beats.max(0.0)));
         });
         self.resync_clip_audio_event_edit_buffers(target);
     }
 
     pub(crate) fn set_clip_audio_event_fade_out_beats(&mut self, target: ClipKey, beats: f64) {
         self.mutate_audio_events_in_clip(target, |e| {
-            e.fade_out_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+            e.set_edge_fade_out(beats.clamp(0.0, e.event_length_beats.max(0.0)));
         });
         self.resync_clip_audio_event_edit_buffers(target);
     }
@@ -658,13 +665,13 @@ impl AppData {
                 // r.md #38: text_compose も event 長基準で fade を適用するので上限は event 長。
                 let v = f64::from(value);
                 self.mutate_text_events_in_clip(target, |e| {
-                    e.fade_in_beats = v.clamp(0.0, e.event_length_beats.max(0.0));
+                    e.set_edge_fade_in(v.clamp(0.0, e.event_length_beats.max(0.0)));
                 });
             }
             F::FadeOutBeats => {
                 let v = f64::from(value);
                 self.mutate_text_events_in_clip(target, |e| {
-                    e.fade_out_beats = v.clamp(0.0, e.event_length_beats.max(0.0));
+                    e.set_edge_fade_out(v.clamp(0.0, e.event_length_beats.max(0.0)));
                 });
             }
         }
@@ -889,14 +896,14 @@ impl AppData {
     pub(crate) fn set_clip_image_event_fade_in_beats(&mut self, target: ClipKey, beats: f64) {
         // r.md #38: image_compose も event 長基準で fade を適用するので上限は event 長。
         self.mutate_image_events_in_clip(target, |e| {
-            e.fade_in_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+            e.set_edge_fade_in(beats.clamp(0.0, e.event_length_beats.max(0.0)));
         });
         self.resync_clip_image_event_edit_buffers(target);
     }
 
     pub(crate) fn set_clip_image_event_fade_out_beats(&mut self, target: ClipKey, beats: f64) {
         self.mutate_image_events_in_clip(target, |e| {
-            e.fade_out_beats = beats.clamp(0.0, e.event_length_beats.max(0.0));
+            e.set_edge_fade_out(beats.clamp(0.0, e.event_length_beats.max(0.0)));
         });
         self.resync_clip_image_event_edit_buffers(target);
     }

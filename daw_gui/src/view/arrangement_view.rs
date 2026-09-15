@@ -1284,14 +1284,28 @@ fn draw_audio_clip_value_overlay(
     let Some(events) = content.audio_events() else {
         return;
     };
-    let Some(event) = events.first() else {
+    // 値は **この clip の窓に見えている** event から読む: gain / fade-in は窓の中で最初の event、
+    // fade-out は窓の中で最後に終わる event。 分割の片 (同じ content を別の窓で見る / 1 つの窓に
+    // 並ぶ) は fade を先頭の片と末尾の片に分けて持つので、content の先頭 event だけを見ると分割
+    // しただけでラベルが変わる。 ランプが窓の外から続く / 外へ続く片は端に fade を持たないので出さない。
+    let (w0, w1) = clip.content_window();
+    let in_window = || {
+        events
+            .iter()
+            .filter(move |e| e.event_start_in_clip_beats < w1 && e.event_start_in_clip_beats + e.event_length_beats > w0)
+    };
+    let Some(event) = in_window().min_by(|a, b| a.event_start_in_clip_beats.total_cmp(&b.event_start_in_clip_beats))
+    else {
         return;
     };
+    let last = in_window()
+        .max_by(|a, b| (a.event_start_in_clip_beats + a.event_length_beats).total_cmp(&(b.event_start_in_clip_beats + b.event_length_beats)))
+        .unwrap_or(event);
 
     // Default 値は無表示 (= clip 名で混雑するのを避ける)。
     let show_gain = event.gain_db.abs() > 0.05;
-    let show_fade_in = event.fade_in_beats > 0.0;
-    let show_fade_out = event.fade_out_beats > 0.0;
+    let show_fade_in = event.fade_in_beats > 0.0 && event.fade_in_lead_beats <= 0.0;
+    let show_fade_out = last.fade_out_beats > 0.0 && last.fade_out_trail_beats <= 0.0;
     if !(show_gain || show_fade_in || show_fade_out) {
         return;
     }
@@ -1333,7 +1347,7 @@ fn draw_audio_clip_value_overlay(
         *x_right -= 6.0;
     };
     if show_fade_out {
-        let s = format!("Fo {:.2}b", event.fade_out_beats);
+        let s = format!("Fo {:.2}b", last.fade_out_beats);
         emit(ui, "audio_clip_lbl_fo", &s, &mut x_right);
     }
     if show_fade_in {

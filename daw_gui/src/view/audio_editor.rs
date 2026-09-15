@@ -707,7 +707,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             .iter()
             .enumerate()
             .map(|(mi, m)| {
-                let clip_beat = event.event_start_in_clip_beats + m.locked_beat;
+                // marker の拍は take の頭から (分割の片では見えている頭より手前が 0)。
+                let clip_beat = event.take_start_in_clip_beats() + m.locked_beat;
                 let x = wf_area.x + ((clip_beat - view_start_beat) / beats_per_px) as f32;
                 (mi, x)
             })
@@ -869,11 +870,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 pending_ghost =
                     Some(PendingGhost::WarpMarker { event_rect, x: drag.current.0 });
             } else if drag.kind == DragKind::Released {
-                // release x → event-local beat (clip 相対 - event 開始)。
+                // release x → take-local beat (見えている窓の中へ収める)。
                 let clip_beat =
                     view_start_beat + (drag.current.0 - wf_area.x) as f64 * beats_per_px;
-                let new_local = (clip_beat - event.event_start_in_clip_beats)
-                    .clamp(0.0, event.event_length_beats);
+                let new_local = (clip_beat - event.take_start_in_clip_beats())
+                    .clamp(event.take_head_beats, event.take_head_beats + event.event_length_beats);
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                     app.handle_event(AppEvent::MoveWarpMarker {
                         event_idx: idx,
@@ -913,7 +914,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     let src = common::audio_render::source_frame_at_beat(&wave_spans, local)
                         .unwrap_or_else(|| {
                             event.source_start_frames as f64
-                                + (local / event.event_length_beats.max(1e-9)) * window
+                                + ((event.take_head_beats + local) / event.take_length_beats().max(1e-9)) * window
                         });
                     // span の source 範囲は「実際に鳴る」 (= 逆再生なら反転後) 座標だが、
                     // warp marker は engine が **反転前** の座標で解釈し、
@@ -925,12 +926,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     } else {
                         src
                     };
-                    let source_frame = src.max(0.0) as u64;
+                    // marker の拍は take の頭から (見えている先頭 = `take_head_beats`)。
+                    let (source_frame, locked_beat) = (src.max(0.0) as u64, event.take_head_beats + local);
                     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                         app.handle_event(AppEvent::AddWarpMarker {
                             event_idx: idx,
                             source_frame,
-                            locked_beat: local,
+                            locked_beat,
                         });
                     }));
                 }

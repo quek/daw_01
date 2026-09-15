@@ -65,3 +65,20 @@
 
 ## 完了条件
 索引の共通規則どおり (全件系を回さない、daw_gui を起動しない、branch に commit、逸脱を報告)。
+
+## 残件: 分割の忠実度 (v42)
+
+理想: **分割は切れ目を入れるだけ** — 分割直後の再生・書き出し・字幕・映像・読み上げは分割前と同じ。 片を後から
+動かしても片ごとに自然に振る舞う。 模型の正本は各フィールドの doc (ここは地図だけ)。
+
+| 欠陥 | 根 | 直し方 (正本) |
+|---|---|---|
+| Text を割ると切り口ごとに同じ文を読み直す | 続きの片を表現できない + 読み上げの一覧が clip の窓を見ない | `TextEvent::continuation` (ユーザー決定: 読むのは最初の片だけ) と `TextEvent::starts_reading`、窓の門 `Clip::window_has_onset` を sequencer / VOICEVOX / 口パク / Glue で共有 |
+| audio を割ると元の音にならない | event に「写像の単位」と「見せる窓」の区別が無い | `AudioEvent::take_head_beats` / `take_tail_beats` (take の窓)、`VideoEvent::take_head_beats`、fade ランプの張り出し `fade_in_lead_beats` / `fade_out_trail_beats`、片の作り方の SSoT `model::event_window::event_piece` (逆は `join_pieces`) |
+| 片の境界でスペクトル処理 / tape の積分が途切れる | engine の状態を event 単位の位置 / id で持つ | `RenderedEvent::stream_key` = 素材 id、`acquire_engine` / `acquire_tape_cursor` が出力位置の連続で引き継ぐ (tape の積分器は event 数の上限も無くなった) |
+
+判断:
+- 片を単独で動かしても / 最初の片を消しても、続きの片は読み上げを始めない (「ー」が歌い直さないのと同じ)。 Glue で前の片とつなぐと元の 1 つに戻る。
+- 片の端 trim は窓を動かすだけ (`AudioEvent::trim_left` / `trim_right`)。 take の外まで伸ばすときだけ同じ伸縮率で source を伸ばす。
+- 移調 / 逆再生 / 伸縮 mode を片に掛けるときは先に take を窓へ詰め直す (`AudioEvent::rebase_take`) — 片自身の頭を起点に効く。
+- 検証: `daw_audio` の `split_fidelity_tests` (engine の render で分割前と比較。 tape / slice は 1 sample も違わない、スペクトル経路は buffer 長の違いと同じ桁)、`common::audio_render` の片の波形、`text_compose` / `video_playback` の分割前比較、`app_state::split_fidelity` (読み上げ・歌唱・trim・移調)。

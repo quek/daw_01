@@ -1,18 +1,24 @@
 //! **分割の SSoT** — note / audio event / content を「切る位置の集合」で割る。
 //!
-//! 分割を伴う経路は切る位置の決め方だけが違い、片の作り方 (id / 歌詞 / fade / source の
-//! 範囲) と「短すぎる片は隣の片にくっつける」規則 ([`split_boundaries`]) はここだけが持つ:
+//! 分割を伴う経路は切る位置の決め方だけが違い、片の作り方 (id / 歌詞 / 窓 / fade / 読み上げ) と
+//! 「短すぎる片は隣の片にくっつける」規則 ([`split_boundaries`]) はここだけが持つ:
 //!
 //! - ピアノロールの `E` (カーソルの 1 点) / `Shift+E` (グリッド線) → [`MidiContent::split_notes`]
 //! - オーディオエディタの `E` / `Shift+E` → [`AudioContent::split_events`]
 //! - クリップの分割 (`E` / `Shift+E`) / セクションの境界 (`Song::split_clips_at`) /
 //!   範囲操作の両端 (`handler::range_ops`) → [`Song::split_content_at_points`]
 //!
+//! **分割は切れ目を入れるだけ** — 分割直後の再生・書き出し・描画は分割前と同じ (r.md #132 残件)。
+//! note は後ろの片を長音「ー」にし、時間軸を持つ event (audio / video / image / text) は元の event の
+//! 窓を切り出す ([`super::event_piece`]: source の写像・fade のランプ・読み上げは切り口を跨いで続く)。
+//!
 //! クリップの分割で content も切るのは、窓 (クリップ) を割っただけでは「跨いだ note の後半」を
 //! 後半の窓が鳴らせないから (再生側は「発音開始が窓内」の note しか鳴らさない)。 共有されて
 //! いる content は先に fork するので linked clip は無傷。
 
-use crate::model::{AudioContent, AudioEvent, ClipContent, ContentId, MidiContent, Note, Song, VideoEvent};
+use crate::model::{
+    AudioContent, AudioEvent, ClipContent, ContentId, MidiContent, Note, Song, TimedEvent, split_pieces,
+};
 
 /// 拍の同一視許容量。
 const EPS: f64 = 1e-9;
@@ -94,9 +100,9 @@ impl MidiContent {
 impl AudioContent {
     /// audio event を切る ([`MidiContent::split_notes`] の event 版、切り口の規則は同じ)。
     ///
-    /// 片ごとに source の範囲を**拍の比**で配り (逆再生は source の末尾側から)、切り口の
-    /// 側の fade は 0 にする (外側の端の fade は端の片が継ぐ)。 先頭の片が元の `id`、
-    /// 後ろの片は新しい `id`。 gain / pan / pitch / stretch / onset / warp marker は全片が継ぐ。
+    /// 片は元の event の窓 ([`super::event_piece`]): source の範囲・伸縮・onset・warp marker は全片が
+    /// そのまま継ぎ、take の窓 (`take_head_beats` / `take_tail_beats`) と fade のランプだけが片ごとに
+    /// 変わる。 先頭の片が元の `id`、後ろの片は新しい `id`。
     ///
     /// 返り値は割った event の**全片の id** (event ごとに先頭の片から)。
     pub fn split_events(
@@ -107,55 +113,48 @@ impl AudioContent {
         let mut extra: Vec<AudioEvent> = Vec::new();
         let mut ids = Vec::new();
         for i in 0..self.events.len() {
-            let ev = self.events[i].clone();
-            let (e0, len) = (ev.event_start_in_clip_beats, ev.event_length_beats);
-            let kept = split_boundaries(e0, e0 + len, cuts(&ev), min_piece);
-            if kept.is_empty() {
+            let mut pieces = split_pieces(&self.events[i], cuts(&self.events[i]), min_piece).into_iter();
+            let Some(head) = pieces.next() else {
                 continue;
-            }
-            let bounds: Vec<f64> =
-                std::iter::once(e0).chain(kept).chain(std::iter::once(e0 + len)).collect();
-            let span = ev.source_end_frames.saturating_sub(ev.source_start_frames);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-            let frame_at = |beat: f64| -> u64 {
-                ((beat - e0) / len * span as f64).round().clamp(0.0, span as f64) as u64
             };
-            let last = bounds.len() - 2;
-            for (j, w) in bounds.windows(2).enumerate() {
-                let (da, db) = (frame_at(w[0]), frame_at(w[1]));
-                let mut piece = ev.clone();
-                piece.event_start_in_clip_beats = w[0];
-                piece.event_length_beats = w[1] - w[0];
-                (piece.source_start_frames, piece.source_end_frames) = if ev.reversed {
-                    // 逆再生: event の頭は source の末尾を読む。
-                    (ev.source_end_frames.saturating_sub(db), ev.source_end_frames.saturating_sub(da))
-                } else {
-                    (ev.source_start_frames.saturating_add(da), ev.source_start_frames.saturating_add(db))
-                };
-                if j > 0 {
-                    piece.fade_in_beats = 0.0;
-                }
-                if j < last {
-                    piece.fade_out_beats = 0.0;
-                }
-                if j == 0 {
-                    ids.push(ev.id);
-                    self.events[i] = piece;
-                } else {
-                    piece.id = self.alloc_event_id();
-                    ids.push(piece.id);
-                    extra.push(piece);
-                }
+            ids.push(head.id);
+            self.events[i] = head;
+            for mut piece in pieces {
+                piece.id = self.alloc_event_id();
+                ids.push(piece.id);
+                extra.push(piece);
             }
         }
         if !extra.is_empty() {
             self.events.extend(extra);
-            self.events.sort_by(|x, y| {
-                x.event_start_in_clip_beats.total_cmp(&y.event_start_in_clip_beats)
-            });
+            sort_by_start(&mut self.events);
         }
         ids
     }
+}
+
+/// 時間軸を持つ event 列を開始拍順に並べる (安定)。
+fn sort_by_start<E: TimedEvent>(events: &mut [E]) {
+    events.sort_by(|a, b| a.start().total_cmp(&b.start()));
+}
+
+/// id を持たない event 列 (video / image / text) を切り口 `ats` で割る。
+fn split_timed<E: TimedEvent>(events: &mut Vec<E>, ats: &[f64]) {
+    let mut out: Vec<E> = Vec::with_capacity(events.len());
+    let mut split = false;
+    for ev in events.drain(..) {
+        let pieces = split_pieces(&ev, ats.iter().copied(), 0.0);
+        if pieces.is_empty() {
+            out.push(ev);
+        } else {
+            split = true;
+            out.extend(pieces);
+        }
+    }
+    if split {
+        sort_by_start(&mut out);
+    }
+    *events = out;
 }
 
 impl Song {
@@ -164,10 +163,10 @@ impl Song {
         self.split_content_at_points(content_id, &[at])
     }
 
-    /// content を **content-local 拍の集合 `ats`** で切る。 どれかを跨ぐ note / event を割り、
-    /// 切り口 (内側) の fade は 0 にする。 **位置は動かさない** — 窓モデルなので、切った 1 つの
-    /// content の上に分割後のクリップの窓が並ぶ。 切り口は構造上の境界なので短い片も作る
-    /// (`min_piece = 0`: 窓の境界ちょうどで切れていないと後ろの窓が鳴らせない)。
+    /// content を **content-local 拍の集合 `ats`** で切る。 どれかを跨ぐ note / event を割る
+    /// (片の作り方は [`MidiContent::split_notes`] / [`super::event_piece`])。 **位置は動かさない** —
+    /// 窓モデルなので、切った 1 つの content の上に分割後のクリップの窓が並ぶ。 切り口は構造上の
+    /// 境界なので短い片も作る (`min_piece = 0`: 窓の境界ちょうどで切れていないと後ろの窓が鳴らせない)。
     ///
     /// content が複数の clip から共有されていれば**先に 1 回だけ fork する** (copy-on-write)
     /// ので、linked clip の中身は変わらない。 返り値は「切り終えた content の id」= 分割後の
@@ -193,27 +192,18 @@ impl Song {
 
     /// `at` を厳密に跨ぐ要素があるか (`split_content_at_points` の早期 return 判定)。
     fn content_crosses(content: &ClipContent, at: f64) -> bool {
-        let crosses = |start: f64, len: f64| start < at - EPS && start + len > at + EPS;
+        fn any_crosses<E: TimedEvent>(events: &[E], at: f64) -> bool {
+            events.iter().any(|e| e.start() < at - EPS && e.start() + e.len() > at + EPS)
+        }
         match content {
-            ClipContent::Midi(m) => {
-                m.notes.iter().any(|n| crosses(n.start_beat, n.duration_beats))
-            }
-            ClipContent::Audio(a) => a
-                .events
+            ClipContent::Midi(m) => m
+                .notes
                 .iter()
-                .any(|e| crosses(e.event_start_in_clip_beats, e.event_length_beats)),
-            ClipContent::Video(v) => v
-                .events
-                .iter()
-                .any(|e| crosses(e.event_start_in_clip_beats, e.event_length_beats)),
-            ClipContent::Image(i) => i
-                .events
-                .iter()
-                .any(|e| crosses(e.event_start_in_clip_beats, e.event_length_beats)),
-            ClipContent::Text(t) => t
-                .events
-                .iter()
-                .any(|e| crosses(e.event_start_in_clip_beats, e.event_length_beats)),
+                .any(|n| n.start_beat < at - EPS && n.start_beat + n.duration_beats > at + EPS),
+            ClipContent::Audio(a) => any_crosses(&a.events, at),
+            ClipContent::Video(v) => any_crosses(&v.events, at),
+            ClipContent::Image(i) => any_crosses(&i.events, at),
+            ClipContent::Text(t) => any_crosses(&t.events, at),
             // automation point は幅を持たないので切る対象が無い (窓の外の point も
             // 補間には効くので、境界に point を挿す必要も無い)。
             ClipContent::Automation(_) => false,
@@ -222,31 +212,6 @@ impl Song {
 
     /// `ats` を跨ぐ要素を割る (位置は動かさない)。
     fn cut_content_at(content: &mut ClipContent, ats: &[f64]) {
-        /// 時間軸 source を持たない overlay (image / text) 用。
-        macro_rules! cut_overlay {
-            ($events:expr, $at:expr) => {{
-                let at = $at;
-                let mut extra = Vec::new();
-                for ev in $events.iter_mut() {
-                    let e0 = ev.event_start_in_clip_beats;
-                    let e1 = e0 + ev.event_length_beats;
-                    if !(e0 < at - EPS && e1 > at + EPS) {
-                        continue;
-                    }
-                    let mut tail = ev.clone();
-                    tail.event_start_in_clip_beats = at;
-                    tail.event_length_beats = e1 - at;
-                    tail.fade_in_beats = 0.0;
-                    extra.push(tail);
-                    ev.event_length_beats = at - e0;
-                    ev.fade_out_beats = 0.0;
-                }
-                $events.extend(extra);
-                $events.sort_by(|a, b| {
-                    a.event_start_in_clip_beats.total_cmp(&b.event_start_in_clip_beats)
-                });
-            }};
-        }
         match content {
             ClipContent::Midi(m) => {
                 m.split_notes(|_| ats.to_vec(), 0.0);
@@ -254,50 +219,10 @@ impl Song {
             ClipContent::Audio(a) => {
                 a.split_events(|_| ats.to_vec(), 0.0);
             }
-            ClipContent::Video(v) => {
-                for &at in ats {
-                    Self::cut_video_at(&mut v.events, at);
-                }
-            }
-            ClipContent::Image(i) => {
-                for &at in ats {
-                    cut_overlay!(i.events, at);
-                }
-            }
-            ClipContent::Text(t) => {
-                for &at in ats {
-                    cut_overlay!(t.events, at);
-                }
-            }
+            ClipContent::Video(v) => split_timed(&mut v.events, ats),
+            ClipContent::Image(i) => split_timed(&mut i.events, ats),
+            ClipContent::Text(t) => split_timed(&mut t.events, ats),
             ClipContent::Automation(_) => {}
         }
-    }
-
-    /// video event を `at` で 2 つに割る (source の範囲は拍の比で配る)。
-    fn cut_video_at(events: &mut Vec<VideoEvent>, at: f64) {
-        let mut extra: Vec<VideoEvent> = Vec::new();
-        for ev in events.iter_mut() {
-            let e0 = ev.event_start_in_clip_beats;
-            let e1 = e0 + ev.event_length_beats;
-            if !(e0 < at - EPS && e1 > at + EPS) {
-                continue;
-            }
-            let frac = (at - e0) / ev.event_length_beats;
-            let span = ev.source_end_micros.saturating_sub(ev.source_start_micros);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
-            let delta = (span as f64 * frac).round().max(0.0) as u64;
-            let mid = ev.source_start_micros.saturating_add(delta);
-            let mut tail = ev.clone();
-            tail.event_start_in_clip_beats = at;
-            tail.event_length_beats = e1 - at;
-            tail.source_start_micros = mid.min(ev.source_end_micros);
-            tail.fade_in_beats = 0.0;
-            extra.push(tail);
-            ev.event_length_beats = at - e0;
-            ev.source_end_micros = mid.max(ev.source_start_micros);
-            ev.fade_out_beats = 0.0;
-        }
-        events.extend(extra);
-        events.sort_by(|x, y| x.event_start_in_clip_beats.total_cmp(&y.event_start_in_clip_beats));
     }
 }

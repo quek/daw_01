@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use common::audio_render::{TempoMap, WaveSpan, event_wave_spans};
-use common::model::{Clip, ClipContent, StretchMode};
+use common::model::{Clip, ClipContent};
 
 use crate::app::AppData;
 use crate::app_types::stretch_remap;
@@ -189,14 +189,9 @@ pub(super) fn build_one(
                             e.event_start_in_clip_beats,
                             e.event_length_beats,
                         );
-                        e.event_start_in_clip_beats = s;
-                        e.event_length_beats = l;
-                        // ピッチ保持を既定: Raw (= 時間操作しない定義) は Stretch へ昇格。
-                        // `stretch_clip_content` と同じ規則にしないと、 span の張る範囲が
-                        // 確定後と食い違う (Raw は native 長で鳴り止むため)。
-                        if e.stretch_mode == StretchMode::Raw {
-                            e.stretch_mode = StretchMode::Stretch;
-                        }
+                        // 確定 (`stretch_clip_content`) と同じ 1 本 (take の軸の伸縮と Raw→Stretch の
+                        // 昇格まで揃えないと、 span の張る範囲が確定後と食い違う)。
+                        e.apply_time_stretch(s, l, st.new_len / st.prev_len);
                         Cow::Owned(e)
                     }
                 };

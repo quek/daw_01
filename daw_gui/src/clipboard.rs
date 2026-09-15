@@ -461,6 +461,15 @@ pub fn sanitize_audio_events(events: Vec<AudioEvent>) -> Vec<AudioEvent> {
             } else {
                 0.0
             };
+            // 窓 (take の頭 / 尻) と fade ランプの張り出しも、非有限・負は分割していない event の 0 へ。
+            for beats in [
+                &mut e.take_head_beats,
+                &mut e.take_tail_beats,
+                &mut e.fade_in_lead_beats,
+                &mut e.fade_out_trail_beats,
+            ] {
+                *beats = if beats.is_finite() { beats.max(0.0) } else { 0.0 };
+            }
             Some(e)
         })
         .collect()

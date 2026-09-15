@@ -179,8 +179,8 @@ pub(super) fn commit_releases(
                     // FadeLength を返さないので Some 確定だが defensive に畳む。
                     if let Some(anchor) = ad.anchor_fade {
                     let prev_beats = match edge {
-                        FadeEdge::In => anchor.fade.fade_in_beats,
-                        FadeEdge::Out => anchor.fade.fade_out_beats,
+                        FadeEdge::In => anchor.fade.visible_fade_in_beats(),
+                        FadeEdge::Out => anchor.fade.visible_fade_out_beats(),
                     };
                     let delta = ClipFadeDelta {
                         key: ad.key,

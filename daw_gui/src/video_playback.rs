@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use common::model::{Clip, FadeCurve, Song, VideoEvent, VideoSourceId};
+use common::model::{Clip, Song, TimedEvent, VideoEvent, VideoSourceId};
 use common::tempo_map::TempoMap;
 
 use crate::launcher_time::{RowScan, RowTimeline};
@@ -233,7 +233,10 @@ fn push_clip_video_frames(
         if event.muted {
             continue;
         }
-        let event_progress_beats = clip_local - event.event_start_in_clip_beats;
+        // source の時刻は **take の頭** (= 分割する前の event の頭、`VideoEvent::take_head_beats`) からの
+        // 実時間で進む。 分割の片は take の頭を共有するので、片を並べると分割前と同じ frame を映す。
+        let take_start_in_clip = event.event_start_in_clip_beats - event.take_head_beats;
+        let event_progress_beats = clip_local - take_start_in_clip;
         let event_progress_secs = match (tempo_map, row_secs) {
             (Some(m), Some(now_secs)) => {
                 // content-local 拍 → song-absolute 拍は `content_to_song_beat` が
@@ -243,9 +246,8 @@ fn push_clip_video_frames(
                 // ずれる (`event_progress_beats` を使う定 BPM 経路は content-local
                 // の引き算なので正しく、この経路だけが食い違っていた)。
                 // ランチャー行ではさらに `song_origin()` (= セルを撃った拍) を足す。
-                let event_start = scan.song_origin()
-                    + clip.content_to_song_beat(event.event_start_in_clip_beats);
-                (now_secs - m.beat_to_seconds(event_start)).max(0.0)
+                let take_start = scan.song_origin() + clip.content_to_song_beat(take_start_in_clip);
+                (now_secs - m.beat_to_seconds(take_start)).max(0.0)
             }
             _ => event_progress_beats * 60.0 / bpm,
         };
@@ -281,41 +283,14 @@ fn song_tempo_map_if_automated(song: &Song) -> Option<common::tempo_map::TempoMa
     automated.then(|| common::tempo_map::TempoMap::from_song(song))
 }
 
-/// Per-event alpha at the given clip-local beat, derived from
-/// `fade_in_beats` / `fade_out_beats` with the event's own
-/// `fade_in_curve` / `fade_out_curve`. Range `0.0..=1.0`. Outside
+/// Per-event alpha at the given clip-local beat. Range `0.0..=1.0`. Outside
 /// both fade regions returns `1.0` (= fully opaque).
 ///
-/// docs/plan_video.md §4 P7: linear / s-curve / exp formulae match
-/// `common::audio_render::fade_envelope` (the audio sibling), so
-/// crossfade visuals stay in step with the audio engine's gain
-/// envelope when the user fades both halves of a clip together.
+/// docs/plan_video.md §4 P7: 式は画像 / 字幕 / 音と共通の
+/// [`common::model::EventFade::gain_at`] なので、映像と音の fade を揃えて掛けたときに見た目と
+/// ゲインが揃う (分割の片が切り口を跨ぐランプの続きを持つのもそこが扱う)。
 fn event_alpha(event: &VideoEvent, clip_local_beat: f64) -> f32 {
-    let event_local = clip_local_beat - event.event_start_in_clip_beats;
-    if event_local < 0.0 {
-        return 0.0;
-    }
-    let mut alpha = 1.0_f32;
-    if event.fade_in_beats > 0.0 && event_local < event.fade_in_beats {
-        let progress = (event_local / event.fade_in_beats) as f32;
-        alpha *= fade_curve_value(progress, event.fade_in_curve);
-    }
-    let event_remaining = event.event_length_beats - event_local;
-    if event.fade_out_beats > 0.0 && event_remaining > 0.0
-        && event_remaining < event.fade_out_beats
-    {
-        let progress = (event_remaining / event.fade_out_beats) as f32;
-        alpha *= fade_curve_value(progress, event.fade_out_curve);
-    }
-    alpha.clamp(0.0, 1.0)
-}
-
-/// Single fade-curve evaluator. `progress` is `0..=1`, output is
-/// `0..=1`. Mirrors `common::audio_render::fade_envelope` math.
-fn fade_curve_value(progress: f32, curve: FadeCurve) -> f32 {
-    // r.md #38: fade カーブの式は `common::audio_render::fade_curve_at` が唯一の SSoT
-    // (音 / 映像 / 画像 / 字幕 / アレンジ画面の描画が全部ここを通る)。
-    common::audio_render::fade_curve_at(progress, curve)
+    event.fade().gain_at(clip_local_beat - event.event_start_in_clip_beats)
 }
 
 /// BGRA8 → RGBA8 channel swap with alpha pinned to 0xFF. SSSE3-accelerated when
@@ -472,6 +447,67 @@ mod tests {
         });
         song.tracks.push(track);
         song
+    }
+
+    /// r.md #132 残件: 映像を割っても (content の中 / クリップごと)、どの拍でも分割前と同じ source 時刻と
+    /// fade の不透明度を映す。 テンポ自動化で拍 → 秒が非線形、event は source より長く (尻で止まる)、
+    /// fade のランプは切り口を跨ぐ — どれも source の範囲を拍の比で配ると崩れる条件。
+    #[test]
+    fn 分割した映像は分割前と同じ時刻と_fade_を映す() {
+        let mut song = song_with_video_clip(60.0, 1);
+        song.length_beats = 12.0;
+        let tempo_content = song.alloc_content_id();
+        song.clip_contents.insert(
+            tempo_content,
+            ClipContent::Automation(AutomationContent {
+                points: vec![
+                    AutomationPoint { id: 1, time_beat: 0.0, value: 70.0, curve: AutomationCurve::Linear },
+                    AutomationPoint { id: 2, time_beat: 12.0, value: 170.0, curve: AutomationCurve::Linear },
+                ],
+                next_point_id: 3,
+            }),
+        );
+        song.song_lanes.push(AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "t".into(),
+                start_beat: 0.0,
+                length_beats: 12.0,
+                content_id: tempo_content,
+                content_offset_beats: 0.0,
+                color: None,
+            }],
+            ..AutomationLane::new(AutomationTarget::SongTempo, 60.0)
+        });
+        let video_content = song.tracks[0].clips[0].content_id;
+        if let Some(ClipContent::Video(v)) = song.clip_contents.get_mut(&video_content) {
+            v.events[0].fade_in_beats = 3.0;
+            v.events[0].fade_out_beats = 2.5;
+            v.events[0].fade_out_curve = common::model::FadeCurve::SCurve;
+        }
+        let frames = |song: &Song| -> Vec<(u64, f32)> {
+            (0..200)
+                .map(|i| 4.0 + 8.0 * (f64::from(i) + 0.5) / 200.0)
+                .map(|beat| {
+                    let active = VideoPlaybackEngine::active_sources_at(song, &RowTimeline::preview(beat));
+                    assert_eq!(active.len(), 1, "拍 {beat} は 1 枚だけ映る");
+                    (active[0].source_micros, active[0].alpha)
+                })
+                .collect()
+        };
+        let whole = frames(&song);
+        let mut content_split = song.clone();
+        content_split.split_content_at_points(video_content, &[1.25, 2.5, 6.5]);
+        let mut clips_split = song.clone();
+        clips_split.split_clips_at(5.25);
+        clips_split.split_clips_at(10.5);
+        for (label, split) in [("content", &content_split), ("clips", &clips_split)] {
+            for (i, (w, s)) in whole.iter().zip(frames(split)).enumerate() {
+                assert!(w.0.abs_diff(s.0) <= 1, "{label} #{i}: source 時刻 {} / {}", w.0, s.0);
+                assert!((w.1 - s.1).abs() < 1e-5, "{label} #{i}: 不透明度 {} / {}", w.1, s.1);
+            }
+        }
     }
 
     /// r.md #8 A4: tempo automation 下では映像 source 時間が tempo 積分で進む

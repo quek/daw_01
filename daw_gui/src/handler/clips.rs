@@ -154,14 +154,9 @@ impl AppData {
                             e.event_start_in_clip_beats - prev_off,
                             e.event_length_beats,
                         );
-                        e.event_start_in_clip_beats = new_off + s;
-                        e.event_length_beats = l;
-                        // ピッチ保持を既定: Raw (= 時間操作しない定義) は Stretch
-                        // (granular) へ昇格。 既に Repitch/Stretch/Slice なら維持。
-                        if e.stretch_mode == common::model::StretchMode::Raw {
-                            e.stretch_mode = common::model::StretchMode::Stretch;
-                        }
-                        // source 窓は固定 = これが stretch の本質。
+                        // 窓 + take の軸 (隠れている頭と尻、warp marker の拍) を同じ倍率で伸縮し、
+                        // Raw はピッチ保持の Stretch へ昇格 (source 窓は固定 = stretch の本質)。
+                        e.apply_time_stretch(new_off + s, l, new_len / prev_len);
                     }
                 }
                 Some(ClipContent::Midi(midi)) => {

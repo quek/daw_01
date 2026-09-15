@@ -369,9 +369,8 @@ pub fn collect_events_for_buffer(
         let notes: &[Note] = song.clip_contents.get(&clip.content_id).and_then(|c| c.notes()).unwrap_or(&[]);
         // r.md #44: clip は content への窓。 鳴らす note は content-local 拍で
         // `[content_offset_beats, +length_beats)` に **発音開始が入る** ものだけ
-        // (= 左端 trim で隠れた note は鳴らない)。 linked clip は content を
-        // 共有するが窓は clip ごとに独立する。
-        let (win_start, win_end) = clip.content_window();
+        // (= 左端 trim で隠れた note は鳴らない、門は `Clip::window_has_onset`)。 linked clip は
+        // content を共有するが窓は clip ごとに独立する。
 
         // 台帳は note の住所 `(clip.id, note.id)` で引くので、linked clip が同じ content を
         // 別の窓で鳴らしても off が取り違わない。
@@ -388,7 +387,7 @@ pub fn collect_events_for_buffer(
             }
             // Skip notes whose On is outside the clip — otherwise we could
             // emit On but lose Off to clamping, leaving a stuck note.
-            if note.start_beat < win_start || note.start_beat >= win_end {
+            if !clip.window_has_onset(note.start_beat) {
                 return;
             }
             let key = common::transpose::sounding_key(note.pitch, transpose);
@@ -410,7 +409,8 @@ pub fn collect_events_for_buffer(
     // トラックの `ClipContent::Text` の各 TextEvent 開始位置で、合成 note_on を発火する。
     // note_id = `talk_event_id(clip.id, event_index)` (= builtin の note_offsets と対応する
     // high band id)。builtin は wav 終端で自動 drain するので note_off は不要 (= 台帳
-    // にも積まない)。空テキストは flush 側 (sync_vocal_metadata) と同条件で skip して
+    // にも積まない)。読み上げを始めない event (空テキスト / 分割の続きの片) は flush 側
+    // (sync_vocal_metadata) と同条件 (`TextEvent::starts_reading`) で skip して
     // event_id の対応を保つ。歌唱 MIDI clip と talk Text clip が混在しても、
     // note_id (= `sing_note_id`、`[0, TALK_EVENT_ID_BASE)`) と event_id (= high band) は
     // 衝突しない。
@@ -425,14 +425,10 @@ pub fn collect_events_for_buffer(
                 return;
             };
             // r.md #44: 読み上げも clip の窓の中で始まる event だけ発火する。
-            let (win_start, win_end) = clip.content_window();
             let local = window.map(|(lo, hi)| (clip.song_to_content_beat(lo), clip.song_to_content_beat(hi)));
             let event_ranges = index.content_ranges(clip.content_id);
             for_each_in_window::<_, MAX_WINDOW_NOTES>(events, event_ranges, local, |event_index, ev| {
-                if ev.text.is_empty() {
-                    return;
-                }
-                if ev.event_start_in_clip_beats < win_start || ev.event_start_in_clip_beats >= win_end {
+                if !ev.starts_reading() || !clip.window_has_onset(ev.event_start_in_clip_beats) {
                     return;
                 }
                 let on_abs_beat = clip.content_to_song_beat(ev.event_start_in_clip_beats);
@@ -1416,5 +1412,51 @@ mod tests {
         assert!(matches!(out[1].event, NoteTransition::Off { .. }));
         assert!(matches!(out[2].event, NoteTransition::On { .. }));
         assert_eq!(out[1].time, out[2].time);
+    }
+
+    /// r.md #132 残件 (2026-09-15 ユーザー決定): 読み上げの Text クリップを割っても、読み上げのトリガは
+    /// **最初の片の 1 回だけ** (続きの片は字幕だけ)。 クリップの分割 (片は同じ content を別の窓で見る) と
+    /// content の中の分割 (`Shift+E` の片) の両方で、曲を頭から鳴らして数える。
+    #[test]
+    fn 分割した読み上げのトリガは最初の片の_1_回だけ() {
+        use common::model::{Device, PluginInstance, TextContent, TextEvent};
+        let mut song = Song { bpm: 120.0, ..Song::default() };
+        let content_id = song.alloc_content_id();
+        let text = TextEvent { text: "こんにちは".into(), event_length_beats: 8.0, ..TextEvent::default() };
+        song.clip_contents.insert(content_id, ClipContent::Text(TextContent { events: vec![text] }));
+        song.tracks.push(track(|t| {
+            t.id = 1;
+            t.devices.push(Device::Plugin(PluginInstance::with_ports(
+                common::plugin_db::BUILTIN_ID_VOICEVOX.to_string(),
+                common::plugin_format::PluginFormat::Builtin,
+                common::port_config::PortConfig { has_note_input: true, has_audio_output: true, ..Default::default() },
+            )));
+            t.clips = vec![Clip { id: 1, start_beat: 0.0, length_beats: 8.0, content_id, ..Default::default() }];
+            t.next_clip_id = 2;
+        }));
+        let talk_ons = |song: &Song| -> Vec<(u64, u32)> {
+            let (mut ons, mut ledger) = (Vec::new(), NoteLedger::default());
+            for buffer in 0..(8 * SPB / 512 + 1) {
+                let mut out = Vec::new();
+                let playhead = (buffer * 512) as f64 / SPB as f64;
+                collect(Some(song), 0, SR, playhead, 120.0, 512, &mut out, &mut ledger);
+                ons.extend(out.iter().filter_map(|e| match e.event {
+                    NoteTransition::On { note_id, .. } if note_id >= common::plugin_metadata::TALK_EVENT_ID_BASE => {
+                        Some((buffer * 512 + u64::from(e.time), note_id))
+                    }
+                    _ => None,
+                }));
+            }
+            ons
+        };
+        assert_eq!(talk_ons(&song).len(), 1, "前提: 分割前は 1 回");
+        let mut clips_split = song.clone();
+        clips_split.split_clips_at(3.0);
+        clips_split.split_clips_at(5.5);
+        assert_eq!(clips_split.tracks[0].clips.len(), 3);
+        assert_eq!(talk_ons(&clips_split).iter().map(|&(at, _)| at).collect::<Vec<_>>(), vec![0], "クリップの分割");
+        let mut content_split = song.clone();
+        content_split.split_content_at_points(content_id, &[2.0, 4.0, 6.0]);
+        assert_eq!(talk_ons(&content_split).iter().map(|&(at, _)| at).collect::<Vec<_>>(), vec![0], "content の分割");
     }
 }

@@ -13,12 +13,6 @@ use crate::sequencer::{PerTrackState, TimedNoteEvent};
 pub const MAX_FRAMES: usize = common::process_data::MAX_FRAMES;
 pub const MAX_EVENTS: usize = common::process_data::MAX_EVENTS;
 
-/// E5 (r.md #8): 1 track が同時に持てる tape 位置 accumulator の数 (= track 内
-/// audio event の最大 index)。 これを超える index の event は積分無し (= 毎回
-/// `event_local × ratio` で再計算) に degrade する。 1 track に数百 clip は実用上
-/// 稀なので 256 で足りる。
-const MAX_TAPE_EVENTS_PER_TRACK: usize = 256;
-
 #[repr(align(64))]
 pub struct TrackScratch {
     /// Per-track audio output (left). Reduced into the master bus after
@@ -45,15 +39,14 @@ pub struct TrackScratch {
     /// input_delay_per_track[track_idx] + 1` (DelayLine spec requires
     /// capacity ≥ delay + 1).
     pub input_delay_line: DelayLine,
-    /// E5 (r.md #8): tape (Raw / Repitch) mode の **連続 source 位置 accumulator**
-    /// (event 単位、 添字 = track 内 schedule 順 index)。
-    /// `(last_event_local, accumulated_source_pos)`。 Repitch は `event_local × ratio`
+    /// E5 (r.md #8): tape (Raw / Repitch) mode の **連続 source 位置の積分器の pool**
+    /// ([`crate::audio_clip_renderer::TapeCursor`]、同時に鳴る発音ごとに 1 本。 発音キーと出力位置の
+    /// 連続で引き当てるので track の event 数に上限は無い)。 Repitch は `event_local × ratio`
     /// で絶対位置を毎 buffer 再計算していたため tempo automation で ratio が変わると
     /// 位置が跳んで click した。 contiguous 再生では ratio を積分 (= 連続)、
     /// seek/schedule 変化 (event_local 不連続) では再 anchor して click を防ぐ。
-    /// `u64::MAX` = 未初期化。 起動時に `MAX_TAPE_EVENTS_PER_TRACK` ぶん pre-alloc し
-    /// RT で再確保しない。
-    pub repitch_accum: Vec<(u64, f64)>,
+    /// 起動時に `MAX_TAPE_STREAMS_PER_TRACK` ぶん pre-alloc し RT で再確保しない。
+    pub repitch_accum: Vec<crate::audio_clip_renderer::TapeCursor>,
     /// r.md #40: この track の stretch engine pool。 引き当ては位置ではなく
     /// **`RenderedEvent::stream_key`** で行う (`acquire_engine`)。
     /// 1 個 ~1 MB なので **確保は off-thread** で行い、
@@ -122,7 +115,10 @@ impl TrackScratch {
             // (`RtBundle::input_delay_replacements`)。全 track に先回りで 1 秒ぶん持たせない
             // (`docs/plan_unbounded_tracks.md` §2.2)。
             input_delay_line: DelayLine::with_capacity(0),
-            repitch_accum: vec![(u64::MAX, 0.0); MAX_TAPE_EVENTS_PER_TRACK],
+            repitch_accum: vec![
+                crate::audio_clip_renderer::TapeCursor::IDLE;
+                crate::audio_clip_renderer::MAX_TAPE_STREAMS_PER_TRACK
+            ],
             // 実体 (= 高価なエンジン) は off-thread で作って配送される。 ここでは
             // 容量だけ予約しておき、RT の `push` が再確保しないことを保証する。
             stretch_engines: Vec::with_capacity(

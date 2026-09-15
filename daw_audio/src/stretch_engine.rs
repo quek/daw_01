@@ -19,7 +19,7 @@
 //! エンジンは **連続ストリーム**処理器で、DAW の「任意位置から鳴らす」用途とは
 //! 素直に噛み合わない。ここが吸収する:
 //!
-//! - `key` (= 安定 clip id + audio event id) と「次に出るべき output sample」
+//! - `key` (= 素材の安定 id、`RenderedEvent::stream_key`) と「次に出るべき output sample」
 //!   (`next_el`) が両方一致するときだけ継続。ズレたら [`sms_output_seek`] で
 //!   パイプラインを詰め直す (= seek / loop / 新規発音 / schedule 再構築)。
 //! - **レイテンシは 0 に見せる**。素材は全部メモリ上にあるので、出力位置より
@@ -197,6 +197,42 @@ impl StretchEngine {
         self.claim_stamp == stamp
     }
 
+    /// 直前の buffer (`stamp` の 1 つ前) で使われたか = 今も鳴っている発音の持ち物か。
+    pub fn was_claimed_before(&self, stamp: u64) -> bool {
+        self.claim_stamp == stamp.wrapping_sub(1)
+    }
+
+    /// [`Self::render`] がこの呼び出しで最初に `fetch` する中間位置 `u`: ストリームが続きなら既に食わせた
+    /// 先読みの続き (`cursor_u`)、そうでなければ prime の頭 (`u_at_start`)。 素材を位置の積分で読む
+    /// 呼び出し側 (tape の読み位置) が、積分の続きを引き当てるのに使う。
+    pub fn next_fetch_u(&self, key: u64, el_start: u64, du: f64, u_at_start: f64) -> f64 {
+        match &self.stream {
+            Some(s) if self.continues(key, el_start, du, u_at_start) => s.cursor_u,
+            _ => u_at_start,
+        }
+    }
+
+    /// 走行中ストリームが **この続き** を出せるか: 同じ発音キーで、次に出す event-local sample が
+    /// `el_start`、`u` 座標系 (`du` と `el_start` での位置 `u_at_start`) も連続している。
+    ///
+    /// [`Self::render`] が prime し直すかの判定と同じ式。 分割の片 (同じ take の続き) は同じキーと
+    /// 連続した座標で来るので、前の片が buffer の途中で鳴り終えたエンジンをそのまま引き継げる。
+    pub fn continues(&self, key: u64, el_start: u64, du: f64, u_at_start: f64) -> bool {
+        self.stream.as_ref().is_some_and(|s| {
+            // (a) 同じ発音か (b) 出力位置が続きか (c) **写像の座標系が同じか**。
+            // (c) が抜けていると、再生中の stretch mode 切替 / clip 端ドラッグで
+            // `cursor_u` が旧空間のまま残り、フリーズしたドローンになる。
+            s.key == key
+                && el_start.abs_diff(s.next_el) <= CONTINUITY_SLACK_SAMPLES
+                // `du` は同じ入力から決定的に導かれるので、相対誤差で見る。
+                && (s.du - du).abs() <= s.du.abs() * 1e-9
+                // `u_of` は tempo 変化では連続 (beat 領域の絶対量)、mode 切替 /
+                // clip 長編集では跳ぶ。 許容幅は出力 `CONTINUITY_SLACK_SAMPLES`
+                // サンプル相当を `u` 系へ写したもの。
+                && (u_at_start - s.out_u).abs() <= CONTINUITY_SLACK_SAMPLES as f64 * du
+        })
+    }
+
     /// この buffer での使用権を取る。
     pub fn claim(&mut self, stamp: u64) {
         self.claim_stamp = stamp;
@@ -263,20 +299,7 @@ impl StretchEngine {
 
         self.apply_params(transpose_semitones, formant_semitones, compensate_pitch);
 
-        let continuous = self.stream.as_ref().is_some_and(|s| {
-            // (a) 同じ発音か (b) 出力位置が続きか (c) **写像の座標系が同じか**。
-            // (c) が抜けていると、再生中の stretch mode 切替 / clip 端ドラッグで
-            // `cursor_u` が旧空間のまま残り、フリーズしたドローンになる。
-            s.key == key
-                && el_start.abs_diff(s.next_el) <= CONTINUITY_SLACK_SAMPLES
-                // `du` は同じ入力から決定的に導かれるので、相対誤差で見る。
-                && (s.du - du).abs() <= s.du.abs() * 1e-9
-                // `u_of` は tempo 変化では連続 (beat 領域の絶対量)、mode 切替 /
-                // clip 長編集では跳ぶ。 許容幅は出力 `CONTINUITY_SLACK_SAMPLES`
-                // サンプル相当を `u` 系へ写したもの。
-                && (u_of(el_start) - s.out_u).abs() <= CONTINUITY_SLACK_SAMPLES as f64 * du
-        });
-        if !continuous {
+        if !self.continues(key, el_start, du, u_of(el_start)) {
             self.prime(key, el_start, du, &u_of, &mut fetch);
         }
 

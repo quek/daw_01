@@ -884,6 +884,36 @@ impl AppData {
         }) == Some(true)
     }
 
+    /// **時間写像を変える編集** (移調 / 逆再生 / 伸縮 mode) を [`Self::mutate_audio_events_in_clip`] と
+    /// 同じ対象へ掛ける。 値が変わる event は先に take を見えている窓へ詰め直す
+    /// ([`common::model::AudioEvent::rebase_take`]) — 分割の片の写像の起点は片の外 (分割前の頭) に
+    /// あるので、詰め直さずに変えると片の頭の音が跳ぶ (逆再生なら前の片の音を逆に読む)。 詰め直すと
+    /// 分割していない event に掛けたのと同じく、片自身の頭を起点に効く。
+    pub(crate) fn mutate_audio_event_mapping_in_clip(
+        &mut self,
+        target: ClipKey,
+        changes: impl Fn(&common::model::AudioEvent) -> bool,
+        mut f: impl FnMut(&mut common::model::AudioEvent),
+    ) -> bool {
+        let song = self.cur.song_doc.song();
+        let secs_per_beat = 60.0 / f64::from(song.bpm.max(1.0));
+        let native_fpb: std::collections::HashMap<common::model::AudioSourceId, f64> = song
+            .media
+            .audio_sources
+            .iter()
+            .map(|(&id, s)| (id, f64::from(s.sample_rate) * secs_per_beat))
+            .collect();
+        self.mutate_audio_events_in_clip(target, |e| {
+            if !changes(e) {
+                return;
+            }
+            if let Some(&fpb) = native_fpb.get(&e.source_id) {
+                e.rebase_take(fpb);
+            }
+            f(e);
+        })
+    }
+
     /// B12-manual (r.md #8): `audio_editor_clip` の `event_idx` 番目 AudioEvent の
     /// `beat_markers` に `f` を適用する (= warp marker 手動編集)。 `mutate_audio_events_in_clip`
     /// と違い選択ではなく特定 event を対象にする (marker drag/add/delete は対象 event が確定して

@@ -609,6 +609,11 @@ fn slice_wave_spans(
 /// warp marker があれば `warp_source_frame`)、 tape / slice は
 /// `tape_sample_at` / `slice_sample_at` の `time_stride` / `read_stride` 合成。
 /// 束縛テストは daw_audio 側の `wave_span_binding_tests` にある。
+///
+/// **take の窓** (r.md #132 残件、[`crate::model::AudioEvent::take_head_beats`]): 写像は take
+/// (分割する前の event) の上で展開し、見えている窓 `[head, head + length)` で切り詰めて event-local へ
+/// 戻す。 分割の片を並べた span 列は分割前の span 列と一致する (写像を片ごとに作り直さない)。
+/// `event_start_beat` は **見えている先頭** の song 絶対拍 (take の頭はそこから `take_head_beats` 前)。
 pub fn event_wave_spans(
     event: &crate::model::AudioEvent,
     source_sample_rate: u32,
@@ -616,10 +621,65 @@ pub fn event_wave_spans(
     event_start_beat: f64,
     out: &mut Vec<WaveSpan>,
 ) {
+    let head = event.take_head_beats;
+    take_wave_spans(
+        event,
+        source_sample_rate,
+        tempo,
+        event_start_beat - head,
+        event.take_length_beats(),
+        out,
+    );
+    if head != 0.0 || event.take_tail_beats != 0.0 {
+        crop_wave_spans(out, head, head + event.event_length_beats);
+    }
+}
+
+/// take-local の span 列を窓 `[lo, hi)` で切り詰め、`lo` を 0 とする event-local へ移す。
+/// 区間の途中で切った span は source 範囲も同じ比で切る (逆再生は右→左に読む向きのまま)。
+/// 途中から始まる span は音の立ち上がりではないので `head = false`。
+fn crop_wave_spans(spans: &mut Vec<WaveSpan>, lo: f64, hi: f64) {
+    spans.retain_mut(|s| {
+        let (b0, b1) = (s.start_beat.max(lo), s.end_beat.min(hi));
+        if b1 <= b0 {
+            return false;
+        }
+        let beats = s.end_beat - s.start_beat;
+        #[allow(clippy::cast_precision_loss)]
+        let frames = s.source_end.saturating_sub(s.source_start) as f64;
+        let (fa, fb) = ((b0 - s.start_beat) / beats, (b1 - s.start_beat) / beats);
+        // 読む向きに沿った先頭からの frame 量 → 絶対 frame の範囲。
+        let (lo_frames, hi_frames) = if s.reversed { (frames * (1.0 - fb), frames * (1.0 - fa)) } else { (frames * fa, frames * fb) };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (src0, src1) = (
+            s.source_start.saturating_add(lo_frames.floor().max(0.0) as u64),
+            s.source_start.saturating_add(hi_frames.ceil().max(0.0) as u64).min(s.source_end),
+        );
+        if b0 > s.start_beat {
+            s.head = false;
+        }
+        s.start_beat = b0 - lo;
+        s.end_beat = b1 - lo;
+        s.source_start = src0.min(src1.saturating_sub(1));
+        s.source_end = src1.max(s.source_start + 1);
+        true
+    });
+}
+
+/// [`event_wave_spans`] の本体: take 全体 (`[0, len_beats)`、頭の song 絶対拍 `event_start_beat`) の
+/// span 列。
+fn take_wave_spans(
+    event: &crate::model::AudioEvent,
+    source_sample_rate: u32,
+    tempo: &TempoMap<'_>,
+    event_start_beat: f64,
+    len_beats: f64,
+    out: &mut Vec<WaveSpan>,
+) {
     out.clear();
     let source_start = event.source_start_frames;
     let window = event.source_end_frames.saturating_sub(source_start);
-    let len_beats = event.event_length_beats.max(0.0);
+    let len_beats = len_beats.max(0.0);
     if window == 0 || len_beats <= 0.0 {
         return;
     }
@@ -1640,6 +1700,64 @@ mod tests {
                 "nominal={nominal_bpm} current={current_bpm} advance={advance} \
                  window_secs={window_secs} native_secs={native_secs}"
             );
+        }
+    }
+
+    /// r.md #132 残件: 分割の片の波形は分割前の波形の一部そのもの — 曲のどの拍でも、分割前の span 列と
+    /// その拍を含む片の span 列が **同じ source 位置** を指し (鳴っていない拍は両方鳴っていない)、
+    /// 片を並べても波形がずれない / 途切れない。
+    #[test]
+    fn 分割の片の波形は分割前の波形の一部と一致する() {
+        use crate::model::{AudioEvent, split_pieces};
+        let window = 48_000u64;
+        let base = |mode: StretchMode, len: f64| AudioEvent {
+            source_end_frames: window,
+            event_length_beats: len,
+            stretch_mode: mode,
+            ..AudioEvent::default()
+        };
+        let events = [
+            ("raw pitched", AudioEvent { pitch_semitones: -5.0, ..base(StretchMode::Raw, 4.0) }),
+            ("repitch reversed", AudioEvent { reversed: true, pitch_semitones: 3.0, ..base(StretchMode::Repitch, 3.0) }),
+            ("stretch", base(StretchMode::Stretch, 5.0)),
+            (
+                "stretch warp",
+                AudioEvent {
+                    beat_markers: vec![bm(0, 0.0), bm(9_000, 1.2), bm(40_000, 2.9), bm(48_000, 4.0)],
+                    ..base(StretchMode::Stretch, 4.0)
+                },
+            ),
+            ("slice gaps", AudioEvent { onsets: vec![0, 11_000, 23_000, 37_000], ..base(StretchMode::Slice, 5.0) }),
+            ("slice cuts pitched", AudioEvent { onsets: vec![0, 11_000, 23_000, 37_000], pitch_semitones: 4.0, ..base(StretchMode::Slice, 1.5) }),
+        ];
+        let tempo = TempoMap::constant(120.0);
+        let spans_at = |ev: &AudioEvent, start: f64| {
+            let mut out = Vec::new();
+            event_wave_spans(ev, 48_000, &tempo, start, &mut out);
+            out
+        };
+        for (label, ev) in events {
+            let len = ev.event_length_beats;
+            let whole = spans_at(&ev, 0.0);
+            let pieces = split_pieces(&ev, [len * 0.23, len * 0.5, len * 0.81], 0.0);
+            assert_eq!(pieces.len(), 4, "{label}");
+            for step in 0..400 {
+                let beat = len * (f64::from(step) + 0.5) / 400.0;
+                let piece = pieces
+                    .iter()
+                    .find(|p| beat >= p.event_start_in_clip_beats && beat < p.event_start_in_clip_beats + p.event_length_beats)
+                    .expect("どの拍も片のどれかに入る");
+                let local = beat - piece.event_start_in_clip_beats;
+                let from_piece = source_frame_at_beat(&spans_at(piece, piece.event_start_in_clip_beats), local);
+                let from_whole = source_frame_at_beat(&whole, beat);
+                match (from_whole, from_piece) {
+                    (Some(w), Some(p)) => {
+                        assert!((w - p).abs() <= 2.0, "{label} @{beat}: 分割前 {w} / 片 {p}");
+                    }
+                    (None, None) => {}
+                    other => panic!("{label} @{beat}: 鳴る / 鳴らないが食い違う {other:?}"),
+                }
+            }
         }
     }
 }

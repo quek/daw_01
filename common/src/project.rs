@@ -1175,6 +1175,74 @@ mod tests {
         assert!(loaded.tracks[0].follow_transpose);
     }
 
+    /// r.md #132 残件 (v42): 分割の片の窓 (audio の take の頭 / 尻と warp marker、映像の take の頭、
+    /// fade ランプの張り出し、読み上げない続きの片) は保存して開き直すと戻る。 分割していない event は
+    /// 新しいフィールドを書かない (= v41 以前の file と同じ形で、読むと分割していない event)。
+    #[test]
+    fn split_pieces_roundtrip_and_unsplit_events_keep_the_legacy_shape() {
+        use crate::model::{AudioContent, AudioEvent, BeatMarker, StretchMode, VideoContent, VideoEvent};
+        let dir = tempdir().unwrap();
+        let mut song = Song::default();
+        let audio = song.alloc_content(
+            ClipContent::Audio(AudioContent {
+                events: vec![AudioEvent {
+                    id: 1,
+                    source_id: 1,
+                    event_length_beats: 4.0,
+                    source_end_frames: 96_000,
+                    stretch_mode: StretchMode::Stretch,
+                    fade_in_beats: 2.0,
+                    beat_markers: vec![
+                        BeatMarker { source_frame: 0, locked_beat: 0.0 },
+                        BeatMarker { source_frame: 60_000, locked_beat: 2.5 },
+                        BeatMarker { source_frame: 96_000, locked_beat: 4.0 },
+                    ],
+                    ..AudioEvent::default()
+                }],
+                next_event_id: 2,
+            }),
+            String::new(),
+        );
+        let video = song.alloc_content(
+            ClipContent::Video(VideoContent {
+                events: vec![VideoEvent { event_length_beats: 4.0, source_end_micros: 2_000_000, fade_out_beats: 1.5, ..VideoEvent::default() }],
+            }),
+            String::new(),
+        );
+        let text = song.alloc_content(
+            ClipContent::Text(TextContent {
+                events: vec![TextEvent { text: "こんにちは".into(), event_length_beats: 4.0, ..TextEvent::default() }],
+            }),
+            String::new(),
+        );
+        // 参照されない content は読み込みで掃除されるので、それぞれを clip に置く。
+        let clips = [audio, video, text].into_iter().enumerate().map(|(i, content_id)| Clip {
+            id: i as u32 + 1,
+            start_beat: 8.0 * i as f64,
+            length_beats: 4.0,
+            content_id,
+            ..Clip::default()
+        });
+        song.tracks = vec![Track { id: 1, clips: clips.collect(), next_clip_id: 4, ..Track::default() }];
+        let unsplit = song.clone();
+        for content in [audio, video, text] {
+            song.split_content_at_points(content, &[1.0, 3.25]);
+        }
+        let path = dir.path().join("pieces.daw");
+        save(&path, &song).unwrap();
+        let loaded = load_project(&path).unwrap().song;
+        for content in [audio, video, text] {
+            assert_eq!(loaded.clip_contents[&content], song.clip_contents[&content], "content {content}");
+        }
+        let ClipContent::Text(t) = &loaded.clip_contents[&text] else { panic!("text") };
+        assert_eq!(t.events.iter().map(|e| e.continuation).collect::<Vec<_>>(), vec![false, true, true]);
+
+        let raw = serde_json::to_value(&unsplit).unwrap().to_string();
+        for key in ["take_head_beats", "take_tail_beats", "fade_in_lead_beats", "fade_out_trail_beats", "continuation"] {
+            assert!(!raw.contains(key), "分割していない event は {key} を書かない");
+        }
+    }
+
     /// 旧 `save` (= `save_project(.., None)` への委譲) は view を書かない。
     #[test]
     fn plain_save_writes_no_view() {

@@ -2060,8 +2060,8 @@ fn compute_audio_drag_outcome(ad: &AudioDragSession, beat_per_px: f64) -> Option
                     FadeEdge::Out => -raw_delta_beats,
                 };
                 let prev = match edge {
-                    FadeEdge::In => anchor.fade.fade_in_beats,
-                    FadeEdge::Out => anchor.fade.fade_out_beats,
+                    FadeEdge::In => anchor.fade.visible_fade_in_beats(),
+                    FadeEdge::Out => anchor.fade.visible_fade_out_beats(),
                 };
                 // r.md #38: 上限は **event 長**。 音 (`audio_clip_renderer`) / 映像 / 画像 /
                 // 字幕はどれも event 長基準で fade を掛けるので、 clip 長で clamp すると
@@ -2378,20 +2378,21 @@ fn fold_arrangement_clip_hash(tracks: &[ArrangementTrack]) -> u64 {
             h ^= c.fades.len() as u64;
             h = h.wrapping_mul(PRIME);
             for f in &c.fades {
-                h ^= u64::from(f.event_index);
-                h = h.wrapping_mul(PRIME);
-                h ^= f.fade.start_in_clip_beats.to_bits();
-                h = h.wrapping_mul(PRIME);
-                h ^= f.fade.len_beats.to_bits();
-                h = h.wrapping_mul(PRIME);
-                h ^= f.fade.fade_in_beats.to_bits();
-                h = h.wrapping_mul(PRIME);
-                h ^= f.fade.fade_out_beats.to_bits();
-                h = h.wrapping_mul(PRIME);
-                h ^= curve_code(f.fade.fade_in_curve);
-                h = h.wrapping_mul(PRIME);
-                h ^= curve_code(f.fade.fade_out_curve);
-                h = h.wrapping_mul(PRIME);
+                let fd = &f.fade;
+                for v in [
+                    u64::from(f.event_index),
+                    fd.start_in_clip_beats.to_bits(),
+                    fd.len_beats.to_bits(),
+                    fd.fade_in_beats.to_bits(),
+                    fd.fade_out_beats.to_bits(),
+                    curve_code(fd.fade_in_curve),
+                    curve_code(fd.fade_out_curve),
+                    fd.fade_in_lead_beats.to_bits(),
+                    fd.fade_out_trail_beats.to_bits(),
+                ] {
+                    h ^= v;
+                    h = h.wrapping_mul(PRIME);
+                }
             }
         }
         // M14 Phase 63n-1 (#028): automation lanes も viewport_key に反映 (caller が collapse / lane
