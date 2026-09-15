@@ -1532,6 +1532,10 @@ pub enum DeferredEdit {
     /// トラック削除 (r.md #43)。 選択集合を **1 件にまとめて** 持つ — id ごとに
     /// enqueue すると round-trip が分かれて undo が N ステップに割れる。
     DeleteTracks { track_ids: Vec<u32> },
+    /// r.md #131: トラックの無効化 (plugin を host から降ろすので state を書き戻してから)。
+    DisableTracks { track_ids: Vec<u32> },
+    /// r.md #131: 無効な group の中へのトラック移動 (同上)。
+    MoveTracks { track_ids: Vec<u32>, parent_id: Option<u32>, anchor_after: Option<u32> },
     UngroupTracks { track_ids: Vec<u32> },
     /// 単一デバイスチェーン: 安定 `device_id` で指した device を chain から外す。
     /// 複数選択を **1 件にまとめて** 持つ (id ごとに enqueue すると undo が

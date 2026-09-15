@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 
 use common::model::{AudioTap, AutomationLane, Device, ModRouting, Song, TapPoint, TapSource, Track};
-use common::routing_deps::aux_consumers;
+use common::routing_deps::{AuxConsumer, aux_consumers};
 
 use super::{ChainMap, tap_bufref_for};
 use crate::graph::native::{ScMode, ScStage};
@@ -46,7 +46,10 @@ pub(super) fn consumer_pass(bus: bool, split: Option<u32>, top_index: u32) -> Sc
 
 /// tap の source を解決し、consumer の pass を決めるのに使う表の束。
 pub(super) struct TapCtx<'a> {
+    /// **有効な** track id → song-track index (`Topology::id_to_idx`。無効トラックの tap は解決しない)。
     pub(super) id_to_idx: &'a HashMap<u32, u32>,
+    /// song-track index → 実効的に有効か (`Topology::enabled`。無効トラックの consumer は数えない)。
+    pub(super) enabled: &'a [bool],
     pub(super) chains: &'a ChainMap,
     /// song-track index → bus か (`Topology::bus_flags`)。
     pub(super) bus_flags: &'a [bool],
@@ -119,32 +122,48 @@ fn tap_source_latency(
     }
 }
 
+/// r.md #131: 実効的に有効なトラック (`enabled`) と master の chain 上の consumer (無効トラックの consumer は
+/// 処理されないので、読む tap も snapshot の要求も持たない)。
+fn live_aux_consumers<'a>(song: &'a Song, enabled: &'a [bool]) -> impl Iterator<Item = AuxConsumer<'a>> {
+    song.tracks
+        .iter()
+        .zip(enabled)
+        .filter(|&(_, &on)| on)
+        .flat_map(|(t, _)| aux_consumers(&t.devices, &t.automation_lanes, &t.mod_routings))
+        .chain(aux_consumers(&song.master_fx_chain, &song.song_lanes, &song.song_mod_routings))
+}
+
+/// envelope follower のうち評価されるもの (`Song::mod_source_active`) の tap。
+fn live_follower_taps(song: &Song) -> impl Iterator<Item = &AudioTap> {
+    song.mod_sources
+        .iter()
+        .filter(|ms| song.mod_source_active(ms))
+        .filter_map(|ms| ms.follower().and_then(|(tap, _)| tap))
+}
+
 /// `(chain_id, tap_point)` を誰かが読むか (chain の snapshot flag を焼く入力)。
-pub(super) fn collect_chain_taps(song: &Song) -> HashSet<(u64, TapPoint)> {
+pub(super) fn collect_chain_taps(song: &Song, enabled: &[bool]) -> HashSet<(u64, TapPoint)> {
     let mut set = HashSet::new();
     let mut add = |tap: &AudioTap| {
         if let TapSource::Chain(c) = tap.source {
             set.insert((c, tap.tap_point));
         }
     };
-    for (_, c) in song.all_aux_consumers().filter(|(_, c)| !c.inactive) {
+    for c in live_aux_consumers(song, enabled).filter(|c| !c.inactive) {
         for route in c.routes.iter().flatten() {
             add(&route.tap);
         }
     }
-    for ms in &song.mod_sources {
-        if let Some((Some(tap), _)) = ms.follower() {
-            add(tap);
-        }
-    }
+    live_follower_taps(song).for_each(add);
     set
 }
 
 /// track の Pre-FX / PostFx (pre-fader) snapshot を誰かが読むかを、各 program に焼く
 /// (§8.3.2、旧 RT の `track_needs_*_snapshot` → `any_tap_at` は毎 buffer Song を歩いて確保していた
-/// = §18-B)。snapshot は bypass と無関係に取るので、処理しえない consumer の配線も数える。
+/// = §18-B)。snapshot は bypass と無関係に取るので、処理しえない consumer の配線も数える
+/// (無効トラックの consumer は除く — 有効に戻すと compile し直す)。
 /// PostFx には pre-fader send を含める (leaf と group で条件を揃える、§18-C)。
-pub(super) fn bake_snapshot_needs(song: &Song, built: &mut [BuiltProgram]) {
+pub(super) fn bake_snapshot_needs(song: &Song, enabled: &[bool], built: &mut [BuiltProgram]) {
     let mut wanted: HashSet<(u32, TapPoint)> = HashSet::new();
     {
         let mut add = |tap: &AudioTap| {
@@ -152,16 +171,12 @@ pub(super) fn bake_snapshot_needs(song: &Song, built: &mut [BuiltProgram]) {
                 wanted.insert((t, tap.tap_point));
             }
         };
-        for (_, c) in song.all_aux_consumers() {
+        for c in live_aux_consumers(song, enabled) {
             for route in c.routes.iter().flatten() {
                 add(&route.tap);
             }
         }
-        for ms in &song.mod_sources {
-            if let Some((Some(tap), _)) = ms.follower() {
-                add(tap);
-            }
-        }
+        live_follower_taps(song).for_each(add);
     }
     for (track, b) in song.tracks.iter().zip(built.iter_mut()) {
         b.program.snapshot_pre_fx = wanted.contains(&(track.id, TapPoint::PreFx));
@@ -275,6 +290,10 @@ pub(super) fn compute_sc_delays(
     let mut input_delay = vec![0u32; n];
     let mut bus_sc_delay = vec![0u32; n];
     for (i, track) in song.tracks.iter().enumerate() {
+        // r.md #131: 無効トラックは処理されないので揃える相手が無い。
+        if !taps.enabled.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         let idx = i as u32;
         let (mut pass1, mut pass2) = (0u32, 0u32);
         let consumers = aux_consumers(&track.devices, &track.automation_lanes, &track.mod_routings);

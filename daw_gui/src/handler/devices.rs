@@ -254,6 +254,10 @@ impl AppData {
         // `SetupAraDocument` to the new instance — leaving it with no regions, so
         // it renders silence and its empty playback renderer stalls the engine.
         self.cur.pipc.ara_doc_cache.remove(&device_id);
+        // Song が変わらない再ロード (undo / redo の reconcile、r.md #131 の有効化) は epoch が進まず、次の frame flush が
+        // 来ない = 上で捨てた document を誰も送り直さない。ここで差分 sync を回す (この device だけが cache に居ないので
+        // この device だけが組み直される)。
+        self.sync_ara_documents();
 
         // 新 plugin の audio 再 sync は edit_song の epoch bump 経由: 下の play() が
         // ensure-synced flush で Play 前に新 schedule を届け (Play 待ち再生)、 Play が
@@ -378,8 +382,8 @@ impl AppData {
             return;
         };
         // 内蔵映像 FX は plugin_host に載らない device なので再 load の
-        // 対象にならない (そもそも load 失敗も起きない)。
-        if inst.ports.is_video() {
+        // 対象にならない (そもそも load 失敗も起きない)。 r.md #131: 無効トラックの device も載せない。
+        if inst.ports.is_video() || !self.is_live_device(device_id) {
             return;
         }
         let name = self.resolve_name(&inst.plugin_id);
@@ -541,6 +545,10 @@ impl AppData {
             caller = %std::panic::Location::caller(),
             "open_slot_gui"
         );
+        // r.md #131: 無効トラックの device は host に居ないので窓を開けない (インスペクタは「無効中」を出す)。
+        if !self.is_live_device(device_id) {
+            return;
+        }
         #[cfg(windows)]
         {
             if self.cur.pipc.open_plugin_guis.contains(&device_id) {
@@ -1102,6 +1110,10 @@ impl AppData {
     pub(crate) fn execute_deferred_edit(&mut self, edit: DeferredEdit) {
         match edit {
             DeferredEdit::DeleteTracks { track_ids } => self.delete_tracks_inner(&track_ids),
+            DeferredEdit::DisableTracks { track_ids } => self.set_tracks_enabled_inner(&track_ids, false),
+            DeferredEdit::MoveTracks { track_ids, parent_id, anchor_after } => {
+                self.action_move_tracks_inner(&track_ids, parent_id, anchor_after)
+            }
             DeferredEdit::UngroupTracks { track_ids } => {
                 self.action_ungroup_tracks_inner(&track_ids)
             }

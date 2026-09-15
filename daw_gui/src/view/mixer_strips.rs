@@ -412,6 +412,23 @@ fn draw_track_strip(
     );
     // Sends セクションは draw_strip の fader 下端より下の band に描画する。
     draw_sends_section(app, ui, track_id, rect, bg, sends_band_h, scope);
+    dim_if_disabled(app, ui, track_id, rect);
+}
+
+/// r.md #131: 実効的に無効なトラックの strip を丸ごと沈める (アレンジのヘッダ / レーンと同じ `row_dim_ink`)。
+/// 描いた後に重ねるだけなので、フェーダー / M·S / send の操作はそのまま効く (効くのは有効に戻してから)。
+fn dim_if_disabled(app: &AppData, ui: &mut Ui<'_, AppData>, track_id: u32, rect: Rect) {
+    if app.cur.song_doc.song().track_effectively_enabled(track_id) {
+        return;
+    }
+    ui.push_rect(RectCommand {
+        rect,
+        fill: app.theme.core.row_dim_ink,
+        border: Color::TRANSPARENT,
+        border_width: 0.0,
+        radius: [4.0; 4],
+        clip_rect: None,
+    });
 }
 
 /// リターン strip。 通常の fader / pan / mute / solo を持つが、 緑 tint
@@ -444,6 +461,7 @@ fn draw_return_strip(
         0.0, // sends_band_h = 0 (リターンは send 元 UI を出さない)
         scope,
     );
+    dim_if_disabled(app, ui, track_id, rect);
 }
 
 #[allow(clippy::too_many_arguments)]

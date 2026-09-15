@@ -48,7 +48,7 @@ fn host_extra_device_yields_remove_action() {
     loaded_devices.insert(100, loaded("p.comp"));
     loaded_devices.insert(101, loaded("p.reverb"));
 
-    let actions = compute_slot_reconcile_actions(&song, &loaded_devices);
+    let actions = compute_slot_reconcile_actions(&song, &loaded_devices, &HashMap::new());
     assert_eq!(
         actions,
         vec![SlotReconcileAction::RemoveDevice { device_id: 101 }],
@@ -66,7 +66,7 @@ fn song_extra_device_yields_load_action() {
     let mut loaded_devices = HashMap::new();
     loaded_devices.insert(200, loaded("p.comp"));
 
-    let actions = compute_slot_reconcile_actions(&song, &loaded_devices);
+    let actions = compute_slot_reconcile_actions(&song, &loaded_devices, &HashMap::new());
     assert_eq!(
         actions,
         vec![SlotReconcileAction::LoadDevice {
@@ -87,7 +87,7 @@ fn plugin_id_mismatch_yields_load_action() {
     let mut loaded_devices = HashMap::new();
     loaded_devices.insert(300, loaded("p.A"));
 
-    let actions = compute_slot_reconcile_actions(&song, &loaded_devices);
+    let actions = compute_slot_reconcile_actions(&song, &loaded_devices, &HashMap::new());
     assert_eq!(
         actions,
         vec![SlotReconcileAction::LoadDevice {
@@ -116,7 +116,7 @@ fn matching_devices_produce_no_action() {
     loaded_devices.insert(401, loaded("p.comp"));
     loaded_devices.insert(402, loaded("p.midi"));
 
-    let actions = compute_slot_reconcile_actions(&song, &loaded_devices);
+    let actions = compute_slot_reconcile_actions(&song, &loaded_devices, &HashMap::new());
     assert!(
         actions.is_empty(),
         "perfectly synced track yields no actions: {actions:?}"
@@ -132,7 +132,7 @@ fn initial_state_propagates_to_load_action() {
     let song = make_song_with_one_track(14, vec![inst]);
     let loaded_devices = HashMap::new();
 
-    let actions = compute_slot_reconcile_actions(&song, &loaded_devices);
+    let actions = compute_slot_reconcile_actions(&song, &loaded_devices, &HashMap::new());
     assert_eq!(
         actions,
         vec![SlotReconcileAction::LoadDevice {
@@ -153,7 +153,7 @@ fn removals_come_before_loads() {
     let mut loaded_devices = HashMap::new();
     loaded_devices.insert(601, loaded("p.stale"));
 
-    let actions = compute_slot_reconcile_actions(&song, &loaded_devices);
+    let actions = compute_slot_reconcile_actions(&song, &loaded_devices, &HashMap::new());
     assert_eq!(
         actions,
         vec![
@@ -165,5 +165,58 @@ fn removals_come_before_loads() {
             },
         ],
         "RemoveDevice が LoadDevice より先: {actions:?}"
+    );
+}
+
+/// r.md #131: 実効的に無効なトラック (自分か祖先 group が無効) の device は host に居るべきでない —
+/// 無効化で `RemoveDevice`、有効に戻すと Song の state 付きで `LoadDevice`。
+#[test]
+fn disabled_track_devices_are_removed_and_reloaded_with_state_when_enabled() {
+    let mut synth = make_instance(700, "p.synth");
+    synth.state = Some(vec![9, 8, 7].into());
+    let mut song = make_song_with_one_track(20, vec![make_instance(701, "p.bus")]);
+    song.tracks.push(daw_gui::app::track_with(|t| {
+        t.id = 21;
+        t.parent_group_id = Some(20);
+        t.devices = vec![common::model::Device::Plugin(synth)];
+    }));
+    let mut loaded_devices = HashMap::new();
+    loaded_devices.insert(700, loaded("p.synth"));
+    loaded_devices.insert(701, loaded("p.bus"));
+    assert!(compute_slot_reconcile_actions(&song, &loaded_devices, &HashMap::new()).is_empty());
+
+    // group 20 を無効 → 子 21 の device も降ろす。
+    song.set_tracks_enabled(&[20], false);
+    let actions = compute_slot_reconcile_actions(&song, &loaded_devices, &HashMap::new());
+    assert_eq!(
+        actions,
+        vec![SlotReconcileAction::RemoveDevice { device_id: 700 }, SlotReconcileAction::RemoveDevice { device_id: 701 }],
+    );
+
+    // 有効に戻す (host は空) → state 付きで載せ直す。
+    song.set_tracks_enabled(&[20], true);
+    let actions = compute_slot_reconcile_actions(&song, &HashMap::new(), &HashMap::new());
+    assert_eq!(
+        actions,
+        vec![
+            SlotReconcileAction::LoadDevice { device_id: 701, plugin_id_str: "p.bus".into(), initial_state: None },
+            SlotReconcileAction::LoadDevice { device_id: 700, plugin_id_str: "p.synth".into(), initial_state: Some(vec![9, 8, 7]) },
+        ],
+    );
+}
+
+/// r.md #131: load 応答待ちの device は、居るべきでなくなったら (読み込み中に無効化) 降ろし、居るべきなら
+/// 送り直さない (編集の直後に実体化した device を二重に load しない)。
+#[test]
+fn pending_loads_are_removed_when_not_hosted_and_not_resent_when_hosted() {
+    let mut song = make_song_with_one_track(30, vec![make_instance(800, "p.synth")]);
+    let pending: HashMap<u64, u64> = [(800, 1)].into_iter().collect();
+    assert!(compute_slot_reconcile_actions(&song, &HashMap::new(), &pending).is_empty(), "応答待ちは送り直さない");
+
+    song.set_tracks_enabled(&[30], false);
+    assert_eq!(
+        compute_slot_reconcile_actions(&song, &HashMap::new(), &pending),
+        vec![SlotReconcileAction::RemoveDevice { device_id: 800 }],
+        "読み込み中に無効化した device は応答後に残らないよう降ろす"
     );
 }

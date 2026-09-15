@@ -87,6 +87,8 @@ mod clip_drag;
 mod xfer;
 mod xfer_ghost;
 mod cursor;
+// r.md #131: 無効トラックの行 (レーン帯 / ランチャーのセル) を沈める overlay。
+mod disabled_rows;
 mod drag;
 mod frame;
 use frame::*;
@@ -323,6 +325,10 @@ pub struct ArrangementTrack {
     /// できる)。 widget は R button の click で `AppEvent::ToggleTrackArmed(track_id)` を
     /// 発行し、 `track.armed = !track.armed` で反転する (mute / solo と完全同 idiom)。
     pub armed: bool,
+    /// r.md #131: 実効的に無効 (`Song::track_effectively_enabled` の否定)。 ヘッダ / レーン帯 / ランチャーの
+    /// セルを `Palette::row_dim_ink` で丸ごと沈める (clip の灰色は caller が `ClipView::color` に焼く)。
+    /// 編集操作は変わらない (効くのは有効に戻してから)。
+    pub disabled: bool,
     pub clips: Vec<ClipView>,
     /// M10 Phase 47b: track volume (`0.0..=1.0`、`1.0` で unity)。
     /// track header rect 内 buttons の下に horizontal slider band として描画される (`row_h` 余裕がある時のみ)。
@@ -1603,6 +1609,8 @@ fn synthesize_master_track(master: &ArrangementMasterRow) -> ArrangementTrack {
         // 強制 `false` 固定。 widget 側で master 行の R button hit は通常 track と同様に発火するが、
         // caller (daw_01) 側が master_id を弾く idiom (mute / solo と同じ取り扱い)。
         armed: false,
+        // r.md #131: master は無効化できない。
+        disabled: false,
         // M14 Phase 72 (#044): master row は audio 経路 (= 強制 Audio)。 video 編集中も master は
         // automation lane のみで意味を持つ row なので kind 差別化なし。
         kind: TrackKind::Audio,

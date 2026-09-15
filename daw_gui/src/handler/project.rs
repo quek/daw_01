@@ -911,17 +911,21 @@ impl AppData {
     /// `RequestAllStates` で最新 state を Song に書き戻しているので、
     /// 削除直前の knob 値も Undo で復元される。
     pub(crate) fn reconcile_plugins_with_song(&mut self) {
-        if self.ipc.plugin_db.is_none() {
-            // plugin DB が未ロードなら SetSlotPlugin の組み立て不可。
-            // RemoveSlotPlugin 単体は db 不要だが、 まとめて skip する
-            // (= db ロード待ち)。
-            if !self.cur.song_doc.song().tracks.is_empty() {
-                tracing::warn!("reconcile: plugin database not loaded; skipped");
-            }
-            return;
-        }
-        let actions =
-            compute_slot_reconcile_actions(self.cur.song_doc.song(), &self.cur.pipc.loaded_devices);
+        let actions = compute_slot_reconcile_actions(
+            self.cur.song_doc.song(),
+            &self.cur.pipc.loaded_devices,
+            &self.cur.pipc.pending_plugin_loads,
+        );
+        self.apply_slot_reconcile_actions(actions);
+        // 「未ロード」表示は host に居るべき device のものだけ残す (undo で消えた device / r.md #131 で無効にした
+        // トラックの device は失敗表示を持ち越さない。有効に戻すと `LoadDevice` が読み込みをやり直す)。
+        let live: std::collections::HashSet<u64> = self.cur.song_doc.song().live_plugins().map(|p| p.id).collect();
+        self.cur.pipc.failed_plugin_loads.retain(|id, _| live.contains(id));
+    }
+
+    /// [`compute_slot_reconcile_actions`] の action を IPC と帳簿へ適用する (reconcile 全体と、r.md #131 の
+    /// 「居るべきかが変わった device だけ」の追従 `follow_live_devices` が共有する)。
+    pub(crate) fn apply_slot_reconcile_actions(&mut self, actions: Vec<SlotReconcileAction>) {
         for action in actions {
             match action {
                 SlotReconcileAction::RemoveDevice { device_id } => {
@@ -939,6 +943,14 @@ impl AppData {
                     self.send_plugin(PluginCommand::RemoveSlotPlugin { device: self.dev(device_id) });
                     self.cur.pipc.loaded_devices.remove(&device_id);
                     self.cur.pipc.pending_plugin_loads.remove(&device_id);
+                    // r.md #131: 追加直後の GUI 自動 open 予約も落とす (無効化したトラックの窓が load 応答後に開かない)。
+                    self.cur.pipc.pending_added_plugin_finalize.remove(&device_id);
+                    self.cur.pipc.gui_open_requests.retain(|&id| id != device_id);
+                }
+                // plugin DB が未ロードなら SetSlotPlugin を組み立てられない (= db ロード待ち)。降ろす側
+                // (`RemoveDevice`) は db が要らないので、ここで止めずに先に済ませる (無効化が db 待ちで漏れない)。
+                SlotReconcileAction::LoadDevice { device_id, .. } if self.ipc.plugin_db.is_none() => {
+                    tracing::warn!(device_id, "reconcile: plugin database not loaded; load skipped");
                 }
                 SlotReconcileAction::LoadDevice {
                     device_id,
@@ -1107,8 +1119,9 @@ impl AppData {
             return;
         }
         // v29: 帰属も chain 内の位置も送らない (host は device_id だけでアドレスする)。
-        // r.md #110: Parallel の中の plugin も全部 (`all_plugins` は信号順)。
-        let to_send: Vec<common::model::PluginInstance> = song.all_plugins().cloned().collect();
+        // r.md #110: Parallel の中の plugin も全部 (`live_plugins` は信号順)。
+        // r.md #131: 無効トラックの plugin は開いたときにロードしない (`Song::live_plugins`)。
+        let to_send: Vec<common::model::PluginInstance> = song.live_plugins().cloned().collect();
         for inst in to_send {
             self.restore_device(&inst);
         }
@@ -1119,12 +1132,12 @@ impl AppData {
     /// [`Self::restore_plugin_from_song`] の track 限定版。`self.cur.song_doc.song()` を読むため
     /// to_send を先に owned で確保してから送る (borrow 回避)。
     pub(crate) fn restore_plugins_for_tracks(&mut self, track_ids: &[u32]) {
-        let to_send: Vec<common::model::PluginInstance> = self
-            .cur.song_doc
-            .song()
+        let song = self.cur.song_doc.song();
+        // r.md #131: 無効なトラック (無効のまま貼った / 無効 group の中へ貼った) の plugin は載せない。
+        let to_send: Vec<common::model::PluginInstance> = song
             .tracks
             .iter()
-            .filter(|t| track_ids.contains(&t.id))
+            .filter(|t| track_ids.contains(&t.id) && song.track_effectively_enabled(t.id))
             .flat_map(|t| t.plugins().cloned())
             .collect();
         for inst in to_send {

@@ -437,6 +437,10 @@ pub struct ProjectEphemeral {
     /// `arrangement_view::draw` が毎フレーム更新。ヘッダ列・クリップレーンどちらの
     /// 上でも同じトラック行を返す。
     pub arrange_hovered_track: Option<u32>,
+    /// r.md #131: ポインタが **トラックヘッダ列** (名前 / M·S·R の行) の上にあるときだけ、そのトラック id
+    /// (`ArrangementResponse.track_header_rects` から。master 行は `MASTER_TRACK_ID`)。`arrange_hovered_track` と
+    /// 違いクリップレーン上では `None` — `Q` はヘッダ上ならトラックの無効化、レーン上ならクリップのミュート。
+    pub arrange_hovered_header_track: Option<u32>,
     /// Arranger (section 帯) の画面 rect (`ArrangementResponse.arranger_rect` の mirror)。
     /// r.md #128: `R` がポインタ位置で「選択パートの範囲」 か「選択クリップの範囲」 かを
     /// 決めるのに読む。 `arrangement_view::draw` が毎フレーム更新。
@@ -945,6 +949,7 @@ impl ProjectState {
                 arrange_drag_active: false,
                 arrange_xfer_drag_active: false,
                 arrange_hovered_track: None,
+                arrange_hovered_header_track: None,
                 arrange_arranger_rect: daw_ui_renderer::Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
                 launcher_pane_rect: daw_ui_renderer::Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
                 launcher_grid_rect: daw_ui_renderer::Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },

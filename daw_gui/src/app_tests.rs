@@ -949,7 +949,7 @@ mod master_fx_tests {
         let expected_id = common::model::plugins(&song.master_fx_chain).next().expect("plugin").id;
         assert_ne!(expected_id, 0, "ensure_ids が安定 id を振る");
         let loaded = HashMap::new();
-        let actions = compute_slot_reconcile_actions(&song, &loaded);
+        let actions = compute_slot_reconcile_actions(&song, &loaded, &HashMap::new());
         assert!(
             actions.iter().any(|a| matches!(
                 a,

@@ -267,6 +267,7 @@ impl AppData {
         // plan が空になり IPC が 1 通も出ない = 無言で壊れる)。
         let removal_plan =
             Self::plan_track_removal_ipc(self.cur.song_doc.song(), &groups_to_ungroup);
+        let live_before = self.hosted_device_ids();
         // group がクリップを持つこともある (group は「子を持つトラック」の暗黙の役割)。
         let audio_editor_key = self.audio_editor_target_key();
 
@@ -307,6 +308,8 @@ impl AppData {
         // 削除させ、 audio worker が destroyed plugin を dispatch しないように
         // する。 順序は `plan_track_removal_ipc` が持っている。
         self.after_tracks_removed(&removal_plan, audio_editor_key);
+        // r.md #131: 無効だった group を解くと子が実効的に有効へ戻る = その plugin を載せる。
+        self.follow_live_devices(&live_before);
         // selection: ungroup 後は元 group の子を選択 (Live 互換)。 明示的な
         // トラック面操作なので last-wins タグも Tracks に倒す。
         if !new_selection.is_empty() {
@@ -320,13 +323,33 @@ impl AppData {
     ///
     /// 規則 (実在 / 依存の循環 / 変化の有無) は `Song::move_tracks` 1 本が持つ。循環するなら Song も undo も
     /// 変えずに理由を status に出す (循環した graph は engine が空の schedule にして master が無音になる)。
-    pub(crate) fn action_move_tracks(
+    ///
+    /// r.md #131: 無効な group の中へ入れると、運んだトラックの plugin は host から降りる。無効化と同じく
+    /// 最新の state を Song に書き戻してから動かす (`DeferredEdit::MoveTracks`)。有効な親へ入れる移動は
+    /// 降ろす device が無いので即時。
+    pub(crate) fn action_move_tracks(&mut self, track_ids: &[u32], parent_id: Option<u32>, anchor_after: Option<u32>) {
+        let into_disabled = parent_id.is_some_and(|p| !self.cur.song_doc.song().track_effectively_enabled(p));
+        if into_disabled && self.song_has_plugin() {
+            let track_ids = track_ids.to_vec();
+            self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::MoveTracks {
+                track_ids,
+                parent_id,
+                anchor_after,
+            }));
+            return;
+        }
+        self.action_move_tracks_inner(track_ids, parent_id, anchor_after);
+    }
+
+    /// トラック群の移動の本体 (即時か deferred の完了)。
+    pub(crate) fn action_move_tracks_inner(
         &mut self,
         track_ids: &[u32],
         parent_id: Option<u32>,
         anchor_after: Option<u32>,
     ) {
         let mut rejected = false;
+        let live_before = self.hosted_device_ids();
         let moved = self.edit_song_checked(|song| match song.move_tracks(track_ids, parent_id, anchor_after) {
             Ok(changed) => changed,
             Err(common::routing_deps::DependencyCycle) => {
@@ -341,6 +364,9 @@ impl AppData {
         }
         if moved {
             tracing::info!(?track_ids, ?parent_id, ?anchor_after, "tracks moved");
+            // r.md #131: 無効な group へ入れた / 出したトラックの plugin を host に追従させる (engine へ構造を届けてから)。
+            self.flush_song_sync();
+            self.follow_live_devices(&live_before);
         }
     }
 

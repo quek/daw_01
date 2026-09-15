@@ -211,7 +211,9 @@ pub fn process_track_owned(
     let (skip_strip, main_to_child) = match program.pass1_role {
         Pass1Role::Leaf => (false, false),
         Pass1Role::GroupWithInstrument { main_to_child } => (true, main_to_child),
-        Pass1Role::Bus => {
+        // r.md #131: 無効トラックの手は直列トレースに載らない (`RenderGraph::build`) ので本来ここへは来ない。
+        // 来ても何も処理せず無音にする (bus と同じ)。
+        Pass1Role::Bus | Pass1Role::Disabled => {
             scratch.track_l[..n].fill(0.0);
             scratch.track_r[..n].fill(0.0);
             scratch.peak_l = 0.0;
@@ -762,7 +764,8 @@ pub fn render_master_buffer(
     master_l[..n].fill(0.0);
     master_r[..n].fill(0.0);
 
-    let any_solo = song.tracks.iter().any(|t| t.solo);
+    // r.md #131: 無効トラックの solo は数えない (表が compile 時に焼いた有効 / 無効を読む)。
+    let any_solo = schedule.solo.any_solo(song);
     // solo の透過はこの buffer の solo から 1 回だけ解く (表を読む手が走る前)。solo が無ければ誰も読まない。
     if any_solo {
         schedule.solo.resolve(song);

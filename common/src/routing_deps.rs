@@ -19,6 +19,7 @@ use crate::model::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeScope {
     /// いま処理されうる consumer だけ (plugin は `!bypassed`、native は `can_activate`)。engine の実行順。
+    /// r.md #131: 実効的に無効なトラックに触れる辺 (その子 / その consumer / そこを読む tap / その send) も数えない。
     Active,
     /// 配線がある consumer は全部 (bypass 中の配線を後で ON にすると循環しうるので、ガードはこちら)。
     Structural,
@@ -53,8 +54,14 @@ impl TrackDeps {
             });
         }
         let mut deps: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
+        // Active は実効的に無効なトラックの辺を張らない (Structural は全部)。
+        let enabled = match scope {
+            EdgeScope::Active => song.effectively_enabled_mask(),
+            EdgeScope::Structural => vec![true; ids.len()],
+        };
+        let live = |i: usize| enabled[i];
         // children (song 順)。
-        for (j, t) in song.tracks.iter().enumerate() {
+        for (j, t) in song.tracks.iter().enumerate().filter(|&(j, _)| live(j)) {
             if let Some(pid) = t.parent_group_id
                 && let Some(&g) = index.get(&pid)
             {
@@ -62,7 +69,7 @@ impl TrackDeps {
             }
         }
         // サイドチェイン。
-        for (i, t) in song.tracks.iter().enumerate() {
+        for (i, t) in song.tracks.iter().enumerate().filter(|&(i, _)| live(i)) {
             for c in aux_consumers(&t.devices, &t.automation_lanes, &t.mod_routings) {
                 if scope == EdgeScope::Active && c.inactive {
                     continue;
@@ -74,6 +81,7 @@ impl TrackDeps {
                     };
                     if let Some(s) = src
                         && s != i
+                        && live(s)
                     {
                         deps[i].push(s);
                     }
@@ -81,9 +89,11 @@ impl TrackDeps {
             }
         }
         // send (source の song 順)。
-        for (src, t) in song.tracks.iter().enumerate() {
+        for (src, t) in song.tracks.iter().enumerate().filter(|&(src, _)| live(src)) {
             for s in &t.sends {
-                if let Some(&dest) = index.get(&s.dest_track_id) {
+                if let Some(&dest) = index.get(&s.dest_track_id)
+                    && live(dest)
+                {
                     deps[dest].push(src);
                 }
             }

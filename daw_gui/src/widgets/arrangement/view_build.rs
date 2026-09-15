@@ -110,6 +110,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         active_groups: &active_groups,
         lane_h_bounds: lane_h_bounds(area),
     };
+    // r.md #131: 実効的に無効なトラック (行を沈め、clip を灰色にする)。
+    let enabled = app.cur.song_doc.song().effectively_enabled_mask();
     let tracks: Vec<ArrangementTrack> = app
         .cur.song_doc
         .song()
@@ -118,6 +120,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         .enumerate()
         .map(|(track_idx, t)| ArrangementTrack {
             id: t.id,
+            disabled: !enabled[track_idx],
             kind: if t.clips.iter().any(|c| {
                 matches!(
                     app.cur.song_doc.song().clip_contents.get(&c.content_id),
@@ -169,7 +172,10 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                             .get(&c.content_id)
                             .cloned()
                             .unwrap_or_else(|| clip_display_label(c, app.cur.song_doc.song())),
-                        color: Some(track_color::to_renderer(track_color::effective_clip_color(t, c))),
+                        color: Some(clip_color_for(
+                            track_color::to_renderer(track_color::effective_clip_color(t, c)),
+                            enabled[track_idx],
+                        )),
                         share_group_color: if refcount_by_content
                             .get(&c.content_id)
                             .copied()
@@ -477,6 +483,16 @@ fn active_share_groups(
         add(cid);
     }
     set
+}
+
+/// r.md #131: clip の表示色。実効的に無効なトラックの clip は **灰色** (輝度を保った無彩色 — 明るい clip は明るい灰、
+/// 暗い clip は暗い灰のままなので、ラベル / 波形の極性判定 `clip_effective_fill` 以降はそのまま効く)。
+pub(super) fn clip_color_for(color: Color, track_enabled: bool) -> Color {
+    if track_enabled {
+        return color;
+    }
+    let l = daw_ui_core::color::relative_luminance(color.r, color.g, color.b);
+    Color::rgba(l, l, l, color.a)
 }
 
 /// widget の heavy cache 無効化キー (描画内容そのものを hash)。

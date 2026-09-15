@@ -286,11 +286,16 @@ pub struct Schedule {
 ///   solo でない bus も透過する — 「あるトラックを solo すると、そのトラックが送っている reverb / delay の **リターン** も
 ///   生かす」Ableton 準拠の挙動。
 /// - 祖先 group (`parent_group_id` を辿る) のどれかが solo なら透過する — folder solo。
+///
+/// r.md #131: 実効的に無効なトラックは solo の判定に数えない (`solo_counts`、`Song::solo_counts` と同じ規則)。
+/// 流れ込む辺も有効なトラック同士だけ (compile の `Topology` がそう組む)。
 #[derive(Debug, Default)]
 pub struct SoloTables {
     /// 辺 (流れ込む側 → 受け取る側) を流れ込む側の順に: `flows_to[flows_start[i]..flows_start[i + 1]]`。
     flows_start: Vec<u32>,
     flows_to: Vec<u32>,
+    /// song-track index → その track の `solo` を数えるか (= 実効的に有効)。
+    solo_counts: Vec<bool>,
     /// 親 group (`u32::MAX` = 無し)。
     parent: Vec<u32>,
     /// 親が子より先に来る並び (祖先の solo を 1 周で子へ降ろす)。
@@ -302,10 +307,16 @@ pub struct SoloTables {
     stack: Vec<u32>,
 }
 
+/// track `i` の solo を数えるか。表の外 (compile 前の空の表) は数える (= 無効化を知らない既定)。
+fn counts(solo_counts: &[bool], i: usize) -> bool {
+    solo_counts.get(i).copied().unwrap_or(true)
+}
+
 impl SoloTables {
-    /// `flows` = 辺 (流れ込む側, 受け取る側)、`parent[i]` = track `i` の親 group (off-thread)。
+    /// `flows` = 辺 (流れ込む側, 受け取る側)、`parent[i]` = track `i` の親 group、`enabled[i]` = track `i` が
+    /// 実効的に有効か (off-thread)。
     #[must_use]
-    pub fn build(flows: impl Iterator<Item = (u32, u32)>, parent: Vec<Option<u32>>) -> Self {
+    pub fn build(flows: impl Iterator<Item = (u32, u32)>, parent: Vec<Option<u32>>, enabled: Vec<bool>) -> Self {
         let n = parent.len();
         let mut edges: Vec<(u32, u32)> = flows.filter(|&(from, to)| (from as usize) < n && (to as usize) < n).collect();
         edges.sort_unstable();
@@ -335,6 +346,7 @@ impl SoloTables {
         Self {
             flows_start,
             flows_to: edges.into_iter().map(|(_, to)| to).collect(),
+            solo_counts: (0..n).map(|i| enabled.get(i).copied().unwrap_or(true)).collect(),
             parent,
             parent_first,
             contributor_soloed: vec![false; n],
@@ -346,8 +358,9 @@ impl SoloTables {
     /// この buffer の `solo` から透過を解く。dispatch の前 (callback スレッド、表を読む手が走る前) に呼ぶ。
     /// RT 安全: 確保済みの表の書き換えのみ。
     pub fn resolve(&mut self, song: &common::model::Song) {
-        let Self { flows_start, flows_to, parent, parent_first, contributor_soloed, ancestor_soloed, stack } = self;
-        let soloed = |i: usize| song.tracks.get(i).is_some_and(|t| t.solo);
+        let Self { flows_start, flows_to, solo_counts, parent, parent_first, contributor_soloed, ancestor_soloed, stack } =
+            self;
+        let soloed = |i: usize| counts(solo_counts, i) && song.tracks.get(i).is_some_and(|t| t.solo);
         // 流れ込む側: solo の track から辺を前へ辿って届く track に印を付ける。
         contributor_soloed.fill(false);
         stack.clear();
@@ -368,6 +381,12 @@ impl SoloTables {
                 ancestor_soloed[i as usize] = soloed(p as usize) || ancestor_soloed[p as usize];
             }
         }
+    }
+
+    /// この buffer に数える solo が 1 つでもあるか (無効トラックの solo は数えない)。RT 安全: 走査のみ。
+    #[must_use]
+    pub fn any_solo(&self, song: &common::model::Song) -> bool {
+        song.tracks.iter().enumerate().any(|(i, t)| t.solo && counts(&self.solo_counts, i))
     }
 
     /// track `i` の (流れ込む track に solo がある, 祖先 group に solo がある) — 直近の [`Self::resolve`] の解。範囲外は無し。

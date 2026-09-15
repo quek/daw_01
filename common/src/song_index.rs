@@ -33,6 +33,8 @@ struct TrackIndex {
     store: ParamStoreIndex,
     /// VOICEVOX の builtin を持つ (読み上げの note を出す、`Track::is_voicevox_vocal`)。
     voicevox_vocal: bool,
+    /// 実効的に有効 (r.md #131、`Song::track_effectively_enabled`)。無効トラックの行はランチャーの行の集合に入らない。
+    enabled: bool,
     /// `(send id, 位置)` を id 順に (同じ id は先頭だけ)。
     sends: Vec<(u32, u32)>,
     /// アレンジの clip `[start_beat, start_beat + length_beats)`。
@@ -77,9 +79,11 @@ impl SongIndex {
         let tracks = song
             .tracks
             .iter()
-            .map(|t| TrackIndex {
+            .zip(song.effectively_enabled_mask())
+            .map(|(t, enabled)| TrackIndex {
                 store: ParamStoreIndex::build(&t.automation_lanes, &t.mod_routings),
                 voicevox_vocal: t.is_voicevox_vocal(),
+                enabled,
                 sends: id_positions(t.sends.iter().map(|s| s.id)),
                 clips: RangeIndex::build(t.clips.iter().map(|c| (c.start_beat, c.start_beat + c.length_beats))),
                 cells: CellIndex::build(t.session_clips.iter().map(|c| (c.clip.id, c.scene_id))),
