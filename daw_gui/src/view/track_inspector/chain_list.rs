@@ -105,7 +105,10 @@ pub(super) fn draw_chain_list(
     let (list_rows, slots, slot_targets) = build_list_rows(app, &rows, sc_open, sc_panel_h);
     let content_h: f32 = list_rows.iter().map(|r| r.height + ROW_GAP).sum::<f32>() + 4.0;
 
-    ui.label_at("inspector_rack_label", "Rack", area.x + pad, y, 12.0, p.text);
+    // r.md #131: 無効なトラックのチェーンは host に居ない (窓を開けない) ことを見出しで示す。
+    let disabled = cursor_tid.is_some_and(|tid| !app.cur.song_doc.song().track_effectively_enabled(tid));
+    let (rack_label, rack_ink) = if disabled { ("Rack (無効中)", p.text_dim) } else { ("Rack", p.text) };
+    ui.label_at("inspector_rack_label", rack_label, area.x + pad, y, 12.0, rack_ink);
     y += 18.0;
     let list_rect = Rect { x: area.x + pad, y, w: area.w - pad * 2.0, h: content_h };
     let style = DragListStyle {
@@ -153,6 +156,7 @@ pub(super) fn draw_chain_list(
         keys_style: toggle_audio_style(&app.theme),
         scope: &scope,
         owner: cursor_tid.and_then(|tid| ParamOwner::resolve(song, tid)),
+        disabled,
     };
     let resp = ui.drag_list(
         "inspector_chain",
@@ -427,6 +431,8 @@ pub(super) struct RowCtx<'a> {
     pub(super) scope: &'a LiveParamScope,
     /// 表示中のチェーンの持ち主の store (内蔵 device のレーン / 変調の置き場)。
     pub(super) owner: Option<ParamOwner<'a>>,
+    /// r.md #131: 表示中のチェーンの持ち主が実効的に無効 (plugin は host に居ない = 窓を開けない)。
+    pub(super) disabled: bool,
 }
 
 /// 行 `i` を描く (背景 / 色帯 / 種類ごとの中身 / 展開)。
@@ -462,7 +468,7 @@ fn draw_row(
     draw_parallel_band(ui, i, r, content, popup_open, p);
     match &r.kind {
         ChainRowKind::Plugin(e) => {
-            draw_plugin_row(app, ui, i, e, content, popup_open, keys_style);
+            draw_plugin_row(app, ui, i, e, content, popup_open, keys_style, ctx.disabled);
             draw_plugin_expansions(app, ui, ctx, e.device_id, content);
         }
         ChainRowKind::Native(n) => {

@@ -1,7 +1,8 @@
 //! `Q` (= 「カーソル直下のものを無効化 / 有効化」) の宛先解決と発行。
 //!
-//! 判定順: マスターパネル → Mixer (Mixer タブ + pointer で門番) → 変調ラック →
-//! インスペクタのチェーン行 → オートメーションレーン → ノート → クリップ / 時間範囲。
+//! 判定順: マスターパネル → Mixer (Mixer タブ + pointer で門番) → トラックヘッダ列 / Mixer のストリップ
+//! (r.md #131 トラックの無効化) → 変調ラック → インスペクタのチェーン行 → オートメーションレーン → ノート →
+//! クリップ / 時間範囲。
 //! `view/root.rs::dispatch_shortcuts` の Q 節を切り出したもの (サイズ budget、 不変条件 9)。
 
 use daw_ui_core::{Edit, Ui};
@@ -25,15 +26,33 @@ pub(super) fn dispatch(
     if !ui.take_shortcut("daw.toggle_mute") {
         return;
     }
-    match app.hovered_bypass_target(mixer_active) {
-        Some(target) => {
-            let event = app.bypass_toggle_event(target);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(event);
-            }));
-        }
-        None => dispatch_toggle_mute(app, ui, is_pianoroll_active),
-    }
+    let event = match app.hovered_bypass_target(mixer_active) {
+        Some(target) => app.bypass_toggle_event(target),
+        None => match hovered_track_to_disable(app, mixer_active, is_pianoroll_active) {
+            Some(event) => event,
+            None => return dispatch_toggle_mute(app, ui, is_pianoroll_active),
+        },
+    };
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        app.handle_event(event);
+    }));
+}
+
+/// r.md #131: ポインタ直下の **トラックヘッダ列** (アレンジ) か **ストリップ** (Mixer) の 1 本を無効 / 有効に
+/// 切り替える event (S キーのソロと同じ「ポインタ直下」規則、選択は使わない)。向きはそのトラック自身の
+/// `enabled` の反転 (無効な group の子でも自分の値を切り替える)。ストリップの内蔵 device の上は
+/// [`AppData::hovered_bypass_target`] が先に取る。クリップレーン上は `None` = クリップのミュートへ落ちる
+/// (時間範囲の枝より前に置くので、範囲選択があってもヘッダ上の `Q` は範囲をミュートしない)。
+fn hovered_track_to_disable(app: &AppData, mixer_active: bool, is_pianoroll_active: bool) -> Option<AppEvent> {
+    let track_id = if mixer_active {
+        app.cur.peph.mixer_hovered_track
+    } else if is_pianoroll_active {
+        None
+    } else {
+        app.cur.peph.arrange_hovered_header_track
+    }?;
+    let enabled = app.cur.song_doc.song().track_by_id(track_id).is_some_and(|t| !t.enabled);
+    Some(AppEvent::SetTracksEnabled { track_ids: vec![track_id], enabled })
 }
 
 /// Q の対象を文脈で決めて mute / bypass を切り替える (`dispatch_shortcuts` の Q 節、 マスター

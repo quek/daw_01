@@ -33,6 +33,10 @@ pub(super) fn emit_track_ops(
     let mut master_srcs: Vec<(BufRef, f32)> = Vec::new();
 
     for &i in order {
+        // r.md #131: 無効トラックは手を出さない (sidechain tap / 合流 / ProcessTrack / master への合流)。
+        if !topo.enabled[i as usize] {
+            continue;
+        }
         let track = &song.tracks[i as usize];
         let track_idx = i;
         // PR4 sidechain: the tap must run **before** this track's devices process
@@ -187,19 +191,31 @@ pub(super) fn emit_followers(
     let mut mod_kinds: Vec<common::model::ModSourceKind> = Vec::new();
     for (slot, ms) in song.mod_sources.iter().enumerate() {
         mod_kinds.push(ms.kind.clone());
-        // §5 D: 状態移送キー = ModSource の安定 id (0 = 未採番、移送対象外)。
-        follower_keys.push(ms.id);
         match &ms.kind {
             common::model::ModSourceKind::EnvelopeFollower { tap, follower } => {
                 follower_slots.push(crate::graph::follower::FollowerSlot::from_config(follower, sample_rate));
-                // docs/plan_modulation.md §6: tap_point で source buffer を解決。
-                // 入力なし (`None`) は follower node を emit しない (scalar は 0 のまま)。
-                if let Some(src) = tap.as_ref().and_then(|tap| tap_bufref_for(tap, id_to_idx, chain_map)) {
-                    nodes.push(NodeOp::EnvelopeFollow { src, slot: slot as u32 });
+                // docs/plan_modulation.md §6: tap_point で source buffer を解決。入力なし (`None`) /
+                // 読み元が居ない (dangling / r.md #131 無効トラック) / 評価されない source (バイパス中・無効
+                // トラックに帰属) は follower node を emit しない。
+                let src = tap
+                    .as_ref()
+                    .filter(|_| song.mod_source_active(ms))
+                    .and_then(|tap| tap_bufref_for(tap, id_to_idx, chain_map));
+                match src {
+                    Some(src) => {
+                        nodes.push(NodeOp::EnvelopeFollow { src, slot: slot as u32 });
+                        // §5 D: 状態移送キー = ModSource の安定 id (0 = 未採番、移送対象外)。
+                        follower_keys.push(ms.id);
+                    }
+                    // 進まない slot は **鍵を持たない** (0 = 状態を移送せず、plan の slot とも組まない)。
+                    // 鍵を残すと前の schedule の envelope を引き継いだまま誰も進めず、`env_at_tick` が
+                    // 最後の値を返し続ける = 読み元を失った変調が固まる (「変調なし」にならない)。
+                    None => follower_keys.push(0),
                 }
             }
             // generator: inert slot (env 未使用、 generator_scalar が値を供給)。
             _ => {
+                follower_keys.push(ms.id);
                 follower_slots.push(crate::graph::follower::FollowerSlot::from_config(
                     &common::model::FollowerConfig::default(),
                     sample_rate,

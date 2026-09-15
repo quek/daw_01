@@ -42,7 +42,7 @@ impl AppData {
         };
         self.monitor_note_on_track(track_id, pitch, velocity);
         if self.cur.recording.live {
-            let armed = self.cur.song_doc.song().track_by_id(track_id).is_some_and(|t| t.armed);
+            let armed = self.armed_track_ids().contains(&track_id);
             if armed {
                 self.record_midi_note_on_tracks(&[track_id], pitch, velocity);
             }

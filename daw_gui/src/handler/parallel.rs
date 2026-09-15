@@ -144,10 +144,11 @@ impl AppData {
             true
         });
         // 複製した plugin を host に実体化する (`paste_devices` と同じ経路)。
+        // r.md #131: 無効トラックの中の複製は host へ載せない (`live_plugins`)。
         let created: Vec<common::model::PluginInstance> = self
             .cur.song_doc
             .song()
-            .all_plugins()
+            .live_plugins()
             .filter(|p| !self.cur.pipc.loaded_devices.contains_key(&p.id) && !p.ports.is_video())
             .cloned()
             .collect();

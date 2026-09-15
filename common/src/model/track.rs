@@ -97,6 +97,14 @@ pub struct Track {
     /// にできる)。 v8 file は `false` で forward-migrate (serde default)。
     #[serde(default)]
     pub armed: bool,
+    /// v40 (r.md #131 `docs/plan_rmd_131_track_disable.md`): トラックの有効 / 無効。`false` の
+    /// トラックは **プロジェクトに残るが実行系からは消える** — プラグインは host から降ろし
+    /// (state は `PluginInstance.state` に保持)、レンダーグラフ / VOICEVOX 合成 / 映像 / 書き出しから
+    /// 外れる。group を無効にすると子も実効的に無効 (子自身の値は別に保つ)。**読むのは
+    /// [`Song::track_effectively_enabled`] 1 本** — このフィールドを直に見ると祖先の無効を落とす。
+    /// 旧ファイルは `true` で読める (`Send.enabled` / `ModSource.enabled` と同じ語彙)。
+    #[serde(default = "default_track_enabled", skip_serializing_if = "is_track_enabled")]
+    pub enabled: bool,
     /// Future use: VOICEVOX speaker / style etc. Kept distinct from the
     /// `instrument` slot because it selects a rendering backend, not a CLAP
     /// plugin.
@@ -207,6 +215,15 @@ pub struct Track {
     pub launcher: RowPlayback,
 }
 
+fn default_track_enabled() -> bool {
+    true
+}
+
+/// `Track.enabled` は有効 (既定) なら書かない (`skip_serializing_if` 用に `&bool` を取る)。
+fn is_track_enabled(enabled: &bool) -> bool {
+    *enabled
+}
+
 /// Where a `Send` taps the source track's signal chain.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode,
@@ -276,6 +293,7 @@ impl Default for Track {
             muted: false,
             solo: false,
             armed: false,
+            enabled: true,
             source: InstrumentSource::None,
             clips: Vec::new(),
             next_clip_id: 1,

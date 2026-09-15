@@ -218,8 +218,11 @@ pub fn active_visual_groups(
     // これで `group_has_visual_content` の descendant BFS（root は self の clip も検査）
     // を、全 group ぶん 1 度の上昇伝播で解く。
     let by_id: HashMap<u32, &Track> = song.tracks.iter().map(|t| (t.id, t)).collect();
+    // r.md #131: 実効的に無効なトラックは映像の実行系に居ない — その clip は subtree の中身に数えず、無効な group は
+    // 合成しない (無効 group の子も実効的に無効なので、group の合成画は常に空 = GPU パスを回さない)。
+    let enabled = song.effectively_enabled_mask();
     let mut subtree_has_clip: HashSet<u32> = HashSet::new();
-    for t in &song.tracks {
+    for (t, _) in song.tracks.iter().zip(&enabled).filter(|&(_, &on)| on) {
         if !track_has_visual_clip(t, song) {
             continue;
         }
@@ -238,7 +241,7 @@ pub fn active_visual_groups(
     }
 
     let mut out = HashMap::new();
-    for track in &song.tracks {
+    for (track, _) in song.tracks.iter().zip(&enabled).filter(|&(_, &on)| on) {
         if !group_ids.contains(&track.id) {
             continue; // group track でない。
         }

@@ -272,6 +272,11 @@ impl AppData {
             self.apply_glue(&sel, &BTreeMap::new());
             return;
         }
+        // r.md #131: audio の結合は offline render で焼く。無効なトラックは実行系に居ないので焼けない。
+        if audio_tracks.iter().any(|&id| !self.cur.song_doc.song().track_effectively_enabled(id)) {
+            self.ui_ephemeral.status_message = "Glue: 無効なトラックの audio は焼けません (有効にしてから)".into();
+            return;
+        }
         self.start_glue_bake(sel, &audio_tracks);
     }
 

@@ -38,6 +38,7 @@ mod time_ops;
 mod time_selection;
 mod view_state;
 mod track;
+mod track_enable;
 pub use automation::*;
 pub use bounce_ops::*;
 pub use clip_window::*;
@@ -292,7 +293,11 @@ pub use view_state::{RackPanelKey, ViewState};
 /// [`AutomationTarget::NativeParam`] / [`AutomationTarget::MasterLimiter`] (実 device id) に変わる。
 /// 旧ファイルは `project::migrate_legacy_song` の末尾 (`native_migration::migrate_strips_to_native`) が
 /// 版に依存せず deserialize 前に移す (旧形と新形は重ならないので冪等)。
-pub const CURRENT_VERSION: u32 = 39;
+///
+/// v40 (r.md #131 トラック無効化、`docs/plan_rmd_131_track_disable.md`): `Track.enabled` を追加。
+/// 旧ファイルは `serde(default)` の `true` で読める (migration 不要)。新ファイルを旧ビルドで開くと
+/// 無効トラックが黙って鳴り出す (未知フィールドを捨てる) ので、版を上げて gate で弾く。
+pub const CURRENT_VERSION: u32 = 40;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -1025,9 +1030,12 @@ impl Song {
     ///   keeps its whole subtree visible (folder-solo, as in Ableton / Reaper)
     ///   and soloing a CHILD keeps its ancestor groups visible.
     ///
+    /// - **Disabled** (r.md #131): 実効的に無効なトラック ([`Song::track_effectively_enabled`])
+    ///   は常に隠す。solo の判定にも数えない (無効トラックの solo は他を隠さない)。
+    ///
     /// Cycle-safe: `parent_group_id` walks are hop-capped at `tracks.len()`.
     pub fn track_visually_silenced(&self, track_id: u32) -> bool {
-        if self.track_by_id(track_id).is_none() {
+        if !self.track_effectively_enabled(track_id) {
             return true;
         }
         // (1) self-or-ancestor mute (a muted group hides its subtree).
@@ -1044,9 +1052,8 @@ impl Song {
             cur = t.parent_group_id;
             hops += 1;
         }
-        // (2) solo rule (mirrors audio exactly).
-        let any_solo = self.tracks.iter().any(|t| t.solo);
-        if !any_solo {
+        // (2) solo rule (mirrors audio exactly)。solo は実効的に有効なトラックのものだけ数える。
+        if !self.tracks.iter().any(|t| self.solo_counts(t)) {
             return false;
         }
         !self.track_solo_audible(track_id)
@@ -1064,7 +1071,7 @@ impl Song {
         }
         // any DESCENDANT (child chain) soloed → keep this ancestor group on.
         self.tracks.iter().any(|c| {
-            c.solo && {
+            self.solo_counts(c) && {
                 let mut cur = c.parent_group_id;
                 let mut hops = 0usize;
                 loop {

@@ -499,7 +499,15 @@ impl LipsyncLayout {
 fn lipsync_sources(song: &Song, mouth_track_id: u32) -> impl Iterator<Item = &Track> {
     song.tracks
         .iter()
-        .filter(move |t| t.lipsync_target_track == Some(mouth_track_id))
+        .filter(move |t| is_lipsync_source(song, t, mouth_track_id))
+}
+
+/// `track` が口 track `mouth_track_id` の口パクの入力か: 出力先がそこで、実効的に有効 (r.md #131 — 無効なトラックは
+/// 歌わないので口も動かさない。VOICEVOX にも問い合わせない)。入力を列挙する口 (`LipsyncLayout` / 再生成の発注 /
+/// 入力 fingerprint) は必ずこの 1 本を通す — 片方だけ無効を見落とすと「入力が変わったのに作り直さない」になる。
+#[must_use]
+pub fn is_lipsync_source(song: &Song, track: &Track, mouth_track_id: u32) -> bool {
+    track.lipsync_target_track == Some(mouth_track_id) && song.track_effectively_enabled(track.id)
 }
 
 /// 列 `scene_id` にあるソースセル (口パクの入力を持つセル) の最大長。

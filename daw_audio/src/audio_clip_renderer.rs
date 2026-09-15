@@ -320,9 +320,12 @@ pub fn compile_audio_schedule(
     // Phase 5 follow-up (audio clip tempo follow): schedule は beat-domain で
     // 保持するので、 compile-time に samples_per_beat 換算は不要。 fade /
     // 範囲は beat のまま、 nominal_bpm = song.bpm を per-event に控える。
+    // r.md #131: 実効的に無効なトラックのクリップは schedule に載せず、それだけが参照する素材は常駐させない。
+    let enabled = song.effectively_enabled_mask();
+    let parked = sources_only_on_disabled_tracks(song, &enabled);
 
     // -- Resolve every AudioSource into a decoded buffer ----------------------
-    for (&id, source) in &song.media.audio_sources {
+    for (&id, source) in song.media.audio_sources.iter().filter(|(id, _)| !parked.contains(id)) {
         let Some(abs) = resolve_source_path(source, project_dir) else {
             // 解決できないのは 2 通りだけ: (a) `project_dir` 未設定の
             // `ProjectRelative`、(b) `Generated` (PR-V4 で廃止 — VOICEVOX は
@@ -368,7 +371,7 @@ pub fn compile_audio_schedule(
 
     // -- Flatten every audio clip's events into RenderedEvent ----------------
     let mut schedule: Vec<RenderedEvent> = Vec::new();
-    for (track_idx, track) in song.tracks.iter().enumerate() {
+    for (track_idx, track) in song.tracks.iter().enumerate().filter(|&(i, _)| enabled[i]) {
         // 隣接の突き合わせ表は張り出しを要求するクリップがあるトラックだけ作る (要求ゼロが普通)。
         let neighbors = track
             .clips
@@ -702,7 +705,9 @@ pub fn has_undecoded_sources(
     renderer: &AudioClipRenderer,
     project_dir: Option<&Path>,
 ) -> bool {
-    song.media.audio_sources.iter().any(|(id, source)| {
+    // r.md #131: 無効トラックだけが参照する素材は decode しない (`compile_audio_schedule` と同じ除外)。
+    let parked = sources_only_on_disabled_tracks(song, &song.effectively_enabled_mask());
+    song.media.audio_sources.iter().filter(|(id, _)| !parked.contains(id)).any(|(id, source)| {
         let Some(abs) = resolve_source_path(source, project_dir) else {
             // Generated (廃止) / project_dir 未設定の ProjectRelative は
             // そもそも decode 対象外なので「未 decode」に数えない。
@@ -713,6 +718,23 @@ pub fn has_undecoded_sources(
             .get(id)
             .is_none_or(|buf| buf.origin != abs)
     })
+}
+
+/// r.md #131: **実効的に無効なトラックのクリップ (アレンジ / セル) からしか参照されない** 音声素材の id。
+/// どのクリップにも参照されない素材は含めない (従来どおり decode する — 無効化と無関係な挙動を変えない)。
+fn sources_only_on_disabled_tracks(song: &Song, enabled: &[bool]) -> std::collections::HashSet<AudioSourceId> {
+    let mut on_enabled = std::collections::HashSet::new();
+    let mut on_disabled = std::collections::HashSet::new();
+    for (track, &on) in song.tracks.iter().zip(enabled) {
+        let set = if on { &mut on_enabled } else { &mut on_disabled };
+        for clip in track.all_clips() {
+            if let Some(ClipContent::Audio(audio)) = song.clip_contents.get(&clip.content_id) {
+                set.extend(audio.events.iter().map(|e| e.source_id));
+            }
+        }
+    }
+    on_disabled.retain(|id| !on_enabled.contains(id));
+    on_disabled
 }
 
 /// Mix every audio event for `track_idx` into `track_l/track_r` for the
@@ -3197,6 +3219,51 @@ mod source_identity_tests {
             "再利用できなかった source は decode job の対象になること \
              (ここが false だと恒久的に前 project の音が鳴り続ける)"
         );
+    }
+
+    /// r.md #131: 無効トラックのクリップは schedule に載らず、**無効トラックだけ**が参照する素材は常駐も
+    /// decode もしない。有効なトラックからも参照される素材 / どのクリップにも参照されない素材は従来どおり。
+    #[test]
+    fn 無効トラックだけが参照する素材は常駐も_decode_もしない() {
+        use common::model::{AudioContent, AudioEvent, Clip, ClipContent, Track};
+        let dir = Path::new("C:/projects/A");
+        let mut song = song_with_source("samples/only_disabled.wav");
+        for id in [2u32, 3] {
+            let mut src = song.media.audio_sources[&1].clone();
+            src.path = AudioSourcePath::ProjectRelative(std::path::PathBuf::from(format!("samples/{id}.wav")));
+            song.media.audio_sources.insert(id, src);
+        }
+        song.bpm = 120.0;
+        // content 10 = 素材 1 (無効トラックだけ)、content 11 = 素材 2 (両方)。素材 3 はどこからも参照しない。
+        let audio = |source_id| {
+            ClipContent::Audio(AudioContent {
+                events: vec![AudioEvent { source_id, event_length_beats: 1.0, ..AudioEvent::default() }],
+                next_event_id: 1,
+            })
+        };
+        song.clip_contents.insert(10, audio(1));
+        song.clip_contents.insert(11, audio(2));
+        let clip = |id, content_id| Clip { id, content_id, length_beats: 4.0, ..Clip::default() };
+        let mut off = Track { id: 1, enabled: false, ..Track::default() };
+        off.clips = vec![clip(1, 10), clip(2, 11)];
+        let mut on = Track { id: 2, ..Track::default() };
+        on.clips = vec![clip(3, 11)];
+        song.tracks = vec![off, on];
+
+        let mut prev = renderer_with_cached(&dir.join("samples/only_disabled.wav"));
+        for id in [2u32, 3] {
+            let cached = renderer_with_cached(&dir.join(format!("samples/{id}.wav")));
+            prev.sources.insert(id, Arc::clone(&cached.sources[&1]));
+        }
+        let out = compile_audio_schedule(&song, Some(&prev), Some(dir), ENGINE_SR, false);
+        assert!(!out.sources.contains_key(&1), "無効トラックだけの素材は手放す");
+        assert!(out.sources.contains_key(&2) && out.sources.contains_key(&3));
+        assert!(out.schedule.iter().all(|e| e.track_idx == 1), "無効トラックのクリップは載らない");
+        assert_eq!(out.schedule.len(), 1);
+        assert!(!has_undecoded_sources(&song, &out, Some(dir)), "手放した素材を decode し直そうとしない");
+
+        song.tracks[0].enabled = true;
+        assert!(has_undecoded_sources(&song, &out, Some(dir)), "有効に戻すと decode の対象に戻る");
     }
 
     /// `project_dir` が未設定だと `ProjectRelative` は解決できない。decode 対象に

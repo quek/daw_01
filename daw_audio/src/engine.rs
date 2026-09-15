@@ -616,6 +616,8 @@ impl ProjectRt {
                 sched.adopt_state_from(&mut self.cached_schedule);
             }
             let old = std::mem::replace(&mut self.cached_schedule, sched);
+            // r.md #131: 無効になった行は誰も書かないので、ここで 1 回だけ無音にする。
+            crate::mixer::silence_disabled_rows(&mut self.scratch, &old.track_programs, &self.cached_schedule.track_programs);
             // 別 project のリングは、この曲にとって「走っていなかった」リング。
             let old_delays: &[u32] = if new.reset_song_scoped_state { &[] } else { &old.input_delay_per_track };
             crate::mixer::install_input_delay_lines(
@@ -2206,6 +2208,33 @@ mod bundle_install_tests {
         assert_no_alloc::assert_no_alloc(|| {
             local.refresh_bundle();
         });
+    }
+
+    /// r.md #131: 無効にしたトラックの行は誰も書かない (手も op も無い) ので、schedule を差し込む瞬間に
+    /// 1 回だけ無音にする — メーター / Global Sampler が前の音を読み続けない。有効な行は触らない。
+    #[test]
+    fn 無効にしたトラックの_scratch_は差し込みで無音になる() {
+        let (mut local, mut bundle_tx, _recycle_rx) = harness();
+        let mut song = Song::default();
+        song.tracks = vec![track(1), track(2)];
+        bundle_tx.push(make_bundle(&Arc::new(song.clone()))).unwrap();
+        local.refresh_bundle();
+        for s in &mut local.scratch {
+            s.track_l.fill(0.5);
+            s.pre_fx_r.fill(0.25);
+            s.pre_fader_l.fill(0.125);
+            s.peak_l = 0.5;
+        }
+
+        song.set_tracks_enabled(&[1], false);
+        bundle_tx.push(make_bundle(&Arc::new(song))).unwrap();
+        local.refresh_bundle();
+
+        let (off, on) = (&local.scratch[0], &local.scratch[1]);
+        assert!(off.track_l.iter().chain(&off.pre_fx_r).chain(&off.pre_fader_l).all(|&x| x == 0.0));
+        assert_eq!(off.peak_l, 0.0);
+        assert!(on.track_l.iter().all(|&x| x == 0.5), "有効な行は触らない");
+        assert_eq!(on.peak_l, 0.5);
     }
 
     /// 組み込み Comp / EQ を持つ 2 track + 組み込み Bus Comp / Tone EQ の master。track 1 には追加の Comp も。

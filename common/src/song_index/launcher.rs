@@ -121,9 +121,16 @@ pub(super) struct LauncherIndex {
 
 impl LauncherIndex {
     /// `index` のセル列の索引が揃った後で作る (off-RT)。
+    ///
+    /// r.md #131: 実効的に無効なトラックの行 (トラック行とそのレーン行) は **行の集合に入れない** — 走行状態の行も
+    /// 作られず (`sync_rows` が落とす)、列を撃っても掴まず、フォローアクションも回らず、publish もされない。
+    /// 列の最長のセルにも数えない。
     pub(super) fn build(song: &Song, index: &SongIndex) -> Self {
         let mut rows = Vec::new();
         for (ti, track) in song.tracks.iter().enumerate() {
+            if !index.tracks.get(ti).is_some_and(|t| t.enabled) {
+                continue;
+            }
             rows.push(((track.id, 0), RowAt::Track(position(ti))));
             for (li, lane) in track.automation_lanes.iter().enumerate() {
                 if lane.target.accepts_launcher_cells() {

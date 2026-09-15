@@ -880,11 +880,16 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let idx = track_index_at_y(&resp.track_header_rects, &app.cur.song_doc.song().tracks, py)?;
         app.cur.song_doc.song().tracks.get(idx).map(|t| t.id)
     });
+    // r.md #131: ヘッダ列だけの hover (`Q` のトラック無効化の宛先)。
+    let hovered_header_track = ui
+        .hover_pos()
+        .and_then(|(px, py)| resp.track_header_rects.iter().find(|(_, r)| r.contains(px, py)).map(|(id, _)| *id));
     let drag_active = resp.edge_scroll_drag;
     if app.cur.peph.arrangement_hover_beat != snapped_beat
         || app.cur.peph.arrangement_hover_beat_raw != raw_beat
         || app.cur.peph.arrangement_hover_clip != hover_clip
         || app.cur.peph.arrange_hovered_track != hovered_track_id
+        || app.cur.peph.arrange_hovered_header_track != hovered_header_track
         || app.cur.peph.arrange_drag_active != drag_active
         || app.cur.peph.arrange_xfer_drag_active != resp.xfer_drag_active
         || app.cur.peph.arrange_arranger_rect != resp.arranger_rect
@@ -901,6 +906,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.cur.peph.arrangement_hover_beat_raw = raw_beat;
             app.cur.peph.arrangement_hover_clip = hover_clip;
             app.cur.peph.arrange_hovered_track = hovered_track_id;
+            app.cur.peph.arrange_hovered_header_track = hovered_header_track;
             app.cur.peph.arrange_drag_active = drag_active;
             app.cur.peph.arrange_arranger_rect = arranger_rect;
             app.cur.peph.launcher_pane_rect = launcher_pane_rect;

@@ -51,6 +51,7 @@ impl AppData {
         let Some(dest_track) = self.cur.song_doc.song().chain_owner_track(dest) else {
             return;
         };
+        let live_before = self.hosted_device_ids();
         let Some(outcome) = self
             .edit_song(move |song| {
                 // `Default` はここ (実行時の Song) で解決する — deferred 実行でも古くならない。
@@ -129,21 +130,25 @@ impl AppData {
         // (load 応答が先に届いたときに取りこぼさないため)。 `OpenPluginShmem` は
         // `on_plugin_loaded_from_child` が live な `audio_tx` から送る既存経路に乗る。
         // r.md #110: Parallel を複製したら中の plugin 全部。
+        // r.md #131: 無効トラックへのコピーは Song に置くだけで host へ載せない。
         let created_plugins: Vec<common::model::PluginInstance> =
-            plugins(&outcome.created).cloned().collect();
+            plugins(&outcome.created).filter(|p| self.is_live_device(p.id)).cloned().collect();
         for inst in &created_plugins {
             self.cur.pipc.pending_added_plugin_finalize.insert(inst.id, false);
         }
         for inst in &created_plugins {
             self.restore_device(inst);
         }
-
         // 移動は plugin_host への IPC が 1 通も要らない (device_id は不変で
         // instance も作り直さない = 音が切れない)。 daw_audio 側は `LoadSong` が
         // `Topology::Recompile` を起こして処理順を再 compile する。 GUI では
         // runner の frame flush が epoch bump を拾うが、 headless / script 経路は
         // frame loop が回らないのでここで明示的に流す (epoch 未変化なら no-op)。
         self.flush_song_sync();
+        // r.md #131: 例外は無効トラックとの間の移動 — 無効トラックへ移した device は host から降ろし、無効トラックから
+        // 出した device は載せる (state は deferred の往復で Song に書き戻し済み。engine へ構造を届けた後に降ろす)。
+        // 有効同士の移動 / 上で載せたコピー (応答待ち) では何も起きない。
+        self.follow_live_devices(&live_before);
 
         // 落とした device を選択し、 落とし先のチェーンを表示し続ける
         // (選択とタグの更新は `set_device_selection` 1 本に通す = SSoT)。
@@ -344,8 +349,9 @@ impl AppData {
             return 0;
         };
         self.note_dropped_cyclic_routes(dropped);
+        // r.md #131: 無効トラックへの貼り付けは Song に置くだけで host へ載せない。
         let created_plugins: Vec<common::model::PluginInstance> =
-            plugins(&created).cloned().collect();
+            plugins(&created).filter(|p| self.is_live_device(p.id)).cloned().collect();
         for inst in &created_plugins {
             self.cur.pipc.pending_added_plugin_finalize.insert(inst.id, false);
         }

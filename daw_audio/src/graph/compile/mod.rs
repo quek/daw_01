@@ -157,9 +157,11 @@ pub fn compile_schedule(
     let n = song.tracks.len();
     // r.md #129 §8.3.4: Limiter の先読み遅延は compile 時に焼く (PDC の会計と DSP が同じ値を見る)。
     let master_limiter_latency = scope.master() && song.master_limiter_latency_active();
+    // r.md #131: 実効的に無効なトラックはグラフに居ない (program は空、手も op も出さない)。
+    let enabled = song.effectively_enabled_mask();
     // r.md #110: device ツリーを program に展開する (`docs/plan_parallel.md` §4.1)。
     // 並列 chain の PDC と chain tap の snapshot flag はここで焼き込む。
-    let (mut master_built, mut built, chain_map) = build_all_programs(song, device_latencies, scope);
+    let (mut master_built, mut built, chain_map) = build_all_programs(song, &enabled, device_latencies, scope);
     let master_latency = |mix_latency: u32| {
         let chain = master_chain(song, scope);
         master_output_latency(chain, device_latencies, mix_latency, sample_rate, master_limiter_latency, scope)
@@ -167,7 +169,7 @@ pub fn compile_schedule(
     if n == 0 {
         let nodes = vec![NodeOp::Mix { srcs: Vec::new(), dst: BufRef::Master }];
         return Ok(Schedule {
-            graph: RenderGraph::build(song, &nodes),
+            graph: RenderGraph::build(song, &nodes, &enabled),
             nodes,
             master_latency_samples: master_latency(0),
             master_limiter_latency,
@@ -178,19 +180,23 @@ pub fn compile_schedule(
     }
 
     // ---- 配線トポロジ: 親参照の検査 → group / send / パラアウトの入力表 → bus 判定 ----
-    let topo = Topology::build(song)?;
+    let topo = Topology::build(song, enabled)?;
     // pass 1 の役割を program に焼く (RT の `process_track_owned` が Song を歩かない)。
-    for ((b, track), (&bus, gwi)) in built.iter_mut().zip(&song.tracks).zip(topo.bus_flags.iter().zip(&topo.gwi_split)) {
-        b.program.pass1_role = match (gwi, bus) {
-            (Some(_), _) => Pass1Role::GroupWithInstrument { main_to_child: track.paraout_main_to_child() },
-            (None, true) => Pass1Role::Bus,
-            (None, false) => Pass1Role::Leaf,
+    let roles = topo.bus_flags.iter().zip(&topo.gwi_split).zip(&topo.enabled);
+    for ((b, track), ((&bus, gwi), &on)) in built.iter_mut().zip(&song.tracks).zip(roles) {
+        b.program.pass1_role = match (on, gwi, bus) {
+            (false, _, _) => Pass1Role::Disabled,
+            (true, Some(_), _) => Pass1Role::GroupWithInstrument { main_to_child: track.paraout_main_to_child() },
+            (true, None, true) => Pass1Role::Bus,
+            (true, None, false) => Pass1Role::Leaf,
         };
     }
     // solo の透過規則の表 (「子 / send 元が solo なら bus も透過」と folder solo。RT で配線を歩かない)。
     let solo = topo.solo_tables(song);
     let taps = TapCtx {
+        song,
         id_to_idx: &topo.id_to_idx,
+        enabled: &topo.enabled,
         chains: &chain_map,
         bus_flags: &topo.bus_flags,
         gwi_split: &topo.gwi_split,
@@ -216,7 +222,7 @@ pub fn compile_schedule(
         emit::emit_followers(song, sample_rate, &topo.id_to_idx, &chain_map, &mut compensated.nodes);
 
     let mut schedule = Schedule {
-        graph: RenderGraph::build(song, &compensated.nodes),
+        graph: RenderGraph::build(song, &compensated.nodes, &topo.enabled),
         solo,
         nodes: compensated.nodes,
         delay_lines: compensated.delay_lines,
@@ -254,12 +260,16 @@ fn master_chain(song: &Song, scope: RenderScope) -> &[common::model::Device] {
 /// r.md #129 §8.3.2: 展開した program に track の snapshot 要求を焼く。ここに置くので `n == 0` の
 /// 早期 return にも効く (GR メーターは device ごとの `NativeSlot::meter` で、面の容量は曲から数える —
 /// `docs/plan_unbounded_tracks.md` §3)。
+///
+/// r.md #131: 実効的に無効なトラック (`enabled[i] == false`) は device を持たない空の program にする —
+/// plugin の依頼も内蔵 DSP も latency も出ず、chain id も登録しない (= その chain を読む tap は dangling と同じ)。
 fn build_all_programs(
     song: &Song,
+    enabled: &[bool],
     device_latencies: &DeviceLatencies,
     scope: RenderScope,
 ) -> (BuiltProgram, Vec<BuiltProgram>, ChainMap) {
-    let chain_taps = collect_chain_taps(song);
+    let chain_taps = collect_chain_taps(song, enabled);
     let master_built = build_program(
         master_chain(song, scope),
         common::model::MASTER_TRACK_ID,
@@ -271,7 +281,11 @@ fn build_all_programs(
     let mut built: Vec<_> = song
         .tracks
         .iter()
-        .map(|t| build_program(&t.devices, t.id, t.paraout_split_device(), device_latencies, &chain_taps, scope))
+        .zip(enabled)
+        .map(|(t, &on)| {
+            let (devices, split) = if on { (t.devices.as_slice(), t.paraout_split_device()) } else { (&[][..], None) };
+            build_program(devices, t.id, split, device_latencies, &chain_taps, scope)
+        })
         .collect();
     let mut chain_map: ChainMap = HashMap::new();
     let mut register = |b: &BuiltProgram, owner: u32| {
@@ -292,7 +306,7 @@ fn build_all_programs(
         register(b, idx as u32);
     }
     register(&master_built, MASTER_OWNER);
-    bake_snapshot_needs(song, &mut built);
+    bake_snapshot_needs(song, enabled, &mut built);
     (master_built, built, chain_map)
 }
 

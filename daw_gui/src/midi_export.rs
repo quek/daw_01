@@ -43,7 +43,8 @@ pub fn export_midi(song: &Song, path: &Path) -> Result<()> {
     smf.tracks.push(build_meta_track(song));
 
     // Track 1..N: 各 daw_01 track の MIDI events (1 daw_01 track = 1 SMF track)。
-    for track in &song.tracks {
+    // r.md #131: 実効的に無効なトラックは書き出さない (再生にも音声 / 映像の書き出しにも出ない)。
+    for track in song.tracks.iter().filter(|t| song.track_effectively_enabled(t.id)) {
         if let Some(events) = build_midi_track(song, track) {
             smf.tracks.push(events);
         }

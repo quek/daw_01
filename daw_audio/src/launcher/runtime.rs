@@ -1814,6 +1814,35 @@ mod tests {
         assert_eq!(rt.rows().track_row(1).tail, RowPhase::Silent);
     }
 
+    /// r.md #131: 無効トラックの行はランチャーの行に居ない — 鳴っていたセルは無効にした瞬間に止まり、
+    /// セルを撃っても列を撃っても鳴らず、有効に戻しても勝手に鳴り出さない (GUI は無効化で主導権を停止へ落とす)。
+    #[test]
+    fn 無効トラックの行は撃てず列にも掴まれず戻しても鳴り出さない() {
+        let mut song = two_rows();
+        let mut rt = LauncherRuntime::for_song(&song);
+        step(&mut rt, &song, 0.0);
+        press(&mut rt, 2, 20, true);
+        song.tracks[1].launcher = RowPlayback::Launcher { clip_id: 20 };
+        step(&mut rt, &song, 0.0);
+        assert_eq!(rt.rows().track_row(1).tail.cell_clip_id(), Some(20), "対照: 有効なら鳴る");
+
+        song.set_tracks_enabled(&[2], false);
+        step(&mut rt, &song, 0.1);
+        assert_eq!(rt.rows().track_row(1).tail.cell_clip_id(), None, "無効にした瞬間に止まる");
+
+        press(&mut rt, 2, 20, true);
+        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
+        step(&mut rt, &song, 0.2);
+        assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10), "有効な行は列で鳴る");
+        assert_eq!(rt.rows().track_row(1).tail.cell_clip_id(), None, "無効な行は撃っても列でも鳴らない");
+
+        song.set_tracks_enabled(&[2], true);
+        for beat in [0.3, 0.4, 4.5] {
+            step(&mut rt, &song, beat);
+            assert_eq!(rt.rows().track_row(1).tail.cell_clip_id(), None, "拍 {beat}: 戻しても勝手に鳴り出さない");
+        }
+    }
+
     #[test]
     fn 空セルの列を撃つと行は停止する() {
         let song = two_rows();

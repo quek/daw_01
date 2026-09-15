@@ -419,6 +419,41 @@ fn a_group_native_comp_detects_its_external_sidechain_in_pass_two() {
     }
 }
 
+/// r.md #131: 読み元が無効なトラックの外部サイドチェインは **無音で検出する** (plugin の aux port が inactive = 無音で
+/// 届くのと同じ)。「解決できない配線」(dangling) と同じ `None` に倒すと自分の入力で検出し、無効にした kick の代わりに
+/// ベース自身で潰れる。
+#[test]
+fn 読み元が無効なトラックの内蔵_comp_は無音で検出する() {
+    let rec = HashSet::new();
+    let n = 256;
+    let mut song = Song {
+        tracks: vec![
+            track(|t| t.id = 1),
+            track(|t| {
+                t.id = 2;
+                t.devices = vec![Device::Native(with_sc(hard_comp(40), TapSource::Track(1), TapPoint::PostFader))];
+            }),
+            track(|t| {
+                t.id = 3;
+                t.parent_group_id = Some(2);
+            }),
+        ],
+        ..Song::default()
+    };
+    song.set_tracks_enabled(&[1], false);
+    let mut sched = compile_schedule_for_test(&song, SR, n as u32).expect("compile");
+    assert_eq!(sched.track_programs[1].natives[0].sc_mode, ScMode::Silent);
+    let mut scratch = scratches(3);
+    let loud = sine(n, 0, 440.0, 0.9);
+    for s in [0, 2] {
+        scratch[s].track_l[..n].copy_from_slice(&loud);
+        scratch[s].track_r[..n].copy_from_slice(&loud);
+    }
+    post_dispatch(&mut sched, &mut scratch, &song, n, &rec, ModTickPlaneRef::default(), NativeIo::default());
+    let gr = sched.track_programs[1].natives[0].gr_db;
+    assert!(gr > -0.5, "無音の検出信号では潰れない (自分の大きい入力でも): {gr}");
+}
+
 /// group G (id 2、scratch 1) と子 (id 3、scratch 2)。G に組み込み Comp (id 40)。
 fn group_song(comp_dev: NativeDevice, lanes: Vec<AutomationLane>, routings: Vec<ModRouting>) -> Song {
     Song {
