@@ -51,6 +51,9 @@
   読む)。順序は GUI が守る: 増える分は `LoadSong` より前、確定した分は `OpenPluginShmem` の後、消えた分は `LoadSong` の後
   (`AppData::sync_loading_devices` / `apply_slot_reconcile_actions`)。失敗で確定した device は表から外れて従来どおり素通し、
   映像 device は host に載らないので関係しない。有効に戻したトラックの読み込みは A7 の一時停止をしない (`LoadPlayback`)。
+  待たせるのはその描画で op を出す plugin だけ (`daw_audio::graph::executable_tracks`: bypass 中 / Sources scope の FX は待たない)。
+  待っている行は plugin が載ったまま凍るので、外れる瞬間に鳴っている音を止める予約にする (`mixer::silence_disabled_rows`)。
+  オフライン描画 (書き出し / 解析 / Bounce / Glue) は読み込みが全部確定してからしか始めない (`reject_offline_render_while_loading`)。
 - 無効トラックだけが参照する音声素材はデコード / 常駐しない (`compile_audio_schedule` `audio_clip_renderer.rs:309-371`)。
 - 無効化・有効化は構造変更として LoadSong で届く (device bypass と同じ)。
 

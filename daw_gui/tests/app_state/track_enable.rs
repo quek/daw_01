@@ -234,6 +234,36 @@ fn 有効化の読み込みが失敗で確定すると読み込み中から外�
     assert!(app.cur.pipc.failed_plugin_loads.contains_key(&device_id));
 }
 
+/// plugin の読み込みが確定するまでは、オフライン描画 (書き出し / 解析) を始めない — 始めると読み込み中の plugin を
+/// 鳴らすトラックは無音で焼かれ、描画中の読み込み応答は捨てられて、終わった後もそのトラックは鳴らず再生も待ち続ける。
+/// 確定すれば始められる。
+#[test]
+fn 読み込み中は書き出しと解析を始めず_確定すれば始める() {
+    use daw_gui::app::FileDialogKind;
+    use daw_gui::state::LoudnessPhase;
+    let (mut app, _audio_rx, mut plugin_rx, _d) = build_app();
+    let (track_id, _device_id) = disabled_while_playing(&mut app);
+    app.cur.transport.is_playing = false;
+    app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![track_id], enabled: true });
+    drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::FileDialogResult {
+        kind: FileDialogKind::ExportWav { range: None },
+        paths: vec![std::path::PathBuf::from("C:/out.wav")],
+    });
+    assert!(app.cur.transport.export_stage.is_none(), "読み込み中に書き出しを始めた");
+    assert!(app.cur.transport.pending_export.is_none());
+    app.handle_event(AppEvent::AnalyzeLoudness);
+    app.handle_event(AppEvent::ConfirmExportRange);
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Idle, "読み込み中に解析を始めた");
+    assert!(!drain(&mut plugin_rx).iter().any(|m| matches!(m, PluginCommand::ReinitAllPlugins { .. })));
+
+    fake_plugin_loaded(&mut app, track_id, 0, "test.synth");
+    app.handle_event(AppEvent::AnalyzeLoudness);
+    app.handle_event(AppEvent::ConfirmExportRange);
+    assert!(matches!(app.cur.loudness.phase, LoudnessPhase::AwaitingReinit { .. }), "確定すれば解析を始める");
+}
+
 /// undo / redo で有効へ戻る場合も同じ規則 (止めない / 読み込み中が構造より先)。無効へ戻る redo は構造を届けてから降ろす。
 #[test]
 fn undo_redo_で有効へ戻るときも読み込み中を構造より先に届け_無効へ戻るときは構造の後に降ろす() {
@@ -289,11 +319,9 @@ fn プロジェクトを開くと読み込む_plugin_を構造より先に読み
     assert!(!declared.contains(&parked), "無効トラックの plugin は読み込まない: {msgs:?}");
 }
 
-/// group を有効に戻すと、子の plugin も読み込み中として構造より先に届く (engine は group の子孫も待たせる)。
-#[test]
-fn group_を有効に戻すと子の読み込み中も構造より先に届く() {
-    let (mut app, mut audio_rx, _plugin_rx, _d) = build_app();
-    load_instrument(&mut app);
+/// 楽器を載せた track 0 を group の子にし、その group を無効化まで済ませる (state の往復も)。`(child, device_id, group)`。
+fn child_in_disabled_group(app: &mut AppData) -> (u32, u64, u32) {
+    load_instrument(app);
     let child = app.cur.song_doc.song().tracks[0].id;
     let device_id = app.cur.song_doc.song().tracks[0].plugins().next().expect("synth").id;
     app.handle_event(AppEvent::AddInstrumentTrack);
@@ -301,6 +329,20 @@ fn group_を有効に戻すと子の読み込み中も構造より先に届く()
     app.handle_event(AppEvent::SetTrackParent { track_ids: vec![child], parent_id: Some(group), anchor_after: None });
     app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![group], enabled: false });
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    assert!(!app.cur.song_doc.song().track_effectively_enabled(child), "前提: 無効な group の子");
+    (child, device_id, group)
+}
+
+/// `track_id` を **実効的に有効** (祖先 group も含めて) にした `LoadSong` の位置。
+fn runs_at(msgs: &[AudioCommand], track_id: u32) -> Option<usize> {
+    position(msgs, |m| matches!(m, AudioCommand::LoadSong { song, .. } if song.track_effectively_enabled(track_id)))
+}
+
+/// group を有効に戻すと、子の plugin も読み込み中として構造より先に届く (engine は group の子孫も待たせる)。
+#[test]
+fn group_を有効に戻すと子の読み込み中も構造より先に届く() {
+    let (mut app, mut audio_rx, _plugin_rx, _d) = build_app();
+    let (_child, device_id, group) = child_in_disabled_group(&mut app);
     app.cur.transport.is_playing = true;
     drain(&mut audio_rx);
 
@@ -308,5 +350,53 @@ fn group_を有効に戻すと子の読み込み中も構造より先に届く()
     let msgs = drain(&mut audio_rx);
     let enabled = load_song_at(&msgs, group, true).expect("構造");
     assert!(loading_sets(&msgs).iter().any(|&(i, ref ids)| i < enabled && ids.contains(&device_id)), "{msgs:?}");
+    assert!(position(&msgs, |m| matches!(m, AudioCommand::Stop { .. })).is_none(), "{msgs:?}");
+}
+
+/// 無効な group を解く (子は実効的に有効へ戻る) のも有効化と同じ規則: 子の plugin は、子を実行に入れる構造 (group を
+/// 外した `LoadSong`) より先に読み込み中として届き、再生は止めない。外した group の plugin は構造の後に降ろす。
+#[test]
+fn 無効な_group_を解くと子の読み込み中を構造より先に届け_再生を止めない() {
+    let (mut app, mut audio_rx, mut plugin_rx, _d) = build_app();
+    let (child, device_id, group) = child_in_disabled_group(&mut app);
+    app.cur.transport.is_playing = true;
+    drain(&mut audio_rx);
+    drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::UngroupTracks { track_ids: vec![group] });
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    assert!(app.cur.song_doc.song().track_by_id(group).is_none(), "前提: group を解いた");
+    let msgs = drain(&mut audio_rx);
+    let runs = runs_at(&msgs, child).expect("子を実行に入れる構造");
+    assert!(loading_sets(&msgs).iter().any(|&(i, ref ids)| i < runs && ids.contains(&device_id)), "{msgs:?}");
+    assert!(position(&msgs, |m| matches!(m, AudioCommand::Stop { .. })).is_none(), "{msgs:?}");
+    assert_eq!(set_slot_states(&drain(&mut plugin_rx), device_id).len(), 1, "有効へ戻った子の plugin を載せる");
+}
+
+/// 無効な group の子を group の外のトラックと一緒にグループ化すると、新しい group は根に置かれて子は実効的に有効へ
+/// 戻る — これも有効化と同じ規則で、子の plugin を載せ、子を実行に入れる構造より先に読み込み中として届ける。
+#[test]
+fn 無効な_group_の子を外のトラックとグループ化すると載せ_読み込み中を構造より先に届ける() {
+    let (mut app, mut audio_rx, mut plugin_rx, _d) = build_app();
+    let (child, device_id, _group) = child_in_disabled_group(&mut app);
+    let outside = app
+        .edit_song(|song| {
+            let id = song.alloc_track_id();
+            song.tracks.push(common::model::Track { id, ..common::model::Track::default() });
+            id
+        })
+        .expect("edit");
+    app.flush_song_sync();
+    app.cur.transport.is_playing = true;
+    drain(&mut audio_rx);
+    drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::GroupSelectedTracks { track_ids: vec![child, outside] });
+    assert!(app.cur.song_doc.song().track_effectively_enabled(child), "前提: 新しい group は根 = 子は有効");
+    assert_eq!(set_slot_states(&drain(&mut plugin_rx), device_id).len(), 1, "有効へ戻った子の plugin を載せる");
+    app.flush_song_sync();
+    let msgs = drain(&mut audio_rx);
+    let runs = runs_at(&msgs, child).expect("子を実行に入れる構造");
+    assert!(loading_sets(&msgs).iter().any(|&(i, ref ids)| i < runs && ids.contains(&device_id)), "{msgs:?}");
     assert!(position(&msgs, |m| matches!(m, AudioCommand::Stop { .. })).is_none(), "{msgs:?}");
 }

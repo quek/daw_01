@@ -2702,6 +2702,50 @@ fn 読み込み中の_plugin_を持つトラックは無効と同じ_schedule_�
     assert_eq!(compile(&song, &[10]).2, vec![Pass1Role::Disabled; 3], "無効と読み込み中は独立に効く");
 }
 
+/// 待たせるのは **その描画で鳴らす** 読み込み中の plugin だけ (op と latency の会計と同じ規則): bypass 中の plugin と、
+/// 素材だけを描く scope (Bounce In Place / Glue) の FX は、読み込みを待っても鳴り方が変わらないので待たない
+/// (待つと Glue が無音を焼く)。素材の scope でも音源 (音声入力を持たない plugin) は待つ。
+#[test]
+fn 読み込みを待たせるのはその描画で鳴らす_plugin_だけ() {
+    use crate::graph::program::Pass1Role;
+
+    let mut lat = DeviceLatencies::new();
+    let synth = Device::Plugin(PluginInstance {
+        id: 20,
+        ..PluginInstance::with_ports(
+            "test.synth".into(),
+            PluginFormat::Clap,
+            PortConfig { has_note_input: true, has_audio_output: true, ..Default::default() },
+        )
+    });
+    let song = Song {
+        tracks: vec![
+            track(|t| {
+                t.id = 1;
+                t.devices = latency_chain(&mut lat, 10, 0);
+            }),
+            track(|t| {
+                t.id = 2;
+                t.devices = vec![synth];
+            }),
+            track(|t| {
+                t.id = 3;
+                t.devices = latency_chain(&mut lat, 30, 0);
+                t.devices[0].set_bypassed(true);
+            }),
+        ],
+        ..Song::default()
+    };
+    let loading: LoadingDevices = [10, 20, 30].into_iter().collect();
+    let held = |scope| {
+        let s = compile_schedule(&song, &lat, &loading, 48_000, 256, scope).unwrap();
+        s.track_programs.iter().map(|p| p.pass1_role == Pass1Role::Disabled).collect::<Vec<_>>()
+    };
+    assert_eq!(held(RenderScope::Mix), vec![true, true, false], "bypass 中の plugin は待たない");
+    assert_eq!(held(RenderScope::PostFx), vec![true, true, false]);
+    assert_eq!(held(RenderScope::Sources), vec![false, true, false], "素材の scope は FX を待たず、音源は待つ");
+}
+
 /// 無効トラックを読む側 / 無効トラックへ送る側は **無音 / 変調なし**: send (無効な送り元 / 無効な return)、
 /// サイドチェイン元、パラアウトの送り先、AudioTap (follower) 元、無効トラックに帰属する follower。
 /// 役割は構造で決まる — 無効な送り元しか持たない return も bus のまま (自分のクリップを鳴らし始めない)。

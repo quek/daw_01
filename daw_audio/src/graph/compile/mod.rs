@@ -40,7 +40,7 @@ use common::model::{AudioTap, Song, TapPoint, TapSource};
 use common::protocol::RenderScope;
 
 use super::program::Pass1Role;
-use super::program_build::{BuiltProgram, ChainLatency, build_program};
+use super::program_build::{BuiltProgram, ChainLatency, build_program, plugin_in_scope};
 use super::render_graph::RenderGraph;
 use super::schedule::{BufRef, MASTER_OWNER, NodeOp, Schedule};
 use deps::Topology;
@@ -129,8 +129,18 @@ pub type DeviceLatencies = HashMap<u64, u32>;
 /// r.md #131: host への読み込みがまだ確定していない安定 `device_id` の集合 (`AudioCommand::SetLoadingDevices`)。
 ///
 /// [`DeviceLatencies`] と同じく `Song` に載らない実行時の状態で、所有者は daw_gui の `pending_plugin_loads`。
-/// compile はこれを持つトラック (と group の子孫) をグラフに入れない (`Song::executable_mask`)。
+/// compile はこれを鳴らすトラック (と group の子孫) をグラフに入れない ([`executable_tracks`])。
 pub type LoadingDevices = HashSet<u64>;
+
+/// r.md #131: song-track index 順に、`scope` の描画でいま実行するトラック (`Song::executable_mask`)。
+///
+/// 待たせるのは **読み込み中で、かつこの描画で op を出す plugin** だけ (`plugin_in_scope` — op と latency の会計と
+/// 同じ規則): bypass 中の plugin や、素材だけを描く scope (`RenderScope::Sources`) の FX は読み込みを待っても
+/// 鳴り方が変わらないので待たない。compile と、live の組み直しの要否 (`SetLoadingDevices`) が同じここを引く。
+#[must_use]
+pub fn executable_tracks(song: &Song, loading_devices: &LoadingDevices, scope: RenderScope) -> Vec<bool> {
+    song.executable_mask(|p| loading_devices.contains(&p.id) && plugin_in_scope(p, scope))
+}
 
 /// Compile a `Schedule` from `song`. PR2 supports the group hierarchy:
 /// children → group `Mix` → `ProcessGroupFx` → upstream (parent group or
@@ -167,9 +177,9 @@ pub fn compile_schedule(
     let n = song.tracks.len();
     // r.md #129 §8.3.4: Limiter の先読み遅延は compile 時に焼く (PDC の会計と DSP が同じ値を見る)。
     let master_limiter_latency = scope.master() && song.master_limiter_latency_active();
-    // r.md #131: いま実行しないトラック (実効的に無効 / 読み込み中の plugin を持つ) はグラフに居ない
+    // r.md #131: いま実行しないトラック (実効的に無効 / 読み込み中の plugin を鳴らす) はグラフに居ない
     // (program は空、手も op も出さない)。以下の `enabled` はすべてこの意味。
-    let enabled = song.executable_mask(|id| loading_devices.contains(&id));
+    let enabled = executable_tracks(song, loading_devices, scope);
     // r.md #110: device ツリーを program に展開する (`docs/plan_parallel.md` §4.1)。
     // 並列 chain の PDC と chain tap の snapshot flag はここで焼き込む。
     let (mut master_built, mut built, chain_map) = build_all_programs(song, &enabled, device_latencies, scope);

@@ -1165,7 +1165,8 @@ fn set_loading_devices(
     // song が届く前の宣言もある (曲を開くとき GUI は `LoadSong` の前に送る) — その場合は表だけ更新し、LoadSong の compile が拾う。
     let song = shared.song.load_full(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
     let Some(s) = song.as_deref() else { return };
-    if s.executable_mask(|id| current.contains(&id)) == s.executable_mask(|id| next.contains(&id)) {
+    let mix = common::protocol::RenderScope::Mix;
+    if crate::graph::executable_tracks(s, &current, mix) == crate::graph::executable_tracks(s, &next, mix) {
         return;
     }
     tracing::info!(project = shared.key.0, loading = next.len(), "loading devices changed (実行するトラックの再 compile)");

@@ -184,6 +184,10 @@ impl AppData {
             self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
         }
+        // 歌唱の合成待ち (`request_bounce`) を挟んでも、焼き始める瞬間に確かめる。
+        if self.reject_offline_render_while_loading("Bounce") {
+            return;
+        }
         let Some(track) = self.cur.song_doc.song().track_by_id(target.track_id) else {
             return;
         };

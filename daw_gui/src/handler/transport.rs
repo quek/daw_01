@@ -297,6 +297,24 @@ impl AppData {
         generation
     }
 
+    /// オフライン描画 (WAV / Video 書き出し・ラウドネス解析・Bounce・Glue) を **plugin の読み込みが全部確定してから**
+    /// だけ始める門。読み込み中なら理由を status に出して `true` (呼び出し側は始めない)。
+    ///
+    /// 読み込み中の plugin を鳴らすトラックは engine のグラフに入らない (r.md #131、`Song::executable_mask`) ので、
+    /// そのまま焼くとそのトラックは無音になる。しかも書き出し / 解析の間は host の instance を組み替えないよう
+    /// 読み込み応答を捨てる (`AppData::handle_event` の block-list) — 捨てた device は応答待ちのまま残り、終わった
+    /// 後もそのトラックは鳴らず、再生も A7 で待ち続ける。再生 (A7) は待ち合わせるが、オフライン描画は他の前提
+    /// (描画中 / 音声エンジン不在) と同じく始めない。
+    pub(crate) fn reject_offline_render_while_loading(&mut self, what: &str) -> bool {
+        let remaining = self.cur.pipc.pending_plugin_loads.len();
+        if remaining == 0 {
+            return false;
+        }
+        self.ui_ephemeral.status_message =
+            format!("{what}: プラグインの読み込み中は開始できません (残 {remaining})");
+        true
+    }
+
     /// 停止を **要求する** 唯一の口。 実際に止まったことの反映 (録音セッションを閉じる /
     /// 停止位置の確定) は、engine が止まったのを観測した [`Self::on_transport_stopped`]
     /// が行う。

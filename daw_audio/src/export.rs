@@ -585,9 +585,8 @@ fn render_loop(
     // it via `render_master_buffer`. `buffer_frames` = このループの処理単位
     // `max_frames` (leaf 宛 sidechain tap の 1-buffer 補償量、 live と同規則)。
     // PDC の入力 (device 単位の報告 latency) と読み込み中の device (r.md #131) は live publish と同じ表を読む
-    // (`compile_schedule` は live / export 共通なので入力も共通)。書き出しは plugin の再初期化の往復を待ってから
-    // 始まり、それより前に頼んだ読み込みの応答はその往復より先に届く (host は命令を順に処理する) ので、ここで
-    // 読み込み中の device が残っているのは書き出しの最中に頼んだ読み込みだけ。
+    // (`compile_schedule` は live / export 共通なので入力も共通)。GUI はオフライン描画を plugin の読み込みが全部
+    // 確定してからしか始めない (`AppData::reject_offline_render_while_loading`) ので、ここで表は空のはず。
     let mut schedule = compile_schedule(
         song,
         &project.device_latencies.load(), // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
