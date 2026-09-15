@@ -538,8 +538,8 @@ fn split_clips_at_は跨ぐノートを切って後半を鳴らせるように�
         spans,
         vec![
             (1.0, 1.0, Some("あ".to_string())),
-            // 後半は継続なので歌詞を持たない (VOICEVOX が二重に歌わない)。
-            (2.0, 2.0, None),
+            // 後半は継続なので長音「ー」(音節を歌い直さず伸ばす)。 `None` は「ら」と歌われる。
+            (2.0, 2.0, Some("ー".to_string())),
         ]
     );
     // 後半の窓 [2,4) に発音開始が入るので、後半クリップでも鳴る。
@@ -2925,6 +2925,38 @@ fn split_content_at_は跨ぐノートを二つに割る() {
     assert_eq!(song.split_content_at(cid, 4.0), cid);
     let ClipContent::Midi(m) = &song.clip_contents[&cid] else { panic!("midi") };
     assert_eq!(m.notes.len(), 3);
+}
+
+/// r.md #132: 逆再生の audio event を複数の切り口で割ると、event の頭から順に source の
+/// **末尾側**から隙間なく配られ、切り口側の fade だけが 0 になる。
+#[test]
+fn 逆再生の_audio_event_は末尾側から隙間なく配られる() {
+    let mut audio = AudioContent {
+        events: vec![AudioEvent {
+            id: 1,
+            event_start_in_clip_beats: 0.0,
+            event_length_beats: 4.0,
+            source_start_frames: 1_000,
+            source_end_frames: 5_000,
+            reversed: true,
+            fade_in_beats: 0.5,
+            fade_out_beats: 0.25,
+            ..AudioEvent::default()
+        }],
+        next_event_id: 2,
+    };
+    let ids = audio.split_events(|_| vec![3.0, 1.0], 0.0);
+    assert_eq!(ids.len(), 3, "3 片 (元 id + 新 id 2 つ)");
+    let got: Vec<(f64, u64, u64, f64, f64)> = audio
+        .events
+        .iter()
+        .map(|e| (e.event_start_in_clip_beats, e.source_start_frames, e.source_end_frames, e.fade_in_beats, e.fade_out_beats))
+        .collect();
+    assert_eq!(
+        got,
+        vec![(0.0, 4_000, 5_000, 0.5, 0.0), (1.0, 2_000, 4_000, 0.0, 0.0), (3.0, 1_000, 2_000, 0.0, 0.25)]
+    );
+    assert_eq!(audio.events[0].id, 1);
 }
 
 /// `docs/plan_rmd_88_89_cross_modulation.md` §8-2 (r.md #88):

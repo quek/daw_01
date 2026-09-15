@@ -19,6 +19,7 @@ mod clip_rename;
 mod dangling_routes;
 mod device_relocate;
 mod dirty_guard;
+mod grid_split;
 mod group_track_lifecycle;
 mod linked_clip_bounds;
 mod make_unique;

@@ -32,6 +32,8 @@ pub mod event_native;
 /// r.md #87: クリップランチャーのイベントと値型 (`AppEvent::Launcher` の中身)。
 pub mod event_launcher;
 pub mod event_sampler;
+/// r.md #132: 分割 / 結合キーのイベント (`AppEvent::SplitJoin` の中身)。
+pub mod event_split;
 pub mod event_tabs;
 pub mod event_virtual_keyboard;
 pub mod handler;

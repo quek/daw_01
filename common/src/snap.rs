@@ -140,6 +140,17 @@ impl SnapConfig {
         }
     }
 
+    /// **スナップの ON / OFF に依らない**、選んでいる分割 1 つ分の長さ (拍)。
+    ///
+    /// グリッドはスナップを切っても画面に出ている (選んでいる分割は変わらない) ので、
+    /// 「グリッド 1 つ分」を使う操作 (ノートのナッジ / `Shift+E` のグリッド分割) はこれを読む。
+    /// トグル 1 つで量が変わってしまわないようにするため。 分割が選ばれていない
+    /// (`mode == Off`) / 計算できないときは `None`。
+    #[must_use]
+    pub fn grid_unit(&self, zoom_x_px_per_beat: f32) -> Option<f64> {
+        Self { enabled: true, ..*self }.beat_unit(zoom_x_px_per_beat)
+    }
+
     /// raw beat 値を snap unit に round。
     /// `alt_pressed` / `enabled = false` / `mode == Off` / unit 計算失敗のとき `raw` をそのまま返す。
     #[must_use]
@@ -165,6 +176,28 @@ impl Default for SnapConfig {
     fn default() -> Self {
         Self::DEFAULT
     }
+}
+
+/// グリッド線 `phase + k * unit` (k は整数) のうち、開区間 `(start, end)` に入るものを昇順で返す。
+///
+/// 端ちょうどの線は含めない (そこで切っても片ができない)。 `unit` が正の有限値でない /
+/// 区間が空なら空。 曲の拍 0 を原点にしたグリッドを content-local 拍で引くときは
+/// `phase = -Clip::content_origin_beat()` を渡す。
+#[must_use]
+pub fn grid_lines_within(unit: f64, phase: f64, start: f64, end: f64) -> Vec<f64> {
+    let finite = unit.is_finite() && phase.is_finite() && start.is_finite() && end.is_finite();
+    if !finite || unit <= 0.0 || end <= start {
+        return Vec::new();
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let first = ((start - phase) / unit).floor() as i64;
+    #[allow(clippy::cast_possible_truncation)]
+    let last = ((end - phase) / unit).ceil() as i64;
+    #[allow(clippy::cast_precision_loss)]
+    (first..=last)
+        .map(|k| phase + k as f64 * unit)
+        .filter(|&b| b > start && b < end)
+        .collect()
 }
 
 /// `Adaptive` の単位 (拍)。snap ([`SnapConfig::beat_unit`]) と表示グリッド (daw_gui

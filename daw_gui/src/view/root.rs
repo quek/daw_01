@@ -19,7 +19,7 @@ use crate::view::{
     font_picker, load_overlay, loudness_report, master_panel, menu_bar, mixer_strips, plugin_picker,
     recovery_modal,
     resource_monitor,
-    settings, shortcuts_help, snap, status_bar, tab_strip, track_inspector, track_picker,
+    settings, shortcuts_help, snap, split_keys, status_bar, tab_strip, track_inspector, track_picker,
     transport, undo_history, virtual_keyboard, voicevox_overlay,
 };
 use crate::event_tabs::TabEvent;
@@ -1070,44 +1070,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }));
     }
 
-    // ----- Split (E) / Glue (J) — Phase 1 PR7 -------------------------------
-    // MIDI / Audio / Vocal すべての clip kind に対して動作する統合操作。
-    // 詳細は `docs/plan_audio_clip.md` §3.3。
-    // `e` も `j` と同じくビューで意味が分かれる — アレンジャー = クリップ分割 /
-    // ピアノロール = **ノート分割** (ポインタ直下 → 選択、 snap は Alt で無効、 の同じ規則)。
-    let split_snap = if ui.take_shortcut("daw.split_clip_at_cursor") {
-        Some(true)
-    } else if ui.take_shortcut("daw.split_clip_at_cursor_no_snap") {
-        Some(false)
-    } else {
-        None
-    };
-    if let Some(snap) = split_snap {
-        if is_pianoroll_active && app.cur.peph.audio_editor_clip.is_none() {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.action_split_notes_at_cursor(snap);
-            }));
-        } else {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::SplitClipAtPlayhead { snap });
-            }));
-        }
-    }
-    // `j` はビューで意味が分かれる — アレンジャー = 範囲を 1 クリップへ焼き込む /
-    // ピアノロール = **Join Notes** (同じ音のノートを 1 本に結合)。
-    // Live も `Ctrl+J` を Consolidate / Join Notes に振り分けている
-    // (`docs/plan_range_selection.md` §7.4)。
-    if ui.take_shortcut("daw.glue_selected_clips") {
-        if is_pianoroll_active && app.cur.peph.audio_editor_clip.is_none() {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.action_join_selected_notes();
-            }));
-        } else {
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.handle_event(AppEvent::GlueSelectedClips);
-            }));
-        }
-    }
+    // ----- Split (E / Alt+E / Shift+E) / Glue (J) -----------------------------
+    // ビューで意味が分かれる (ピアノロール = ノート / それ以外 = クリップ)。 振り分けは `split_keys`。
+    split_keys::dispatch(app, ui, is_pianoroll_active);
 
     // ----- Help -----
     if ui.take_shortcut("daw.toggle_help") {
@@ -1473,6 +1438,48 @@ mod tests {
             "1 フレームに 3 回届いたら 3 ステップ動く: got {}",
             note_start(&app)
         );
+    }
+
+    /// r.md #132: ピアノロールの上で `Shift+E` → 本番のキー定義から `AppEvent::SplitJoin` が届き、
+    /// 選択ノートがグリッド (1/16 拍) ごとに割れる。 `handle_event` を通るので 1 undo step。
+    #[test]
+    fn shift_e_over_piano_roll_splits_the_selected_note_at_the_grid() {
+        let mut app = app_with_selected_note(4.0);
+        app.cur.view.bottom_panel = Some(1); // Piano Roll タブ
+        let before = app.cur.song_doc.history_current();
+        let mut host: UiHost<AppData> = UiHost::no_redraw();
+        *host.shortcut_map_mut() = crate::view::shortcuts::daw_shortcut_map();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 1280, height: 720 };
+        let bottom_rect = Rect { x: 0.0, y: 400.0, w: 1280.0, h: 320.0 };
+        let input = FrameInput {
+            keyboard: vec![KeyEvent {
+                state: ElementState::Pressed,
+                text: Some("E".to_string()),
+                physical_key: PhysicalKey::Char('E'),
+                repeat: false,
+            }],
+            pointer: daw_ui_core::PointerFrame {
+                pos: Some((100.0, 500.0)), // 下部パネルの中
+                modifiers: Modifiers { shift: true, ..Modifiers::empty() },
+                ..Default::default()
+            },
+            ..FrameInput::default()
+        };
+        let edits = host.frame_to_edits(&app, &mut scene, screen, input, |app, ui| {
+            dispatch_shortcuts(app, ui, bottom_rect);
+        });
+        for e in edits {
+            e.apply(&mut app);
+        }
+        let song = app.cur.song_doc.song();
+        let spans: Vec<(f64, f64)> = song
+            .clip_notes(&song.tracks[0].clips[0])
+            .iter()
+            .map(|n| (n.start_beat, n.duration_beats))
+            .collect();
+        assert_eq!(spans, vec![(4.0, 0.25), (4.25, 0.25), (4.5, 0.25), (4.75, 0.25)]);
+        assert_eq!(app.cur.song_doc.history_current() - before, 1, "1 回のキー操作 = 1 undo step");
     }
 
     /// ノートを選んでいなければ矢印は何もしない (ユーザー決定: 再生位置移動等に割り当てない)。

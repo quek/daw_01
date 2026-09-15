@@ -1089,7 +1089,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     // ----- Mouse hover → clip 内 beat (E キー split / 将来の波形操作用) -----
     // wf_area 内のマウス位置を clip-local beat (clip 始端 = 0) に変換。
-    // E キー (action_split_clips_at_cursor) は audio editor 開いてる時
+    // E キー (`AppData::split_clips`) は audio editor 開いてる時
     // 既存の arrangement_hover ではなく **この値** を優先採用する
     // (= bottom panel にマウスがある時点で arrangement hover は更新
     // されないため、 そのままだと「マウスを arrangement に置いて」 status
@@ -1106,6 +1106,14 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     if app.cur.peph.audio_editor_hover_beat_in_clip != hover_in_clip {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.cur.peph.audio_editor_hover_beat_in_clip = hover_in_clip;
+        }));
+    }
+    // r.md #132: `Shift+E` のグリッド単位 (Adaptive はズームで変わる) を handler が求めるための写し。
+    #[allow(clippy::cast_possible_truncation)]
+    let zoom_x = (1.0 / beats_per_px) as f32;
+    if app.cur.peph.audio_editor_zoom_x.to_bits() != zoom_x.to_bits() {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.cur.peph.audio_editor_zoom_x = zoom_x;
         }));
     }
 

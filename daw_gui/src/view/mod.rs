@@ -46,6 +46,7 @@ pub mod settings;
 pub mod shortcuts;
 pub mod shortcuts_help;
 pub mod snap;
+pub mod split_keys;
 pub mod status_bar;
 pub mod tab_strip;
 pub mod strip_sections;

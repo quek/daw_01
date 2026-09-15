@@ -8,7 +8,9 @@ use crate::app_types::*;
 use crate::event::*;
 use common::protocol::AudioCommand;
 
-use super::notes::{NOTE_MIN_LEN_BEATS, NUDGE_AUDITION_LEN};
+use common::model::MIN_NOTE_LEN_BEATS;
+
+use super::notes::NUDGE_AUDITION_LEN;
 
 impl AppData {
     /// カーソルキー 1 押しが動かす拍数。
@@ -24,10 +26,9 @@ impl AppData {
     pub fn nudge_beat_unit(&self, step: NudgeStep) -> f64 {
         let cfg = crate::view::snap::piano_roll_snap_config(self);
         let zoom = self.pianoroll_zoom_x();
-        // スナップ OFF でも「選ばれている分割」 は決まっているので、 有効化した設定で
-        // unit を求める (トグル 1 つで微調整量まで変わってしまうのを避ける)。
-        let selected_unit = crate::view::snap::SnapConfig { enabled: true, ..cfg }
-            .beat_unit(zoom)
+        // スナップ OFF でも「選ばれている分割」 は決まっている (`SnapConfig::grid_unit`)。
+        let selected_unit = cfg
+            .grid_unit(zoom)
             .filter(|u| u.is_finite() && *u > 0.0)
             // `SnapMode::Off` は `beat_unit` が None。 1/16 音符 (= ピアノロール既定) を基準に。
             .unwrap_or(0.25);
@@ -124,7 +125,7 @@ impl AppData {
         let delta = crate::widgets::piano_roll::clamp_shared_delta(
             movable.iter().map(|&(_, _, dur, _)| dur),
             raw,
-            NOTE_MIN_LEN_BEATS,
+            MIN_NOTE_LEN_BEATS,
             f64::INFINITY,
         );
         if delta.abs() < 1e-9 {

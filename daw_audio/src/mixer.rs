@@ -332,8 +332,8 @@ pub fn pass_strip(scratch: &mut TrackScratch, n: usize) {
 /// 確保量でクランプ済みなので push で再確保しない。
 pub fn queue_all_notes_off(scratch: &mut [TrackScratch]) {
     for s in scratch.iter_mut() {
-        for &note in &s.state.active_notes {
-            s.state.pending_offs.push(note);
+        for note in s.state.active_notes.iter() {
+            s.state.pending_offs.push((note.voice_id, note.key));
         }
         s.state.active_notes.clear();
     }

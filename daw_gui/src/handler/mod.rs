@@ -59,6 +59,8 @@ pub mod select_all;
 pub mod selection_view;
 /// r.md #61: 終了シーケンスの実行 (子プロセス teardown の待ち合わせ)。
 pub mod shutdown;
+/// r.md #132: 分割 (`E` / `Shift+E`) と結合 (`J`) の入口。
+pub mod split;
 pub mod sync;
 pub mod tabs;
 pub mod tick;

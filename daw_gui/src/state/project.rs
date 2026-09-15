@@ -572,6 +572,11 @@ pub struct ProjectEphemeral {
     /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック
     /// 系操作で「マウス位置を cursor として使う」 ために保持する。
     pub audio_editor_hover_beat_in_clip: Option<f64>,
+    /// r.md #132: Audio Editor の波形の横倍率 (px / 拍)。 audio_editor.rs が毎フレーム mirror
+    /// する session-only 値 (`0.0` = まだ描かれていない)。 倍率は波形領域の px 幅から決まる
+    /// ので **view しか知らない**が、`Shift+E` のグリッド単位 (Adaptive はズームで変わる) は
+    /// handler が求めるので、ここへ写す (`pianoroll_viewport` と同じ理由)。
+    pub audio_editor_zoom_x: f32,
     /// `Z` キーの段階ズーム履歴。 1 回目 push で横ズーム前の view、
     /// 2 回目 push で縦ズーム前の view を積む。 `X` が pop して 1 段ずつ戻し、
     /// 空になったら全体フィットに落ちる。 load / new / recovery で clear。
@@ -971,6 +976,7 @@ impl ProjectState {
                 audio_editor_clip: None,
                 pianoroll_focus_clip: None,
                 audio_editor_hover_beat_in_clip: None,
+                audio_editor_zoom_x: 0.0,
                 arrange_zoom_history: Vec::new(),
                 arrange_zoom_anchor: None,
                 zoom_lane_fill: None,
