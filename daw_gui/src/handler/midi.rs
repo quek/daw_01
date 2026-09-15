@@ -156,12 +156,12 @@ impl AppData {
     }
 
     /// 録音待機 (`Track::armed`) のトラック id。 録音・モニターの宛先。
+    /// r.md #131: 実効的に無効なトラックは宛先にしない (待機のまま無効な group へ移した場合も)。
     pub(crate) fn armed_track_ids(&self) -> Vec<u32> {
-        self.cur.song_doc
-            .song()
-            .tracks
+        let song = self.cur.song_doc.song();
+        song.tracks
             .iter()
-            .filter(|t| t.armed)
+            .filter(|t| t.armed && song.track_effectively_enabled(t.id))
             .map(|t| t.id)
             .collect()
     }

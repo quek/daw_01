@@ -57,6 +57,8 @@ pub(super) fn draw_plugin_row(
     row: Rect,
     popup_open: bool,
     keys_style: &ToggleButtonStyle,
+    // r.md #131: チェーンの持ち主が実効的に無効 (host に instance が無い)。
+    disabled: bool,
 ) {
     let p = &app.theme.core;
     let device_id = entry.device_id;
@@ -80,8 +82,9 @@ pub(super) fn draw_plugin_row(
             })
         },
     );
-    // [Par | GUI]
-    if entry.shows_button() {
+    // [Par | GUI]。r.md #131: 無効トラックでは host の instance を要る窓 / param パネルは出さない
+    // (Song だけで完結する映像 FX / 声のパネルは開ける)。
+    if entry.shows_button() && !(disabled && !entry.is_video && !entry.is_voicevox) {
         right -= btn_gui_w + 2.0;
         let label = if entry.shows_param_panel() { "Par" } else { "GUI" };
         ui.button_at(
@@ -152,7 +155,7 @@ pub(super) fn draw_plugin_row(
         11.0,
         if failed {
             p.text_error
-        } else if entry.bypassed {
+        } else if entry.bypassed || disabled {
             p.text_faint
         } else {
             p.text

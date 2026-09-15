@@ -502,6 +502,20 @@ fn draw_rows_inner(
         // Phase 47c: ↑/↓/× button は削除 (drag&drop reorder + Delete shortcut で代替)。
         // `MoveTrackUp/Down` は context menu / keyboard 用に残す (削除は root の arbiter)。
 
+        // r.md #131: 無効トラックはヘッダ行を丸ごと沈める (レーン帯 / セルの `disabled_rows` と同じトークン)。
+        // 描いた後に重ねるだけなので、名前 / M·S·R / 音量帯の操作はそのまま効く。
+        if t.disabled {
+            let ink = ui.palette().row_dim_ink;
+            ui.push_rect(RectCommand {
+                rect: row,
+                fill: ink,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: Some(row),
+            });
+        }
+
         // Response.track_header_rects に積む
         response.track_header_rects.push((t.id, row));
 

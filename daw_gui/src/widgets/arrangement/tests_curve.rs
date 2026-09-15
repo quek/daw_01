@@ -90,6 +90,7 @@ fn track_with_lane(lane: ArrangementAutomationLane) -> ArrangementTrack {
         muted: false,
         solo: false,
         armed: false,
+        disabled: false,
         clips: Vec::new(),
         volume: 1.0,
         peak: (0.0, 0.0),

@@ -94,7 +94,8 @@ impl AppData {
         };
 
         let is_video = ports.is_video();
-        if !is_video {
+        // r.md #131: 無効なトラックへ足した plugin は Song に置くだけ (有効に戻したとき reconcile が載せる)。
+        if !is_video && self.cur.song_doc.song().track_effectively_enabled(track_id) {
             // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync +
             // (open_gui なら) GUI 自動 open する (project-load の一斉復元はこの
             // 集合に積まれない)。 Shift (open_gui=false) でも sync は必要なので
@@ -621,6 +622,12 @@ impl AppData {
     }
 
     pub(crate) fn toggle_track_armed(&mut self, track_id: u32) {
+        // r.md #131: 無効なトラックは録音待機にできない (外すのは可 — 無効化は待機を解除済みのはず)。
+        let song = self.cur.song_doc.song();
+        if !song.track_effectively_enabled(track_id) && !song.track_by_id(track_id).is_some_and(|t| t.armed) {
+            self.ui_ephemeral.status_message = "無効なトラックは録音待機にできません".to_string();
+            return;
+        }
         let Some(Some(armed)) = self.edit_song(|song| {
             let t = song.tracks.iter_mut().find(|t| t.id == track_id)?;
             t.armed = !t.armed;

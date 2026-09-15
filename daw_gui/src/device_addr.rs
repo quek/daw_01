@@ -147,6 +147,16 @@ pub enum SlotReconcileAction {
     },
 }
 
+impl SlotReconcileAction {
+    /// action が指す device。
+    #[must_use]
+    pub fn device_id(&self) -> u64 {
+        match self {
+            Self::RemoveDevice { device_id } | Self::LoadDevice { device_id, .. } => *device_id,
+        }
+    }
+}
+
 /// Phase B 純粋関数化。 song と現在の `loaded_devices` cache を見て、 host
 /// と Song を揃えるための action 列を返す。 副作用なし (IPC は呼ばない、
 /// AppData にも触らない)。
@@ -154,9 +164,15 @@ pub enum SlotReconcileAction {
 /// 走査順は Song 順 (track → master_fx_chain、Parallel の中は chain 順 = 音の処理順)
 /// なので `LoadDevice` の並びは決定的。 `RemoveDevice` は host 側 map の iteration
 /// 順に依存しないよう id 昇順に sort する。
+///
+/// **host に居るべき device の唯一の導出口** (r.md #131): 実効的に無効なトラックの device は
+/// 居るべきでない (`Song::live_plugins`) — 無効化で `RemoveDevice`、有効化で state 付きの `LoadDevice`、
+/// undo / redo も同じ口。`pending_loads` (= load 応答待ち、`AppData::pending_plugin_loads` の鍵) のうち
+/// 居るべきでないものも `RemoveDevice` にする (読み込み中に無効化すると、応答後に載ったまま残らない)。
 pub fn compute_slot_reconcile_actions(
     song: &common::model::Song,
     loaded_devices: &HashMap<u64, LoadedDeviceInfo>,
+    pending_loads: &HashMap<u64, u64>,
 ) -> Vec<SlotReconcileAction> {
     // Song 側で host slot を持つ device (= 映像でない device) の id 集合。
     // 内蔵映像効果は plugin_host に載らない device なので、 ここに混ぜると
@@ -164,15 +180,17 @@ pub fn compute_slot_reconcile_actions(
     let mut song_host_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut actions = Vec::new();
 
-    for inst in song.all_plugins() {
+    for inst in song.live_plugins() {
         if inst.ports.is_video() {
             continue;
         }
         song_host_ids.insert(inst.id);
-        let need_load = match loaded_devices.get(&inst.id) {
-            None => true,
-            Some(info) => info.plugin_id_str != inst.plugin_id,
-        };
+        // 応答待ちの load がある device は送り直さない (編集の直後に実体化した device をここで二重に load しない)。
+        let need_load = !pending_loads.contains_key(&inst.id)
+            && match loaded_devices.get(&inst.id) {
+                None => true,
+                Some(info) => info.plugin_id_str != inst.plugin_id,
+            };
         if !need_load {
             continue;
         }
@@ -187,10 +205,12 @@ pub fn compute_slot_reconcile_actions(
     //     から load する** 順序は現行仕様なので、 先頭へ差し込む。
     let mut host_extra: Vec<u64> = loaded_devices
         .keys()
+        .chain(pending_loads.keys())
         .copied()
         .filter(|id| !song_host_ids.contains(id))
         .collect();
     host_extra.sort_unstable();
+    host_extra.dedup();
     let removals: Vec<SlotReconcileAction> = host_extra
         .into_iter()
         .map(|device_id| SlotReconcileAction::RemoveDevice { device_id })

@@ -1947,7 +1947,8 @@ impl Runner {
         // 吸収した子 + group affine、通常 track は自分の視覚アイテム + identity 配置。
         // 選択中 group は children 空でも bounding box 用に emit。
         let mut composites: Vec<crate::group_compose::TrackComposite> = Vec::new();
-        for track in song.tracks.iter().rev() {
+        // r.md #131: 実効的に無効なトラックは合成しない (選択中の Transform の枠も出さない = GPU パスを回さない)。
+        for (track, _) in song.tracks.iter().zip(song.effectively_enabled_mask()).rev().filter(|&(_, on)| on) {
             let items = buckets.remove(&track.id).unwrap_or_default();
             // 配置 transform は **どのトラックでも** Transform device から
             // 解決（立ち絵 group も通常トラックも統一）。device が無ければ None = identity 配置。

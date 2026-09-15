@@ -577,6 +577,10 @@ pub enum AppEvent {
     /// なので N 本消しても undo は 1 ステップ。 song に居ない id (master row の
     /// `MASTER_TRACK_ID` / subtree 削除で先に消えた子) は黙って無視される。
     DeleteTracks(Vec<u32>),
+    /// r.md #131: トラック群を無効 (`enabled = false`) / 有効にする (安定 `Track::id`、master は無視)。
+    /// ヘッダ / ミキサーのストリップ上の `Q` は 1 本、ヘッダの右クリックメニューは選択全体。
+    /// 1 event = 1 undo step。無効化は plugin state の往復を挟む (`AppData::set_tracks_enabled`)。
+    SetTracksEnabled { track_ids: Vec<u32>, enabled: bool },
     /// 選択トラック群を複製する (r.md #30)。`Shared` = クリップ中身 (MIDI ノート /
     /// オーディオ / オートメーション) を元トラックと **リンク** (同じ content_id を
     /// 共有、 片方のノート編集が両方に反映) して重ねる用、 `Unique` = deep clone +
@@ -1834,6 +1838,8 @@ impl AppEvent {
             E::UngroupTracks { .. } => "グループ解除",
             E::SetTrackParent { .. } => "トラック親変更",
             E::RemoveLastTrack | E::DeleteTracks(..) => "トラック削除",
+            E::SetTracksEnabled { enabled: false, .. } => "トラック無効化",
+            E::SetTracksEnabled { enabled: true, .. } => "トラック有効化",
             E::DuplicateTracksShared(..) | E::DuplicateTracksUnique(..) => "トラック複製",
             E::MoveTrackUp(..) | E::MoveTrackDown(..) | E::ReorderTracks(..) => "トラック並べ替え",
             E::CommitRenameTrack => "トラック名変更",

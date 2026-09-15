@@ -2589,3 +2589,172 @@ fn sched_free_eq_output(song: &Song, x: &[f32]) -> Vec<f32> {
     crate::graph::run_chain_program(&mut alone, 0..len, &mut l, &mut r, &mut a, &mut b, &ctx);
     l
 }
+
+// ---- r.md #131: 無効トラック (`docs/plan_rmd_131_track_disable.md`) ----
+
+/// op が読み書きする track index (scratch / program / send の送り元)。
+fn op_tracks(op: &NodeOp) -> Vec<u32> {
+    let buf = |b: &BufRef| match *b {
+        BufRef::TrackScratch(i) | BufRef::PreFaderScratch(i) | BufRef::PreFxScratch(i) => Some(i),
+        _ => None,
+    };
+    match op {
+        NodeOp::ProcessTrack { track_idx } | NodeOp::ProcessGroupFx { track_idx, .. } => vec![*track_idx],
+        NodeOp::Mix { srcs, dst } | NodeOp::MixAdditive { srcs, dst } => {
+            srcs.iter().filter_map(|(b, _)| buf(b)).chain(buf(dst)).collect()
+        }
+        NodeOp::MixSend { src, dst, src_track_idx, .. } => buf(src).into_iter().chain(buf(dst)).chain([*src_track_idx]).collect(),
+        NodeOp::ApplyDelay { buf: b, .. } => buf(b).into_iter().collect(),
+        NodeOp::SidechainTap { src, .. } | NodeOp::EnvelopeFollow { src, .. } => buf(src).into_iter().collect(),
+        NodeOp::NativeSidechainTap { src, owner, .. } => buf(src).into_iter().chain([*owner]).collect(),
+        NodeOp::ParallelOutTap { dst_track, .. } => vec![*dst_track],
+    }
+}
+
+/// 無効トラック (と無効 group の子孫) は **グラフに居ない**: 直列トレースの手も op も無く、program は空
+/// (plugin の依頼も latency も無い)、master への合流にも出ない。戻すと元の schedule に戻る。
+#[test]
+fn 無効トラックと無効_group_の子孫はグラフに居ない() {
+    use crate::graph::program::Pass1Role;
+    use crate::graph::render_graph::Step;
+
+    let mut lat = DeviceLatencies::new();
+    let mut song = Song {
+        tracks: vec![
+            track(|t| {
+                t.id = 1;
+                t.devices = latency_chain(&mut lat, 10, 500);
+            }),
+            track(|t| {
+                t.id = 2;
+                t.parent_group_id = Some(1);
+                t.devices = latency_chain(&mut lat, 11, 300);
+            }),
+            track(|t| {
+                t.id = 3;
+                t.devices = latency_chain(&mut lat, 12, 40);
+            }),
+        ],
+        ..Song::default()
+    };
+    let live = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    assert_eq!(live.master_latency_samples, 800, "対照: 全部有効なら group の経路 300 + 500");
+
+    song.set_tracks_enabled(&[1], false);
+    let sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    assert_eq!(sched.graph.trace.iter().filter(|s| matches!(s, Step::Process(_))).collect::<Vec<_>>(), vec![&Step::Process(2)]);
+    for (i, p) in sched.track_programs.iter().enumerate() {
+        let off = i < 2;
+        assert_eq!(p.pass1_role == Pass1Role::Disabled, off, "track idx {i}: {:?}", p.pass1_role);
+        assert_eq!(p.ops.is_empty(), off, "無効トラックの program は device を展開しない (idx {i})");
+    }
+    let touched: Vec<u32> = sched.nodes.iter().flat_map(op_tracks).collect();
+    assert!(touched.iter().all(|&i| i == 2), "無効トラックに触れる op がある: {:?}", sched.nodes);
+    assert!(sched.nodes.iter().any(|op| matches!(op, NodeOp::Mix { dst: BufRef::Master, srcs } if srcs == &vec![(BufRef::TrackScratch(2), 1.0)])));
+    assert_eq!(sched.master_latency_samples, 40, "無効な経路の latency は数えない");
+
+    song.set_tracks_enabled(&[1], true);
+    let back = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    assert_eq!(format!("{:?}", back.nodes), format!("{:?}", live.nodes), "戻すと同じ schedule");
+    assert_eq!(back.master_latency_samples, 800);
+}
+
+/// 無効トラックを読む側 / 無効トラックへ送る側は **無音 / 変調なし**: send (無効な送り元 / 無効な return)、
+/// サイドチェイン元、パラアウトの送り先、AudioTap (follower) 元、無効トラックに帰属する follower。
+/// 役割は構造で決まる — 無効な送り元しか持たない return も bus のまま (自分のクリップを鳴らし始めない)。
+#[test]
+fn 無効トラックへの送りとそこを読む_tap_は出ない() {
+    use crate::graph::program::Pass1Role;
+    use common::model::{AudioTap, AuxInputRoute, AuxOutputRoute, FollowerConfig, ModSource, ModSourceKind, Send, SendMode};
+
+    let send = |id: u32, dest: u32| Send { id, dest_track_id: dest, gain: 1.0, mode: SendMode::PreFader, enabled: true };
+    let follower = |id: u32, owner: u32, tap: u32| ModSource {
+        id,
+        owner_track_id: owner,
+        color: [0.0; 3],
+        kind: ModSourceKind::EnvelopeFollower { tap: Some(AudioTap::post_fader(tap)), follower: FollowerConfig::default() },
+        enabled: true,
+    };
+    let mut song = Song {
+        tracks: vec![
+            // idx 0: 無効にする送り元 (return 3 へ send)。
+            track(|t| {
+                t.id = 1;
+                t.sends = vec![send(1, 3)];
+            }),
+            // idx 1: 有効。track 1 をサイドチェインに読み、無効にする return 4 へ send。
+            track(|t| {
+                t.id = 2;
+                t.devices = vec![Device::Plugin(PluginInstance {
+                    id: 77,
+                    aux_inputs: vec![Some(AuxInputRoute::post_fader(1))],
+                    ..PluginInstance::with_ports("test.compressor".into(), PluginFormat::Vst3, audio_fx_ports())
+                })];
+                t.sends = vec![send(2, 4)];
+            }),
+            track(|t| t.id = 3),
+            track(|t| t.id = 4),
+            // idx 4: パラアウト元 (有効) → 無効にする独立 dest 6。
+            track(|t| {
+                t.id = 5;
+                t.devices = vec![Device::Plugin(PluginInstance {
+                    id: 10,
+                    aux_outputs: vec![Some(AuxOutputRoute::to_track(6))],
+                    aux_output_count: 1,
+                    ..PluginInstance::with_ports("test.drum_sampler".into(), PluginFormat::Clap, instrument_ports())
+                })];
+            }),
+            track(|t| t.id = 6),
+        ],
+        // 21: 有効な track 2 に帰属し、無効にする track 1 を読む / 22: 無効にする track 1 に帰属し、有効な track 2 を読む。
+        mod_sources: vec![follower(21, 2, 1), follower(22, 1, 2)],
+        ..Song::default()
+    };
+    let lat = DeviceLatencies::new();
+    let is_route = |op: &NodeOp| {
+        matches!(op, NodeOp::MixSend { .. } | NodeOp::SidechainTap { .. } | NodeOp::ParallelOutTap { .. } | NodeOp::EnvelopeFollow { .. })
+    };
+    let live = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    assert_eq!(live.nodes.iter().filter(|op| is_route(op)).count(), 6, "対照: send 2 / SC 1 / パラアウト 1 / follower 2");
+    assert_eq!(live.follower_keys, vec![21, 22]);
+
+    song.set_tracks_enabled(&[1, 4, 6], false);
+    let sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    assert!(!sched.nodes.iter().any(is_route), "無効トラックに触れる経路が残っている: {:?}", sched.nodes);
+    assert_eq!(sched.follower_keys, vec![0, 0], "進まない follower は状態を引き継がない (固まった変調を残さない)");
+    let roles: Vec<Pass1Role> = sched.track_programs.iter().map(|p| p.pass1_role).collect();
+    assert_eq!(
+        roles,
+        vec![Pass1Role::Disabled, Pass1Role::Leaf, Pass1Role::Bus, Pass1Role::Disabled, Pass1Role::Leaf, Pass1Role::Disabled],
+        "return 3 は無効な送り元しか持たなくても bus のまま"
+    );
+    assert_eq!(sched.input_delay_per_track, vec![0; 6], "無効な SC 元に揃える遅延は掛けない");
+}
+
+/// 無効トラックの solo は数えない (他を黙らせない)。solo の透過も無効な子からは流れ込まない。
+#[test]
+fn 無効トラックの_solo_は数えない() {
+    let mut song = Song {
+        tracks: vec![
+            track(|t| t.id = 1),
+            track(|t| {
+                t.id = 2;
+                t.parent_group_id = Some(1);
+                t.solo = true;
+            }),
+            track(|t| t.id = 3),
+        ],
+        ..Song::default()
+    };
+    let lat = DeviceLatencies::new();
+    let mut sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    assert!(sched.solo.any_solo(&song));
+    sched.solo.resolve(&song);
+    assert!(sched.solo.of(0).0, "対照: solo の子から group へ透過が流れ込む");
+
+    song.set_tracks_enabled(&[2], false);
+    let mut sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).unwrap();
+    assert!(!sched.solo.any_solo(&song), "無効な子の solo は数えない");
+    sched.solo.resolve(&song);
+    assert!(!sched.solo.of(0).0, "無効な子からは透過が流れ込まない");
+}

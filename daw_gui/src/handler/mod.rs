@@ -64,6 +64,8 @@ pub mod split;
 pub mod sync;
 pub mod tabs;
 pub mod tick;
+/// r.md #131: トラックの無効化 / 有効化 (編集の口と plugin host の追従)。
+pub mod track_enable;
 pub mod tracks;
 pub mod transport;
 /// r.md #130: グローバルトランスポーズ (基準値 / 追従 / 演奏プレビューの鍵盤 / ヘッダの印)。

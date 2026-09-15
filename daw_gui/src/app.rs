@@ -861,6 +861,7 @@ impl AppData {
             }
             AppEvent::RemoveLastTrack => self.action_remove_last_track(),
             AppEvent::DeleteTracks(track_ids) => self.delete_tracks(track_ids),
+            AppEvent::SetTracksEnabled { track_ids, enabled } => self.set_tracks_enabled(track_ids, enabled),
             AppEvent::DuplicateTracksShared(track_ids) => self.duplicate_tracks(track_ids, true),
             AppEvent::DuplicateTracksUnique(track_ids) => self.duplicate_tracks(track_ids, false),
             AppEvent::MoveTrackUp(idx) => self.swap_tracks(idx, idx.saturating_sub(1)),

@@ -515,6 +515,8 @@ impl super::Song {
     ///    ここだけ `Arranger` へ戻すのは、その行はそもそもランチャーが握れない
     ///    (握ると量子化グリッドが自己参照する) から
     /// 6. 消えた列を指す `last_launched_scene_id` を `0` (未発火) へ落とす
+    /// 7. 実効的に無効なトラック (r.md #131) の行の `Launcher` を停止へ落とす
+    ///    ([`Self::stop_launcher_rows_on_disabled_tracks`])
     pub fn normalize_session(&mut self) {
         self.ensure_scene_ids();
         let live_scenes: std::collections::HashSet<u32> =
@@ -595,6 +597,7 @@ impl super::Song {
                 |c| c.clip.id,
             );
         }
+        self.stop_launcher_rows_on_disabled_tracks();
     }
 }
 
@@ -852,6 +855,25 @@ mod tests {
             RowPlayback::LauncherStopped,
             "セルが消えても Arranger へは戻さない (アレンジのクリップが黙って鳴り出す)"
         );
+    }
+
+    /// r.md #131: undo / redo は再生状態をいまの Song から持ち越す。無効化の snapshot へ「有効に戻していた間に撃った
+    /// セル」を持ち越すと、engine の行の集合に居ない行が `Launcher` のまま残り、有効に戻した瞬間に撃ち直される。
+    #[test]
+    fn 無効トラックの行へ持ち越した再生状態は停止へ落ちる() {
+        let mut live = song_with_cell();
+        let cell = live.tracks[0].session_clips[0].clip.id;
+        live.tracks[0].launcher = RowPlayback::Launcher { clip_id: cell };
+
+        let mut enabled = live.clone();
+        enabled.tracks[0].launcher = RowPlayback::LauncherStopped;
+        enabled.carry_playback_state_from(&live);
+        assert_eq!(enabled.tracks[0].launcher, RowPlayback::Launcher { clip_id: cell }, "対照: 有効な行は持ち越す");
+
+        let mut disabled = live.clone();
+        disabled.set_tracks_enabled(&[1], false);
+        disabled.carry_playback_state_from(&live);
+        assert_eq!(disabled.tracks[0].launcher, RowPlayback::LauncherStopped);
     }
 
     #[test]

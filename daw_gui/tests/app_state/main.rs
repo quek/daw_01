@@ -41,5 +41,6 @@ mod song_refs;
 mod state_roundtrip_watchdog;
 mod sync_flush;
 mod track_delete;
+mod track_enable;
 mod track_reparent;
 mod transform_edit_regress;

@@ -195,8 +195,9 @@ pub fn build_plan(
     anchor_secs: impl Fn(f64) -> f64,
 ) -> ModPlan {
     // r.md #115: バイパス中の source (`!enabled`) は計画に載せない (= 値面にも載らず、 それを
-    // 引く routing / 辺は合成側が飛ばす)。 以下の `pos` はこの列の位置。
-    let sources: Vec<&ModSource> = song.mod_sources.iter().filter(|m| m.enabled).collect();
+    // 引く routing / 辺は合成側が飛ばす)。 r.md #131: 無効トラックに帰属する source も同じ
+    // (`Song::mod_source_active`)。 以下の `pos` はこの列の位置。
+    let sources: Vec<&ModSource> = song.mod_sources.iter().filter(|m| song.mod_source_active(m)).collect();
     let n = sources.len();
     let lookup = PlanLookup::new(song, &sources);
     // 1. 辺を集める。id → 元の位置。

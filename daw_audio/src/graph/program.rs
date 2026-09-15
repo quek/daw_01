@@ -216,6 +216,10 @@ pub enum Pass1Role {
     /// `main_to_child` = 楽器の main 出力も子トラックへ送る (全部子、`Track::paraout_main_to_child`)。
     /// pass 1 は自分の scratch を空にし、pass 2 の合流は clearing `Mix` になる (compile の emit と同じ値)。
     GroupWithInstrument { main_to_child: bool },
+    /// r.md #131: 実効的に無効なトラック。device を持たない空の program で、直列トレースにも `nodes` にも手が
+    /// 無い (= CPU を使わない)。scratch は schedule を差し込むときに 1 回だけ無音にする
+    /// (`mixer::silence_disabled_rows`) — 誰も書かないので、メーター / Global Sampler が読んでも無音のまま。
+    Disabled,
 }
 
 /// 1 track (または master) の device ツリーを展開した命令列 + その scratch。

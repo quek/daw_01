@@ -79,6 +79,8 @@
   publish された値面で変調込み) / `TransposeCurve`・`TrackTranspose` (オフライン、変調は焼かない) /
   `Song::track_follows_transpose` / `sounding_key`。engine は `daw_audio::automation::resolve_song_transpose` が
   置き場の索引で lane / routing を引いて呼ぶ。追従の実効値は `SongIndex::follows_transpose` に焼く (RT で祖先を辿らない)。
+  祖先の走査は #131 の「実効的に有効」と `common::model::lineage` を共有し、全トラックを引く口 (索引 / compile /
+  アレンジの view) は `Song::follows_transpose_mask` で 1 回に引く。
 - **発音台帳**は #132 の `daw_audio::note_ledger::NoteLedger` 1 本 (統合時に #130 の台帳を載せ替えた): 照合は note の
   住所 `(clip_id, note_id)`、voice id は台帳が note-on ごとに振り、鍵盤は送った値 (移調込み)。窓ごとに「まだ鳴るべき」
   印を付け、印の無い発音 (再生中の E / Shift+E で前半の片が短くなった / 短くした / 削除 / ミュート / trim や移動で

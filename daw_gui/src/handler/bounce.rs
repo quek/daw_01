@@ -306,6 +306,12 @@ impl AppData {
             self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
             return;
         }
+        // r.md #131: 無効なトラックは実行系に居ない (plugin も host から降りている) ので焼けない。焼くと無音 /
+        // 素通しの音でクリップを置き換えてしまう。
+        if !self.cur.song_doc.song().track_effectively_enabled(target.track_id) {
+            self.ui_ephemeral.status_message = "Bounce: 無効なトラックは焼けません (有効にしてから)".into();
+            return;
+        }
         // 歌唱トラック + builtin plugin_id 解決済み → 合成完了を待ってから render。
         // 待ち中の編集で index が動いても追跡できるよう stable id で退避する。
         let vocal = self

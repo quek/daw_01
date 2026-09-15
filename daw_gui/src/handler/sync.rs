@@ -123,7 +123,9 @@ impl AppData {
         // 安定 device_id keyed)。
         let mut live: std::collections::HashMap<u64, Vec<common::protocol::AraClipSpec>> =
             std::collections::HashMap::new();
-        for track in &self.cur.song_doc.song().tracks {
+        // r.md #131: 無効トラックの ARA device は host に居ない (document を組まない。cache から外れた分は下の stale)。
+        let song = self.cur.song_doc.song();
+        for track in song.tracks.iter().filter(|t| song.track_effectively_enabled(t.id)) {
             for device in track.plugins() {
                 if device.id == 0
                     || !db.find_by_id(&device.plugin_id).is_some_and(|entry| entry.is_ara())
@@ -228,7 +230,8 @@ impl AppData {
         use common::model::{AudioSourcePath, ClipContent};
         // 対象: ARA device を持つ track の audio event が参照する Generated source。
         let mut todo: Vec<common::model::AudioSourceId> = Vec::new();
-        for track in &self.cur.song_doc.song().tracks {
+        let song = self.cur.song_doc.song();
+        for track in song.tracks.iter().filter(|t| song.track_effectively_enabled(t.id)) {
             let has_ara = track
                 .plugins()
                 .any(|d| db.find_by_id(&d.plugin_id).is_some_and(|e| e.is_ara()));

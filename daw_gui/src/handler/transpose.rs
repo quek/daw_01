@@ -107,8 +107,10 @@ impl AppData {
     /// ヘッダの名前の横に「移調に追従しない」印を出すか: 実効的に追従しない (自分か祖先グループで外した)、
     /// または ARA のプラグイン (Melodyne 等) を持つ — ARA はプラグインが素材を直接読むので、ホストの移調が
     /// そのトラックのオーディオに効かない (`docs/plan_rmd_130_transpose.md` の「main が決めた細部」)。
-    pub fn track_shows_no_transpose_mark(&self, track: &Track) -> bool {
-        if !self.cur.song_doc.song().track_follows_transpose(track.id) {
+    /// `follows` はそのトラックの実効的な追従 (`Song::follows_transpose_mask` の値。全トラックを 1 回で引く
+    /// 呼び出し側がトラックごとに祖先を辿らないよう、値で受ける)。
+    pub fn track_shows_no_transpose_mark(&self, track: &Track, follows: bool) -> bool {
+        if !follows {
             return true;
         }
         self.ipc
@@ -201,7 +203,9 @@ mod tests {
         app.edit_song(|song| song.track_by_id_mut(t2).expect("t2").parent_group_id = Some(t1));
         let marks = |app: &crate::state::AppData| {
             let song = app.cur.song_doc.song();
-            [t1, t2].map(|id| app.track_shows_no_transpose_mark(song.track_by_id(id).expect("track")))
+            [t1, t2].map(|id| {
+                app.track_shows_no_transpose_mark(song.track_by_id(id).expect("track"), song.track_follows_transpose(id))
+            })
         };
         assert_eq!(marks(&app), [false, false]);
         app.handle_event(AppEvent::SetTracksFollowTranspose { track_ids: vec![t1], follow: false });

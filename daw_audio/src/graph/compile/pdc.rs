@@ -109,6 +109,11 @@ fn compute_path_latency(
     if cache[idx as usize] != u32::MAX {
         return cache[idx as usize];
     }
+    // r.md #131: 無効トラックはグラフに居ない (合流にも fan-in にも出ない) ので遅延を持たない。
+    if !topo.enabled.get(idx as usize).copied().unwrap_or(false) {
+        cache[idx as usize] = 0;
+        return 0;
+    }
     let track = &song.tracks[idx as usize];
     // 依存先 track の path latency (未計算なら再帰で求めて `cache` に入れる)。
     let path_of =

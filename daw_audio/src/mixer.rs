@@ -181,6 +181,36 @@ pub(crate) fn install_input_delay_lines(
     }
 }
 
+/// r.md #131: 新しい schedule で無効 (`Pass1Role::Disabled`) になった行の scratch を無音にする (schedule を差し込む
+/// 瞬間、audio thread)。無効トラックの行は誰も書かない (手も op も無い) ので、無効になった瞬間に 1 回消せば以後ずっと
+/// 無音 — メーター / Global Sampler / 並べ替えで同じ行に来た別トラックが前の音を読まない。旧 schedule でも無効だった
+/// 行は既に無音なので触らない (定常の差し込みで全無効行を毎回 fill しない)。
+///
+/// 発音台帳 (`PerTrackState::active_notes`) と次の buffer 頭の Off も捨てる。無効トラックの plugin は host から降り
+/// (有効に戻すと載せ直す)、行は sequencer に呼ばれないので、残すと有効に戻したとき「まだ鳴っている」ことになり、
+/// 跨いでいる note を追わない (載せ直した plugin には On が届いていない)。
+///
+/// RT 安全: 事前確保済みの buffer への fill と、容量を保つ clear のみ (1 行あたり `MAX_FRAMES` × 6 本)。
+pub(crate) fn silence_disabled_rows(
+    scratch: &mut [TrackScratch],
+    old_programs: &[crate::graph::ChainProgram],
+    new_programs: &[crate::graph::ChainProgram],
+) {
+    use crate::graph::program::Pass1Role;
+    for (i, (s, p)) in scratch.iter_mut().zip(new_programs).enumerate() {
+        let was_disabled = old_programs.get(i).is_some_and(|o| o.pass1_role == Pass1Role::Disabled);
+        if p.pass1_role != Pass1Role::Disabled || was_disabled {
+            continue;
+        }
+        for buf in [&mut s.track_l, &mut s.track_r, &mut s.pre_fader_l, &mut s.pre_fader_r, &mut s.pre_fx_l, &mut s.pre_fx_r] {
+            buf.fill(0.0);
+        }
+        (s.peak_l, s.peak_r, s.effective_mute) = (0.0, 0.0, false);
+        s.state.active_notes.clear();
+        s.state.pending_offs.clear();
+    }
+}
+
 /// per-track scratch の **成長便** (`RtBundle::scratch_growth`、`docs/plan_unbounded_tracks.md` §2.1)。
 ///
 /// `rows` = index `base..base + rows.len()` の行 (off-thread で確保)。容量は `base + rows.len()` 以上

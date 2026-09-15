@@ -67,6 +67,8 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
         live.automation_clip_drag.as_ref(),
         &mut response,
     );
+    // 6c. r.md #131: 無効トラックの行を沈める (レーンのクリップとランチャーのセルの上に乗るので帯の後)。
+    disabled_rows::draw(ui, &f);
     launcher::release::commit(ui, &f, launcher_sessions, &mut response);
     // 7. caller 向け rect 群の収集。
     rects::collect(&f, &live, &mut response);

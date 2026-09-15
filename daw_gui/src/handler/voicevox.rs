@@ -101,7 +101,7 @@ fn collect_lipsync_snaps(
     let mut talk_snaps: Vec<TalkSnap> = Vec::new();
     let layout = common::lipsync::LipsyncLayout::build(song, target_id);
     for (idx, src) in song.tracks.iter().enumerate() {
-        if src.lipsync_target_track != Some(target_id) {
+        if !common::lipsync::is_lipsync_source(song, src, target_id) {
             continue;
         }
         let priority = idx as u32;
@@ -510,12 +510,17 @@ impl AppData {
         let bpm = self.cur.song_doc.song().bpm;
         // r.md #75: 塊 (= `/sing_frame_audio_query` 1 回) の長さ。アプリ設定が SSoT。
         let chunk_secs = self.voicevox_chunk_secs();
-        let has_vocal_track = self.cur.song_doc.song().tracks.iter().any(|t| t.is_voicevox_vocal());
-        if has_vocal_track {
+        // r.md #131: 無効なトラックは合成しない — メタデータを送ると plugin host の synth thread が自動起動する
+        // (`builtin/voicevox.rs` の `set_note_metadata`)。有効な vocal トラックが無ければ engine も起動しない。
+        let has_live_vocal = {
+            let song = self.cur.song_doc.song();
+            song.tracks.iter().any(|t| t.is_voicevox_vocal() && song.track_effectively_enabled(t.id))
+        };
+        if has_live_vocal {
             self.ensure_voicevox_engine();
         }
         for track in &self.cur.song_doc.song().tracks {
-            if !track.is_voicevox_vocal() {
+            if !track.is_voicevox_vocal() || !self.cur.song_doc.song().track_effectively_enabled(track.id) {
                 continue;
             }
             // builtin VOICEVOX を chain 内に持つ device の安定 id
@@ -769,7 +774,7 @@ impl AppData {
         // snap 収集と**同じ関数**を通る (片方だけ条件が変わる余地を無くす)。
         let layout = common::lipsync::LipsyncLayout::build(song, target_id);
         for (idx, src) in song.tracks.iter().enumerate() {
-            if src.lipsync_target_track != Some(target_id) {
+            if !common::lipsync::is_lipsync_source(song, src, target_id) {
                 continue;
             }
             (idx as u32).hash(&mut h); // priority (= トラック並び順)

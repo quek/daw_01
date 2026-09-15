@@ -209,6 +209,12 @@ impl AppData {
         }
     }
 
+    /// r.md #131: 行が実効的に有効なトラックのものか (マスター行は常に有効)。無効な行のセルは撃てない。
+    #[must_use]
+    pub fn launcher_row_enabled(&self, row: LauncherRow) -> bool {
+        self.cur.song_doc.song().track_effectively_enabled(Self::launcher_row_ids(row).0)
+    }
+
     pub(crate) fn send_launcher_audio(&self, cmd: LauncherAudioCommand) {
         use common::protocol::AudioCommand as A;
         let a = match cmd {
@@ -383,6 +389,10 @@ impl AppData {
     pub fn launch_cell(&mut self, cell: LauncherCellKey, pressed: bool, immediate: bool) {
         use common::model::LaunchMode;
         let row = cell.row();
+        // r.md #131: 無効トラックのセルは発火できない (engine 側も行の集合に居ない)。
+        if !self.launcher_row_enabled(row) {
+            return;
+        }
         let clip_id = cell.clip_id();
         let mode = self.launch_settings_of(cell).map_or(LaunchMode::Trigger, |s| s.mode);
         // Toggle の判定は **いま鳴っているセル** で行う。`Song` 側 (= 最後に撃った
@@ -441,6 +451,9 @@ impl AppData {
     pub fn play_from_cell_beat(&mut self, cell: LauncherCellKey, phase_beats: f64) {
         let row = cell.row();
         let clip_id = cell.clip_id();
+        if !self.launcher_row_enabled(row) {
+            return;
+        }
         self.set_row_playback(row, RowPlayback::Launcher { clip_id });
         match self.cell_beat_to_song_beat(cell, phase_beats) {
             Some(song_beat) => self.action_play_from_cursor(song_beat),
@@ -511,7 +524,8 @@ impl AppData {
             // shifts all tracks to Launcher control)。その列にセルが無い行は停止
             // (計画書 Q11 「空セル = 停止」)。アレンジ主導のまま残すと、シーンを撃った
             // 直後にアレンジの音とセルの音が混ざって鳴る。
-            for row in self.all_launcher_rows() {
+            // r.md #131: 無効トラックの行は触らない (engine の列の発火も掴まない)。
+            for row in self.all_launcher_rows().into_iter().filter(|r| self.launcher_row_enabled(*r)) {
                 let next = match self.cell_in_row_at_scene(row, scene_id) {
                     Some(cell) => RowPlayback::Launcher { clip_id: cell.clip_id() },
                     None => RowPlayback::LauncherStopped,

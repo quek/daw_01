@@ -157,25 +157,16 @@ impl<'a> TrackTranspose<'a> {
 impl Song {
     /// トラック `track_id` が移調に **実効的に** 追従するか: 自分と祖先グループ全部の
     /// [`crate::model::Track::follow_transpose`] が立っている (グループで外すと子もまとめて外れる)。
-    /// 無いトラックは `false`。祖先の走査は [`Song::track_visually_silenced`] と同じ形 (循環は本数で打ち切る)。
+    /// 無いトラックは `false`。祖先の走査は r.md #131 の [`Song::track_effectively_enabled`] と共有する。
     #[must_use]
     pub fn track_follows_transpose(&self, track_id: u32) -> bool {
-        let mut cur = Some(track_id);
-        let mut hops = 0usize;
-        while let Some(id) = cur {
-            if hops > self.tracks.len() {
-                break;
-            }
-            let Some(t) = self.track_by_id(id) else {
-                return hops > 0;
-            };
-            if !t.follow_transpose {
-                return false;
-            }
-            cur = t.parent_group_id;
-            hops += 1;
-        }
-        hops > 0
+        self.lineage_all(track_id, |t| t.follow_transpose)
+    }
+
+    /// song-track index 順の [`Self::track_follows_transpose`] (索引が全トラックを 1 回で引く口)。
+    #[must_use]
+    pub fn follows_transpose_mask(&self) -> Vec<bool> {
+        self.lineage_mask(|t| t.follow_transpose)
     }
 
     /// 移調量が 0 以外になりうるか (基準値 / 有効なレーン / 有効な変調のどれかがある)。engine が
@@ -207,6 +198,7 @@ mod tests {
         song.track_by_id_mut(1).unwrap().follow_transpose = true;
         song.track_by_id_mut(2).unwrap().follow_transpose = false;
         assert_eq!([1, 2, 3, 4].map(|id| song.track_follows_transpose(id)), [true, false, false, true]);
+        assert_eq!(song.follows_transpose_mask(), vec![true, false, false, true], "索引の mask と 1 本の判定は同じ答え");
         assert!(!song.track_follows_transpose(99), "無いトラックは追従しない");
     }
 

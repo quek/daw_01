@@ -280,11 +280,13 @@ fn step_preds(trace: &[Step], nodes: &[NodeOp], res: &Resources) -> Vec<Vec<u32>
 }
 
 impl RenderGraph {
-    /// `nodes` (compile 済みの op 列) と `song` から組む (off-thread)。
+    /// `nodes` (compile 済みの op 列) と `song` から組む (off-thread)。`enabled[i]` = track `i` が実効的に有効か —
+    /// r.md #131: 無効トラックの `Process` は直列トレースに載せない (job にならない = worker を起こさない)。
     #[must_use]
-    pub fn build(song: &Song, nodes: &[NodeOp]) -> Self {
+    pub fn build(song: &Song, nodes: &[NodeOp], enabled: &[bool]) -> Self {
         let res = Resources::new(song);
         let trace: Vec<Step> = (0..song.tracks.len() as u32)
+            .filter(|&i| enabled.get(i as usize).copied().unwrap_or(true))
             .map(Step::Process)
             .chain(
                 nodes

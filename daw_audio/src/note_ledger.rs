@@ -38,7 +38,7 @@
 //! 窓に掛かる note を索引で引く既存の走査のついでに印を付けるだけなので、追加の走査は台帳の中だけ。
 //!
 //! RT 安全: 台帳は再生前に確保した容量の中でだけ push / swap_remove / retain する (確保・解放なし)。
-//! id の空き探しと住所の照合は鳴っている数 (≤ 容量) で有界。
+//! id の空き探しと住所の照合は鳴っている数 + 同じ窓で外した数 (どちらも ≤ 確保した容量) で有界。
 
 use common::plugin_metadata::{TALK_EVENT_ID_BASE, sing_note_id};
 use common::process_data::MAX_EVENTS;

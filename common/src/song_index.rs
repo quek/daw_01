@@ -33,6 +33,8 @@ struct TrackIndex {
     store: ParamStoreIndex,
     /// VOICEVOX の builtin を持つ (読み上げの note を出す、`Track::is_voicevox_vocal`)。
     voicevox_vocal: bool,
+    /// 実効的に有効 (r.md #131、`Song::track_effectively_enabled`)。無効トラックの行はランチャーの行の集合に入らない。
+    enabled: bool,
     /// r.md #130: 移調に実効的に追従する (`Song::track_follows_transpose`、祖先グループまで辿った値)。
     follows_transpose: bool,
     /// `(send id, 位置)` を id 順に (同じ id は先頭だけ)。
@@ -79,10 +81,12 @@ impl SongIndex {
         let tracks = song
             .tracks
             .iter()
-            .map(|t| TrackIndex {
+            .zip(song.effectively_enabled_mask().into_iter().zip(song.follows_transpose_mask()))
+            .map(|(t, (enabled, follows_transpose))| TrackIndex {
                 store: ParamStoreIndex::build(&t.automation_lanes, &t.mod_routings),
                 voicevox_vocal: t.is_voicevox_vocal(),
-                follows_transpose: song.track_follows_transpose(t.id),
+                enabled,
+                follows_transpose,
                 sends: id_positions(t.sends.iter().map(|s| s.id)),
                 clips: RangeIndex::build(t.clips.iter().map(|c| (c.start_beat, c.start_beat + c.length_beats))),
                 cells: CellIndex::build(t.session_clips.iter().map(|c| (c.clip.id, c.scene_id))),
