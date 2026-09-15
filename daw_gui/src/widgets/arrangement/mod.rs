@@ -372,6 +372,9 @@ pub struct ArrangementTrack {
     /// `style.track_color_strip_w` の色縦ストライプを描画 (selected / group / video 背景の上に
     /// 重ねる)。 `None` で既存挙動完全互換 (strip 非描画)。 `ClipView.color` の track 版。
     pub color: Option<Color>,
+    /// r.md #130: ヘッダの名前の横に「移調に追従しない」印を出すか。caller が
+    /// `AppData::track_shows_no_transpose_mark` (祖先グループまで辿った実効値 / ARA) で解いて渡す。
+    pub no_transpose_mark: bool,
 }
 
 // ============================================================
@@ -1616,6 +1619,7 @@ fn synthesize_master_track(master: &ArrangementMasterRow) -> ArrangementTrack {
         automation_lanes: master.automation_lanes.clone(),
         row_h: master.height_px_override,
         color: None,
+        no_transpose_mark: false,
     }
 }
 

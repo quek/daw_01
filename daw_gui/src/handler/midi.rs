@@ -26,6 +26,7 @@ fn learnable_binding(
         T::NativeParam { device_id, param } => Some(B::NativeParam { device_id, param }),
         T::MasterLimiter(p) => Some(B::MasterLimiter(p)),
         T::SongTempo => Some(B::SongTempo),
+        T::SongTranspose => Some(B::SongTranspose),
         T::TrackBuiltin(
             P::Mute
             | P::SendGain { .. }
@@ -90,7 +91,7 @@ impl AppData {
         // **モニター中の音は必ず止める。** note-on の後に割り当てが増えると
         // note-off だけが飲まれ、鳴らしっぱなしになる (押している最中に Learn を
         // 済ませると起こる)。飲むかどうかに関係なく先に消音する。
-        let monitoring = self.cur.recording.monitor_notes.iter().any(|(_, p)| *p == pitch);
+        let monitoring = self.cur.recording.monitor_notes.keys().any(|(_, p)| *p == pitch);
         if self.fire_launcher_bindings(
             channel,
             common::model::MidiBindInput::Note(pitch),
@@ -120,39 +121,37 @@ impl AppData {
 
     /// 1 トラックへの発音 (台帳 `monitor_notes` に控える)。 MIDI 入力は録音待機
     /// トラック全部、 仮想鍵盤 (r.md #113) はカーソルトラック 1 本にこれを呼ぶ。
+    /// r.md #130: 鳴らすのは移調込みの鍵盤 (`send_preview_on`)、台帳はその鍵盤を持つ。
     pub(crate) fn monitor_note_on_track(&mut self, track_id: u32, pitch: u8, velocity: u8) {
         // 同じ鍵の重複 on (auto-repeat / 取りこぼした off) は 1 回に畳む。
-        if !self.cur.recording.monitor_notes.insert((track_id, pitch)) {
+        if self.cur.recording.monitor_notes.contains_key(&(track_id, pitch)) {
             return;
         }
-        self.send_audio(AudioCommand::PreviewNoteOn {
-            project: self.pk(),
-            track_id,
-            pitch,
-            velocity,
-        });
+        if let Some(key) = self.send_preview_on(track_id, pitch, velocity) {
+            self.cur.recording.monitor_notes.insert((track_id, pitch), key);
+        }
     }
 
     /// モニター発音の消音。 arm を外した後に来た note-off でも確実に止められる
-    /// よう、armed の集合ではなく **鳴らした台帳** を引いて off を送る。
+    /// よう、armed の集合ではなく **鳴らした台帳** を引いて off を送る (鍵盤も台帳の値)。
     pub(crate) fn monitor_note_off(&mut self, pitch: u8) {
-        let sounding: Vec<u32> = self
+        let sounding: Vec<(u32, u8)> = self
             .cur.recording
             .monitor_notes
             .iter()
-            .filter(|(_, p)| *p == pitch)
-            .map(|(t, _)| *t)
+            .filter(|((_, p), _)| *p == pitch)
+            .map(|(&(t, _), &key)| (t, key))
             .collect();
-        for track_id in sounding {
+        for (track_id, key) in sounding {
             self.cur.recording.monitor_notes.remove(&(track_id, pitch));
-            self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id, pitch });
+            self.send_preview_off(track_id, key);
         }
     }
 
     /// 鳴らしているモニター音を全て止める (arm 変更 / 停止 / 曲の入れ替え)。
     pub(crate) fn silence_monitor_notes(&mut self) {
-        for (track_id, pitch) in std::mem::take(&mut self.cur.recording.monitor_notes) {
-            self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id, pitch });
+        for ((track_id, _), key) in std::mem::take(&mut self.cur.recording.monitor_notes) {
+            self.send_preview_off(track_id, key);
         }
     }
 
@@ -296,6 +295,13 @@ impl AppData {
                 // plugin host 側の BPM 消費者 (VOICEVOX metadata / ARA / lipsync)
                 // は edit_song の epoch bump を runner の frame flush が拾って追従する
                 // (旧 pending_host_sync coalesce を epoch 一本化で置換)。
+            }
+            // r.md #130: CC 0..127 → -24..=+24 半音 (値域の SSoT は `target_range`)。transport の欄と同じ口。
+            common::model::BindingTarget::SongTranspose => {
+                let range = common::automation::target_range(&common::model::AutomationTarget::SongTranspose, None);
+                #[allow(clippy::cast_possible_truncation)]
+                let semitones = common::transpose::quantize_transpose(range.from_norm(f64::from(v_norm))) as i8;
+                self.set_song_transpose(semitones);
             }
             common::model::BindingTarget::PluginParam {
                 device_id,

@@ -101,6 +101,7 @@ fn track_with_lane(lane: ArrangementAutomationLane) -> ArrangementTrack {
         row_h: None,
         kind: TrackKind::Audio,
         color: None,
+        no_transpose_mark: false,
     }
 }
 

@@ -291,7 +291,12 @@ pub use view_state::{RackPanelKey, ViewState};
 /// [`AutomationTarget::NativeParam`] / [`AutomationTarget::MasterLimiter`] (実 device id) に変わる。
 /// 旧ファイルは `project::migrate_legacy_song` の末尾 (`native_migration::migrate_strips_to_native`) が
 /// 版に依存せず deserialize 前に移す (旧形と新形は重ならないので冪等)。
-pub const CURRENT_VERSION: u32 = 39;
+///
+/// v41 (r.md #130 グローバルトランスポーズ、`docs/plan_rmd_130_transpose.md`): [`Song::transpose`]・
+/// [`Track::follow_transpose`]・[`AutomationTarget::SongTranspose`]・[`BindingTarget::SongTranspose`] を追加。
+/// 旧ファイルは `serde(default)` (移調 0 / 全トラック追従) で読める。新ファイルを旧ビルドで開くと unknown variant で
+/// 落ちるので版で弾く。
+pub const CURRENT_VERSION: u32 = 41;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -665,6 +670,12 @@ pub struct Song {
     /// 消えた列を指していたら [`Song::normalize_session`] が `0` へ落とす。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub last_launched_scene_id: u32,
+    /// v41 (r.md #130): **グローバルトランスポーズの基準値** (半音、`-24..=24`)。ノートのデータは書き換えない
+    /// 非破壊の曲パラメーターで、テンポと同じくレーン (`AutomationTarget::SongTranspose`) と変調を受ける。
+    /// 実効値の評価は [`crate::transpose::transpose_in_clip`] 1 本、追従するトラックは
+    /// [`Song::track_follows_transpose`]。書き出す音が変わるので曲の一部 (undo / `*`)。旧 file は 0。
+    #[serde(default, skip_serializing_if = "is_zero_i8")]
+    pub transpose: i8,
 }
 
 /// v34 以前の `.daw` に無いので 1 小節へ forward-migrate (Live / Bitwig / Studio One と同じ既定)。
@@ -723,6 +734,7 @@ impl Default for Song {
             scenes: Vec::new(),
             global_launch_quantize: DEFAULT_GLOBAL_LAUNCH_QUANTIZE,
             last_launched_scene_id: 0,
+            transpose: 0,
         }
     }
 }
@@ -1450,6 +1462,11 @@ impl Song {
 /// serde `skip_serializing_if` 用: `u32` が 0 か。`Clip::speaker_id`
 /// の「未採番は serialize しない」に使う。
 fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+/// serde `skip_serializing_if` 用: `i8` が 0 か (`Song::transpose` の「移調なしは書かない」)。
+fn is_zero_i8(v: &i8) -> bool {
     *v == 0
 }
 

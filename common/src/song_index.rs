@@ -33,6 +33,8 @@ struct TrackIndex {
     store: ParamStoreIndex,
     /// VOICEVOX の builtin を持つ (読み上げの note を出す、`Track::is_voicevox_vocal`)。
     voicevox_vocal: bool,
+    /// r.md #130: 移調に実効的に追従する (`Song::track_follows_transpose`、祖先グループまで辿った値)。
+    follows_transpose: bool,
     /// `(send id, 位置)` を id 順に (同じ id は先頭だけ)。
     sends: Vec<(u32, u32)>,
     /// アレンジの clip `[start_beat, start_beat + length_beats)`。
@@ -80,6 +82,7 @@ impl SongIndex {
             .map(|t| TrackIndex {
                 store: ParamStoreIndex::build(&t.automation_lanes, &t.mod_routings),
                 voicevox_vocal: t.is_voicevox_vocal(),
+                follows_transpose: song.track_follows_transpose(t.id),
                 sends: id_positions(t.sends.iter().map(|s| s.id)),
                 clips: RangeIndex::build(t.clips.iter().map(|c| (c.start_beat, c.start_beat + c.length_beats))),
                 cells: CellIndex::build(t.session_clips.iter().map(|c| (c.clip.id, c.scene_id))),
@@ -152,6 +155,12 @@ impl SongIndex {
     #[must_use]
     pub fn is_voicevox_vocal(&self, track_idx: usize) -> bool {
         self.tracks.get(track_idx).is_some_and(|t| t.voicevox_vocal)
+    }
+
+    /// `tracks[track_idx]` が移調に追従するか (`Song::track_follows_transpose`、RT が祖先を辿らないため)。
+    #[must_use]
+    pub fn follows_transpose(&self, track_idx: usize) -> bool {
+        self.tracks.get(track_idx).is_some_and(|t| t.follows_transpose)
     }
 
     /// `tracks[track_idx]` の send id の send。

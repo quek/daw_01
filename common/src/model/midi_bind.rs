@@ -80,6 +80,9 @@ pub enum BindingTarget {
     /// curve とは独立 (= curve がある場合は curve が優先、 CC は base bpm を
     /// 動かすイメージ)。
     SongTempo,
+    /// v41 (r.md #130): `Song.transpose` (CC 0..127 を `-24..=24` 半音へ linear マップして丸める)。
+    /// `SongTempo` と同じく基準値を動かす (レーンがあればレーンが優先)。
+    SongTranspose,
     /// plugin parameter bind (r.md #8 B2)。 安定 `device_id` で plugin instance を
     /// 特定 (`AutomationTarget::PluginParam` と同じ addressing)、 `param_id` は
     /// format ごと (CLAP `clap_id` / VST3 `ParamID`)。 CC 受信時は

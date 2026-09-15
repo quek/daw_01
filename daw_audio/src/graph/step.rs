@@ -43,6 +43,9 @@ pub struct BufferParams<'a> {
     pub follower_drive: FollowerDrive<'a>,
     pub rows: &'a RowSourceTable,
     pub native_io: NativeIo<'a>,
+    /// r.md #130: この buffer の曲の移調量 (半音、`crate::automation::resolve_song_transpose`)。追従しない
+    /// トラックへは `process_track_owned` が 0 にして渡す。
+    pub transpose: i32,
 }
 
 /// 1 buffer の描画の文脈。**dispatch 窓の間だけ** 生きる (callback スレッドのスタック上に作り、並列実行では
@@ -208,6 +211,7 @@ pub fn run_step(ctx: &RenderCtx<'_>, step: Step, slot: usize) {
                     p.mod_plane,
                     p.rows.track_rows(i as usize),
                     p.native_io,
+                    p.transpose,
                 );
             }
             Step::Node(k) => {

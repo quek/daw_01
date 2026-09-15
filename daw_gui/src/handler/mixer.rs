@@ -643,16 +643,17 @@ impl AppData {
             // r.md #51: arm を外した瞬間に、そのトラックで鳴らしていたモニター音を
             // 止める。 note-off はもう届かない (armed でないので送り先から外れる) ので、
             // ここで消さないと鍵盤を離しても鳴り続ける。
-            let held: Vec<u8> = self
+            // 止めるのは台帳の **送った鍵盤** (r.md #130、移調込み)。
+            let held: Vec<(u8, u8)> = self
                 .cur.recording
                 .monitor_notes
                 .iter()
-                .filter(|(t, _)| *t == track_id)
-                .map(|(_, p)| *p)
+                .filter(|((t, _), _)| *t == track_id)
+                .map(|(&(_, p), &key)| (p, key))
                 .collect();
-            for pitch in held {
+            for (pitch, key) in held {
                 self.cur.recording.monitor_notes.remove(&(track_id, pitch));
-                self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id, pitch });
+                self.send_preview_off(track_id, key);
             }
         }
     }

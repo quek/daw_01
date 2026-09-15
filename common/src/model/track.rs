@@ -183,6 +183,20 @@ pub struct Track {
     /// 書き出す音もこの状態で決まる (`docs/plan_rmd_87_clip_launcher.md` Q9 / Q10)。
     #[serde(default, skip_serializing_if = "RowPlayback::is_arranger")]
     pub launcher: RowPlayback,
+    /// v41 (r.md #130): グローバルトランスポーズに追従するか (既定 `true`、ドラムや効果音のトラックで外す)。
+    /// 実効値は祖先グループまで辿った [`Song::track_follows_transpose`] — 評価はそこ 1 本を通す。
+    /// 書き出す音が変わるので Song に置く (undo / `*`)。旧 file は `true` で読む。
+    #[serde(default = "default_follow_transpose", skip_serializing_if = "is_default_follow_transpose")]
+    pub follow_transpose: bool,
+}
+
+/// v40 以前の `.daw` にはフィールドが無い = 全トラックが移調に追従する。
+fn default_follow_transpose() -> bool {
+    true
+}
+
+fn is_default_follow_transpose(v: &bool) -> bool {
+    *v
 }
 
 /// Where a `Send` taps the source track's signal chain.
@@ -269,6 +283,7 @@ impl Default for Track {
             mouth_map: None,
             session_clips: Vec::new(),
             launcher: RowPlayback::Arranger,
+            follow_transpose: default_follow_transpose(),
         }
     }
 }

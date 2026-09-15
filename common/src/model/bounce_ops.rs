@@ -39,6 +39,9 @@ impl Song {
     /// - **ランチャーの主導権は必ずアレンジへ戻す**: 行が [`RowPlayback::Launcher`] /
     ///   `LauncherStopped` のままだと、offline 走査は「今のセッションの状態」を再現する
     ///   (= セルの音が鳴り、アレンジのクリップは鳴らない) ので、焼く対象が丸ごと入れ替わる。
+    /// - **移調 0 で焼く** (r.md #130 確定仕様 Q8): 焼いた音は元のトラック / 新しいトラックでもう一度移調に
+    ///   追従するので、移調を焼き込むと二重に移調される。「外に出すもの (WAV / SMF) = 鳴る音、プロジェクトの
+    ///   中に作るもの = 書いた音」。基準値を 0 にし、移調のレーンと変調も外す (深さの変調は下の掃除が連鎖で外す)。
     #[must_use]
     pub fn isolated_track(&self, track_id: u32) -> Option<Song> {
         let mut kept = self.track_by_id(track_id)?.clone();
@@ -56,6 +59,9 @@ impl Song {
         }
         let mut isolated = self.clone();
         isolated.tracks = vec![kept];
+        isolated.transpose = 0;
+        isolated.song_lanes.retain(|l| l.target != AutomationTarget::SongTranspose);
+        isolated.song_mod_routings.retain(|r| r.target != AutomationTarget::SongTranspose);
         isolated.prune_dangling_refs();
         Some(isolated)
     }
@@ -298,6 +304,29 @@ mod tests {
         assert!(isolated.master_limiter.on, "master の段は Song に残し、scope が通さない");
         assert_eq!(isolated.song_lanes.len(), song.song_lanes.len());
         assert_eq!(isolated.master_fx_chain, song.master_fx_chain);
+    }
+
+    /// r.md #130 Q8: 焼き込みは書いた音 (移調 0) で描く。基準値・移調のレーン・移調の変調が外れ、
+    /// 他の song 側のレーン / 変調とトラックの追従設定は残る (焼いた音はもう一度移調に追従する)。
+    #[test]
+    fn isolated_track_renders_without_transpose() {
+        let mut song = Song { transpose: 5, ..Song::default() };
+        let tid = song.alloc_track_id();
+        song.tracks = vec![Track { follow_transpose: false, ..track(tid) }];
+        song.mod_sources.push(ModSource { id: 1, owner_track_id: MASTER_TRACK_ID, color: [1.0; 3], kind: ModSourceKind::default(), enabled: true });
+        let routing = |id, target| ModRouting { id, target, source_id: 1, depth: 0.5, polarity: Polarity::Unipolar, enabled: true };
+        song.song_lanes = vec![
+            AutomationLane { id: 1, ..AutomationLane::new(AutomationTarget::SongTranspose, 3.0) },
+            AutomationLane { id: 2, ..AutomationLane::new(AutomationTarget::SongTempo, 120.0) },
+        ];
+        song.song_mod_routings = vec![routing(1, AutomationTarget::SongTranspose), routing(2, AutomationTarget::SongTempo)];
+
+        let isolated = song.isolated_track(tid).expect("isolated");
+        assert_eq!(isolated.transpose, 0);
+        assert!(!isolated.transpose_can_be_nonzero(), "移調が 0 以外になる経路が残らない");
+        assert_eq!(isolated.song_lanes.iter().map(|l| l.id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(isolated.song_mod_routings.iter().map(|r| r.id).collect::<Vec<_>>(), vec![2]);
+        assert!(!isolated.tracks[0].follow_transpose, "追従設定は写したまま");
     }
 
     /// Bounce with FX の置き方 = PostFx 点から後ろを写す規則: フェーダー (値 / レーン / 変調とその深さ) / send /

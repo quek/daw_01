@@ -90,6 +90,11 @@ pub fn target_range(target: &AutomationTarget, plugin_range: Option<(f64, f64)>)
         // control の表示レンジ (transport.rs SCRUB_STYLE_BPM / SCRUB_STYLE_TSIG_NUM)。
         AutomationTarget::SongTempo => ParamRange::Linear { lo: 1.0, hi: 400.0 },
         AutomationTarget::SongTimeSigNumerator => ParamRange::Linear { lo: 1.0, hi: 32.0 },
+        // r.md #130: 半音 (`crate::transpose::TRANSPOSE_MAX_SEMITONES` が幅の SSoT)。
+        AutomationTarget::SongTranspose => {
+            let max = f64::from(crate::transpose::TRANSPOSE_MAX_SEMITONES);
+            ParamRange::Linear { lo: -max, hi: max }
+        }
         AutomationTarget::ImageBuiltin(p) => match p {
             I::Rotation => ROTATION,
             I::X | I::Y | I::W | I::H | I::Opacity => UNIT,
@@ -814,7 +819,7 @@ pub fn samples_to_beats(song: &Song, sample_rate: u32, target_sample: u64) -> f6
 /// `[start_beat, start_beat + length_beats)` contains `song_beat`.
 /// Returns the *first* match — overlapping clips on the same lane are
 /// not expected in practice but are tolerated.
-fn clip_covering(clips: &[AutomationClip], song_beat: f64) -> Option<&AutomationClip> {
+pub(crate) fn clip_covering(clips: &[AutomationClip], song_beat: f64) -> Option<&AutomationClip> {
     clips.iter().find(|c| {
         c.length_beats > 0.0
             && song_beat >= c.start_beat
@@ -1405,6 +1410,7 @@ mod tests {
                 | AutomationTarget::MasterLimiter(_)
                 | AutomationTarget::SongTempo
                 | AutomationTarget::SongTimeSigNumerator
+                | AutomationTarget::SongTranspose
                 | AutomationTarget::ImageBuiltin(_)
                 | AutomationTarget::TextBuiltin(_)
                 | AutomationTarget::GroupTransform(_)
@@ -1433,7 +1439,7 @@ mod tests {
             v.extend(NativeParamId::all_of(kind).iter().map(|&param| AutomationTarget::NativeParam { device_id: 1, param }));
         }
         v.extend([MasterLimiterParam::On, MasterLimiterParam::Ceiling].map(AutomationTarget::MasterLimiter));
-        v.extend([AutomationTarget::SongTempo, AutomationTarget::SongTimeSigNumerator]);
+        v.extend([AutomationTarget::SongTempo, AutomationTarget::SongTimeSigNumerator, AutomationTarget::SongTranspose]);
         v.extend([I::X, I::Y, I::W, I::H, I::Opacity, I::Rotation].map(AutomationTarget::ImageBuiltin));
         v.extend(
             [

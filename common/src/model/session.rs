@@ -891,7 +891,8 @@ mod tests {
         // 旧 file か手編集だけ。放置すると「保存されるのに永久に鳴らないセル」と、
         // `LauncherStopped` で `default_value` に張り付いたテンポが残る。
         let mut song = song_with_cell();
-        for target in [AutomationTarget::SongTempo, AutomationTarget::SongTimeSigNumerator] {
+        // r.md #130: 移調のレーンも同じ扱い (オフラインの歌声 / SMF がアレンジのカーブで解くため)。
+        for target in [AutomationTarget::SongTempo, AutomationTarget::SongTimeSigNumerator, AutomationTarget::SongTranspose] {
             let mut lane = AutomationLane::new(target, 120.0);
             lane.id = song.song_lanes.len() as u32 + 1;
             lane.session_clips.push(SessionAutomationClip {

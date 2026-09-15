@@ -872,7 +872,8 @@ pub fn handle_project_command(
         | AudioCommand::SetParallelActiveChain { .. }
         | AudioCommand::SetParallelSelectorFade { .. }
         | AudioCommand::SetSongBpm { .. }
-        | AudioCommand::SetSongTimeSigNumerator { .. }) => {
+        | AudioCommand::SetSongTimeSigNumerator { .. }
+        | AudioCommand::SetSongTranspose { .. }) => {
             ctl.update_song_values(engine_shared, session_sample_rate, phase_tables, |s| {
                 song_values::apply(&cmd, s);
             });

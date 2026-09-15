@@ -352,13 +352,26 @@ impl AppData {
     /// audio engine の song を full song へ戻す。 これは epoch flush とは独立の明示
     /// 直接 send: isolated 送出も restore も edit_epoch を動かさないので
     /// `flush_song_sync` は no-op (epoch 一致) のまま = 自力で full song を送り直さ
-    /// ないと engine が isolate された 1 トラックのままになる。 vocal / ARA 等の派生
-    /// 同期は不要 (song 内容は bounce 前と同一)。
+    /// ないと engine が isolate された 1 トラックのままになる。 ARA 等の派生同期は不要
+    /// (song 内容は bounce 前と同一)。**歌唱のメタデータだけは送り直す** — 焼いている間は書いた音
+    /// (移調 0、r.md #130 Q8) で送っていたので、移調込みへ戻す (差分キャッシュの比較で、移調していない曲や
+    /// 歌唱でない bounce では何も送らない)。
     pub(crate) fn restore_engine_song_after_bounce(&mut self) {
         let song = self.cur.song_doc.song().clone();
         // LoadSong の全送出点でマスター音量を Song に揃える (bounce 側の送出と同じ規則)。
         self.send_audio(AudioCommand::SetMasterGain { project: self.pk(), gain: song.master_gain });
         self.send_audio(AudioCommand::LoadSong { project: self.pk(), song });
+        self.sync_vocal_metadata();
+    }
+
+    /// いま **焼いている** (歌唱の合成待ち / offline render 中の) トラック。そのトラックの歌唱メタデータは書いた音
+    /// (移調 0) で送る (r.md #130 Q8: 焼いた音はもう一度移調に追従する)。
+    pub(crate) fn baking_vocal_track(&self) -> Option<u32> {
+        let pipc = &self.cur.pipc;
+        pipc.pending_vocal_synth_bounce
+            .as_ref()
+            .map(|p| p.track_id)
+            .or_else(|| pipc.pending_clip_fx_bounce.as_ref().map(|p| p.source_track_id))
     }
 
     /// PR-C: BounceClipFxOnline 完了通知の処理。 SetRenderMode(Realtime)

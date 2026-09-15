@@ -54,10 +54,13 @@ pub struct TimedParamEvent {
 /// loop-wrap.
 #[derive(Default)]
 pub struct PerTrackState {
-    /// Notes currently sounding on this track as `(note_id, key)`. Used to flush stuck
-    /// notes on Stop / loop wrap. **note_id を持ち回るのが要点** — CLAP / VST3 のプラグインは
+    /// **発音台帳**: この track で鳴っている note の `(note_id, 送った鍵盤)`。Stop / loop wrap / seek の一括消音と、
+    /// 通常の Off / 鳴らし直しが引く。**note_id を持ち回るのが要点** — CLAP / VST3 のプラグインは
     /// note-off をノート id で voice に当てる (`-1` だけが「未指定」) ので、 `0` や別 id の
     /// Off は無視されて鳴りっぱなしになる (Surge XT で停止しても止まらなかった)。
+    ///
+    /// **鍵盤は送った値を持つ** (r.md #130)。Off をその時点の `note.pitch` / 移調量から計算し直すと、鳴っている
+    /// 間に音程や移調が変わったとき別の鍵盤を止めにいき、旧鍵盤が停止まで残る。照合は note_id だけで行う。
     pub active_notes: Vec<(u32, u8)>,
     /// NoteOffs `(note_id, key)` that must fire at frame 0 of the *next* buffer (after
     /// Stop / clip-end) so notes don't hang.
@@ -195,78 +198,167 @@ fn for_each_in_window<T, const N: usize>(
     }
 }
 
-/// 1 つの note の On / chase / Off をこの窓で emit する ([`collect_events_for_buffer`] の本体)。
-/// `note` は呼び出し側で muted / 長さ 0 / clip 窓外を除外済み。
+/// 窓 1 つぶんの **発音台帳** ([`PerTrackState::active_notes`]) の読み書き口。
+///
+/// 台帳が「送った鍵盤」の SSoT で、Off と鳴らし直しは台帳の鍵盤で出す (r.md #130)。照合は note_id だけ。
+/// `seen[i]` は「`notes[i]` がこの窓でもまだ鳴っているべきだと確かめた」印で、窓の終わりに印の無い発音
+/// (= 鳴らすべき note がもう無い: 再生中にミュートした / 消した / 後ろへ動かした / clip ごと外れた) は
+/// [`Self::sweep`] が窓の先頭で止める。止めないと、その Off は二度と来ず停止まで鳴り続ける。
+///
+/// RT 安全: 印はスタックの配列、台帳は `ACTIVE_NOTES_CAP` を超えて伸ばさない。
+struct Ledger<'a> {
+    notes: &'a mut Vec<(u32, u8)>,
+    seen: [bool; ACTIVE_NOTES_CAP],
+}
+
+impl<'a> Ledger<'a> {
+    fn new(notes: &'a mut Vec<(u32, u8)>) -> Self {
+        Self { notes, seen: [false; ACTIVE_NOTES_CAP] }
+    }
+
+    fn find(&self, note_id: u32) -> Option<usize> {
+        self.notes.iter().position(|&(id, _)| id == note_id)
+    }
+
+    fn key(&self, i: usize) -> u8 {
+        self.notes[i].1
+    }
+
+    fn is_full(&self) -> bool {
+        self.notes.len() >= ACTIVE_NOTES_CAP
+    }
+
+    /// 印を付ける。容量の外 (テストが上限を超えて積んだ分) は印を持たない = 掃除しない側に倒す。
+    fn mark(&mut self, i: usize) {
+        if let Some(s) = self.seen.get_mut(i) {
+            *s = true;
+        }
+    }
+
+    /// 呼び出し側が [`Self::is_full`] を確かめてから呼ぶ。
+    fn push(&mut self, note_id: u32, key: u8) {
+        self.notes.push((note_id, key));
+        self.mark(self.notes.len() - 1);
+    }
+
+    fn remove(&mut self, i: usize) {
+        let last = self.notes.len() - 1;
+        self.notes.swap_remove(i);
+        let moved = self.seen.get(last).copied().unwrap_or(true);
+        if let Some(s) = self.seen.get_mut(i) {
+            *s = moved;
+        }
+        if let Some(s) = self.seen.get_mut(last) {
+            *s = false;
+        }
+    }
+
+    /// 印の無い発音を `at` frame で止める。`out` が満杯なら止めずに残す (次の窓 / 停止の一括消音が拾う。
+    /// 握りつぶして台帳から外すと stuck note になる)。
+    fn sweep(&mut self, out: &mut Vec<TimedNoteEvent>, at: u32) {
+        for i in (0..self.notes.len()).rev() {
+            if self.seen.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            if out.len() >= MAX_EVENTS {
+                return;
+            }
+            let (note_id, key) = self.notes[i];
+            out.push(TimedNoteEvent { time: at, event: NoteTransition::Off { note_id, key } });
+            self.remove(i);
+        }
+    }
+}
+
+/// 1 つの note の On / chase / 鳴らし直し / Off をこの窓で emit する ([`collect_events_for_buffer`] の本体)。
+/// `note` は呼び出し側で muted / 長さ 0 / clip 窓外を除外済み。`key` はこの窓で鳴るべき鍵盤
+/// (移調込み、範囲外で鳴らさないなら `None`)。
+#[allow(clippy::too_many_arguments)]
 fn emit_note_events(
     win: BufferWindow,
     clip: &Clip,
     clip_end_beats: f64,
     note: &Note,
     note_id: u32,
+    key: Option<u8>,
     out: &mut Vec<TimedNoteEvent>,
-    active_notes: &mut Vec<(u32, u8)>,
+    ledger: &mut Ledger<'_>,
 ) {
     // beat-domain で note の絶対 beat 位置を求める。 Off は clip 末端
     // で clamp (= 旧 sample-domain ロジックと同 idiom)。
     let on_abs_beat = clip.content_to_song_beat(note.start_beat);
     let raw_off_abs_beat = clip.content_to_song_beat(note.start_beat + note.duration_beats);
     let off_abs_beat = raw_off_abs_beat.min(clip_end_beats);
-    let is_active = |active_notes: &[(u32, u8)]| {
-        active_notes.iter().any(|&(id, k)| id == note_id && k == note.pitch)
-    };
-    let on_event = NoteTransition::On {
-        note_id,
-        key: note.pitch,
-        velocity: f64::from(note.velocity) / 127.0,
-    };
+    let velocity = f64::from(note.velocity) / 127.0;
+    let active = ledger.find(note_id);
 
     if let Some(on_frame) = win.frame_in(on_abs_beat) {
-        // RT-safe: 容量超過分は drop し `Vec` 再確保を避ける。 On を
-        // drop したら対応する `active_notes` も積まず整合を保つ
-        // (= 後で flush しても残らない)。 `out` は `MAX_EVENTS`、
-        // `active_notes` は `ACTIVE_NOTES_CAP` でクランプ。
-        if out.len() >= MAX_EVENTS || active_notes.len() >= ACTIVE_NOTES_CAP {
+        // この窓で発音が始まる。同じ note の古い発音 (再生中に後ろへ動かした等) が台帳に残っていれば、
+        // 台帳の鍵盤で先に止める (同時刻は Off → On の順に並ぶ)。
+        if let Some(i) = active {
+            if out.len() >= MAX_EVENTS {
+                ledger.mark(i);
+                return;
+            }
+            out.push(TimedNoteEvent { time: on_frame, event: NoteTransition::Off { note_id, key: ledger.key(i) } });
+            ledger.remove(i);
+        }
+        // RT-safe: 容量超過分は drop し `Vec` 再確保を避ける。 On を drop したら台帳にも積まず
+        // 整合を保つ (= 後で flush しても残らない)。
+        let Some(key) = key else { return };
+        if out.len() >= MAX_EVENTS || ledger.is_full() {
             return;
         }
-        out.push(TimedNoteEvent { time: on_frame, event: on_event });
-        active_notes.push((note_id, note.pitch));
-    } else if win.offset(on_abs_beat) < 0.0 && !is_active(active_notes) {
-        // r.md #120 (note chase): 窓の先頭を **跨いで鳴っているはずなのに追跡集合に
-        // 無い** note は、 その場で On を出す。 「鳴っているはず」 は note の区間、
-        // 「追跡集合に無い」 は Play の起点 / seek / loop wrap / ランチャー区間の
-        // 切れ目 (どれも `active_notes` を空にする) と、 範囲書き出しの走査開始を
-        // 全部同じ条件で拾う (= 経路ごとの「chase して」 flag を配らない)。 定常再生
-        // 中は On を出した時点で追跡集合に入るので二度は鳴らない。
-        //
-        // 残りが 1 sample 未満の note は追わない (鳴らしても 1 sample の断片)。残りが 1 sample 以上なら Off は
-        // `boundary_frame` で frame 1 以降に落ちるので、同時刻の Off → On (`collect_events_for_buffer` 末尾の
-        // sort 契約) で On が Off の後に残る stuck note にもならない。
-        if (off_abs_beat - win.playhead_beats) * win.samples_per_beat < 1.0 - 1e-6 {
-            return;
+        out.push(TimedNoteEvent { time: on_frame, event: NoteTransition::On { note_id, key, velocity } });
+        ledger.push(note_id, key);
+    } else if win.offset(on_abs_beat) < 0.0 {
+        // 残りが 1 sample 未満の note は追わない / 鳴らし直さない (鳴らしても 1 sample の断片)。残りが
+        // 1 sample 以上なら Off は `boundary_frame` で frame 1 以降に落ちるので、同時刻の Off → On
+        // (`collect_events_for_buffer` 末尾の sort 契約) で On が Off の後に残る stuck note にもならない。
+        let remains = (off_abs_beat - win.playhead_beats) * win.samples_per_beat >= 1.0 - 1e-6;
+        match (active, key) {
+            // 終わりかけ: この窓の Off (下、台帳の鍵盤) が止める。Off を取りこぼしていた発音は印が無いので
+            // 窓の終わりの掃除が止める。
+            (Some(_), _) if !remains => {}
+            // 鳴っている鍵盤のまま続く (定常再生)。
+            (Some(i), Some(k)) if ledger.key(i) == k => ledger.mark(i),
+            // バスが満杯なら鳴らし直しは次の窓に回す (印を付けて掃除させない)。
+            (Some(i), _) if out.len() + 2 > MAX_EVENTS => ledger.mark(i),
+            // r.md #130 (確定仕様 Q3): 鳴っている鍵盤と今鳴るべき鍵盤が違う (再生中に音程 / 移調 / 追従が
+            // 変わった) → 台帳の鍵盤を窓の先頭で止め、新しい鍵盤で鳴らし直す (範囲外になったら止めるだけ)。
+            (Some(i), next) => {
+                out.push(TimedNoteEvent {
+                    time: win.time_offset,
+                    event: NoteTransition::Off { note_id, key: ledger.key(i) },
+                });
+                ledger.remove(i);
+                if let Some(k) = next {
+                    out.push(TimedNoteEvent { time: win.time_offset, event: NoteTransition::On { note_id, key: k, velocity } });
+                    ledger.push(note_id, k);
+                }
+            }
+            // r.md #120 (note chase): 窓の先頭を **跨いで鳴っているはずなのに台帳に無い** note は、その場で
+            // On を出す。「台帳に無い」は Play の起点 / seek / loop wrap / ランチャー区間の切れ目 (どれも台帳を
+            // 空にする) と、範囲書き出しの走査開始を全部同じ条件で拾う (= 経路ごとの「chase して」 flag を
+            // 配らない)。定常再生中は On を出した時点で台帳に入るので二度は鳴らない。
+            (None, Some(k)) if remains && out.len() < MAX_EVENTS && !ledger.is_full() => {
+                out.push(TimedNoteEvent { time: win.time_offset, event: NoteTransition::On { note_id, key: k, velocity } });
+                ledger.push(note_id, k);
+            }
+            (None, _) => {}
         }
-        if out.len() >= MAX_EVENTS || active_notes.len() >= ACTIVE_NOTES_CAP {
-            return;
-        }
-        out.push(TimedNoteEvent { time: win.time_offset, event: on_event });
-        active_notes.push((note_id, note.pitch));
     }
     if off_abs_beat > on_abs_beat
         && let Some(off_frame) = win.frame_in(off_abs_beat)
+        && let Some(i) = ledger.find(note_id)
     {
-        // RT-safe: `out` 容量超過時は Off を emit せず、 `active_notes`
-        // からも除かない (= 後続の Stop / loop-wrap flush で NoteOff が
-        // 送られ note が残らない)。 push できない Off を握りつぶして
-        // 追跡解除すると stuck note になるため、 両方とも skip する。
+        // RT-safe: `out` 容量超過時は Off を emit せず、台帳からも除かない (= 後続の Stop / loop-wrap flush で
+        // NoteOff が送られ note が残らない)。push できない Off を握りつぶして追跡解除すると stuck note になる。
         if out.len() >= MAX_EVENTS {
             return;
         }
-        out.push(TimedNoteEvent {
-            time: off_frame,
-            event: NoteTransition::Off { note_id, key: note.pitch },
-        });
-        if let Some(pos) = active_notes.iter().position(|&(id, k)| id == note_id && k == note.pitch) {
-            active_notes.swap_remove(pos);
-        }
+        out.push(TimedNoteEvent { time: off_frame, event: NoteTransition::Off { note_id, key: ledger.key(i) } });
+        ledger.remove(i);
     }
 }
 
@@ -291,6 +383,11 @@ fn emit_note_events(
 /// (従来と完全に同じ挙動)。ランチャー行は「セル 1 つのスライス」と、
 /// ループ端で割った区間の開始 frame を渡す。`playhead_beats` はその区間の実効拍。
 /// 割り方は `crate::launcher::render` が唯一の口 (ここには分岐を持ち込まない)。
+///
+/// r.md #130: 鍵盤は `note.pitch + transpose` (`common::transpose::sounding_key`、範囲外は鳴らさない)。
+/// `transpose` は呼び出し側が buffer 頭で解いた曲の移調量で、追従しないトラックは 0。値が変わった窓では、
+/// 鳴っている note を台帳の鍵盤で止めて新しい鍵盤で鳴らし直す ([`emit_note_events`])。窓の終わりに、鳴らすべき
+/// note が見つからなかった台帳の発音を窓の先頭で止める ([`Ledger::sweep`])。
 #[allow(clippy::too_many_arguments)]
 pub fn collect_events_for_buffer(
     song: Option<&Song>,
@@ -305,6 +402,7 @@ pub fn collect_events_for_buffer(
     current_bpm: f32,
     frames: u32,
     time_offset: u32,
+    transpose: i32,
     out: &mut Vec<TimedNoteEvent>,
     active_notes: &mut Vec<(u32, u8)>,
 ) {
@@ -316,6 +414,7 @@ pub fn collect_events_for_buffer(
     let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(current_bpm);
     let win = BufferWindow { playhead_beats, samples_per_beat, frames, time_offset };
     let window = win.beat_span();
+    let mut ledger = Ledger::new(active_notes);
 
     // note_id は `(clip.id, note.id)` からの決定論的導出
     // (`common::plugin_metadata::sing_note_id`)。daw_gui の `sync_vocal_metadata` が
@@ -371,9 +470,11 @@ pub fn collect_events_for_buffer(
             if note.start_beat < win_start || note.start_beat >= win_end {
                 return;
             }
-            emit_note_events(win, clip, clip_end_beats, note, note_id, out, active_notes);
+            let key = common::transpose::sounding_key(note.pitch, transpose);
+            emit_note_events(win, clip, clip_end_beats, note, note_id, key, out, &mut ledger);
         });
     });
+    ledger.sweep(out, time_offset);
 
     // (talk) 読み上げトリガ (`docs/plan_voicevox_talk.md` §3.4)。VOICEVOX デバイス付き
     // トラックの `ClipContent::Text` の各 TextEvent 開始位置で、合成 note_on を発火する。
@@ -452,6 +553,22 @@ mod tests {
         out: &mut Vec<TimedNoteEvent>,
         active_notes: &mut Vec<(u32, u8)>,
     ) {
+        collect_transposed(song, track_idx, sample_rate, playhead_beats, current_bpm, frames, 0, out, active_notes);
+    }
+
+    /// [`collect`] の移調つき版。
+    #[allow(clippy::too_many_arguments)]
+    fn collect_transposed(
+        song: Option<&Song>,
+        track_idx: u32,
+        sample_rate: u32,
+        playhead_beats: f64,
+        current_bpm: f32,
+        frames: u32,
+        transpose: i32,
+        out: &mut Vec<TimedNoteEvent>,
+        active_notes: &mut Vec<(u32, u8)>,
+    ) {
         let empty: &[Clip] = &[];
         let clips = song
             .and_then(|s| s.tracks.get(track_idx as usize))
@@ -468,6 +585,7 @@ mod tests {
             current_bpm,
             frames,
             0,
+            transpose,
             out,
             active_notes,
         );
@@ -825,8 +943,8 @@ mod tests {
         out.clear();
         let index = SongIndex::build(&song);
         collect_events_for_buffer(
-            Some(&song), &index, 0, &song.tracks[0].clips, index.track_clips(0), SR, 1.5, 120.0, 512, 512, &mut out,
-            &mut active,
+            Some(&song), &index, 0, &song.tracks[0].clips, index.track_clips(0), SR, 1.5, 120.0, 512, 512, 0,
+            &mut out, &mut active,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].time, 512);
@@ -841,6 +959,89 @@ mod tests {
         collect(Some(&song), 0, SR, 2.0 - 0.5 / SPB as f64, 120.0, 1024, &mut out, &mut active);
         assert!(out.iter().all(|e| matches!(e.event, NoteTransition::Off { .. })), "{out:?}");
         assert!(active.is_empty());
+    }
+
+    /// `(time, On か, key)` の列。
+    fn transitions(out: &[TimedNoteEvent]) -> Vec<(u32, bool, u8)> {
+        out.iter()
+            .map(|e| match e.event {
+                NoteTransition::On { key, .. } => (e.time, true, key),
+                NoteTransition::Off { key, .. } => (e.time, false, key),
+            })
+            .collect()
+    }
+
+    /// r.md #130 (確定仕様 Q3 / Q4): 再生中に移調が変わると、鳴っている note は **台帳の鍵盤で** 止まり新しい
+    /// 鍵盤で鳴り直す。範囲外 (127 超) へ出たら止まるだけで、戻れば鳴り直す。最後の Off も台帳の鍵盤で出て、
+    /// 台帳に何も残らない。
+    #[test]
+    fn 再生中に移調が変わると台帳の鍵盤で止めて新しい鍵盤で鳴らし直す() {
+        let song = one_note_song(0.0, 4.0, 120);
+        let id = common::plugin_metadata::sing_note_id(1, 1);
+        let mut active = Vec::new();
+        let mut step = |beat: f64, frames: u32, transpose: i32| {
+            let mut out = Vec::new();
+            collect_transposed(Some(&song), 0, SR, beat, 120.0, frames, transpose, &mut out, &mut active);
+            (transitions(&out), active.clone())
+        };
+        assert_eq!(step(0.0, 512, 0), (vec![(0, true, 120)], vec![(id, 120)]));
+        assert_eq!(step(1.0, 512, 2), (vec![(0, false, 120), (0, true, 122)], vec![(id, 122)]), "鳴らし直し");
+        assert_eq!(step(1.5, 512, 2), (vec![], vec![(id, 122)]), "同じ移調のままなら何も出さない");
+        assert_eq!(step(2.0, 512, 12), (vec![(0, false, 122)], vec![]), "範囲外へ出たら止めるだけ");
+        assert_eq!(step(2.5, 512, 12), (vec![], vec![]), "範囲外の間は鳴らさない");
+        assert_eq!(step(3.0, 512, -1), (vec![(0, true, 119)], vec![(id, 119)]), "範囲に戻れば途中から鳴る");
+        let end = 4.0 - 100.0 / SPB as f64;
+        assert_eq!(step(end, 200, -1), (vec![(100, false, 119)], vec![]), "Off は台帳の鍵盤 (本来の位置)");
+    }
+
+    /// r.md #130 が一緒に直した既存の欠陥: 再生中にノートの音程を変えると (↑↓ / スケール補正)、旧鍵盤を止めて
+    /// 新しい鍵盤で鳴らし直す。以前は Off を `note.pitch` から計算し直していたので、旧鍵盤が停止まで鳴り残った。
+    #[test]
+    fn 再生中にノートの音程を変えても旧鍵盤が残らない() {
+        let mut song = one_note_song(0.0, 4.0, 60);
+        let mut active = Vec::new();
+        let mut out = Vec::new();
+        collect(Some(&song), 0, SR, 0.0, 120.0, 512, &mut out, &mut active);
+        assert_eq!(transitions(&out), vec![(0, true, 60)]);
+
+        let cid = song.tracks[0].clips[0].content_id;
+        song.clip_contents.get_mut(&cid).unwrap().notes_mut().expect("Midi")[0].pitch = 64;
+        out.clear();
+        collect(Some(&song), 0, SR, 1.0, 120.0, 512, &mut out, &mut active);
+        assert_eq!(transitions(&out), vec![(0, false, 60), (0, true, 64)]);
+
+        out.clear();
+        collect(Some(&song), 0, SR, 4.0 - 100.0 / SPB as f64, 120.0, 200, &mut out, &mut active);
+        assert_eq!(transitions(&out), vec![(100, false, 64)]);
+        assert!(active.is_empty(), "鳴り残りが無い: {active:?}");
+    }
+
+    /// 再生中に鳴っている note をミュート / 削除 / clip ごとミュートすると、次の窓の先頭で台帳の鍵盤が止まる。
+    /// 止めないと、その note の Off は二度と来ず停止まで鳴り続ける。
+    #[test]
+    fn 再生中に鳴らなくなった_note_は次の窓の先頭で止まる() {
+        let edits: [(&str, fn(&mut Song)); 3] = [
+            ("note をミュート", |s| {
+                let cid = s.tracks[0].clips[0].content_id;
+                s.clip_contents.get_mut(&cid).unwrap().notes_mut().expect("Midi")[0].muted = true;
+            }),
+            ("note を削除", |s| {
+                let cid = s.tracks[0].clips[0].content_id;
+                s.clip_contents.get_mut(&cid).unwrap().notes_mut().expect("Midi").clear();
+            }),
+            ("clip をミュート", |s| s.tracks[0].clips[0].muted = true),
+        ];
+        for (label, edit) in edits {
+            let mut song = one_note_song(0.0, 4.0, 60);
+            let mut active = Vec::new();
+            let mut out = Vec::new();
+            collect(Some(&song), 0, SR, 0.0, 120.0, 512, &mut out, &mut active);
+            edit(&mut song);
+            out.clear();
+            collect(Some(&song), 0, SR, 1.0, 120.0, 512, &mut out, &mut active);
+            assert_eq!(transitions(&out), vec![(0, false, 60)], "{label}");
+            assert!(active.is_empty(), "{label}: {active:?}");
+        }
     }
 
     #[test]

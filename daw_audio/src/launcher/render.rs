@@ -34,6 +34,9 @@ pub fn collect_row_midi(
     playhead_beats: f64,
     current_bpm: f32,
     frames: u32,
+    // r.md #130: この行の移調量 (半音、追従しないトラックは 0)。アレンジ区間もセルの区間も同じ値
+    // (移調は曲のタイムラインのパラメーターで、セルの位相には依らない)。
+    transpose: i32,
     out: &mut Vec<TimedNoteEvent>,
     active_notes: &mut Vec<(u32, u8)>,
 ) {
@@ -87,6 +90,7 @@ pub fn collect_row_midi(
             current_bpm,
             seg.frames(),
             seg.start_frame,
+            transpose,
             out,
             active_notes,
         );
@@ -115,6 +119,8 @@ pub fn render_row_audio(
     current_bpm: f32,
     sample_rate: u32,
     frames: u32,
+    // r.md #130: この行の移調量 (半音、追従しないトラックは 0)。
+    transpose: i32,
     state: &mut ClipRenderState<'_>,
 ) {
     let bpf = beats_per_frame(current_bpm, sample_rate);
@@ -136,6 +142,7 @@ pub fn render_row_audio(
             current_bpm,
             sample_rate,
             seg_frames,
+            transpose,
             state,
         );
     });
@@ -385,7 +392,7 @@ mod tests {
         let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
         let mut out = Vec::with_capacity(256);
         let mut active = Vec::with_capacity(256);
-        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 3.99, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 3.99, 120.0, 512, 0, &mut out, &mut active);
 
         let ons: Vec<u32> = out
             .iter()
@@ -428,7 +435,7 @@ mod tests {
         // 撃った直後の buffer: On が出る。
         let mut out = Vec::with_capacity(256);
         let mut active = Vec::with_capacity(256);
-        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, 0, &mut out, &mut active);
         assert!(
             out.iter().any(|e| matches!(
                 e.event,
@@ -438,7 +445,7 @@ mod tests {
         );
         // ループ端を跨ぐ buffer: Off と次の周の On が両方出る。
         let mut out = Vec::with_capacity(256);
-        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 3.99, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 3.99, 120.0, 512, 0, &mut out, &mut active);
         assert!(
             out.iter().any(|e| matches!(
                 e.event,
@@ -484,7 +491,7 @@ mod tests {
         while beat < launch + 11.0 {
             let mut out = Vec::with_capacity(64);
             collect_row_midi(
-                Some(&song), &index, 0, src, 48_000, beat, 120.0, 512, &mut out, &mut active,
+                Some(&song), &index, 0, src, 48_000, beat, 120.0, 512, 0, &mut out, &mut active,
             );
             ons += out
                 .iter()
@@ -527,7 +534,7 @@ mod tests {
 
         // 1 buffer 目: セルが鳴り出す。
         let playing = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
-        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,playing, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,playing, 48_000, 0.0, 120.0, 512, 0, &mut out, &mut active);
         assert_eq!(active.len(), 1, "セルの note が鳴っていない: {out:?}");
         assert_eq!(active[0].1, 60, "セルの note が鳴っていない: {out:?}");
 
@@ -539,7 +546,7 @@ mod tests {
             tail: RowPhase::Arranger,
             switch_frame: 0,
         };
-        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,switch, 48_000, 2.0, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,switch, 48_000, 2.0, 120.0, 512, 0, &mut out, &mut active);
         let offs: Vec<u32> = out
             .iter()
             .filter(|e| {
@@ -558,7 +565,7 @@ mod tests {
         let src = RowTimeSource::uniform(RowKey::track(1), RowPhase::Arranger);
         let mut out = Vec::with_capacity(256);
         let mut active = Vec::with_capacity(256);
-        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, 0, &mut out, &mut active);
         assert!(out.is_empty(), "アレンジには clip が無いのに鳴った: {out:?}");
     }
 
@@ -568,7 +575,7 @@ mod tests {
         let src = RowTimeSource::uniform(RowKey::track(1), RowPhase::Silent);
         let mut out = Vec::with_capacity(256);
         let mut active = Vec::with_capacity(256);
-        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, &mut out, &mut active);
+        collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, 0, &mut out, &mut active);
         assert!(out.is_empty());
     }
 
@@ -687,6 +694,7 @@ mod tests {
                     beat,
                     120.0,
                     512,
+                    0,
                     &mut out,
                     &mut active,
                 );
@@ -836,8 +844,10 @@ mod rt_assert_tests {
                 rt.publish(telemetry, span.start_beat);
                 let src = rt.rows().track_row(0);
                 out.clear();
+                // r.md #130: 移調を途中で何度も変えて、鳴っている note の鳴らし直しも検査に入れる。
+                let transpose = if (i / 16) % 2 == 0 { 0 } else { 3 };
                 collect_row_midi(
-                    Some(&song), &index, 0, src, 48_000, beat, 120.0, 512, &mut out, &mut active,
+                    Some(&song), &index, 0, src, 48_000, beat, 120.0, 512, transpose, &mut out, &mut active,
                 );
                 render_row_audio(
                     &renderer,
@@ -849,6 +859,7 @@ mod rt_assert_tests {
                     120.0,
                     48_000,
                     512,
+                    0,
                     &mut ClipRenderState {
                         repitch_accum: &mut accum,
                         engines: &mut engines,

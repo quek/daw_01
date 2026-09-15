@@ -37,6 +37,7 @@ pub mod song_index;
 pub mod tempo_map;
 pub mod time;
 pub mod timing;
+pub mod transpose;
 pub mod truepeak;
 pub mod video_fx;
 pub mod voicevox;

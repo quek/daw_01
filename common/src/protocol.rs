@@ -556,6 +556,9 @@ pub enum AudioCommand {
     SetSongBpm { project: ProjectKey, bpm: f32 },
     /// TimeSig 分子の軽量更新。 1..=32 で clamp 想定。
     SetSongTimeSigNumerator { project: ProjectKey, num: u8 },
+    /// r.md #130: 移調の基準値 (`Song::transpose`、半音) の軽量更新。値のみ (BPM と同じく transport の
+    /// scrub 中に毎 frame 流れうる)。受け側で ±`TRANSPOSE_MAX_SEMITONES` に丸める。
+    SetSongTranspose { project: ProjectKey, semitones: i8 },
     /// GUI が現在 recording 中の lane (track + target) を audio thread に
     /// 通知する。 該当 lane の curve eval を bypass する。 空 Vec = なし。
     SetRecordingLanes {
@@ -744,6 +747,7 @@ impl AudioCommand {
             | SetTrackArmed { project, .. }
             | SetSongBpm { project, .. }
             | SetSongTimeSigNumerator { project, .. }
+            | SetSongTranspose { project, .. }
             | SetRecordingLanes { project, .. }
             | SetMetronomeEnabled { project, .. }
             | PreviewNoteOn { project, .. }

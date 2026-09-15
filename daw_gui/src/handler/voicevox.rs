@@ -9,12 +9,24 @@ use crate::event::*;
 use common::model::Clip;
 use common::plugin_format::PluginFormat;
 use common::protocol::{PluginCommand, VocalSynthFailure};
+use common::transpose::TrackTranspose;
 
 /// 口パクの生成物 (アレンジの clip / 列のセル) を目標形へ畳む純関数群。
 /// `AppData` 側の面倒 (発注 / debounce / binding) とは分けて持つ。
 mod mouth_rebuild;
 
 use mouth_rebuild::{rebuild_mouth_clip, rebuild_mouth_containers, split_spans_by_container};
+
+/// `clip` のノート `note` を **歌う音程** (r.md #130: 移調込み、範囲外で歌わないなら `None`)。
+///
+/// 歌唱のメタデータ ([`collect_sing_metadata`])・口パクの問い合わせ ([`collect_lipsync_snaps`])・その入力
+/// fingerprint ([`hash_lipsync_clip`]) が **この 1 本** を通す (合成と口の形で別の音程を使わない / 開いただけで
+/// fingerprint がずれない)。`in_song` = アレンジのクリップ (ノート開始の曲の拍で移調量を解く)。ランチャーの
+/// セルは曲の位置を持たないので曲の基準値 (`TrackTranspose::key`)。
+/// 範囲外を 0 に丸めない — 0 は VOICEVOX で休符と衝突する。
+fn sung_pitch(transpose: &TrackTranspose<'_>, clip: &Clip, in_song: bool, note: &common::model::Note) -> Option<u8> {
+    transpose.key(note.pitch, in_song.then(|| clip.content_to_song_beat(note.start_beat)))
+}
 
 /// 口パクの入力 clip / セル 1 つを fingerprint へ混ぜる
 /// ([`AppData::lipsync_input_fingerprint`] の 1 要素ぶん)。
@@ -27,10 +39,12 @@ fn hash_lipsync_clip(
     clip: &Clip,
     place: &common::lipsync::FlatPlacement,
     source: &common::lipsync::LipsyncSource<'_>,
+    transpose: &TrackTranspose<'_>,
 ) {
     use std::hash::Hash;
     place.container.hash(h);
-    if place.container == common::lipsync::LipsyncContainer::Arrangement {
+    let in_song = place.container == common::lipsync::LipsyncContainer::Arrangement;
+    if in_song {
         clip.start_beat.to_bits().hash(h);
     }
     // r.md #44: 窓 (offset) も配置に効くので fingerprint に含める
@@ -39,12 +53,12 @@ fn hash_lipsync_clip(
     clip.content_offset_beats.to_bits().hash(h);
     match source {
         // sing: build_sing_query が読む note フィールドのみ
-        // (`velocity` / `muted` は phoneme へ影響しないので含めない)。
+        // (`velocity` / `muted` は phoneme へ影響しないので含めない)。音程は歌う音程 (移調込み)。
         common::lipsync::LipsyncSource::Sing { notes, .. } => {
             for n in *notes {
                 n.start_beat.to_bits().hash(h);
                 n.duration_beats.to_bits().hash(h);
-                n.pitch.hash(h);
+                sung_pitch(transpose, clip, in_song, n).hash(h);
                 n.lyric.hash(h);
             }
         }
@@ -91,14 +105,23 @@ fn collect_lipsync_snaps(
             continue;
         }
         let priority = idx as u32;
+        let transpose = TrackTranspose::of(song, src.id);
         for (clip, place) in layout.placements(src) {
             match common::lipsync::lipsync_source_of(song, clip) {
                 // sing: phoneme 列 frame 0 は「基準ノートの `REST_FRAMES` 手前」に来る
                 // (= 合成 wav 先頭と同じ位置、r.md #39)。r.md #44: phoneme は
                 // content-local 起点なので原点基準で置き、長さの上限は窓の末尾にする。
-                Some(common::lipsync::LipsyncSource::Sing { notes, base_beat }) => {
+                // r.md #130: 問い合わせるのは **歌う音程** のノート (合成のメタデータと同じ移調、範囲外は
+                // 歌わないので除く)。基準ノートも歌うノートから引き直す。
+                Some(common::lipsync::LipsyncSource::Sing { notes, .. }) => {
+                    let in_song = place.container == common::lipsync::LipsyncContainer::Arrangement;
+                    let sung: Vec<common::model::Note> = notes
+                        .iter()
+                        .filter_map(|n| Some(common::model::Note { pitch: sung_pitch(&transpose, clip, in_song, n)?, ..n.clone() }))
+                        .collect();
+                    let Some(base_beat) = common::voicevox::sing_base_beat(&sung) else { continue };
                     let head = common::voicevox::sing_head_beat(base_beat, bpm) - place.shift;
-                    snaps.push((place.origin, place.window_len, head, priority, notes.to_vec()));
+                    snaps.push((place.origin, place.window_len, head, priority, sung));
                 }
                 // talk: phoneme 列 frame 0 = wav 先頭 = 「発話開始の pre-silence 分手前」
                 // (現行 pre-silence は 0 なので event 開始)。
@@ -216,10 +239,16 @@ fn arrangement_synth_end_beat(song: &common::model::Song, clip: &Clip, bpm: f32)
 /// アレンジのクリップは `base_beat == 0.0` なので従来と同じ値になる。
 /// `clip_id` は `note_id` の導出元であり、合成進捗のクリップ帰属にも使う (r.md #75)。
 /// `speaker_id` は per-clip 歌唱声 (`0` = builtin 側で `DEFAULT_SINGER_ID` へフォールバック)。
+///
+/// r.md #130: `pitch` は **歌う音程** ([`sung_pitch`]、移調込み)。範囲外で歌わないノートは載せない
+/// (sequencer も同じノートを鳴らさない)。`in_song` = アレンジのクリップ。VOICEVOX のキャッシュキーは音程を
+/// 含むので、移調すると再合成され、元に戻せばキャッシュに当たる。
 fn collect_sing_metadata(
     song: &common::model::Song,
     clip: &Clip,
     base_beat: f64,
+    transpose: &TrackTranspose<'_>,
+    in_song: bool,
 ) -> Vec<common::plugin_metadata::NoteMetadata> {
     let notes: &[common::model::Note] = song
         .clip_contents
@@ -228,16 +257,18 @@ fn collect_sing_metadata(
         .unwrap_or(&[]);
     notes
         .iter()
-        .map(|n| common::plugin_metadata::NoteMetadata {
-            note_id: common::plugin_metadata::sing_note_id(clip.id, n.id),
-            start_beat: base_beat + clip.content_to_song_beat(n.start_beat),
-            duration_beats: n.duration_beats,
-            pitch: n.pitch,
-            velocity: n.velocity,
-            lyric: n.lyric.clone().unwrap_or_default(),
-            clip_id: clip.id,
-            speaker_id: clip.speaker_id,
-            cell_base_beat: base_beat,
+        .filter_map(|n| {
+            Some(common::plugin_metadata::NoteMetadata {
+                note_id: common::plugin_metadata::sing_note_id(clip.id, n.id),
+                start_beat: base_beat + clip.content_to_song_beat(n.start_beat),
+                duration_beats: n.duration_beats,
+                pitch: sung_pitch(transpose, clip, in_song, n)?,
+                velocity: n.velocity,
+                lyric: n.lyric.clone().unwrap_or_default(),
+                clip_id: clip.id,
+                speaker_id: clip.speaker_id,
+                cell_base_beat: base_beat,
+            })
         })
         .collect()
 }
@@ -500,9 +531,20 @@ impl AppData {
             // 曲頭で歌い出す** ので、走査と原点は必ず `synth_clips_with_base` 1 本で
             // 揃える (r.md #87)。
             let clips = synth_clips_with_base(song, track, bpm);
+            // r.md #130: 歌うのは移調込みの音程。ただし **このトラックを焼いている間は書いた音** (Q8: 焼いた音は
+            // もう一度移調に追従するので、移調を焼き込むと二重になる)。焼き終えたら差分キャッシュの比較で
+            // 移調込みのメタデータが自動で送り直される。
+            let transpose = if self.baking_vocal_track() == Some(track.id) {
+                TrackTranspose::written(song)
+            } else {
+                TrackTranspose::of(song, track.id)
+            };
             let entries: Vec<common::plugin_metadata::NoteMetadata> = clips
                 .iter()
-                .flat_map(|&(clip, base)| collect_sing_metadata(song, clip, base))
+                .flat_map(|&(clip, base)| {
+                    let in_song = track.clip_index_by_id(clip.id).is_some();
+                    collect_sing_metadata(song, clip, base, &transpose, in_song)
+                })
                 .collect();
             let talk: Vec<common::plugin_metadata::TalkMetadata> = clips
                 .iter()
@@ -731,10 +773,11 @@ impl AppData {
                 continue;
             }
             (idx as u32).hash(&mut h); // priority (= トラック並び順)
+            let transpose = TrackTranspose::of(song, src.id);
             for (clip, place) in layout.placements(src) {
                 // snap を生成する clip (notes 有り / 非空 text 有り) だけが出力に効く。
                 if let Some(source) = common::lipsync::lipsync_source_of(song, clip) {
-                    hash_lipsync_clip(&mut h, clip, &place, &source);
+                    hash_lipsync_clip(&mut h, clip, &place, &source, &transpose);
                 }
             }
         }

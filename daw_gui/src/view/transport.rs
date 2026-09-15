@@ -40,6 +40,11 @@ const BEAT_READOUT_W: f32 = 66.0;
 /// タイム表記 (`分:秒.ミリ秒`) の枠幅。 最長表記は `999:59.999`。
 const TIME_READOUT_W: f32 = 66.0;
 
+/// r.md #130: `Transpose` ラベルが占める幅 (ラベルの後ろの隙間込み) と、数値欄の幅。最長表記は `-24`。
+/// 実 measure で収まることは `transpose_fits_its_slots` が固定する。
+const TRANSPOSE_LABEL_W: f32 = 62.0;
+const TRANSPOSE_FIELD_W: f32 = 40.0;
+
 /// Phase 5 Step 5.1 follow-up (gui_01 #035): BPM scrubable_number style。
 /// sensitivity 0.5 = `1 px drag で 0.5 BPM 変化` (Ableton 流の感度)、
 /// range は SetSongBpmFromScrub handler の clamp と同じ 1..=400。
@@ -290,12 +295,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let cy = area.y + (area.h - 28.0) * 0.5;
     let bh = 28.0;
 
-    // 左詰め列は 4 つのまとまりに分けて、running `x` をバケツリレーする。
+    // 左詰め列はまとまりごとに分けて、running `x` をバケツリレーする。
     // 分けてあるのは実コード 300 行 budget (不変条件 9) のため — r.md #87 の
     // ランチャー用コントロールを足す前に、既存の `draw` を責務ごとに割った。
-    // **並び順はこの 4 行が SSoT**。
+    // **並び順はこの 5 行が SSoT** (r.md #130: 移調は Key の右隣)。
     let mut x = area.x + pad;
     x = draw_tempo_and_key(app, ui, area, x, cy, bh);
+    x = draw_transpose(app, ui, area, x, cy, bh);
     x = draw_playback_buttons(app, ui, area, x, cy, bh);
     x = draw_recording_controls(app, ui, x, cy, bh);
     // 左詰め列の最後尾。 ここで `x` を進めても誰も読まないので捨てる —
@@ -545,6 +551,69 @@ fn draw_tempo_and_key(
     x + scale_w + 12.0
 }
 
+/// r.md #130: グローバルトランスポーズ (`Transpose [+2]`、Key の右隣)。
+///
+/// 操作は BPM と同じ: 縦ドラッグ (1 半音 / 10 px) / クリックで入力 / ダブルクリックで 0 / ◉ で変調 /
+/// ドラッグ中はレーンの録音 (`push_param_gesture`)。**0 以外は数字に色** を付ける (移調したまま気付かない
+/// ことを防ぐ)。色はテーマの accent (固定色を書かない)。表示は基準値 `Song::transpose` (レーンの
+/// カーブや変調の到達値は欄の変調帯が見せる = BPM と同じ)。
+fn draw_transpose(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    mut x: f32,
+    cy: f32,
+    bh: f32,
+) -> f32 {
+    let p = &app.theme.core;
+    ui.label_at("transport_transpose_label", "Transpose", x, area.y + (area.h - 12.0) * 0.5, 12.0, p.text);
+    x += TRANSPOSE_LABEL_W;
+
+    let song = app.cur.song_doc.song();
+    let target = AutomationTarget::SongTranspose;
+    let value = f64::from(song.transpose);
+    let max = f64::from(common::transpose::TRANSPOSE_MAX_SEMITONES);
+    let style = ScrubableNumberStyle {
+        text_color: if song.transpose == 0 { p.text } else { p.accent },
+        sensitivity: 0.1,
+        range: Some((-max, max)),
+        ..scrub_style_bpm(&app.theme)
+    };
+    let modulation = crate::view::modulation::build_mod(
+        app,
+        target.clone(),
+        value,
+        crate::view::modulation::PLAIN_IDENT,
+        crate::view::native_device::ParamOwner::master(song),
+    );
+    let w = TRANSPOSE_FIELD_W;
+    let resp = ui.scrubable_number_at(
+        "transport_transpose",
+        Rect { x, y: cy, w, h: bh },
+        value,
+        0.0,
+        crate::automation_value::TRANSPOSE_FORMAT,
+        &style,
+        move |v: f64| {
+            #[allow(clippy::cast_possible_truncation)]
+            let next = common::transpose::quantize_transpose(v) as i8;
+            Edit::mutate(move |app: &mut AppData| app.handle_event(AppEvent::SetSongTranspose(next)))
+        },
+        None,
+        Some(modulation.modulation()),
+    );
+    crate::view::modulation::push_mod_depth_bracket(
+        ui,
+        app,
+        ParamSurface::Transport,
+        MASTER_TRACK_ID,
+        &target,
+        resp.mod_dragging,
+    );
+    push_param_gesture(ui, app, ParamSurface::Transport, MASTER_TRACK_ID, target, resp.dragging);
+    x + w + 12.0
+}
+
 /// 再生位置の読み値 + Play / Rec / Loop / Follow のまとまり。
 fn draw_playback_buttons(
     app: &AppData,
@@ -788,6 +857,7 @@ fn draw_recording_controls(
             ) => "Learn Param",
             Some(common::model::BindingTarget::TrackPan(_)) => "Learn Pan",
             Some(common::model::BindingTarget::SongTempo) => "Learn Tempo",
+            Some(common::model::BindingTarget::SongTranspose) => "Learn Trsp",
             _ => "Learn Vol",
         }
     };
@@ -905,5 +975,23 @@ mod tests {
             time_w <= TIME_READOUT_W,
             "タイム最長表記 '999:59.999' ({time_w}px @ {READOUT_FONT}pt) が枠 {TIME_READOUT_W}px に収まる"
         );
+    }
+
+    /// r.md #130: `Transpose` ラベルは隙間を残して枠に収まり、数値欄は最長表記 `-24` を内側余白込みで出せる
+    /// (`label_at` / 数値欄は clip しないので、はみ出すと隣の欄に文字が重なる)。
+    #[test]
+    fn transpose_fits_its_slots() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        let theme = crate::theme::Theme::default();
+        let style = scrub_style_bpm(&theme);
+        let (mut label_w, mut field_w) = (0.0_f32, 0.0_f32);
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            label_w = ui.measure_text("Transpose", 12.0);
+            field_w = ui.measure_text(&crate::automation_value::TRANSPOSE_FORMAT.format_value(-24.0), style.font_size);
+        });
+        assert!(label_w + 2.0 <= TRANSPOSE_LABEL_W, "ラベル {label_w}px が枠 {TRANSPOSE_LABEL_W}px に収まる");
+        assert!(field_w + style.pad_x * 2.0 <= TRANSPOSE_FIELD_W, "'-24' {field_w}px が欄 {TRANSPOSE_FIELD_W}px に収まる");
     }
 }

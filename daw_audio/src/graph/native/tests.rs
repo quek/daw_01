@@ -276,6 +276,7 @@ fn stage_native_taps(sched: &mut Schedule, scratch: &mut [TrackScratch], song: &
         follower_drive: FollowerDrive::default(),
         rows: &rows,
         native_io: NativeIo::default(),
+        transpose: 0,
     };
     let ctx = crate::graph::step::RenderCtx::new(song, index, sched, scratch, &mut ml, &mut mr, &refs, None, None, params);
     crate::graph::step::run_nodes_for_test(&ctx, |op| matches!(op, NodeOp::NativeSidechainTap { .. }));
@@ -644,7 +645,7 @@ fn native_ops_and_sidechain_staging_do_not_allocate() {
         // PreFx tap (自トラック Pre-FX を読む Comp 21) を持つ track の pass 1 全体。
         crate::graph::process_track_owned(
             1, &song.tracks[1], &mut scratch[1], p, &refs, None, None, SR, n as u32, true, Some(song), index, false, false, 0,
-            &rec, 120.0, b as f64, LoopRegion::default(), ModTickPlaneRef::default(), TrackRows::default(), io,
+            &rec, 120.0, b as f64, LoopRegion::default(), ModTickPlaneRef::default(), TrackRows::default(), io, 0,
         );
     };
     step(0, &song, &song_index, &mut scratch, &mut sched); // warm-up

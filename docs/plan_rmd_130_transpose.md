@@ -74,6 +74,24 @@
 - バウンス (`handler/bounce.rs:244-268`): 焼く isolated Song は移調 0 (移調のオートメーション・変調も外す)。できた
   トラック / クリップの追従は元と同じ (Q8)。
 
+### 実装で決めた細部 (worktree `rmd-130-transpose`)
+- **評価の口**は `common/src/transpose.rs` 1 ファイル: `transpose_in_clip` (唯一の式) / `transpose_at` (GUI プレビュー、
+  publish された値面で変調込み) / `TransposeCurve`・`TrackTranspose` (オフライン、変調は焼かない) /
+  `Song::track_follows_transpose` / `sounding_key`。engine は `daw_audio::automation::resolve_song_transpose` が
+  置き場の索引で lane / routing を引いて呼ぶ。追従の実効値は `SongIndex::follows_transpose` に焼く (RT で祖先を辿らない)。
+- **発音台帳** (`sequencer::Ledger`): 照合は note_id だけ、鍵盤は送った値。窓ごとに「まだ鳴るべき」印を付け、
+  印の無い発音 (再生中にミュート / 削除 / 後ろへ移動 / clip ごと外れた note) は窓の先頭で止める
+  (同じ根 = 「台帳を今の Song と突き合わせない」の同件として一緒に直した)。
+- **オーディオ**: 移調されうる event (`RenderedEvent::transposable` = 追従トラック && `Song::transpose_can_be_nonzero`)
+  だけに compile 時にスペクトルエンジンを用意し、tape / slice は移調 0 の間は完全バイパスのまま。
+- **ランチャーのセルの VOICEVOX 歌唱 / 口パク**: 曲の位置を持たないので曲の基準値 `Song::transpose` で解く
+  (アレンジのクリップはノート開始の曲の拍のレーン値)。engine のセルの MIDI は再生時の曲の playhead の値。
+- **演奏プレビュー**: 押している間に移調が変わっても鳴らし直さない (台帳の鍵盤で止めるだけ)。鳴らし直すのは再生中の
+  ノートだけ (Q3)。MIDI Capture の試聴も移調込みの鍵盤で送る。
+- **歌唱の Bounce**: 焼いている間 (`AppData::baking_vocal_track`) はそのトラックの歌唱メタデータを書いた音で送り、
+  終わったら差分キャッシュの比較で移調込みへ戻す。
+- **印の字形**は `♮` (二次テキスト色、名前帯の右端)。MIDI Learn ボタンのラベルは `Learn Trsp`。
+
 ## テスト (高いレイヤーで、本番の算術を写すだけのテストは書かない)
 - engine: 再生中に移調を変えると旧鍵盤の off と新鍵盤の on が出て、停止時に残りが無い (シーケンサ / mixer の単体で)。
 - 既存欠陥の回帰: 再生中にノートの pitch を変えても旧鍵盤が残らない。

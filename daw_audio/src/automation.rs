@@ -287,6 +287,36 @@ pub fn resolve_master_limiter(
     out
 }
 
+/// この buffer の **移調量** (半音、r.md #130) を解決する。`store` は song 側の置き場。
+///
+/// 評価は `common::transpose::transpose_in_clip` 1 本 (GUI のプレビュー / VOICEVOX / SMF と同じ式) で、ここは
+/// 置き場の索引で lane (有効かつ録音中でないもの) と routing を引いて渡すだけ。**block-rate** — 鍵盤は buffer の
+/// 頭の値で決め、値が変わった buffer で鳴っているノートを鳴らし直す (`crate::sequencer`、確定仕様 Q3)。
+/// 移調のレーンにランチャーのセルは置けない (`AutomationTarget::accepts_launcher_cells`) のでアレンジのカーブだけを見る。
+///
+/// RT 安全: 確保・ロックなし。
+pub fn resolve_song_transpose(
+    song: &Song,
+    store: ParamStore<'_>,
+    playhead_beats: f64,
+    recording_lanes: &RecordingLanes,
+    mod_plane: ModTickPlaneRef<'_>,
+) -> i32 {
+    let target = AutomationTarget::SongTranspose;
+    // 録音中はカーブを評価せず基準値 (= ノブの値) を素通しする (テンポ / 音量と同じ規則)。
+    let lane = store
+        .enabled_lane(&target)
+        .filter(|_| !is_recording(recording_lanes, common::model::MASTER_TRACK_ID, &target));
+    common::transpose::transpose_in_clip(
+        song,
+        lane.map(|v| (v.lane, v.arrangement_clip(playhead_beats))),
+        store.routings_for(&target).iter(),
+        |id| mod_plane.scalar_at_frame_opt(id, 0),
+        |r| mod_plane.depth_at_frame(r.id, 0).unwrap_or(r.depth),
+        playhead_beats,
+    )
+}
+
 /// Phase 2b (`docs/plan_automation.md` §8.3): push automation events for
 /// the specified device (v29: 安定 device id `PluginInstance::id` で指定)
 /// into `pd.events_in` as `EventKind::ParamValue` entries.

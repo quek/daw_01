@@ -131,10 +131,15 @@ fn tempo_breakpoints(song: &Song) -> Vec<(u32, f32)> {
 /// daw_01 track から MIDI events を build。 MIDI clip (`ClipContent::Midi`) が
 /// 1 つも無ければ None (= track 自体を出力 skip)。 1 つでもあれば、 全 clip の
 /// notes を beat → tick 換算で並べた SMF track を返す。
+///
+/// r.md #130 (確定仕様 Q7): **鳴る音で書き出す** — 追従するトラックはノート開始の拍の移調量
+/// (`common::transpose::TrackTranspose`、変調は焼かない) を足した鍵盤、追従しないトラックは書いた鍵盤。
+/// 範囲外で鳴らないノートは書かない。
 fn build_midi_track(song: &Song, track: &common::model::Track) -> Option<Vec<TrackEvent<'static>>> {
     // (tick, MidiMessage) の (NoteOn + NoteOff) を集約。
     let mut events: Vec<(u32, MidiMessage)> = Vec::new();
     let mut has_any_midi = false;
+    let transpose = common::transpose::TrackTranspose::of(song, track.id);
     for clip in &track.clips {
         let Some(content) = song.clip_contents.get(&clip.content_id) else {
             continue;
@@ -161,20 +166,23 @@ fn build_midi_track(song: &Song, track: &common::model::Track) -> Option<Vec<Tra
             }
             // content-local beat → song-domain beat → tick。 Off は clip 末端 clamp。
             let on_beat = clip.content_to_song_beat(note.start_beat);
+            let Some(key) = transpose.key(note.pitch, Some(on_beat)) else {
+                continue;
+            };
             let off_beat = (on_beat + note.duration_beats).min(clip_end_beats);
             let on_tick = beat_to_tick(on_beat);
             let off_tick = beat_to_tick(off_beat).max(on_tick + 1);
             events.push((
                 on_tick,
                 MidiMessage::NoteOn {
-                    key: u7::from(note.pitch.min(127)),
+                    key: u7::from(key.min(127)),
                     vel: u7::from(note.velocity.min(127)),
                 },
             ));
             events.push((
                 off_tick,
                 MidiMessage::NoteOff {
-                    key: u7::from(note.pitch.min(127)),
+                    key: u7::from(key.min(127)),
                     vel: u7::from(0),
                 },
             ));
@@ -335,6 +343,41 @@ mod tests {
             "tail tempo ≈ 120bpm, got {:?}",
             tempos.last()
         );
+    }
+
+    /// r.md #130 Q7: SMF は **鳴る音** で書く。追従するトラックは移調した鍵盤 (範囲外で鳴らないノートは書かない)、
+    /// 追従しないトラックは書いた鍵盤のまま。
+    #[test]
+    fn transpose_writes_sounding_keys_for_following_tracks_only() {
+        let mut song = Song { transpose: 3, ..Song::default() };
+        let cid = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Midi(MidiContent { notes: vec![note(60, 100, 0.0, 1.0), note(126, 100, 1.0, 1.0)], next_note_id: 1 }),
+        );
+        for (id, follow) in [(1, true), (2, false)] {
+            song.tracks.push(crate::app::track_with(|t| {
+                t.id = id;
+                t.follow_transpose = follow;
+                t.clips = vec![Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id: cid, ..Default::default() }];
+            }));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transposed.mid");
+        export_midi(&song, &path).unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        let parsed = Smf::parse(&raw).unwrap();
+        let on_keys = |track: &[TrackEvent<'_>]| -> Vec<u8> {
+            track
+                .iter()
+                .filter_map(|e| match e.kind {
+                    TrackEventKind::Midi { message: MidiMessage::NoteOn { key, .. }, .. } => Some(key.as_int()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(on_keys(&parsed.tracks[1]), vec![63], "追従: +3、範囲外 (129) は書かない");
+        assert_eq!(on_keys(&parsed.tracks[2]), vec![60, 126], "追従しない: 書いた音");
     }
 
     #[test]

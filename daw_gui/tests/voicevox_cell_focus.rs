@@ -9,6 +9,8 @@
 //! - 口パクの生成物が入力を失ったら消えること。残ると **歌が無いのに口だけ動く**。
 //!   再生成の経路 (`mark_lipsync_dirty`) は binding を持つ track が居なければ何も
 //!   しないので、一度取り残されると二度と片付かない。
+//! - r.md #130: 歌が移調に追従し (セルは曲の基準値)、焼き込みの間だけ書いた音で合成を頼むこと。
+//!   外れても歌声が伴奏と別のキーで鳴るだけで、ログにも `*` にも出ない。
 
 use std::sync::Arc;
 
@@ -217,6 +219,50 @@ fn 鳴っている行はそのセルの座標で送る() {
         (hint - base).abs() <= 1e-9,
         "鳴っているセルの区間を指す: hint={hint} base={base}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// r.md #130 グローバルトランスポーズ
+// ---------------------------------------------------------------------------
+
+/// 最後に送った note metadata の `(clip_id, 歌う音程)`。
+fn sung_pitches(msgs: &[PluginCommand]) -> Vec<(u32, u8)> {
+    msgs.iter()
+        .rev()
+        .find_map(|m| match m {
+            PluginCommand::SetBuiltinPluginNoteMetadata { entries, .. } => {
+                Some(entries.iter().map(|e| (e.clip_id, e.pitch)).collect())
+            }
+            _ => None,
+        })
+        .expect("note metadata が送られている")
+}
+
+/// 移調した曲の歌は **移調した音程** で合成を頼む — アレンジの clip はノートの拍の移調量 (レーンがあればレーン)、
+/// 曲の位置を持たないセルは曲の基準値。そのトラックを **焼いている間** (合成待ち → offline render) は書いた音で
+/// 頼み、焼き終えたら移調込みへ戻す (焼いた音はもう一度移調に追従するので、移調を焼き込むと二重になる)。
+/// 送り直しは差分キャッシュの比較だけで起きる (音程が metadata に載っているので)。
+#[test]
+fn 移調した歌は移調した音程で合成し_焼いている間だけ書いた音で頼む() {
+    let (mut app, mut rx) = app_with_vocal_cell();
+    app.handle_event(AppEvent::SetSongTranspose(3));
+    app.sync_vocal_metadata();
+    assert_eq!(sung_pitches(&drain(&mut rx)), vec![(1, 63), (2, 63)]);
+
+    app.edit_song(|song| {
+        let lane = common::model::AutomationLane::new(common::model::AutomationTarget::SongTranspose, -5.0);
+        song.song_lanes.push(common::model::AutomationLane { id: 1, ..lane });
+    });
+    app.sync_vocal_metadata();
+    assert_eq!(sung_pitches(&drain(&mut rx)), vec![(1, 55), (2, 63)], "アレンジはレーン、セルは基準値");
+
+    app.handle_event(AppEvent::BounceClipInPlace(common::model::ClipKey { track_id: 1, clip_id: 1 }));
+    assert!(app.cur.pipc.pending_vocal_synth_bounce.is_some(), "前提: 歌唱の合成待ちに入った");
+    assert_eq!(sung_pitches(&drain(&mut rx)), vec![(1, 60), (2, 60)], "焼いている間は書いた音");
+
+    app.cur.pipc.pending_vocal_synth_bounce = None;
+    app.sync_vocal_metadata();
+    assert_eq!(sung_pitches(&drain(&mut rx)), vec![(1, 55), (2, 63)], "焼き終えたら移調込みへ戻す");
 }
 
 // ---------------------------------------------------------------------------

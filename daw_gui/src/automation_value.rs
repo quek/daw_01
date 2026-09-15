@@ -32,6 +32,15 @@ pub const PAN_FORMAT: ScrubableNumberFormat = ScrubableNumberFormat::SignedLabel
     scale: 100.0,
 };
 
+/// **移調の数値表記** (`"+2"` / `"0"` / `"-5"`、半音、r.md #130)。transport の Transpose 欄と移調レーンの
+/// 既定値 / 点のドラッグ readout が共有する (表記を変えるならここ 1 箇所)。入力は `"+2"` / `"-2"` / `"2"`。
+pub const TRANSPOSE_FORMAT: ScrubableNumberFormat = ScrubableNumberFormat::SignedLabeled {
+    neg: "-",
+    pos: "+",
+    center: "0",
+    scale: 1.0,
+};
+
 /// `AutomationTarget` 1 つ分の値の人間可読表示記述子。
 #[derive(Clone, Copy, Debug)]
 pub struct AutomationValueDisplay {
@@ -204,6 +213,8 @@ fn display_units(target: &AutomationTarget) -> (&'static str, ScrubableNumberFor
         T::ModRoutingDepth { .. } => ("", F::Decimal(2), id, id),
         T::SongTempo => ("BPM", F::Decimal(1), id, id),
         T::SongTimeSigNumerator => ("", F::Integer, id, id),
+        // 半音 (符号が単位の役を持つので単位ラベルは空)。
+        T::SongTranspose => ("", TRANSPOSE_FORMAT, id, id),
         // 回転 (ラジアン↔度)。
         T::ImageBuiltin(ImageBuiltinParam::Rotation)
         | T::TextBuiltin(TextBuiltinParam::Rotation)

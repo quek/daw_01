@@ -41,7 +41,9 @@ impl ParamSubject {
             AutomationTarget::PluginParam { device_id, .. } => Self::Plugin(*device_id),
             AutomationTarget::NativeParam { device_id, .. } => Self::Native(*device_id),
             AutomationTarget::MasterLimiter(_) => Self::MasterLimiter,
-            AutomationTarget::SongTempo | AutomationTarget::SongTimeSigNumerator => Self::Song,
+            AutomationTarget::SongTempo | AutomationTarget::SongTimeSigNumerator | AutomationTarget::SongTranspose => {
+                Self::Song
+            }
             AutomationTarget::ModSourceParam { source_id, .. } => Self::ModSource(*source_id),
             AutomationTarget::ModRoutingDepth { routing_id } => Self::ModRouting(*routing_id),
             AutomationTarget::ImageBuiltin(_) | AutomationTarget::TextBuiltin(_) | AutomationTarget::GroupTransform(_) => {

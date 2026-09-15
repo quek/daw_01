@@ -31,6 +31,28 @@ fn draw_header_meter(ui: &mut Ui<'_, AppData>, t: &ArrangementTrack, meter: Rect
     ui.level_meter_stereo(("arr_thmeter", t.id), meter, t.peak.0, t.peak.1, MeterBallistic::Peak, style);
 }
 
+/// r.md #130: 移調に追従しないトラックの印 (`♮` = 書いた音のまま鳴る) を名前帯 `name` の右端に描き、
+/// 名前ボタンに残す領域を返す。印の上の click は名前ボタンではなく行の click (トラック選択) に落ちる。
+/// 色は disclosure と同じ二次テキスト (ヘッダの地の上なのでテーマのクローム色で読める)。
+fn draw_no_transpose_mark(ui: &mut Ui<'_, AppData>, t: &ArrangementTrack, name: Rect, style: &ArrangementStyle) -> Rect {
+    let w = style.track_text_size * 1.2;
+    if !t.no_transpose_mark || name.w <= w {
+        return name;
+    }
+    let mark = Rect { x: name.x + name.w - w, w, ..name };
+    ui.push_text(GlyphArea {
+        text: Arc::from("\u{266E}"),
+        left: mark.x,
+        top: mark.y + (mark.h - style.track_text_size * 1.2) * 0.5,
+        font_size: style.track_text_size,
+        line_height: style.track_text_size * 1.2,
+        color: style.disclosure_color,
+        clip_rect: Some(mark),
+        ..GlyphArea::default()
+    });
+    Rect { w: name.w - w, ..name }
+}
+
 /// volume band の 0dB 目印。 band を縦に横切る 1px 線を、 band より上下 1px ずつ長く引く
 /// (fill / 溝のどちらの上でも「目盛り」と読めるように、 band の外へ少しはみ出させる)。
 /// 位置は fill と同じ `MeterScale::default()` の写像 (= drag の `frac_to_amp` と同じ曲線)。
@@ -377,6 +399,7 @@ fn draw_rows_inner(
         } else {
             name_rect
         };
+        let name_rect_visible = draw_no_transpose_mark(ui, t, name_rect_visible, style);
         let button_zones: [Rect; 4] = [name_rect_visible, m_rect, s_rect, r_rect];
 
         let id_name = ("arr_tname", t.id);

@@ -1716,7 +1716,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
 
         // gui_01 #055: 鍵盤レーン click のピッチプレビュー。前フレーム値 (recording.preview_note の
         // pitch) と差分し、変化した frame だけ PreviewPitchChanged を発火。鳴らす track は描画中 clip の track。
-        if response.keyboard_active_pitch != app.cur.recording.preview_note.map(|(_, p)| p) {
+        if response.keyboard_active_pitch != app.cur.recording.preview_note.map(|h| h.pitch) {
             let track_id = target.track_id;
             let pitch = response.keyboard_active_pitch;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {

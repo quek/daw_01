@@ -64,6 +64,8 @@ pub enum StreamGesture {
     BpmScrub,
     /// Transport bar の拍子分子 scrubable_number ドラッグ。
     TimeSigScrub,
+    /// r.md #130: Transport bar の Transpose 欄のドラッグ。
+    TransposeScrub,
     /// MIDI Learn binding 経由のハードウェア CC ストリーム。
     MidiCc,
     /// Touch/Latch/Write mode の automation 録音 (playhead 追従の point 書込)。

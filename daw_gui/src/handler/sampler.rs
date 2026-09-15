@@ -306,18 +306,20 @@ impl AppData {
         let now = wall_clock_ns();
         let sr = f64::from(self.ipc.sample_rate.max(1));
         let ns_to_frames = |ns: u64| (ns as f64 * sr / 1e9).round() as u64;
+        // r.md #130: 試聴は弾いたときと同じ音 (移調込みの鍵盤、範囲外は鳴らさない)。engine は送った鍵盤で
+        // on / off を組むので、ここで鍵盤に直して送る。
         let mut notes: Vec<PreviewNote> = self
             .midi_capture
             .notes_in(start_ns, end_ns, now)
-            .map(|n| {
+            .filter_map(|n| {
                 let on = n.on_ns.max(start_ns) - start_ns;
                 let off = n.end_ns(now).min(end_ns).max(n.on_ns.max(start_ns)) - start_ns;
-                PreviewNote {
+                Some(PreviewNote {
                     offset_frames: ns_to_frames(on),
                     duration_frames: ns_to_frames(off - on).max(1),
-                    pitch: n.pitch,
+                    pitch: self.preview_key(track_id, n.pitch)?,
                     velocity: n.velocity,
-                }
+                })
             })
             .collect();
         if notes.is_empty() {

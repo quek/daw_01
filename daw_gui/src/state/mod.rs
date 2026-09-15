@@ -42,7 +42,7 @@ pub use selection::SelectionState;
 pub use ipc::{DeviceParamKey, IpcState};
 pub use voicevox::VoicevoxState;
 pub use media::MediaState;
-pub use recording::{ParamSurface, RecordingState};
+pub use recording::{HeldPreview, ParamSurface, RecordingState};
 pub use ui_prefs::UiPrefs;
 pub use ui_ephemeral::{ModRackHover, ScrubGesture, UiEphemeral};
 pub use launcher_ui::{LauncherFocus, LauncherUiState};

@@ -847,7 +847,7 @@ impl ProjectState {
                 live: false,
                 count_in_bars: 0,
                 midi_recording_active_notes: std::collections::HashMap::new(),
-                monitor_notes: std::collections::HashSet::new(),
+                monitor_notes: std::collections::HashMap::new(),
                 metronome_enabled_pre_recording: None,
                 midi_learn_target: None,
                 active_param_gestures: std::collections::HashMap::new(),

@@ -38,6 +38,7 @@ impl AutomationTarget {
             Self::MasterLimiter(_)
             | Self::SongTempo
             | Self::SongTimeSigNumerator
+            | Self::SongTranspose
             | Self::ImageBuiltin(_)
             | Self::TextBuiltin(_)
             | Self::GroupTransform(_)
@@ -61,6 +62,7 @@ impl AutomationTarget {
             Self::MasterLimiter(_)
             | Self::SongTempo
             | Self::SongTimeSigNumerator
+            | Self::SongTranspose
             | Self::ImageBuiltin(_)
             | Self::TextBuiltin(_)
             | Self::GroupTransform(_)
@@ -167,7 +169,8 @@ impl Song {
             AutomationTarget::ModRoutingDepth { routing_id } => self.mod_routing_owner(*routing_id),
             AutomationTarget::MasterLimiter(_)
             | AutomationTarget::SongTempo
-            | AutomationTarget::SongTimeSigNumerator => Some(MASTER_TRACK_ID),
+            | AutomationTarget::SongTimeSigNumerator
+            | AutomationTarget::SongTranspose => Some(MASTER_TRACK_ID),
             AutomationTarget::ImageBuiltin(_)
             | AutomationTarget::TextBuiltin(_)
             | AutomationTarget::GroupTransform(_) => None,
@@ -372,7 +375,8 @@ impl PruneCtx {
             },
             AutomationTarget::MasterLimiter(_)
             | AutomationTarget::SongTempo
-            | AutomationTarget::SongTimeSigNumerator => owner == MASTER_TRACK_ID,
+            | AutomationTarget::SongTimeSigNumerator
+            | AutomationTarget::SongTranspose => owner == MASTER_TRACK_ID,
             AutomationTarget::ModSourceParam { source_id, .. } => self.live_sources.contains(source_id),
             AutomationTarget::ModRoutingDepth { routing_id } => self.live_routings.contains(routing_id),
             AutomationTarget::ImageBuiltin(_)
@@ -398,6 +402,7 @@ impl PruneCtx {
             | BindingTarget::SwitchRowToArranger { track_id } => self.tracks.contains(track_id),
             BindingTarget::MasterLimiter(_)
             | BindingTarget::SongTempo
+            | BindingTarget::SongTranspose
             | BindingTarget::LaunchScene { .. }
             | BindingTarget::StopAllLauncherRows
             | BindingTarget::SwitchAllToArranger => true,

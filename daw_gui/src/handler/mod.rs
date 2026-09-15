@@ -64,6 +64,8 @@ pub mod tabs;
 pub mod tick;
 pub mod tracks;
 pub mod transport;
+/// r.md #130: グローバルトランスポーズ (基準値 / 追従 / 演奏プレビューの鍵盤 / ヘッダの印)。
+pub mod transpose;
 pub mod view_model;
 /// `ViewState` の snapshot / restore (保存される表示状態の唯一の口)。
 pub mod view_state;

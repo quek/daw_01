@@ -48,6 +48,7 @@ pub fn automation_target_display_name(
         AutomationTarget::PluginParam { param_id, .. } => format!("Param {param_id}"),
         AutomationTarget::SongTempo => "Tempo".into(),
         AutomationTarget::SongTimeSigNumerator => "Time Sig".into(),
+        AutomationTarget::SongTranspose => "Transpose".into(),
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::X) => "Image X".into(),
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::Y) => "Image Y".into(),
         AutomationTarget::ImageBuiltin(ImageBuiltinParam::W) => "Image W".into(),

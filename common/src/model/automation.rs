@@ -49,6 +49,9 @@ pub enum AutomationTarget {
     /// a designated "master" track. M5 scope.
     SongTempo,
     SongTimeSigNumerator,
+    /// v41 (r.md #130): グローバルトランスポーズ (半音、[`Song::transpose`] の基準値を上書き / 変調する)。
+    /// 評価の SSoT は [`crate::transpose::transpose_in_clip`]。
+    SongTranspose,
     /// v14: image track 上の PiP 数値 (x / y / w / h / opacity)。 lane
     /// の時間軸は track-global beats、 値域 0.0..=1.0。 image clip が
     /// 存在する時間範囲だけ lane 値が画像 PiP rect / opacity に適用さ
@@ -89,7 +92,7 @@ pub enum AutomationTarget {
 impl AutomationTarget {
     /// このレーン行に**ランチャーのセルを置けるか** (r.md #87 Q4 の例外)。
     ///
-    /// [`Self::SongTempo`] / [`Self::SongTimeSigNumerator`] だけが `false`。理由は 2 つ:
+    /// [`Self::SongTempo`] / [`Self::SongTimeSigNumerator`] / [`Self::SongTranspose`] だけが `false`。理由:
     ///
     /// 1. **循環になる。** ローンチ量子化の境界は `TempoMap` 由来の小節グリッドで解く
     ///    (`docs/plan_rmd_87_clip_launcher.md` §2.2)。テンポ / 拍子がランチャー駆動だと
@@ -98,6 +101,9 @@ impl AutomationTarget {
     ///    は GUI 側の拍 ↔ サンプル換算 (ルーラー / 波形レイアウト / 書き出し範囲) の
     ///    土台でもある。engine だけが知る走行状態に依存させると、同じ拍が 2 つの
     ///    別の時刻を指す。
+    /// 3. **移調 (r.md #130) はオフラインでも曲の拍で解く。** VOICEVOX 歌唱のメタデータと SMF 書き出しは
+    ///    [`crate::transpose::TransposeCurve`] でアレンジのカーブを引く (engine の走行状態を知らない) ので、
+    ///    セルで動かすと「歌声と伴奏で違う移調」になる。
     ///
     /// **GUI (セルを描かない / 落とせない / 作れない) と engine (行として登録しない) の
     /// 両方がこの 1 本を引くこと** — 片方だけで弾くと、もう片方に置けてしまったセルが
@@ -105,7 +111,7 @@ impl AutomationTarget {
     /// が load 時の掃除も同じ判定で行う。
     #[must_use]
     pub fn accepts_launcher_cells(&self) -> bool {
-        !matches!(self, Self::SongTempo | Self::SongTimeSigNumerator)
+        !matches!(self, Self::SongTempo | Self::SongTimeSigNumerator | Self::SongTranspose)
     }
 }
 

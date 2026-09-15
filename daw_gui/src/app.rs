@@ -487,22 +487,7 @@ impl AppData {
                 // 対象 track が存在しない / pitch=None なら next=None (= 発音停止)。
                 let next = pitch
                     .and_then(|p| self.cur.song_doc.song().track_by_id(track_id).map(|t| (t.id, p)));
-                for action in diff_preview(self.cur.recording.preview_note, next) {
-                    match action {
-                        PreviewAction::NoteOff { track_id, pitch } => {
-                            self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id, pitch });
-                        }
-                        PreviewAction::NoteOn { track_id, pitch } => {
-                            self.send_audio(AudioCommand::PreviewNoteOn {
-                                project: self.pk(),
-                                track_id,
-                                pitch,
-                                velocity: PREVIEW_VELOCITY,
-                            });
-                        }
-                    }
-                }
-                self.cur.recording.preview_note = next;
+                self.set_keyboard_lane_preview(next);
             }
             AppEvent::LoopSelectedClipToggle { automation, sections } => {
                 self.loop_selected_clip_toggle(automation, sections);
@@ -539,6 +524,8 @@ impl AppData {
                     self.send_audio(AudioCommand::SetSongTimeSigNumerator { project: self.pk(), num: clamped });
                 }
             }
+            AppEvent::SetSongTranspose(semitones) => self.set_song_transpose(semitones),
+            AppEvent::SetTracksFollowTranspose { track_ids, follow } => self.set_tracks_follow_transpose(&track_ids, follow),
             AppEvent::TimeSigNumEditChanged(s) => {
                 self.cur.peph.time_sig_num_edit_text = s;
             }

@@ -579,6 +579,7 @@ impl AppData {
             | T::MasterLimiter(_)
             | T::SongTempo
             | T::SongTimeSigNumerator
+            | T::SongTranspose
             | T::ImageBuiltin(_)
             | T::TextBuiltin(_)
             | T::GroupTransform(_)

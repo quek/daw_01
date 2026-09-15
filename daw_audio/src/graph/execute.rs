@@ -175,8 +175,12 @@ pub fn process_track_owned(
     rows: TrackRows<'_>,
     // r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
     native_io: NativeIo<'_>,
+    // r.md #130: この buffer の曲の移調量 (半音)。このトラックが追従しなければここで 0 にする
+    // (実効的な追従は祖先グループまで辿った値を索引が持つ)。
+    song_transpose: i32,
 ) {
     let n = frames as usize;
+    let transpose = if index.follows_transpose(track_idx as usize) { song_transpose } else { 0 };
     // r.md #129: SC Listen の置換要求は program の実行開始時に消す (GWI は pass 1 の開始 = ここ。
     // pass 2 の `run_group_fx_chain` は prefix で立った要求を PostFx 点で消費する)。
     program.listen_pending = None;
@@ -256,6 +260,7 @@ pub fn process_track_owned(
             playhead_beats,
             current_bpm,
             frames,
+            transpose,
             &mut scratch.midi_bus_a,
             &mut scratch.state.active_notes,
         );
@@ -296,6 +301,7 @@ pub fn process_track_owned(
             current_bpm,
             sample_rate,
             frames,
+            transpose,
             &mut crate::audio_clip_renderer::ClipRenderState {
                 repitch_accum: &mut scratch.repitch_accum,
                 engines: &mut scratch.stretch_engines,
@@ -532,6 +538,8 @@ pub fn execute_schedule_post_dispatch(
         follower_drive,
         rows,
         native_io,
+        // pass 2 の op は移調を読まない (移調は pass 1 のノート / クリップだけに効く)。
+        transpose: 0,
     };
     let index = SongIndex::build(song);
     let ctx = RenderCtx::new(song, &index, schedule, scratch, master_l, master_r, plugin_refs, None, None, params);
@@ -767,6 +775,15 @@ pub fn render_master_buffer(
     if any_solo {
         schedule.solo.resolve(song);
     }
+    // r.md #130: 曲の移調量は buffer 頭で 1 回だけ解く (track ごとに解くと同じ buffer で別の値を見うる)。
+    // live と書き出しが同じここを通るので、WAV / ラウドネス解析も移調込み (不変条件 6)。
+    let transpose = crate::automation::resolve_song_transpose(
+        song,
+        index.song_store(song),
+        playhead_beats,
+        recording_lanes,
+        mod_plane,
+    );
     let params = BufferParams {
         sample_rate,
         frames,
@@ -780,6 +797,7 @@ pub fn render_master_buffer(
         follower_drive,
         rows,
         native_io,
+        transpose,
     };
 
     // ---- 依存グラフ: track 本体 / 合流 / PDC / send / sidechain / bus の chain / follower ----
@@ -1456,5 +1474,77 @@ mod render_master_tests {
         );
         assert!(master_l.iter().all(|&v| v == 0.0), "master must be cleared+silent");
         assert!(master_r.iter().all(|&v| v == 0.0));
+    }
+
+    /// r.md #130: live と書き出しが共有する 1 buffer の描画で、曲の移調 +2 はノートを追従するトラックだけ
+    /// +2 の鍵盤で鳴らし、追従しないトラック (自分で外した / 追従しないグループの子) は書いた鍵盤のまま。
+    /// 移調のレーンを録音中は、カーブではなく基準値で鳴る (ノブの値を素通し)。
+    #[test]
+    fn transpose_moves_only_following_tracks_in_the_shared_render() {
+        use common::model::{AutomationLane, AutomationTarget, Clip, ClipContent, MidiContent, Note};
+        let mut song = Song { transpose: 2, ..Song::default() };
+        let content_id = song.alloc_content_id();
+        let note = Note { id: 1, start_beat: 0.0, duration_beats: 1.0, pitch: 60, velocity: 100, lyric: None, muted: false };
+        song.clip_contents.insert(content_id, ClipContent::Midi(MidiContent { notes: vec![note], next_note_id: 2 }));
+        let clip = Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id, ..Clip::default() };
+        // 1: 追従 / 2: 自分で外す / 3: 追従しないグループ 4 の子。
+        song.tracks = vec![
+            track(|t| {
+                t.id = 1;
+                t.clips = vec![clip.clone()];
+            }),
+            track(|t| {
+                t.id = 2;
+                t.follow_transpose = false;
+                t.clips = vec![clip.clone()];
+            }),
+            track(|t| {
+                t.id = 3;
+                t.parent_group_id = Some(4);
+                t.clips = vec![clip.clone()];
+            }),
+            track(|t| {
+                t.id = 4;
+                t.follow_transpose = false;
+            }),
+        ];
+        let render = |song: &Song, recording: &std::collections::HashSet<(u32, AutomationTarget)>| {
+            let mut schedule = compile_schedule_for_test(song, 48_000, 0).unwrap();
+            let mut scratch: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
+            let (mut l, mut r) = (vec![0.0f32; 64], vec![0.0f32; 64]);
+            render_master_buffer(
+                song,
+                &SongIndex::build(song),
+                &mut schedule,
+                &mut scratch,
+                &HashMap::new(),
+                None,
+                &crate::audio_clip_renderer::AudioClipRenderer::empty(),
+                &mut l,
+                &mut r,
+                48_000,
+                64,
+                true,
+                LoopRegion::default(),
+                recording,
+                120.0,
+                0.0,
+                ModTickPlaneRef::default(),
+                FollowerDrive::default(),
+                &RowSourceTable::default(),
+                1.0,
+                &mut MasterLimiterState::new(),
+                NativeIo::default(),
+            );
+            scratch.iter().take(3).map(|s| s.state.active_notes.iter().map(|&(_, key)| key).collect()).collect::<Vec<Vec<u8>>>()
+        };
+        let none = std::collections::HashSet::new();
+        assert_eq!(render(&song, &none), vec![vec![62], vec![60], vec![60]]);
+
+        // レーン (全域 -5) があればレーンが勝つ。録音中のレーンは基準値 (+2) に戻る。
+        song.song_lanes.push(AutomationLane { id: 1, ..AutomationLane::new(AutomationTarget::SongTranspose, -5.0) });
+        assert_eq!(render(&song, &none)[0], vec![55]);
+        let recording = std::collections::HashSet::from([(common::model::MASTER_TRACK_ID, AutomationTarget::SongTranspose)]);
+        assert_eq!(render(&song, &recording)[0], vec![62]);
     }
 }

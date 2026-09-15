@@ -103,6 +103,13 @@ pub enum AppEvent {
     /// Phase 5 Step 5.1 follow-up: TimeSig numerator scrub。 1..=32 clamp、
     /// `time_sig_num_edit_text` 同期、 軽量 IPC `AudioCommand::SetSongTimeSigNumerator`。
     SetSongTimeSigNumFromScrub(u8),
+    /// r.md #130: transport の Transpose 欄 (縦ドラッグ / 入力 / ダブルクリックで 0) が流す移調の基準値 (半音)。
+    /// handler が ±24 に丸め、連続する値は 1 undo step に畳み、軽量 IPC `AudioCommand::SetSongTranspose` で
+    /// engine へ即時反映する。
+    SetSongTranspose(i8),
+    /// r.md #130: トラックヘッダの右クリック「移調に追従」。`track_ids` 全部の
+    /// `Track::follow_transpose` を `follow` にする (右クリックしたトラックが選択に含まれれば選択全体)。Undo 対象。
+    SetTracksFollowTranspose { track_ids: Vec<u32>, follow: bool },
     Undo,
     Redo,
     /// r.md #29: Undo 履歴パネルの開閉トグル (View メニュー / パネル ✕ / Esc)。
@@ -1761,6 +1768,8 @@ impl AppEvent {
             E::CommitTimeSigNumEdit
             | E::SetSongTimeSigDenominator(..)
             | E::SetSongTimeSigNumFromScrub(..) => "拍子変更",
+            E::SetSongTranspose(..) => "移調変更",
+            E::SetTracksFollowTranspose { .. } => "移調への追従を切替",
 
             // ---- ノート ----
             E::AddNote { .. } => "ノート追加",

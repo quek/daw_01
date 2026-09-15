@@ -26,6 +26,17 @@ impl ParamSurface {
     }
 }
 
+/// 鳴らしている鍵盤プレビュー 1 音 (鍵盤レーン / ナッジ試聴)。r.md #130: **押している pitch と送った鍵盤を組で**
+/// 持つ — 差分と「同じ音か」は書いた音の `pitch` で取り、消音は移調込みで送った `key` を止める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldPreview {
+    pub track_id: u32,
+    /// 押している (書いた音の) pitch。
+    pub pitch: u8,
+    /// 実際に送った鍵盤 (`AppData::send_preview_on`)。`None` = 移調で範囲外になり送っていない。
+    pub key: Option<u8>,
+}
+
 pub struct RecordingState {
     /// Phase 4 (`docs/plan_automation.md` §6): automation recording mode。
     /// transport bar の 4 way toggle (Read / Touch / Latch / Write) で切替。
@@ -64,12 +75,14 @@ pub struct RecordingState {
     /// ここを見て長さを確定する。
     pub midi_recording_active_notes:
         std::collections::HashMap<(u32, u8), (f64, u32)>,
-    /// r.md #51: モニターで鳴らしている `(track_id, pitch)`。
+    /// r.md #51: モニターで鳴らしている `(track_id, 弾いた pitch) → 送った鍵盤`。
     ///
     /// 録音待機トラックは transport 状態に関わらず入力を発音する
     /// (一般的なインプットモニター) ので、note-off を取りこぼすと音が鳴り
     /// 続ける。 arm 解除 / パニック / 停止で確実に消音するための held-value。
-    pub monitor_notes: std::collections::HashSet<(u32, u8)>,
+    /// r.md #130: 値は移調込みで **送った鍵盤**。消音はこれを止める (弾いた pitch から移調し直すと、
+    /// 押している間に移調が変わったとき別の鍵盤を止めにいく)。範囲外で送らなかった音は載せない。
+    pub monitor_notes: std::collections::HashMap<(u32, u8), u8>,
     /// Phase 7 B4 Step C (2026-05-13): count-in 開始前の metronome_enabled
     /// 状態 snapshot。 count-in 中だけ強制 ON にし、録音セッションのクローズで
     /// 元の値へ戻す (= user の「click off」 設定を尊重しつつ count-in 中は
@@ -125,23 +138,23 @@ pub struct RecordingState {
     /// eval に戻るときに最新 points を読ませる)。 session-only / Undo 対象外。
     pub last_sent_recording_lanes:
         std::collections::HashSet<(u32, common::model::AutomationTarget)>,
-    /// 鍵盤レーン click のプレビュー発音中の `(track_id, pitch)` (gui_01 #055,
+    /// 鍵盤レーン click のプレビュー発音中の音 (gui_01 #055,
     /// `docs/plan_pianoroll_keyboard_preview.md`)。 widget の
     /// `PianoRollResponse::keyboard_active_pitch` を前フレーム値と差分して
     /// note-on/off を導出するための held-value。 押下開始した track id を pitch
     /// と一緒に持つことで、 note-off を必ず note-on と同じ track へ送る
     /// (glissando / release で stuck note を防ぐ)。 `None` で発音なし。
     /// session-only (project save には含めない)。
-    pub preview_note: Option<(u32, u8)>,
+    pub preview_note: Option<HeldPreview>,
     /// r.md #67: カーソルキー (↑/↓) で音程を変えたときに短く鳴らす試聴音
-    /// `(track_id, pitch, 消音予定時刻)`。
+    /// `(鳴らしている音, 消音予定時刻)`。
     ///
     /// 鍵盤レーンの [`Self::preview_note`] とは **別枠**。 あちらは「押している間ずっと
     /// 鳴らす」 held-value で、 widget が毎フレーム差分して note-off を送るため、
     /// キー操作由来の発音を載せると 1 フレームで消えてしまう。 こちらは時間で自動消音する
     /// one-shot (`AppData::expire_nudge_audition` が `on_tick` から回収)。
     /// session-only / Undo 対象外。
-    pub nudge_audition: Option<(u32, u8, std::time::Instant)>,
+    pub nudge_audition: Option<(HeldPreview, std::time::Instant)>,
     pub midi_input_label: String,
 
     pub step_cursor_beat: f64,

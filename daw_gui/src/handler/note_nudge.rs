@@ -6,7 +6,6 @@
 use crate::state::*;
 use crate::app_types::*;
 use crate::event::*;
-use common::protocol::AudioCommand;
 
 use super::notes::{NOTE_MIN_LEN_BEATS, NUDGE_AUDITION_LEN};
 
@@ -291,32 +290,30 @@ impl AppData {
         else {
             return;
         };
-        if let Some((prev_track, prev_pitch, _)) = self.cur.recording.nudge_audition {
-            if prev_track == track_id && prev_pitch == pitch {
+        if let Some((prev, _)) = self.cur.recording.nudge_audition {
+            if prev.track_id == track_id && prev.pitch == pitch {
                 return; // 同じ音のまま = 鳴らし直さない
             }
-            self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id: prev_track, pitch: prev_pitch });
+            self.release_held_preview(prev);
         }
-        self.send_audio(AudioCommand::PreviewNoteOn {
-            project: self.pk(),
-            track_id,
-            pitch,
-            velocity: PREVIEW_VELOCITY,
-        });
-        self.cur.recording.nudge_audition =
-            Some((track_id, pitch, std::time::Instant::now() + NUDGE_AUDITION_LEN));
+        // r.md #130: 鳴らすのは移調込みの鍵盤。消音用に送った鍵盤を控える。
+        let key = self.send_preview_on(track_id, pitch, PREVIEW_VELOCITY);
+        self.cur.recording.nudge_audition = Some((
+            crate::state::HeldPreview { track_id, pitch, key },
+            std::time::Instant::now() + NUDGE_AUDITION_LEN,
+        ));
     }
 
     /// [`Self::audition_anchor_note`] が鳴らした試聴音を、期限が来ていれば消音する
     /// (`on_tick` から毎ティック呼ばれる)。`force` は停止 / 曲差し替え / 終了時の即時消音。
     pub(crate) fn expire_nudge_audition(&mut self, force: bool) {
-        let Some((track_id, pitch, due)) = self.cur.recording.nudge_audition else {
+        let Some((held, due)) = self.cur.recording.nudge_audition else {
             return;
         };
         if !force && std::time::Instant::now() < due {
             return;
         }
         self.cur.recording.nudge_audition = None;
-        self.send_audio(AudioCommand::PreviewNoteOff { project: self.pk(), track_id, pitch });
+        self.release_held_preview(held);
     }
 }

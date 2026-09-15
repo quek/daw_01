@@ -1141,6 +1141,40 @@ mod tests {
         assert_eq!(loaded.view.unwrap().hidden_automation_lanes, expected);
     }
 
+    /// r.md #130: 移調の基準値 / トラックの追従 / 移調のレーン・MIDI binding は保存して開き直すと戻る。
+    /// フィールドを持たない旧 file (と、既定値のまま保存した file) は移調 0 / 全トラック追従で読める。
+    #[test]
+    fn transpose_settings_roundtrip_and_legacy_files_default_to_following() {
+        use crate::model::{AutomationLane, AutomationTarget, BindingTarget, MidiBindInput, MidiBinding};
+        let dir = tempdir().unwrap();
+        let mut song = Song { transpose: -3, ..Song::default() };
+        song.tracks = vec![Track { id: 1, ..Track::default() }, Track { id: 2, follow_transpose: false, ..Track::default() }];
+        song.song_lanes.push(AutomationLane { id: 1, ..AutomationLane::new(AutomationTarget::SongTranspose, 2.0) });
+        song.midi_bindings.push(MidiBinding {
+            channel: 0,
+            input: MidiBindInput::cc(20),
+            legacy_controller: None,
+            target: BindingTarget::SongTranspose,
+        });
+        let path = dir.path().join("transpose.daw");
+        save(&path, &song).unwrap();
+        let loaded = load_project(&path).unwrap().song;
+        assert_eq!(loaded.transpose, -3);
+        assert_eq!(loaded.tracks.iter().map(|t| t.follow_transpose).collect::<Vec<_>>(), vec![true, false]);
+        assert_eq!(loaded.song_lanes[0].target, AutomationTarget::SongTranspose);
+        assert_eq!(loaded.midi_bindings[0].target, BindingTarget::SongTranspose);
+
+        // 既定値は書かない (旧 file と同じ形) = 読むと既定値。
+        let legacy = Song { tracks: vec![Track { id: 1, ..Track::default() }], ..Song::default() };
+        let raw = serde_json::to_value(&legacy).unwrap();
+        assert!(raw.get("transpose").is_none() && raw["tracks"][0].get("follow_transpose").is_none());
+        let path = dir.path().join("legacy_transpose.daw");
+        write_project_with_version(&path, &legacy, 39);
+        let loaded = load_project(&path).unwrap().song;
+        assert_eq!(loaded.transpose, 0);
+        assert!(loaded.tracks[0].follow_transpose);
+    }
+
     /// 旧 `save` (= `save_project(.., None)` への委譲) は view を書かない。
     #[test]
     fn plain_save_writes_no_view() {

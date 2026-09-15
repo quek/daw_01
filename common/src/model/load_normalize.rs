@@ -35,6 +35,9 @@ impl Song {
         if self.video_resolution.0 == 0 || self.video_resolution.1 == 0 {
             self.video_resolution = default_video_resolution();
         }
+        // r.md #130: 移調の基準値は RT / VOICEVOX / SMF がそのまま使う (LoadSong は素通し)。
+        let max = crate::transpose::TRANSPOSE_MAX_SEMITONES;
+        self.transpose = self.transpose.clamp(-max, max);
         // r.md #110: Parallel chain の gain / pan は RT が snapshot からそのまま掛ける
         // (IPC の `SetChain*` は境界で clamp するが、LoadSong は素通し) ので、
         // ここで値域に収める。

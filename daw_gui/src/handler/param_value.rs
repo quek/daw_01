@@ -156,6 +156,7 @@ impl AppData {
             }
             T::SongTempo => Some(f64::from(song.bpm)),
             T::SongTimeSigNumerator => Some(f64::from(song.time_sig.0)),
+            T::SongTranspose => Some(f64::from(song.transpose)),
             // Image / Text PiP: 同 track の first event (セル込み) の field 値 (`docs/plan_image_automation.md`
             // §4)。drag が event の field を更新 → ここで読み直す → 録音が点を打つ。
             T::ImageBuiltin(field) => first_image_event(song, owner).map(|ev| image_builtin_value(ev, *field)),
@@ -284,6 +285,7 @@ fn fallback_plain(target: &AutomationTarget) -> f64 {
         T::TrackBuiltin(B::ParallelSelect { .. }) => 0.5,
         T::SongTempo => f64::from(Song::default().bpm),
         T::SongTimeSigNumerator => f64::from(Song::default().time_sig.0),
+        T::SongTranspose => f64::from(Song::default().transpose),
         T::ImageBuiltin(field) => image_builtin_value(&common::model::ImageEvent::default(), *field),
         T::TextBuiltin(field) => text_builtin_value(&common::model::TextEvent::default(), *field),
         T::GroupTransform(p) => f64::from(group_transform_field(&common::model::GroupTransform::default(), *p)),

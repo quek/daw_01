@@ -115,6 +115,7 @@
             row_h: None,
             kind: TrackKind::Audio,
             color: None,
+            no_transpose_mark: false,
         }
     }
 
@@ -706,6 +707,7 @@
             automation_lanes: Vec::new(),
             row_h: None,
             color: None,
+            no_transpose_mark: false,
         };
         assert_eq!(t.kind, TrackKind::Video);
     }
@@ -1579,6 +1581,7 @@
             automation_lanes: Vec::new(),
             row_h: None,
             color: None,
+            no_transpose_mark: false,
         }
     }
 

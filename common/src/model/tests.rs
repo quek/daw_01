@@ -1480,7 +1480,9 @@ fn current_version_is_pinned() {
     // v38: Selector / ADSR / LFO 拡張 (serde default で読める)。
     // v39 (r.md #129): strip / master_strip → 組み込み `Device::Native` と `master_limiter`
     // (`project::native_migration` が版に依存せず移す)。
-    assert_eq!(CURRENT_VERSION, 39);
+    // v41 (r.md #130): `Song.transpose` / `Track.follow_transpose` / `SongTranspose` の target と binding
+    // (serde default で読める。v40 は r.md #131 に事前割当された版で、この branch では欠番)。
+    assert_eq!(CURRENT_VERSION, 41);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! 値のみの `Song` 更新 (mixer / 内蔵 device / send / record-arm / bpm / 拍子)。
+//! 値のみの `Song` 更新 (mixer / 内蔵 device / send / record-arm / bpm / 拍子 / 移調)。
 //!
 //! どれも `Song` の 1 フィールドを書き換えて **値のみ bundle** で publish するだけで、
 //! routing schedule の再 compile を伴わない (`docs/plan_arch_refactor.md` §5 D)。
@@ -95,6 +95,10 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
         }
         AudioCommand::SetSongBpm { bpm, .. } => song.bpm = bpm.clamp(1.0, 400.0),
         AudioCommand::SetSongTimeSigNumerator { num, .. } => song.time_sig.0 = num.clamp(1, 32),
+        AudioCommand::SetSongTranspose { semitones, .. } => {
+            let max = common::transpose::TRANSPOSE_MAX_SEMITONES;
+            song.transpose = semitones.clamp(-max, max);
+        }
         _ => return false,
     }
     true
@@ -168,6 +172,8 @@ mod tests {
         assert_eq!(song.bpm, 1.0);
         assert!(apply(&AudioCommand::SetSongTimeSigNumerator { project: common::protocol::ProjectKey(1), num: 0 }, &mut song));
         assert_eq!(song.time_sig.0, 1);
+        assert!(apply(&AudioCommand::SetSongTranspose { project: common::protocol::ProjectKey(1), semitones: -100 }, &mut song));
+        assert_eq!(song.transpose, -24);
 
         // 存在しない id は何も壊さない。
         assert!(apply(&AudioCommand::SetTrackMuted { project: common::protocol::ProjectKey(1), track: 99, muted: true }, &mut song));

@@ -266,6 +266,9 @@ impl AppData {
                                 "Bounce: 対象クリップが消えたため中止しました".into();
                         }
                     }
+                    // r.md #130: 合成待ちの間は書いた音で送っていた。render に進めなかったら移調込みへ戻す
+                    // (進んだなら焼いている間は書いた音のままなので差分キャッシュが何も送らない)。
+                    self.sync_vocal_metadata();
                 }
             }
             PluginEvent::SlotPluginLoaded {

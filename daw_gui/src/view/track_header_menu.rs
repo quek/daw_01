@@ -10,61 +10,97 @@ use daw_ui_core::{Edit, Ui};
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, ColorPickerTarget};
+use crate::view::checked;
 
-/// track header の右クリックメニュー (Rename / 複製 / 色 / Delete) と改名 overlay。
+/// メニュー項目。**並び順は [`TrackMenuItem::ALL`] が SSoT** (ラベルと発行を index で割らない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackMenuItem {
+    Rename,
+    DuplicateUnique,
+    DuplicateShared,
+    Color,
+    ResetClipColors,
+    /// r.md #130: チェック付きの「移調に追従」。
+    FollowTranspose,
+    Delete,
+}
+
+impl TrackMenuItem {
+    const ALL: [Self; 7] = [
+        Self::Rename,
+        Self::DuplicateUnique,
+        Self::DuplicateShared,
+        Self::Color,
+        Self::ResetClipColors,
+        Self::FollowTranspose,
+        Self::Delete,
+    ];
+
+    /// 表示ラベル。`follows` は右クリックしたトラック自身の「移調に追従」(チェックの状態)。
+    fn label(self, follows: bool) -> String {
+        match self {
+            Self::Rename => "Rename".into(),
+            Self::DuplicateUnique => "複製 (独立)".into(),
+            Self::DuplicateShared => "複製 (リンク)".into(),
+            Self::Color => "色...".into(),
+            Self::ResetClipColors => "クリップ色をトラックに揃える".into(),
+            Self::FollowTranspose => checked("移調に追従", follows),
+            Self::Delete => "Delete".into(),
+        }
+    }
+}
+
+/// track header の右クリックメニュー (Rename / 複製 / 色 / 移調に追従 / Delete) と改名 overlay。
 ///
 /// rename 対象は安定 ID で直接持つ (index 経由の解決はしない = reorder/delete で
 /// 別 track にすり替わらない、 SSoT)。
 pub(crate) fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, resp: &ArrangementResponse) {
     let renaming_track_id = app.cur.peph.track_rename_id;
-    for (track_id, rect) in &resp.track_header_rects {
-        let track_id = *track_id;
-        let rect = *rect;
-        ui.context_menu_for(
-            rect,
-            &[
-                "Rename",
-                "複製 (独立)",
-                "複製 (リンク)",
-                "色...",
-                "クリップ色をトラックに揃える",
-                "Delete",
-            ],
-            move |idx, ui| {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    // 複製 (r.md #30) / 削除 (r.md #43) の対象: 右クリック track が
-                    // 選択集合に含まれるなら選択全体、 含まれないなら右クリック track
-                    // 単独 (REAPER / Ableton 流)。 メニュー内で規則を割らない。
-                    let target_ids = || {
-                        if app.cur.selection.selected_track_ids.contains(&track_id) {
-                            app.cur.selection.selected_track_ids.clone()
-                        } else {
-                            vec![track_id]
-                        }
-                    };
-                    match idx {
-                        0 => app.handle_event(AppEvent::BeginRenameTrack(track_id)),
-                        // 独立複製 (Alt+D 相当): 元と切り離した別コピー。
-                        1 => app.handle_event(AppEvent::DuplicateTracksUnique(target_ids())),
-                        // リンク複製 (D 相当): クリップ中身を元と content_id 共有。
-                        2 => app.handle_event(AppEvent::DuplicateTracksShared(target_ids())),
-                        // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
-                        // (anchor = 右クリックした track header rect)。
-                        3 => app.open_color_picker(ColorPickerTarget::Track(track_id), rect),
-                        // Ableton 流: track の全 clip の色上書きを外して track 色継承に戻す。
-                        4 => app.handle_event(AppEvent::ResetTrackClipColors {
-                            track: track_id,
-                        }),
-                        5 => app.handle_event(AppEvent::DeleteTracks(target_ids())),
-                        _ => {}
-                    }
-                }));
-            },
-        );
+    let song = app.cur.song_doc.song();
+    for &(track_id, rect) in &resp.track_header_rects {
+        let follows = song.track_by_id(track_id).is_none_or(|t| t.follow_transpose);
+        let labels = TrackMenuItem::ALL.map(|item| item.label(follows));
+        let items = labels.each_ref().map(String::as_str);
+        ui.context_menu_for(rect, &items, move |idx, ui| {
+            if let Some(&item) = TrackMenuItem::ALL.get(idx) {
+                ui.push_edit(Edit::mutate(move |app: &mut AppData| apply(app, item, track_id, rect, follows)));
+            }
+        });
 
         if Some(track_id) == renaming_track_id {
             draw_rename_input(app, ui, track_id, rect);
         }
+    }
+}
+
+/// メニュー項目 1 つを発行する。`follows` はメニューを開いたときの右クリックしたトラックの「移調に追従」。
+fn apply(app: &mut AppData, item: TrackMenuItem, track_id: u32, rect: Rect, follows: bool) {
+    // 複製 (r.md #30) / 削除 (r.md #43) / 移調に追従 (r.md #130) の対象: 右クリック track が
+    // 選択集合に含まれるなら選択全体、 含まれないなら右クリック track 単独 (REAPER / Ableton 流)。
+    // メニュー内で規則を割らない。
+    let target_ids = |app: &AppData| {
+        if app.cur.selection.selected_track_ids.contains(&track_id) {
+            app.cur.selection.selected_track_ids.clone()
+        } else {
+            vec![track_id]
+        }
+    };
+    match item {
+        TrackMenuItem::Rename => app.handle_event(AppEvent::BeginRenameTrack(track_id)),
+        // 独立複製 (Alt+D 相当): 元と切り離した別コピー。
+        TrackMenuItem::DuplicateUnique => app.handle_event(AppEvent::DuplicateTracksUnique(target_ids(app))),
+        // リンク複製 (D 相当): クリップ中身を元と content_id 共有。
+        TrackMenuItem::DuplicateShared => app.handle_event(AppEvent::DuplicateTracksShared(target_ids(app))),
+        // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
+        // (anchor = 右クリックした track header rect)。
+        TrackMenuItem::Color => app.open_color_picker(ColorPickerTarget::Track(track_id), rect),
+        // Ableton 流: track の全 clip の色上書きを外して track 色継承に戻す。
+        TrackMenuItem::ResetClipColors => app.handle_event(AppEvent::ResetTrackClipColors { track: track_id }),
+        // 右クリックしたトラックのチェックを反転した値に、対象全部を揃える (混在していても 1 回で揃う)。
+        TrackMenuItem::FollowTranspose => {
+            app.handle_event(AppEvent::SetTracksFollowTranspose { track_ids: target_ids(app), follow: !follows });
+        }
+        TrackMenuItem::Delete => app.handle_event(AppEvent::DeleteTracks(target_ids(app))),
     }
 }
 
