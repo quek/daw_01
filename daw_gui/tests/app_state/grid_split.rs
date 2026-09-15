@@ -193,6 +193,11 @@ fn アレンジの_shift_e_はクリップをグリッド線で割る() {
     // クリップは 1/32 拍だけ小節線の手前から始まる → 先頭の 1/32 拍は次の片へくっつく。
     let start = 1.0 - 1.0 / 32.0;
     let mut app = app_with_midi(&[(1, start, 4.0 - start)], vec![note(1, 0.0, 4.0 - start, 60, Some("ら"))]);
+    // 両端に隣とのクロスフェードの張り出しが付いている。
+    app.edit_song(|song| {
+        song.tracks[0].clips[0].xfade_lead_beats = 0.01;
+        song.tracks[0].clips[0].xfade_tail_beats = 0.02;
+    });
     app.cur.view.arrange_snap_choice = GRID_1_4;
     app.cur.view.arrange_snap_enabled = true;
     app.cur.peph.arrangement_hover_clip = Some(A);
@@ -206,6 +211,9 @@ fn アレンジの_shift_e_はクリップをグリッド線で割る() {
     assert_eq!(spans, vec![(start, 2.0 - start), (2.0, 1.0), (3.0, 1.0)]);
     assert_eq!(clips[0].id, 1, "先頭の片が元のクリップ");
     assert!(clips.iter().all(|c| c.content_id == clips[0].content_id), "片は同じ content の窓");
+    // 片同士は接しているので、切り口の端が張り出しを継ぐと同じ素材が切り口の先で 2 重に鳴る。
+    let overhangs: Vec<(f64, f64)> = clips.iter().map(|c| (c.xfade_lead_beats, c.xfade_tail_beats)).collect();
+    assert_eq!(overhangs, vec![(0.01, 0.0), (0.0, 0.0), (0.0, 0.02)], "外側の端だけが元の張り出しを持つ");
     // 跨いでいたノートは切り口で割れ、各片の窓に発音開始が入る。
     for c in &clips {
         let (w0, w1) = c.content_window();

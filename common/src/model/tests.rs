@@ -2882,6 +2882,9 @@ fn 左端を削られたクリップはcontentの窓だけが進む() {
 fn 真ん中を抜かれた両断片は同じcontentを別の窓で見る() {
     let mut t = track_with_raw_clips(&[(1, 0.0, 16.0)]);
     t.clips[0].content_id = 7;
+    // 両端に隣とのクロスフェードの張り出しが付いている。
+    t.clips[0].xfade_lead_beats = 0.01;
+    t.clips[0].xfade_tail_beats = 0.02;
     t.place_clip(Clip { id: 0, start_beat: 4.0, length_beats: 4.0, content_id: 9, ..Clip::default() });
     let mut frags: Vec<&Clip> = t.clips.iter().filter(|c| c.content_id == 7).collect();
     frags.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
@@ -2891,6 +2894,13 @@ fn 真ん中を抜かれた両断片は同じcontentを別の窓で見る() {
     assert_eq!((frags[1].start_beat, frags[1].length_beats), (8.0, 8.0));
     assert_eq!(frags[1].content_offset_beats, 8.0, "右断片は窓が 8 拍進む");
     assert_ne!(frags[0].id, frags[1].id, "断片には別々の id が振られる");
+    // 削られてできた端 (置いたクリップに接する側) は張り出しを継がない。 継ぐと、置いた
+    // クリップの頭と尻に消したはずの素材が重なって鳴る (再生側は「隣が接していれば張り出す」)。
+    assert_eq!(
+        [(frags[0].xfade_lead_beats, frags[0].xfade_tail_beats), (frags[1].xfade_lead_beats, frags[1].xfade_tail_beats)],
+        [(0.01, 0.0), (0.0, 0.02)],
+        "外側の端だけが元の張り出しを持つ"
+    );
 }
 
 #[test]

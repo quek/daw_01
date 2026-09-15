@@ -8,7 +8,7 @@
 //! いる分割)、原点は曲の拍 0。
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use common::model::{ClipContent, ClipKey, Song, MIN_CLIP_LEN_BEATS, MIN_NOTE_LEN_BEATS};
+use common::model::{ClipContent, ClipKey, ClipWindow, Song, MIN_CLIP_LEN_BEATS, MIN_NOTE_LEN_BEATS};
 use common::snap::grid_lines_within;
 
 use crate::app_types::*;
@@ -404,20 +404,23 @@ pub(crate) fn split_clip_window(song: &mut Song, key: ClipKey, cuts: &[f64]) -> 
     if let Some(front) = track.clip_by_id_mut(key.clip_id) {
         front.content_id = content_id;
         front.length_beats = first - start;
+        front.clear_overhang(false, true);
     }
     let mut pieces = vec![key];
     for (i, &at) in cuts.iter().enumerate() {
-        let to = cuts.get(i + 1).copied().unwrap_or(end);
-        let piece = common::model::Clip {
+        let next = cuts.get(i + 1).copied();
+        let mut piece = common::model::Clip {
             id: 0,
             content_id,
             start_beat: at,
-            length_beats: to - at,
+            length_beats: next.unwrap_or(end) - at,
             content_offset_beats: off + (at - start),
             auto_lipsync: false,
             lipsync_gen: 0,
             ..clip.clone()
         };
+        // 切り口の端はクロスフェードの張り出しを継がない (外側の端 = 末尾の片の尻だけが継ぐ)。
+        piece.clear_overhang(true, next.is_some());
         let clip_id = track.place_clip(piece);
         pieces.push(ClipKey { track_id: key.track_id, clip_id });
     }

@@ -111,9 +111,9 @@ impl TrackScratch {
             track_r: vec![0.0; MAX_FRAMES],
             midi_bus_a: Vec::with_capacity(MAX_EVENTS),
             midi_bus_b: Vec::with_capacity(MAX_EVENTS),
-            // capacity は sequencer の `ACTIVE_NOTES_CAP` (= `MAX_EVENTS`) と
-            // 一致させる。 push 前 clamp が `MAX_EVENTS` で効くので、 ここを
-            // それ未満にすると clamp が防げない区間で RT realloc が起きる。
+            // capacity は発音台帳の上限 `note_ledger::MAX_SOUNDING` (= `MAX_EVENTS`) と
+            // 一致させる。 `queue_all_notes_off` は台帳の全件を `pending_offs` へ積むので、
+            // ここをそれ未満にすると RT realloc が起きる。
             state: PerTrackState::with_capacity(MAX_EVENTS),
             peak_l: 0.0,
             peak_r: 0.0,
@@ -328,8 +328,8 @@ pub fn pass_strip(scratch: &mut TrackScratch, n: usize) {
 /// どれかが必ず漏れ、跳び越された Off が二度と emit されず note が鳴り続ける。
 ///
 /// RT-safe: `pending_offs` は `process_track_owned` の冒頭で毎 buffer drain + clear
-/// されるので push 時点では空。`active_notes` は `PerTrackState::with_capacity` の
-/// 確保量でクランプ済みなので push で再確保しない。
+/// されるので push 時点では空。`active_notes` (発音台帳) は `note_ledger::MAX_SOUNDING` で
+/// クランプ済みで、`pending_offs` も同じ量を確保しているので push で再確保しない。
 pub fn queue_all_notes_off(scratch: &mut [TrackScratch]) {
     for s in scratch.iter_mut() {
         for note in s.state.active_notes.iter() {

@@ -15,6 +15,14 @@ pub trait ClipWindow: Clone {
     fn set_window_len(&mut self, v: f64);
     fn window_offset(&self) -> f64;
     fn set_window_offset(&mut self, v: f64);
+    /// **切り口で作り直した端**から、窓の外へ鳴らす張り出し (クロスフェード) を外す
+    /// (`lead` = 先頭側 / `tail` = 末尾側)。
+    ///
+    /// 張り出しは組んだ相手との境界のための量なので、新しい端は継がない。 継ぐと、その端に
+    /// 接するもの (分割した同じ content の続き / 上書きで置いたクリップ) の上で窓の外の素材が
+    /// 重なって鳴る (再生側は「隣が接していれば張り出す」だけを見るため)。 張り出しを持たない
+    /// 窓は何もしない。
+    fn clear_overhang(&mut self, lead: bool, tail: bool);
 }
 
 /// 拍の同一視イプシロン。これ以下の長さになった断片は落とす。
@@ -62,6 +70,7 @@ pub fn carve_range<T: ClipWindow>(
             (false, false) => false, // 完全被覆
             (true, false) => {
                 c.set_window_len(start - c0); // 右側を削る (content 不変)
+                c.clear_overhang(false, true);
                 true
             }
             (false, true) => {
@@ -70,6 +79,7 @@ pub fn carve_range<T: ClipWindow>(
                 c.set_window_offset(c.window_offset() + delta);
                 c.set_window_start(end);
                 c.set_window_len(c1 - end);
+                c.clear_overhang(true, false);
                 true
             }
             (true, true) => {
@@ -79,8 +89,10 @@ pub fn carve_range<T: ClipWindow>(
                 right.set_window_offset(right.window_offset() + delta);
                 right.set_window_start(end);
                 right.set_window_len(c1 - end);
+                right.clear_overhang(true, false);
                 split_right.push(right);
                 c.set_window_len(start - c0);
+                c.clear_overhang(false, true);
                 true
             }
         }

@@ -383,7 +383,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let anchor_idx = app.audio_editor_anchor_event();
     // 矩形選択 (lasso) の hit-test 用に、 描画した event の rect を収集する。
     let mut event_rects: Vec<(usize, Rect)> = Vec::new();
-    let clip_len_beats = clip.length_beats.max(1e-6); // 0 div 防御
     // view ベース px → beats 換算係数。 view_len_beats は zoom 中に変動
     // するので毎フレーム再計算。 wf_area.w (px) は view_len_beats (beats)
     // 分の幅を表示している。 1 px = beats_per_px。
@@ -1088,7 +1087,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
 
     // ----- Mouse hover → clip 内 beat (E キー split / 将来の波形操作用) -----
-    // wf_area 内のマウス位置を clip-local beat (clip 始端 = 0) に変換。
+    // wf_area 内のマウス位置を **content-local** 拍 (event の `event_start_in_clip_beats` と
+    // 同じ軸、r.md #44) に変換し、クリップの窓 `[content_offset, +length)` に収める。
     // E キー (`AppData::split_clips`) は audio editor 開いてる時
     // 既存の arrangement_hover ではなく **この値** を優先採用する
     // (= bottom panel にマウスがある時点で arrangement hover は更新
@@ -1101,7 +1101,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
         let in_clip = view_start_beat
             + ((px - wf_area.x).max(0.0) as f64) * beats_per_px;
-        Some(in_clip.clamp(0.0, clip_len_beats))
+        // 窓は content 原点から `content_offset` ずれている (左端 trim / 分割した後ろの片)。
+        // `[0, length)` に収めると、ポインタの下ではなく窓の頭で切っていた。
+        let (w0, w1) = clip.content_window();
+        Some(in_clip.clamp(w0, w1))
     });
     if app.cur.peph.audio_editor_hover_beat_in_clip != hover_in_clip {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {

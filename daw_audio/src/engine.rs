@@ -870,8 +870,8 @@ impl ProjectRt {
     ///
     /// RT-safe: `pending_offs` は `process_track_owned` の冒頭で毎 buffer drain +
     /// clear され、この関数はどれも buffer 冒頭 (`consume_transport_requests`) か
-    /// buffer 末 (loop wrap) で呼ばれるので push 時点では空。`active_notes` は
-    /// `ACTIVE_NOTES_CAP` (= `PerTrackState::with_capacity` の確保量) でクランプ
+    /// buffer 末 (loop wrap) で呼ばれるので push 時点では空。`active_notes` (発音台帳) は
+    /// `note_ledger::MAX_SOUNDING` (= `PerTrackState::with_capacity` の確保量) でクランプ
     /// 済みなので、push で再確保しない。
     fn queue_all_notes_off(&mut self) {
         crate::mixer::queue_all_notes_off(&mut self.scratch);
