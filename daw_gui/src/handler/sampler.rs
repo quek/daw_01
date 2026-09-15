@@ -227,7 +227,7 @@ impl AppData {
         }
         let name = format!(
             "Sampler_{}_{}",
-            source_label_short(self.cur.song_doc.song(), self.sampler.source),
+            source_label_short(self, self.sampler.source),
             chrono_stamp()
         );
         let imported = match materialize_capture(&name, &frames, ring.sample_rate(), self.project_dir().as_deref()) {
@@ -404,14 +404,18 @@ impl AppData {
     }
 }
 
-/// 録音源の短い表示名 (ファイル名に入る)。
-fn source_label_short(song: &common::model::Song, source: SamplerSource) -> String {
+/// 録音源の短い表示名 (ファイル名に入る)。トラック名は**録音源のタブ** (`project`) の Song から引く —
+/// 録音源は別タブのトラックも選べる (`view/sampler_tab.rs`) ので、今のタブの Song で引くと
+/// 同じ id を持つ無関係なトラックの名前 (無ければ「削除済み」) になる。
+fn source_label_short(app: &AppData, source: SamplerSource) -> String {
     match source {
         SamplerSource::Master => "Master".to_string(),
-        SamplerSource::Track { tap, .. } => {
-            let name = tap
-                .source_track()
-                .map_or(std::borrow::Cow::Borrowed("Track"), |id| song.track_display_name(id));
+        SamplerSource::Track { project, tap } => {
+            let name = match (tap.source_track(), app.tab(project)) {
+                (Some(id), Some(ps)) => ps.song_doc.song().track_display_name(id),
+                // タブを閉じると録音源は Master へ戻る (`handler/tabs.rs`) ので、ここは chain 由来の tap だけ。
+                _ => std::borrow::Cow::Borrowed("Track"),
+            };
             let safe: String = name
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })

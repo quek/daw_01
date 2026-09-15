@@ -102,8 +102,10 @@ pub struct ProjectIpc {
     /// The editor *windows* are now created and owned by the plugin-host process
     /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed
     /// state here for toggle / dedup / cleanup. Not `#[cfg(windows)]` because
-    /// it's a plain id set — the window FFI lives in the plugin-host process.
-    pub open_plugin_guis: std::collections::HashSet<u64>,
+    /// it's a plain id map — the window FFI lives in the plugin-host process.
+    /// 値はその窓へ最後に送ったタイトル: 表示名 (r.md #133 の並び順の番号) やプロジェクト名が
+    /// 開いた後に変わったら `AppData::sync_plugin_editor_titles` が差分だけ送り直す。
+    pub open_plugin_guis: std::collections::HashMap<u64, String>,
     /// v29: `device_id → 要求 generation`。 `SetSlotPlugin` を送ったが
     /// `SlotPluginLoaded` / `SlotPluginLoadFailed` がまだの device 集合。
     /// While non-empty, Play is queued so the audio engine doesn't
@@ -871,7 +873,7 @@ impl ProjectState {
                 pending_glue_bake: None,
                 pending_vocal_synth_bounce: None,
                 pending_vocal_synth_export: std::collections::HashSet::new(),
-                open_plugin_guis: std::collections::HashSet::new(),
+                open_plugin_guis: std::collections::HashMap::new(),
                 pending_plugin_loads: std::collections::HashMap::new(),
                 failed_plugin_loads: std::collections::HashMap::new(),
                 pending_added_plugin_finalize: std::collections::HashMap::new(),

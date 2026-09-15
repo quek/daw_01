@@ -13,6 +13,11 @@ use daw_gui::event_launcher::LauncherEvent;
 
 use super::support::{self, select_track_single};
 
+#[cfg(windows)]
+use common::protocol::PluginCommand;
+#[cfg(windows)]
+use daw_gui::event_device::DeviceEvent;
+
 fn track_names(app: &AppData) -> Vec<String> {
     app.cur.song_doc.song().tracks.iter().map(|t| t.name.clone()).collect()
 }
@@ -145,6 +150,49 @@ fn 未命名トラックの複製は未命名のまま新しい位置の番号�
     assert!(names.contains(&"Lead"), "名前付きは名前ごと写す: {names:?}");
     let (pos, copy) = added.iter().find(|(_, t)| t.name.is_empty()).copied().expect("未命名の複製");
     assert_eq!(song.track_display_name(copy.id), (pos + 1).to_string(), "複製は新しい位置の番号で出る");
+}
+
+/// プラグイン窓のタイトルは開いたときに 1 度作るだけだと、未命名トラックの番号が上にトラックを
+/// 足すだけで変わるので、窓だけ古い番号を出し続ける。frame 末の追従で差分だけ送り直す。
+/// (エディタ窓を開く経路は Windows だけ。)
+#[cfg(windows)]
+#[test]
+fn プラグイン窓のタイトルは開いた後の番号の変化と改名に追従する() {
+    let (mut app, _a, mut plugin_rx, _d) = support::build_app();
+    support::load_instrument(&mut app);
+    let track_id = app.cur.song_doc.song().tracks[0].id;
+    let device_id = app.cur.song_doc.song().tracks[0].plugins().next().expect("楽器").id;
+    support::drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::Device(DeviceEvent::ToggleSlotGui { device_id }));
+    let opened: Vec<String> = support::drain(&mut plugin_rx)
+        .into_iter()
+        .filter_map(|c| match c {
+            PluginCommand::OpenSlotGuiEmbedded { title, .. } => Some(title),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opened, ["Plugin — 1 / Test Synth [Untitled]"]);
+
+    let mut resent_titles = |app: &mut AppData| -> Vec<String> {
+        app.sync_all_plugin_editor_titles();
+        support::drain(&mut plugin_rx)
+            .into_iter()
+            .filter_map(|c| match c {
+                PluginCommand::SetSlotGuiTitle { title, .. } => Some(title),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(resent_titles(&mut app).is_empty(), "何も変わっていなければ送らない");
+
+    select_track_single(&mut app, 0);
+    app.handle_event(AppEvent::AddInstrumentTrack); // 選択中の行の直上に入る
+    assert_eq!(resent_titles(&mut app), ["Plugin — 2 / Test Synth [Untitled]"], "上に 1 本足すと 2");
+    assert!(resent_titles(&mut app).is_empty(), "送るのは変わったときだけ");
+
+    rename_track(&mut app, track_id, "Lead");
+    assert_eq!(resent_titles(&mut app), ["Plugin — Lead / Test Synth [Untitled]"]);
 }
 
 #[test]

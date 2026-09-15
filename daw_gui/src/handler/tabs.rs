@@ -338,6 +338,14 @@ impl AppData {
         }
     }
 
+    /// エディタ窓のタイトル追従 ([`Self::sync_plugin_editor_titles`]) を全タブで回す。背景タブの
+    /// 窓も開いたまま残り (Q6)、背景タブ宛ての event (別タブへの drop 等) でその Song も変わる。
+    pub fn sync_all_plugin_editor_titles(&mut self) {
+        for key in self.tabs.order.clone() {
+            self.with_project(key, |app| app.sync_plugin_editor_titles());
+        }
+    }
+
     /// autosave を全タブで回す (各タブが自分の sidecar / session file に書く)。
     pub(crate) fn autosave_all_tabs(&mut self) {
         for key in self.tabs.order.clone() {

@@ -1042,6 +1042,11 @@ pub enum PluginCommand {
         owner_main_window: Option<PlatformWindowHandle>,
     },
     CloseSlotGui { device: DeviceAddr },
+    /// 開いているエディタ窓のタイトルを差し替える (窓が無ければ何もしない)。タイトルの中身
+    /// (トラックの表示名 / プロジェクト名) は開いた後にも変わる — r.md #133 で未命名トラックの
+    /// 表示名は並び順の番号なので、上にトラックを足す・並べ替える・消すだけで変わる。
+    /// daw_gui が差分を見て、変わったときだけ送る。
+    SetSlotGuiTitle { device: DeviceAddr, title: String },
     /// r.md #55: **開いているエディタ窓を全部閉じる** (`Ctrl+Shift+W`)。全 project。
     ///
     /// 列挙元は daw_gui ではなく **窓を所有する plugin_host** (`instances` の
