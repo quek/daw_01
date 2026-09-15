@@ -15,11 +15,57 @@
 use std::path::{Path, PathBuf};
 
 const AUTOSAVE_SUFFIX: &str = ".autosave.daw";
+const LOCK_SUFFIX: &str = ".lock";
 
-/// 起動 1 回ごとに発行する recovery session id (uuid v4)。
-/// `recovery_path_for_session` の引数に使う。
-pub fn new_session_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+/// 未保存の文書を per-user データフォルダの中で識別する id (uuid v4)。
+///
+/// 1 つの id が、その文書の **autosave** (`recovery/<id>.autosave.daw`)、**素材の置き場**
+/// (`import_cache/<id>/` / `bounce_cache/<id>/`、`daw_gui::unsaved_place`)、置き場の
+/// **使用中ロック** (`recovery/<id>.lock`) の名前をそろえる。recovery から復元した文書は
+/// ファイル名の id を引き継ぐので、復元前に取り込んだ素材の置き場もそのまま自分のものになる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DocId(uuid::Uuid);
+
+impl DocId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    /// ファイル / フォルダ名から読む。**書き出す形 (hyphenated 小文字) と一字一句同じ**名前だけを
+    /// 受ける — 名前をそのままパスへ繋ぐので、`.` / `..` や別表記 (`{...}` / 大文字) を id として
+    /// 通すと、掃除が置き場の親や別のフォルダを指してしまう。
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let id = uuid::Uuid::try_parse(name).ok().map(Self)?;
+        (id.to_string() == name).then_some(id)
+    }
+
+    /// recovery dir の `<id>.autosave.daw` の id。sidecar (`<file>.daw.autosave.daw`) は `None`。
+    #[must_use]
+    pub fn of_recovery_file(autosave: &Path) -> Option<Self> {
+        let name = autosave.file_name()?.to_str()?;
+        Self::parse(name.strip_suffix(AUTOSAVE_SUFFIX)?)
+    }
+
+    /// `recovery/<id>.lock` の id。
+    #[must_use]
+    pub fn of_lock_file(lock: &Path) -> Option<Self> {
+        let name = lock.file_name()?.to_str()?;
+        Self::parse(name.strip_suffix(LOCK_SUFFIX)?)
+    }
+}
+
+impl Default for DocId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for DocId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.hyphenated().fmt(f)
+    }
 }
 
 /// recovery dir を `create_dir_all` で作る。 `dir` は呼び出し側が
@@ -61,10 +107,15 @@ pub fn scan_recovery_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// 当セッション用 recovery file path (`dir / "<id>.autosave.daw"`)。
+/// 未保存の文書 `id` の recovery file path (`dir / "<id>.autosave.daw"`)。
 /// `dir` は呼び出し側が [`crate::app_dirs::AppDirs::recovery_dir`] から渡す。
-pub fn recovery_path_for_session(dir: &Path, session_id: &str) -> PathBuf {
-    dir.join(format!("{session_id}{AUTOSAVE_SUFFIX}"))
+pub fn recovery_path_for(dir: &Path, id: DocId) -> PathBuf {
+    dir.join(format!("{id}{AUTOSAVE_SUFFIX}"))
+}
+
+/// 未保存の文書 `id` の素材の置き場を使用中と示すロックファイル (`dir / "<id>.lock"`)。
+pub fn lock_path_for(dir: &Path, id: DocId) -> PathBuf {
+    dir.join(format!("{id}{LOCK_SUFFIX}"))
 }
 
 /// `<file>.daw` に対する sidecar autosave path (`<file>.daw.autosave.daw`)。
@@ -134,13 +185,29 @@ mod tests {
     }
 
     #[test]
-    fn recovery_path_uses_session_id() {
-        let p = recovery_path_for_session(
-            Path::new("C:\\appdata\\daw_01\\recovery"),
-            "test_session_id",
-        );
-        let name = p.file_name().unwrap().to_str().unwrap();
-        assert!(name.contains("test_session_id"));
-        assert!(name.ends_with(".autosave.daw"));
+    fn recovery_and_lock_paths_round_trip_the_doc_id() {
+        let dir = Path::new("C:\\appdata\\daw_01\\recovery");
+        let id = DocId::new();
+        assert_eq!(DocId::of_recovery_file(&recovery_path_for(dir, id)), Some(id));
+        assert_eq!(DocId::of_lock_file(&lock_path_for(dir, id)), Some(id));
+        assert_eq!(DocId::of_recovery_file(Path::new("C:\\proj\\song.daw.autosave.daw")), None);
+    }
+
+    /// 名前をそのままパスへ繋ぐので、書き出す形以外は id として受けない。
+    #[test]
+    fn doc_id_rejects_names_that_are_not_its_own_spelling() {
+        let id = DocId::new();
+        assert_eq!(DocId::parse(&id.to_string()), Some(id));
+        for bad in [
+            String::new(),
+            ".".into(),
+            "..".into(),
+            id.to_string().to_uppercase(),
+            format!("{{{id}}}"),
+            id.to_string().replace('-', ""),
+        ] {
+            assert_eq!(DocId::parse(&bad), None, "{bad:?}");
+        }
+        assert_eq!(DocId::of_recovery_file(Path::new("..autosave.daw")), None);
     }
 }

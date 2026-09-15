@@ -1,5 +1,5 @@
 //! handler::recovery — autosave (sidecar / recovery_dir) と、クラッシュ復旧 modal の
-//! 復元 / 破棄、 正常終了 / タブを閉じるときの recovery file 掃除。
+//! 復元 / 破棄、 正常終了 / タブを閉じるときの recovery file と未保存の置き場の掃除。
 //!
 //! `handler/project.rs` から機械分割した `impl AppData` メソッド群 (挙動は元と同一、
 //! サイズ budget = 不変条件 9)。
@@ -29,10 +29,7 @@ impl AppData {
                     tracing::warn!(error = ?e, "failed to create recovery dir");
                     return;
                 }
-                common::recovery::recovery_path_for_session(
-                    &dir,
-                    &self.cur.song_doc.recovery_session_id,
-                )
+                common::recovery::recovery_path_for(&dir, self.cur.song_doc.unsaved.id())
             }
         };
 
@@ -62,10 +59,7 @@ impl AppData {
     pub(crate) fn clear_stale_autosave_after_save(&mut self, saved_path: &Path) {
         let mut stale: Vec<PathBuf> = vec![common::recovery::sidecar_for(saved_path)];
         if let Some(dir) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recovery_dir()) {
-            stale.push(common::recovery::recovery_path_for_session(
-                &dir,
-                &self.cur.song_doc.recovery_session_id,
-            ));
+            stale.push(common::recovery::recovery_path_for(&dir, self.cur.song_doc.unsaved.id()));
         }
         for p in stale {
             if p.exists() {
@@ -100,10 +94,7 @@ impl AppData {
             stale.push(common::recovery::sidecar_for(orig));
         }
         if let Some(dir) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recovery_dir()) {
-            stale.push(common::recovery::recovery_path_for_session(
-                &dir,
-                &self.cur.song_doc.recovery_session_id,
-            ));
+            stale.push(common::recovery::recovery_path_for(&dir, self.cur.song_doc.unsaved.id()));
         }
         for p in stale {
             if p.exists() {
@@ -137,6 +128,12 @@ impl AppData {
     /// Recovery modal で「復元」 を押した処理。 sidecar 形式 (`<x>.daw.autosave.daw`)
     /// なら元 `<x>.daw` を file_path にセット、 recovery_dir 内 (`<uuid>.autosave.daw`)
     /// なら file_path = None (新規プロジェクト扱い、 ユーザーが Save As)。
+    ///
+    /// recovery_dir 内のものは **その id ごと** 引き継ぐ: 復元前に取り込んだ素材はその id の
+    /// 置き場 (`crate::unsaved_place`) にあり、 以後の autosave も同じファイルへ書く。 どちらの
+    /// 形でも autosave ファイルは消さない — 復元した中身は保存先にまだ書かれていないので、
+    /// 保存 / 破棄 / 閉じるまではそれが唯一の控え (復元直後に落ちてもまた復元できる)。 同じ理由で
+    /// 復元した文書は未保存 (`*`) にする — clean にすると確認なしで閉じられ、 控えごと消える。
     pub(crate) fn restore_recovery(&mut self, autosave_path: PathBuf) {
         let Ok(loaded) = common::project::load_project(&autosave_path) else {
             tracing::error!(
@@ -150,10 +147,14 @@ impl AppData {
         let (mut song, view, loop_region, hidden_lanes) =
             (loaded.song, loaded.view, loaded.loop_region, loaded.hidden_automation_lanes);
         song.ensure_ids();
+        let restore_to = common::recovery::original_file_for_sidecar(&autosave_path);
+        // 置き場を引き継げるか (別の daw_gui が先に復元していないか) を、何かを壊す前に確かめる。
+        let Ok(adopted) = self.adopt_recovery_place(&autosave_path, restore_to.is_none()) else {
+            return;
+        };
         // `docs/plan_project_tabs.md` §5.4: Open と同じ規則 — **同じファイルを 2 つのタブで
         // 開かない** (開くと互いに上書きし合う)。sidecar の復元先は元の .daw なので、
         // それを開いているタブがあればそこへ復元する。
-        let restore_to = common::recovery::original_file_for_sidecar(&autosave_path);
         if let Some(key) = restore_to.as_deref().and_then(|p| self.tab_with_path(p)) {
             self.switch_tab(key);
         } else if !self.cur_tab_is_pristine() && self.new_tab().is_none() {
@@ -166,13 +167,15 @@ impl AppData {
         // 直後の復元」 で旧 plugin 実体・editor 窓・GUI cache が残る)。
         self.teardown_all_loaded_plugins();
         self.restore_plugin_from_song(&song);
+        // 置き換えられる文書の未保存の間の autosave / 置き場を片付け、 復元する文書の置き場へ。
+        self.retire_replaced_unsaved_storage(adopted);
         self.cur.song_doc.replace_song(song);
         self.cur.song_doc.file_path = restore_to;
-        // 復元した内容を新しい保存ベースラインに確定し、 履歴と Song スコープ
-        // 状態を破棄する (action_open_path と同じく decode / view 復元より先)。
+        // 履歴と Song スコープ状態を破棄する (action_open_path と同じく decode / view 復元より先)。
         // sidecar は元 project と同じ `project_id` を持つので、同一 project の
         // 復元ではキャッシュは温存される。
         self.after_song_replaced();
+        self.cur.song_doc.mark_dirty_after_load_fixup();
         // recovery 復元も load path と同じく background streaming
         // decode へ。 file_path を先にセット済みなので ProjectRelative も解決可。
         self.begin_asset_decode("プロジェクトを読込中");
@@ -183,7 +186,6 @@ impl AppData {
         }
         self.resize_track_peak_display();
         self.resync_song_edit_texts();
-        let _ = std::fs::remove_file(&autosave_path);
         self.ui_ephemeral.recovery_candidates.retain(|p| p != &autosave_path);
         if self.ui_ephemeral.recovery_candidates.is_empty() {
             self.ui_ephemeral.show_recovery_modal = false;
@@ -194,7 +196,26 @@ impl AppData {
         );
     }
 
+    /// recovery_dir 内の `<id>.autosave.daw` (`untitled`) なら、その id の置き場を引き継ぐ。
+    /// sidecar / per-user データフォルダ無しは `Ok(None)` (引き継ぐ置き場が無い)。
+    /// 別のプロセスが使用中などで引き継げなければ status に出して `Err`。
+    fn adopt_recovery_place(
+        &mut self,
+        autosave_path: &Path,
+        untitled: bool,
+    ) -> Result<Option<crate::unsaved_place::UnsavedPlace>, ()> {
+        let id = common::recovery::DocId::of_recovery_file(autosave_path).filter(|_| untitled);
+        let (Some(id), Some(dirs)) = (id, self.ui_prefs.app_dirs.as_ref()) else {
+            return Ok(None);
+        };
+        crate::unsaved_place::UnsavedPlace::adopt(dirs, id).map(Some).map_err(|e| {
+            tracing::warn!(error = %e, %id, "cannot adopt the unsaved media place of a recovery");
+            self.ui_ephemeral.status_message = format!("復元失敗: {e}");
+        })
+    }
+
     /// Recovery modal で「破棄」 を押した処理。 file 削除 + candidates から外す。
+    /// recovery_dir 内のもの (`<id>.autosave.daw`) は、その id の未保存の置き場も消す。
     pub(crate) fn discard_recovery(&mut self, autosave_path: PathBuf) {
         if let Err(e) = std::fs::remove_file(&autosave_path) {
             tracing::warn!(
@@ -203,43 +224,39 @@ impl AppData {
                 "failed to remove recovery file"
             );
         }
+        if let (Some(id), Some(dirs)) = (
+            common::recovery::DocId::of_recovery_file(&autosave_path),
+            self.ui_prefs.app_dirs.as_ref(),
+        ) {
+            crate::unsaved_place::remove_unowned(dirs, id);
+        }
         self.ui_ephemeral.recovery_candidates.retain(|p| p != &autosave_path);
         if self.ui_ephemeral.recovery_candidates.is_empty() {
             self.ui_ephemeral.show_recovery_modal = false;
         }
     }
 
-    /// アプリ正常終了時 (`WindowEvent::CloseRequested`) に呼ぶ cleanup。
-    /// 自セッションで作った recovery file (sidecar / recovery_dir 両方) を **全タブ** で削除。
-    /// recovery file が無ければ no-op。 削除失敗は warn でログのみ。
-    pub fn on_shutdown(&self) {
-        self.remove_recovery_files_of(&self.cur);
-        for ps in &self.tabs.parked {
-            self.remove_recovery_files_of(ps);
+    /// アプリ終了の完了時 (`finish_shutdown`) に呼ぶ cleanup。 **全タブ** の文書が per-user
+    /// データフォルダに持つもの (recovery_dir の autosave / sidecar / 未保存の置き場) を削除。
+    /// 無ければ no-op。 削除失敗は warn でログのみ (残った置き場は次の起動の掃除が拾う)。
+    pub fn on_shutdown(&mut self) {
+        let dirs = self.ui_prefs.app_dirs.clone();
+        Self::retire_doc_files(dirs.as_ref(), &mut self.cur);
+        for ps in &mut self.tabs.parked {
+            Self::retire_doc_files(dirs.as_ref(), ps);
         }
     }
 
-    /// アクティブなタブの recovery file を削除する (タブを閉じるとき)。
-    pub(crate) fn remove_recovery_files_of_cur(&self) {
-        self.remove_recovery_files_of(&self.cur);
+    /// アクティブなタブの文書のファイルを削除する (タブを閉じるとき)。
+    pub(crate) fn remove_recovery_files_of_cur(&mut self) {
+        let dirs = self.ui_prefs.app_dirs.clone();
+        Self::retire_doc_files(dirs.as_ref(), &mut self.cur);
     }
 
-    fn remove_recovery_files_of(&self, ps: &ProjectState) {
-        // 自セッションの recovery_dir file
-        if let Some(dir) = self.ui_prefs.app_dirs.as_ref().map(|d| d.recovery_dir()) {
-            let p = common::recovery::recovery_path_for_session(
-                &dir,
-                &ps.song_doc.recovery_session_id,
-            );
-            if p.exists()
-                && let Err(e) = std::fs::remove_file(&p)
-            {
-                tracing::warn!(
-                    error = ?e,
-                    path = %p.display(),
-                    "failed to remove recovery file on shutdown"
-                );
-            }
+    fn retire_doc_files(dirs: Option<&common::app_dirs::AppDirs>, ps: &mut ProjectState) {
+        // 自セッションの recovery_dir file と未保存の置き場
+        if let Some(dirs) = dirs {
+            Self::retire_unsaved_storage(dirs, &mut ps.song_doc);
         }
         // sidecar (file_path が Some なら)
         if let Some(orig) = ps.song_doc.file_path.as_ref() {

@@ -56,6 +56,7 @@ pub mod import_audio;
 pub mod import_image;
 pub mod media_bundle;
 pub mod media_dest;
+pub mod unsaved_place;
 pub mod launcher_time;
 pub mod text_compose;
 #[cfg(windows)]

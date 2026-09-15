@@ -181,7 +181,7 @@ impl AppData {
         }
     }
 
-    /// `Draining` → `Finished`。**recovery ファイルの削除はここ**。
+    /// `Draining` → `Finished`。**recovery ファイルと未保存の置き場の削除はここ**。
     ///
     /// drain の開始時に消すと、teardown に数秒かかる間に autosave が書き直したり
     /// (event gate で塞いだが)、OS に強制終了されて「まだ終われていないのに

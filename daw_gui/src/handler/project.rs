@@ -738,6 +738,8 @@ impl AppData {
         // いた回帰の修正 (load 成功後・新 plugin load 前に実行)。
         self.teardown_all_loaded_plugins();
         self.restore_plugin_from_song(&song);
+        // 置き換えられる Untitled (pristine) が未保存の間に持っていた autosave / 置き場を片付ける。
+        self.retire_replaced_unsaved_storage(None);
         self.cur.song_doc.replace_song(song);
         self.cur.song_doc.file_path = Some(path.clone());
         // load した内容を新しい保存ベースラインに確定し、 前プロジェクトの

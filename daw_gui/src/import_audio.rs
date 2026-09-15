@@ -5,9 +5,10 @@
 //! 1. Compute SHA-256 of the source file (first 4 bytes → 8 hex chars
 //!    used as a dedup key in the `samples/` filename).
 //! 2. Copy the file into `<project_dir>/samples/<basename>_<hash>.<ext>`
-//!    if not already present. Unsaved projects use the per-user
-//!    import_cache directory ([`crate::media_dest`]); saving the project
-//!    later moves those files into the real `samples/` dir.
+//!    if not already present. Unsaved projects use the document's own place
+//!    under the per-user import_cache ([`crate::media_dest`]); saving the
+//!    project later moves those files into the real `samples/` dir
+//!    ([`crate::media_bundle::plan_unsaved_migration`]).
 //! 3. Decode via `common::audio_decode` (symphonia) into a planar
 //!    `AudioSourceBuffer` — WAV / AIFF / FLAC / MP3 / OGG / M4A (r.md #19).
 //! 4. Build the `AudioSource` model entry referencing
@@ -22,12 +23,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use common::app_dirs::AppDirs;
-use common::model::{AudioSource, AudioSourcePath};
+use common::model::AudioSource;
 use sha2::{Digest, Sha256};
 
 use crate::audio_source_cache::AudioSourceBuffer;
-use crate::media_dest::{MediaDest, MediaPool};
+use crate::media_dest::MediaDest;
 
 /// Maximum audio file size accepted on import (§7.2 = 4 GiB). Guards the
 /// whole-file decode-into-memory against a pathological source, for every
@@ -187,95 +187,6 @@ impl From<common::audio_decode::DecodeError> for ImportError {
     }
 }
 
-/// Plan an import_cache → samples/ (or bounce_cache → bounce/) migration for
-/// `song` **without touching the filesystem**. Walks every `AudioSource`,
-/// matches `Absolute` paths under the pool's unsaved cache (resolved from the
-/// injected `dirs`, [`MediaPool::unsaved_dir`]), rewrites each to
-/// `ProjectRelative(<subdir> / <filename>)` **in place**, and returns the
-/// list of physical `(cache_abs, dst_abs)` moves that committing requires.
-///
-/// Splitting the path rewrite (pure, reversible by dropping the song) from the
-/// physical move (destructive) lets the save flow serialize the project file
-/// *first* and only [`commit_migration`] the moves once that write succeeds —
-/// so a failed serialize never leaves audio files half-moved out of the cache.
-pub fn plan_unsaved_audio_migration(
-    song: &mut common::model::Song,
-    project_dir: &Path,
-    dirs: &AppDirs,
-) -> Vec<(PathBuf, PathBuf)> {
-    plan_unsaved_cache_migration(song, project_dir, dirs, MediaPool::Samples)
-}
-
-/// [`plan_unsaved_audio_migration`] for the bounce cache (→ `bounce/`).
-pub fn plan_unsaved_bounce_migration(
-    song: &mut common::model::Song,
-    project_dir: &Path,
-    dirs: &AppDirs,
-) -> Vec<(PathBuf, PathBuf)> {
-    plan_unsaved_cache_migration(song, project_dir, dirs, MediaPool::Bounce)
-}
-
-fn plan_unsaved_cache_migration(
-    song: &mut common::model::Song,
-    project_dir: &Path,
-    dirs: &AppDirs,
-    pool: MediaPool,
-) -> Vec<(PathBuf, PathBuf)> {
-    let cache_root = pool.unsaved_dir(dirs);
-    let dst_subdir = pool.bundle_subdir();
-    let dst_dir = project_dir.join(dst_subdir);
-    let mut moves = Vec::new();
-    for source in song.media.audio_sources.values_mut() {
-        let abs = match &source.path {
-            AudioSourcePath::Absolute(p) => p.clone(),
-            _ => continue,
-        };
-        if !abs.starts_with(&cache_root) {
-            continue;
-        }
-        let Some(filename) = abs.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        // filename borrows abs; finish computing the owned dst / rel paths
-        // before moving abs into the plan.
-        let dst = dst_dir.join(filename);
-        let rel = PathBuf::from(dst_subdir).join(filename);
-        source.path = AudioSourcePath::ProjectRelative(rel);
-        moves.push((abs, dst));
-    }
-    moves
-}
-
-/// Execute the physical moves planned by `plan_unsaved_*_migration`. Call this
-/// **after** the project file has been written successfully. Idempotent: if the
-/// destination already exists (dedup, or a prior plan already moved it) the
-/// cache copy is dropped and the move is skipped. Errors propagate; the save
-/// flow logs + surfaces them but keeps going (the affected source is treated as
-/// missing rather than aborting the whole save).
-pub fn commit_migration(moves: &[(PathBuf, PathBuf)]) -> Result<()> {
-    for (abs, dst) in moves {
-        if let Some(dst_dir) = dst.parent() {
-            fs::create_dir_all(dst_dir).with_context(|| {
-                format!("create_dir_all {}", dst_dir.display())
-            })?;
-        }
-        if dst.exists() {
-            // Same content already present (= dedup hit or prior migration).
-            let _ = fs::remove_file(abs);
-        } else if fs::rename(abs, dst).is_err() {
-            // rename within the same volume is atomic; fall back to
-            // copy + remove for cross-volume imports. 複製は書きかけを `dst` に出さない —
-            // 途中で落ちた `dst` を次の保存が上の `exists` で「移行済み」と見なすと、
-            // cache の原本を消して完成品がどこにも残らなくなる。
-            common::atomic_file::copy_new(abs, dst).with_context(|| {
-                format!("copy {} -> {}", abs.display(), dst.display())
-            })?;
-            let _ = fs::remove_file(abs);
-        }
-    }
-    Ok(())
-}
-
 /// One-shot helper: hash → copy → decode → build `AudioSource` model.
 ///
 /// The copy goes to `dest` ([`MediaDest`]): a saved project's `samples/`
@@ -327,6 +238,8 @@ pub fn import_one(src: &Path, dest: &MediaDest) -> Result<ImportedAudio, ImportE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media_dest::MediaPool;
+    use common::model::AudioSourcePath;
     use hound::{SampleFormat, WavSpec, WavWriter};
     use tempfile::tempdir;
 
@@ -345,74 +258,6 @@ mod tests {
             }
         }
         writer.finalize().unwrap();
-    }
-
-    fn mk_source(path: AudioSourcePath) -> AudioSource {
-        AudioSource {
-            path,
-            sample_rate: 48_000,
-            channels: 2,
-            frames: 1,
-            original_bpm: None,
-            root_key: None,
-        }
-    }
-
-    /// atomicity の核: `plan_unsaved_cache_migration` は path を ProjectRelative へ
-    /// 書き換えるが **ファイルを動かさない**。 実際の move は `commit_migration` が
-    /// 行う。 これにより save flow は serialize 成功後にのみ commit でき、 書き出し
-    /// 失敗時は plan を捨てれば import_cache のファイルが無傷で残る。
-    #[test]
-    fn plan_rewrites_paths_without_moving_files_then_commit_moves() {
-        let data = tempdir().unwrap();
-        let dirs = AppDirs::under(data.path());
-        let proj = tempdir().unwrap();
-        fs::create_dir_all(dirs.import_cache_dir()).unwrap();
-        let src = dirs.import_cache_dir().join("foo.wav");
-        write_test_wav(&src, 8, 1, 48_000);
-
-        let mut song = common::model::Song::default();
-        song.media.audio_sources
-            .insert(1, mk_source(AudioSourcePath::Absolute(src.clone())));
-
-        // plan: path だけ書き換え、 ファイルは cache に残る (I/O なし)。
-        let moves = plan_unsaved_audio_migration(&mut song, proj.path(), &dirs);
-        assert_eq!(moves.len(), 1, "one move planned");
-        assert!(src.exists(), "plan must NOT move the file");
-        assert!(
-            matches!(
-                &song.media.audio_sources[&1].path,
-                AudioSourcePath::ProjectRelative(p)
-                    if p == &PathBuf::from("samples").join("foo.wav")
-            ),
-            "plan rewrites path to ProjectRelative(samples/foo.wav)"
-        );
-
-        // commit: 実際に move する。
-        commit_migration(&moves).unwrap();
-        assert!(!src.exists(), "commit moved the file out of the cache");
-        assert!(
-            proj.path().join("samples").join("foo.wav").exists(),
-            "file now lives under <project>/samples/"
-        );
-    }
-
-    /// `commit_migration` は dst が既存 (dedup / 先行 plan が move 済み) のとき
-    /// cache コピーを落とすだけで二重 move しない。
-    #[test]
-    fn commit_dedups_when_destination_exists() {
-        let cache = tempdir().unwrap();
-        let proj = tempdir().unwrap();
-        let src = cache.path().join("bar.wav");
-        let dst_dir = proj.path().join("samples");
-        fs::create_dir_all(&dst_dir).unwrap();
-        let dst = dst_dir.join("bar.wav");
-        write_test_wav(&src, 8, 1, 48_000);
-        write_test_wav(&dst, 8, 1, 48_000); // dst が既に存在
-
-        commit_migration(&[(src.clone(), dst.clone())]).unwrap();
-        assert!(!src.exists(), "cache copy dropped on dedup");
-        assert!(dst.exists(), "existing destination is kept");
     }
 
     #[test]
@@ -493,13 +338,13 @@ mod tests {
         let src = dir.path().join("kick.wav");
         write_test_wav(&src, 256, 1, 44_100);
         // ユーザーの実 import_cache ではなく注入した per-user root の下に置く。
-        let dirs = AppDirs::under(dir.path().join("appdata"));
-        let dest = MediaDest::resolve(MediaPool::Samples, None, Some(&dirs)).unwrap();
+        let place = dir.path().join("appdata").join("import_cache").join("doc");
+        let dest = MediaDest::unsaved(&place);
 
         let imported = import_one(&src, &dest).unwrap();
         assert!(matches!(
             &imported.source.path,
-            AudioSourcePath::Absolute(p) if p.starts_with(dirs.import_cache_dir())
+            AudioSourcePath::Absolute(p) if p.starts_with(&place)
         ));
     }
 }

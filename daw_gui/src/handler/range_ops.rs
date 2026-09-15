@@ -758,7 +758,7 @@ impl AppData {
             AppEvent::DuplicateTime => self.duplicate_time(),
             AppEvent::InsertSilence => self.insert_silence(),
             AppEvent::PasteTime { copy, source_project_id } => {
-                self.paste_time(&copy, source_project_id);
+                self.paste_time(*copy, source_project_id);
             }
             _ => {}
         }
@@ -845,16 +845,24 @@ impl AppData {
 
     /// Paste Time (`Ctrl+Shift+V`): clipboard の時間ごとの写しを範囲選択の先頭に差し込む。
     /// 貼った時間が新しい範囲選択になる。
-    pub(crate) fn paste_time(&mut self, copy: &common::model::TimeRangeCopy, source_project_id: u64) {
+    pub(crate) fn paste_time(&mut self, mut copy: common::model::TimeRangeCopy, source_project_id: u64) {
         let Some((a, _)) = self.time_ops_range() else { return };
         let same_project = source_project_id == self.cur.song_doc.song().project_id;
+        if !same_project {
+            // 写しの媒体は絶対パス: 貼り先のフォルダ基準へ戻し、別の文書の置き場のものは複製する
+            // (クリップ / セル / トラックの貼り付けと同じ口、`media_for_import`)。
+            copy.media = self.media_for_import(&copy.media);
+        }
         let changed = self.edit_song_rippling(|song| {
-            song.paste_time_range(a, copy, same_project).map(|p| p.ripple).into_iter().collect()
+            song.paste_time_range(a, &copy, same_project).map(|p| p.ripple).into_iter().collect()
         });
         if changed {
             let lanes = self.cur.selection.time.as_ref().map(|t| t.lanes.clone()).unwrap_or_default();
             self.set_time_selection(TimeSelection::new(a, a + copy.span_beats, lanes));
             self.ui_ephemeral.status_message = format!("時間を貼り付け: {:.2} 拍", copy.span_beats);
+            if !same_project {
+                self.decode_imported_media(&copy.media);
+            }
         }
     }
 

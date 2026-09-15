@@ -310,14 +310,15 @@ mod tests {
 
         // ユーザーの実 import_cache ではなく注入した per-user root。
         let dirs = common::app_dirs::AppDirs::under(dir.path().join("appdata"));
-        let dest = MediaDest::resolve(MediaPool::Images, None, Some(&dirs)).unwrap();
+        let doc = common::recovery::DocId::new();
+        let dest = MediaDest::unsaved(MediaPool::Images.unsaved_dir(&dirs, doc));
         let imported = import_one_image(&png_path, &dest).expect("import");
         match imported.source.path {
             ImageSourcePath::Absolute(p) => {
-                // 部分文字列ではなく **音声 / 動画と同じ cache root の下か**
+                // 部分文字列ではなく **同じ文書の音声 / 動画と同じ置き場の下か**
                 // を見る (r.md #81 で置き場を一本化した。substring 比較だと
                 // 置き場が別物に戻っても通ってしまう)。
-                let root = MediaPool::Samples.unsaved_dir(&dirs);
+                let root = MediaPool::Samples.unsaved_dir(&dirs, doc);
                 assert!(
                     p.starts_with(&root),
                     "{} is not under the shared unsaved-import cache {}",

@@ -3,10 +3,10 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use common::model::{AudioContent, AudioEvent, Clip, ClipContent};
 use crate::import_audio;
-use crate::media_dest::{MediaDest, MediaPool};
+use crate::media_dest::MediaPool;
 
 impl AppData {
     /// Import one or more audio files into the song (Phase 1 PR3).
@@ -115,26 +115,6 @@ impl AppData {
                 errors.join(" / ")
             ),
         };
-    }
-
-    /// 保存済みプロジェクトのディレクトリ (`samples/` の親)。未保存なら `None`。
-    pub(crate) fn project_dir(&self) -> Option<PathBuf> {
-        self.cur.song_doc
-            .file_path
-            .as_ref()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-    }
-
-    /// 取り込み / 生成したメディアの置き場 ([`crate::media_dest`])。未保存の置き場は注入された
-    /// `app_dirs` からだけ引く。未保存で `app_dirs` も無ければ `what` を付けて status に出して `None`。
-    pub(crate) fn media_dest(&mut self, pool: MediaPool, what: &str) -> Option<MediaDest> {
-        let dest =
-            MediaDest::resolve(pool, self.project_dir().as_deref(), self.ui_prefs.app_dirs.as_ref());
-        if dest.is_none() {
-            self.ui_ephemeral.status_message =
-                format!("{what}: {}", crate::media_dest::NO_UNSAVED_DIR);
-        }
-        dest
     }
 
     /// 取り込んだ音声の配置先を確定する (1 drop 内の複数件で共有する走行状態)。

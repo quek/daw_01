@@ -3,59 +3,60 @@
 //! こちらは凍結済み snapshot を受け取ってからの後半。
 //!
 //! 順序 (どれも serialize 成功が前提):
-//! 1. 未保存キャッシュ → bundle の move を commit (snapshot 由来)
+//! 1. 未保存の置き場 → bundle の運搬を commit (snapshot 由来。 自分の置き場は move、
+//!    別の文書の置き場は copy)
 //! 2. Save As なら旧 bundle の参照ファイルを新 bundle へ複製
 //! 3. live と undo / redo 全段の path も bundle 相対へ書き換え (履歴側の
 //!    `Absolute(cache)` を残すと Undo で音源を見失う)
 //! 4. file_path 確定 → autosave 掃除 → recent 更新
 //! 5. bundle 内の未参照ファイルをゴミ箱へ (live + 履歴 + 進行中 render の予約が「参照」)
-//! 6. audio engine へ新 project_dir + song を流す
+//! 6. 中身が bundle へ移った未保存の置き場を消す
+//! 7. audio engine へ新 project_dir + song を流す
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use common::app_dirs::AppDirs;
 use common::model::Song;
+use common::recovery::DocId;
 
-use crate::import_audio;
 use crate::media_bundle;
 use crate::state::*;
 
 impl AppData {
-    /// `song` 内の未保存 import/bounce cache source を `<project_dir>/{samples,bounce,images}/`
-    /// へ移して path を `ProjectRelative` に書き換える。 save flow で **直列化する
-    /// snapshot と working state の live / 履歴のすべて** に適用する: ファイルは move
-    /// なので、 片方だけ移すと他方が移動後ファイルを見失う (= 初回呼び出しが move、
-    /// 2 回目以降は dst.exists で path 書換のみ)。 失敗しても save は続行し missing
-    /// source として扱う。 status へ最後の失敗メッセージを残す。
+    /// `song` 内の未保存の置き場の媒体を `<project_dir>/{samples,bounce,images}/` へ運んで path を
+    /// `ProjectRelative` に書き換える。 save flow で **直列化する snapshot と working state の
+    /// live / 履歴のすべて** に適用する: 自分の置き場のファイルは move なので、 片方だけ運ぶと
+    /// 他方が移動後ファイルを見失う (= 初回呼び出しが運び、 2 回目以降は dst.exists で path 書換のみ)。
+    /// 失敗しても save は続行し missing source として扱う。 status へ失敗を残す。
     pub(crate) fn migrate_unsaved_sources(
         song: &mut Song,
         project_dir: &Path,
-        app_dirs: Option<&AppDirs>,
+        unsaved: Option<(&AppDirs, DocId)>,
         status: &mut String,
     ) {
-        let moves = Self::plan_unsaved_migrations(song, project_dir, app_dirs);
-        if let Err(e) = import_audio::commit_migration(&moves) {
-            tracing::warn!(error = ?e, "未保存キャッシュ → bundle への移行で一部失敗");
-            *status = format!("メディアの bundle への移行で一部失敗: {e}");
-        }
+        let plan = Self::plan_unsaved_migrations(song, project_dir, unsaved);
+        Self::report_transfer_failures(&media_bundle::commit_transfers(&plan), status);
     }
 
-    /// audio (`samples/`) / bounce (`bounce/`) / video (`samples/`) / image (`images/`)
-    /// の 4 プールぶんの plan を 1 本にまとめる (path 書換のみ、 I/O なし)。
-    /// 未保存キャッシュは注入された `app_dirs` の下だけ (`crate::media_dest` と同じ解決)。
-    /// `app_dirs` が無ければキャッシュへ取り込めていないので、移すものも無い。
+    /// 未保存の置き場は注入された `app_dirs` の下だけ (`crate::media_dest` と同じ解決)。
+    /// `app_dirs` が無ければ置き場へ取り込めていないので、運ぶものも無い。
     fn plan_unsaved_migrations(
         song: &mut Song,
         project_dir: &Path,
-        app_dirs: Option<&AppDirs>,
-    ) -> Vec<(PathBuf, PathBuf)> {
-        let Some(dirs) = app_dirs else { return Vec::new() };
-        let mut moves = import_audio::plan_unsaved_audio_migration(song, project_dir, dirs);
-        moves.extend(import_audio::plan_unsaved_bounce_migration(song, project_dir, dirs));
-        moves.extend(media_bundle::plan_unsaved_video_migration(song, project_dir, dirs));
-        moves.extend(media_bundle::plan_unsaved_image_migration(song, project_dir, dirs));
-        moves
+        unsaved: Option<(&AppDirs, DocId)>,
+    ) -> Vec<media_bundle::MediaTransfer> {
+        let Some((dirs, own)) = unsaved else { return Vec::new() };
+        media_bundle::plan_unsaved_migration(song, project_dir, dirs, own)
+    }
+
+    fn report_transfer_failures(failures: &[String], status: &mut String) {
+        for f in failures {
+            tracing::warn!(detail = %f, "未保存の置き場 → bundle への運搬に失敗");
+        }
+        if let Some(last) = failures.last() {
+            *status = format!("メディアの bundle への移行で {} 件失敗: {last}", failures.len());
+        }
     }
 
     /// 凍結済み `snapshot` をファイルへ書き出して保存を完了する。
@@ -77,9 +78,11 @@ impl AppData {
             return;
         };
         // serialize する snapshot の path を ProjectRelative に書き換え、 実ファイル
-        // 移動の plan を取る (= ここでは I/O しない、 破棄しても無害)。
+        // 運搬の plan を取る (= ここでは I/O しない、 破棄しても無害)。
         let app_dirs = self.ui_prefs.app_dirs.clone();
-        let moves = Self::plan_unsaved_migrations(&mut snapshot, &dir, app_dirs.as_ref());
+        let own = self.cur.song_doc.unsaved.id();
+        let unsaved = app_dirs.as_ref().map(|d| (d, own));
+        let moves = Self::plan_unsaved_migrations(&mut snapshot, &dir, unsaved);
         // 現在の表示状態を同梱して保存する (snapshot は楽曲のみ凍結、
         // view は presentation なので保存実行時の live を採るので十分)。
         let view = self.snapshot_view_state();
@@ -96,10 +99,10 @@ impl AppData {
         // ファイルを move (plan を commit)、 次に live / 履歴を migrate して
         // ProjectRelative + 自己完結にする (plan 済みファイルは dst.exists で
         // dedup、 live 固有 source があれば move)。
-        if let Err(e) = import_audio::commit_migration(&moves) {
-            tracing::warn!(error = ?e, "bundle への移行確定で一部失敗");
-            self.ui_ephemeral.status_message = format!("メディアの bundle への移行で一部失敗: {e}");
-        }
+        Self::report_transfer_failures(
+            &media_bundle::commit_transfers(&moves),
+            &mut self.ui_ephemeral.status_message,
+        );
         // Save As (保存先フォルダが変わった): 旧 bundle の参照ファイルを新 bundle へ
         // 複製する。 live と履歴の `ProjectRelative` はこの時点ではまだ旧 bundle 相対
         // なので、 file_path を差し替える **前** に旧 dir を読む。
@@ -112,11 +115,10 @@ impl AppData {
         // ため、 記録後に行う)。
         let edited_since_snapshot = self.cur.song_doc.edit_epoch() != snap_epoch;
         let mut status = std::mem::take(&mut self.ui_ephemeral.status_message);
-        let dirs = app_dirs.as_ref();
-        self.normalize_song(|song| Self::migrate_unsaved_sources(song, &dir, dirs, &mut status));
+        self.normalize_song(|song| Self::migrate_unsaved_sources(song, &dir, unsaved, &mut status));
         self.cur
             .song_doc
-            .rewrite_history(|song| Self::migrate_unsaved_sources(song, &dir, dirs, &mut status));
+            .rewrite_history(|song| Self::migrate_unsaved_sources(song, &dir, unsaved, &mut status));
         self.ui_ephemeral.status_message = status;
         // serialize 成功時のみ file_path を確定する (旧契約)。
         self.cur.song_doc.file_path = Some(path.clone());
@@ -165,6 +167,8 @@ impl AppData {
         // bundle 内の未参照ファイルをゴミ箱へ。 migration / 複製が済んで live と履歴の
         // 参照が全部この bundle 相対になった **後**、 engine へ流す前に行う。
         self.sweep_bundle(&dir, &path);
+        // 未保存の間の置き場は中身が bundle へ移ったので消す (同じく migration の後)。
+        self.release_unsaved_place_after_save();
         // PR6: migration (直上の normalize) で audio_sources の path が
         // `Absolute(import_cache)` → `ProjectRelative(samples/)` に書き換わり、
         // project_dir も新たに確定した (file_path は上で path に設定済)。
@@ -225,19 +229,22 @@ impl AppData {
         }
     }
 
-    /// 進行中の bounce / glue が名前を予約したファイル (project-relative)。 render が
-    /// 書き終わるまで song に載らないので、 参照集合に足さないと掃除が消してしまう。
-    fn in_flight_render_outputs(&self, project_dir: &Path) -> impl Iterator<Item = PathBuf> + '_ {
-        let bounce = self.cur.pipc.pending_clip_fx_bounce.as_ref().map(|p| p.out_path.clone());
+    /// 進行中の bounce / glue が名前を予約したファイル (絶対)。 render が書き終わるまで song に
+    /// 載らないので、 掃除 / 置き場の後始末はこれも「使用中」 に数える。
+    pub(crate) fn in_flight_render_paths(&self) -> impl Iterator<Item = &Path> + '_ {
+        let bounce = self.cur.pipc.pending_clip_fx_bounce.as_ref().map(|p| p.out_path.as_path());
         let glue = self
             .cur.pipc
             .pending_glue_bake
             .iter()
-            .flat_map(|p| p.jobs.iter().map(|j| j.out_path.clone()));
+            .flat_map(|p| p.jobs.iter().map(|j| j.out_path.as_path()));
+        bounce.into_iter().chain(glue)
+    }
+
+    /// [`Self::in_flight_render_paths`] のうち bundle 内のもの (project-relative)。
+    fn in_flight_render_outputs(&self, project_dir: &Path) -> impl Iterator<Item = PathBuf> + '_ {
         let dir = project_dir.to_path_buf();
-        bounce
-            .into_iter()
-            .chain(glue)
+        self.in_flight_render_paths()
             .filter_map(move |abs| abs.strip_prefix(&dir).ok().map(Path::to_path_buf))
     }
 
