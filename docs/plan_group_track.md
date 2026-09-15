@@ -117,7 +117,7 @@ PR2.1 で daw_plugin_host の `Tracks::chains` と daw_audio engine の `slot_to
 - これにより新 group が親、選択 track 群が子になる
 
 ### 命名
-- `Group N` (N = `song.tracks.len() + 1`)
+- 名前は付けない (空 = 未命名。表示は並び順の番号、r.md #133 / `Track::display_name`)
 - 後で rename 可
 
 ### 入力前提

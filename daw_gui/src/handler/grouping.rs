@@ -73,10 +73,9 @@ impl AppData {
         let Some(group_id) = self.edit_song(|song| song.alloc_track_id()) else {
             return;
         };
-        let group_index = self.cur.song_doc.song().tracks.len() + 1;
         let group_track = track_with(|t| {
             t.id = group_id;
-            t.name = format!("Group {group_index}");
+            // 名前は付けない (未命名 = 並び順の番号で表示、r.md #133)。
             // Reaper folder model: a "group" is just a track that has
             // children. No dedicated kind enum — once the children's
             // `parent_group_id` is repointed below, this track auto-

@@ -1098,8 +1098,8 @@ pub enum AppEvent {
     ToggleResourcePanel,
 
     // -------- Aux send / return ------------------------------------------
-    /// master 直下 (`parent_group_id = None`) の通常 track を 1 本作り
-    /// `"Return N"` と命名する (N = 既存リターン数 + 1)。 track が選択中なら
+    /// master 直下 (`parent_group_id = None`) の通常 track を 1 本、 未命名で作る
+    /// (表示は並び順の番号、 r.md #133)。 track が選択中なら
     /// その track に `Send { dest = 新リターン, gain 1.0, PostFader, enabled }`
     /// を 1 本足して即座に効果が聞こえるようにする (Ableton "Add Return")。
     /// 構造変化なので full-song resend を trigger する。

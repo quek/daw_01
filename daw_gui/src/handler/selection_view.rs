@@ -872,11 +872,10 @@ impl AppData {
         if !self.is_pianoroll_clip_locked(r) {
             return false;
         }
-        let name = self
-            .cur.song_doc
-            .song()
+        let song = self.cur.song_doc.song();
+        let name = song
             .track_by_id(r.track_id)
-            .map_or_else(String::new, |t| format!("「{}」 ", t.name));
+            .map_or_else(String::new, |_| format!("「{}」 ", song.track_display_name(r.track_id)));
         self.ui_ephemeral.status_message =
             format!("{name}トラックはロック中です (凡例の L で解除)");
         true

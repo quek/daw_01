@@ -2132,7 +2132,7 @@ fn draw_legend(
                     app.handle_event(AppEvent::SetPianoRollTargetClip(k));
                 }));
             }
-            let label = track.name.clone();
+            let label = app.cur.song_doc.song().track_display_name(track_id).into_owned();
             // 行背景は panel_raised / accent_wash (パレット自身のクローム面) なので、
             // 極性固定インクではなく通常の本文色でよい。
             let text_color = if is_target { p.text } else { p.text_dim };

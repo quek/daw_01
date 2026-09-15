@@ -253,7 +253,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
 
     // ---- トラック別 / プラグイン別 CPU 内訳 ----
     let bottom = py + ph - ROW_H;
-    'tracks: for track in &app.cur.song_doc.song().tracks {
+    'tracks: for (track_idx, track) in app.cur.song_doc.song().tracks.iter().enumerate() {
         // host に実体がある device (= `loaded_devices` に居る) だけを出す。
         // device_id そのものが計測キーなので、 chain 順との対応づけは要らない。
         let loaded: Vec<&common::model::PluginInstance> = track
@@ -265,7 +265,7 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
             &app.theme,
             ui,
             &format!("resmon_tr_{}", track.id),
-            &track.name,
+            &track.display_name(track_idx),
             0.0,
             load_of(track_us),
             row(y),

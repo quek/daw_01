@@ -18,7 +18,7 @@ fn view_with_scenes(n: usize) -> LauncherView {
             .map(|i| LauncherSceneView {
                 #[allow(clippy::cast_possible_truncation)]
                 id: i as u32 + 1,
-                name: Arc::from(format!("Scene {}", i + 1)),
+                name: Arc::from(common::model::Scene::new(0).display_name(i)),
                 color: Color::rgb(0.5, 0.5, 0.5),
                 follow: false,
                 selected: false,

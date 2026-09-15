@@ -32,17 +32,6 @@ impl AppData {
         crate::group_compose::is_group_track(self.cur.song_doc.song(), track_id)
     }
 
-    /// A track acts as a "return" iff at least one other track has a
-    /// `Send` whose `dest_track_id` points at it. Purely derived (no
-    /// `Track::kind`), mirroring `is_group_track`. SSOT (CLAUDE.md).
-    pub fn is_return_track(&self, track_id: u32) -> bool {
-        self.cur.song_doc.song()
-            .tracks
-            .iter()
-            .flat_map(|t| t.sends.iter())
-            .any(|s| s.dest_track_id == track_id)
-    }
-
     /// 「＋ Send」 ピッカーに出す宛先候補 `(track_id, display_name)`。
     /// `src_track_id` 自身と、 send を足すと依存が循環する track を除く (r.md #129 §10.13)。
     /// 循環の判定は `Song::can_add_send` と同じ依存 graph (children / サイドチェイン / send、
@@ -57,14 +46,7 @@ impl AppData {
             .iter()
             .enumerate()
             .filter(|(_, t)| t.id != src_track_id && !deps.would_cycle(t.id, src_track_id))
-            .map(|(i, t)| {
-                let name = if t.name.is_empty() {
-                    format!("Track {}", i + 1)
-                } else {
-                    t.name.clone()
-                };
-                (t.id, name)
-            })
+            .map(|(i, t)| (t.id, t.display_name(i).into_owned()))
             .collect()
     }
 
@@ -275,11 +257,7 @@ impl AppData {
                 TrackMixEntry {
                     index: i as u32,
                     track_id: t.id,
-                    name: if t.name.is_empty() {
-                        format!("Track {}", i + 1)
-                    } else {
-                        t.name.clone()
-                    },
+                    name: t.display_name(i).into_owned(),
                     // 再生中はオートメーション lane の playhead 値を表示
                     // (= audio と一致してフェーダー / パンノブが動く)。 停止中・非
                     // automation・書き込み中は静的値。
@@ -303,23 +281,12 @@ impl AppData {
         if n_selected > 1 {
             return format!("{n_selected} tracks selected");
         }
-        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-            return "Master".into();
-        }
-        match self.cursor_track_index() {
-            Some(idx) => self
-                .cur.song_doc.song()
-                .tracks
-                .get(idx)
-                .map(|t| {
-                    if t.name.is_empty() {
-                        format!("Track {}", idx + 1)
-                    } else {
-                        t.name.clone()
-                    }
-                })
-                .unwrap_or_else(|| format!("Track {}", idx + 1)),
-            None => "(no track)".into(),
+        let song = self.cur.song_doc.song();
+        match self.cursor_track_id() {
+            Some(id) if id == common::model::MASTER_TRACK_ID || song.track_by_id(id).is_some() => {
+                song.track_display_name(id).into_owned()
+            }
+            _ => "(no track)".into(),
         }
     }
 
@@ -404,7 +371,12 @@ impl AppData {
     pub fn mod_source_track_choices(&self) -> Vec<(Option<common::model::TapSource>, String)> {
         let song = self.cur.song_doc.song();
         let mut out: Vec<(Option<common::model::TapSource>, String)> = std::iter::once((None, "—".to_string()))
-            .chain(song.tracks.iter().map(|t| (Some(common::model::TapSource::Track(t.id)), t.name.clone())))
+            .chain(
+                song.tracks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (Some(common::model::TapSource::Track(t.id)), t.display_name(i).into_owned())),
+            )
             .collect();
         if let Some(devices) = self.cursor_track_id().and_then(|id| song.fx_chain_by_track_id(id)) {
             common::model::for_each_chain(devices, &mut |parallel, c| {
@@ -451,7 +423,7 @@ impl AppData {
                 let label = if track_id == owner {
                     label
                 } else {
-                    format!("{} \u{25b8} {label}", self.track_display_name(track_id))
+                    format!("{} \u{25b8} {label}", song.track_display_name(track_id))
                 };
                 out.push(ModRoutingRow {
                     id: r.id,
@@ -466,20 +438,6 @@ impl AppData {
             }
         }
         out
-    }
-
-    /// `track_id` の表示名 (`MASTER_TRACK_ID` → "Master")。 削除済みは id を出す
-    /// (無言で空にすると「名前の無い行」になって原因が追えない)。
-    pub fn track_display_name(&self, track_id: u32) -> String {
-        if track_id == common::model::MASTER_TRACK_ID {
-            return "Master".to_string();
-        }
-        self.cur.song_doc
-            .song()
-            .tracks
-            .iter()
-            .find(|t| t.id == track_id)
-            .map_or_else(|| format!("Track {track_id}"), |t| t.name.clone())
     }
 
     /// docs/plan_modulation_routing_redesign.md §6: a stable display color for a
@@ -1091,10 +1049,8 @@ impl AppData {
                 cache.content_labels.clear();
                 cache.section_names.clear();
                 cache.content_names.clear();
-                for t in &self.cur.song_doc.song().tracks {
-                    cache
-                        .track_names
-                        .insert(t.id, std::sync::Arc::from(t.name.as_str()));
+                for (i, t) in self.cur.song_doc.song().tracks.iter().enumerate() {
+                    cache.track_names.insert(t.id, std::sync::Arc::from(t.display_name(i).as_ref()));
                     for c in &t.clips {
                         cache.content_labels.entry(c.content_id).or_insert_with(|| {
                             crate::widgets::arrangement::view_build::clip_display_label(

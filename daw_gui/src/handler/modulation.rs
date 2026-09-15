@@ -366,8 +366,9 @@ impl AppData {
     /// 消える。 待受の可視化を ◉ ボタンだけに任せられない理由がこれ。
     pub fn armed_mod_source_label(&self) -> Option<([f32; 3], String)> {
         let sid = self.cur.peph.armed_mod_source?;
-        let src = self.cur.song_doc.song().mod_sources.iter().find(|m| m.id == sid)?;
-        let track = self.track_display_name(src.owner_track_id);
+        let song = self.cur.song_doc.song();
+        let src = song.mod_sources.iter().find(|m| m.id == sid)?;
+        let track = song.track_display_name(src.owner_track_id);
         Some((src.color, format!("{track} / {}", src.kind.short_label())))
     }
 

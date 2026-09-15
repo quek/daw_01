@@ -899,21 +899,11 @@ fn draw_sends_rows(
     let inner_w = rect.w - pad * 2.0 - scrollbar_w;
 
     for (send_idx, send) in src_track.sends.iter().enumerate() {
-        let dest_name = app
-            .cur.song_doc.song()
-            .track_by_id(send.dest_track_id)
-            .map(|t| {
-                if t.name.is_empty() {
-                    format!("\u{2192}{}", send.dest_track_id)
-                } else {
-                    format!("\u{2192}{}", t.name)
-                }
-            })
-            .unwrap_or_else(|| format!("\u{2192}?{}", send.dest_track_id));
+        let dest_name = format!("\u{2192}{}", app.cur.song_doc.song().track_display_name(send.dest_track_id));
         // 矢印の後ろに空白を置かない: 名前欄は 51px しかなく (80px strip − pad − ×)、
-        // 空白 1 文字 (font 10 で 5.3px) を足すと既定リターン名 "Return 1" (42.2px)
-        // まで ellipsis されて "→ Return…" になり、 どのリターン宛てか判別できなく
-        // なっていた。 空白なしなら "→Return 10" まで収まる。
+        // 空白 1 文字 (font 10 で 5.3px) を足すと旧既定名 "Return 1" (42.2px) が
+        // ellipsis されて "→ Return…" になり、 どの宛先か判別できなくなっていた
+        // (ユーザーが付けた長めの名前でも同じことが起きる)。
 
         // header 行: 宛先名 (左、 × にかぶらないよう省略付き) + × (右上)。
         let close_x = inner_x + inner_w - SEND_CLOSE_BTN_W;

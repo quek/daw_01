@@ -974,6 +974,21 @@ impl Song {
         self.tracks.iter_mut().find(|t| t.id == track_id)
     }
 
+    /// `track_id` の表示名 — **トラック名を画面に出す口はこれと [`Track::display_name`] の 2 本だけ** (r.md #133)。
+    /// 未命名は並び順の番号、`MASTER_TRACK_ID` は `Master`。無いトラック (削除済みを指したまま) は
+    /// `(削除済み)` — 空を返すと「名前の無い行」になって、何を指していたのかが追えない。
+    #[must_use]
+    pub fn track_display_name(&self, track_id: u32) -> std::borrow::Cow<'_, str> {
+        if track_id == MASTER_TRACK_ID {
+            return std::borrow::Cow::Borrowed("Master");
+        }
+        self.tracks
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.id == track_id)
+            .map_or(std::borrow::Cow::Borrowed("(削除済み)"), |(i, t)| t.display_name(i))
+    }
+
     /// [`ClipKey`] が指すクリップ。 アレンジのクリップとランチャーのセルの
     /// **どちらも**引ける ([`Track::clip_by_id`])。
     #[must_use]

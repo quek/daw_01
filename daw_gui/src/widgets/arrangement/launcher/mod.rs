@@ -448,7 +448,7 @@ impl LauncherRowView {
 #[derive(Clone, Debug)]
 pub(super) struct LauncherSceneView {
     pub id: u32,
-    /// 表示名 (未命名は `Scene N`)。
+    /// 表示名 (未命名は並び順の番号)。
     pub name: Arc<str>,
     pub color: Color,
     /// シーンにフォローアクションが設定されている (▶ を縞にする)。

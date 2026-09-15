@@ -3,6 +3,8 @@
 //! arch-refactor #9 (god-file budget) で model.rs から分割。pure code movement で
 //! 挙動・serialize 形式は不変。sibling 型は `use super::*` 経由で参照する。
 
+use std::borrow::Cow;
+
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +18,22 @@ use super::*;
 /// every volume / gain clamp (track volume, master gain, send gain) so a fader
 /// pushed to its visual top no longer snaps back to unity (r.md #11).
 pub const MAX_TRACK_GAIN: f32 = 2.0;
+
+/// 未命名のトラック / シーン ([`Track::name`] / [`Scene::name`] が空) の表示名 = 並び順の番号
+/// (`index` は 0 始まり)。r.md #133: 自動名はこの数字だけで、名前としては保存しない。
+#[must_use]
+pub fn positional_auto_name(index: usize) -> String {
+    (index + 1).to_string()
+}
+
+/// トラック / シーンの改名で確定する名前。前後の空白を落とし、空、または自動名
+/// ([`positional_auto_name`]) と同じ文字列なら「未命名」(空) を返す — 自動名を焼き込むと
+/// 並べ替えても番号が追従しなくなる。
+#[must_use]
+pub fn normalize_committed_name(text: &str, index: usize) -> String {
+    let text = text.trim();
+    if text == positional_auto_name(index) { String::new() } else { text.to_string() }
+}
 
 /// v23 (`docs/plan_linear_chain.md`): a track owns **one** linear CLAP
 /// signal chain, `devices: Vec<PluginInstance>`. Roles (MIDI FX / instrument
@@ -51,6 +69,10 @@ pub struct Track {
     /// widget addresses tracks by this id, not by index.
     #[serde(default)]
     pub id: u32,
+    /// ユーザーが付けた名前。**空 = 未命名**で、表示名は [`Track::display_name`] /
+    /// [`Song::track_display_name`] が並び順の番号 (`1` / `2` …) から作る (r.md #133)。
+    /// 自動名を焼き込まないので、並べ替え・削除に番号が追従する ([`Scene::name`] と同じ契約)。
+    /// 空でも key は書き出す — 旧ビルドの `Track` は `name` を必須にしているので、省くと読めなくなる。
     pub name: String,
     /// v23: 1 本の線形デバイスチェーン。役割は保持せず ports から位置導出。
     /// r.md #110: 要素は [`Device`] (plugin / Parallel = 並列 chain の container)。
@@ -319,6 +341,18 @@ impl Default for GroupTransform {
 }
 
 impl Track {
+    /// 表示名。未命名なら並び順の番号 (`index` は `Song::tracks` の 0 始まりの位置 = アレンジの上からの順。
+    /// グループ / リターン / 折りたたまれた子も 1 本と数える)。位置が分からない呼び側は
+    /// [`Song::track_display_name`] を使う。
+    #[must_use]
+    pub fn display_name(&self, index: usize) -> Cow<'_, str> {
+        if self.name.is_empty() {
+            Cow::Owned(positional_auto_name(index))
+        } else {
+            Cow::Borrowed(&self.name)
+        }
+    }
+
     /// v35 (r.md #87): arrangement (`clips`) と launcher (`session_clips`) の
     /// **全 Clip**。
     ///

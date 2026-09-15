@@ -134,7 +134,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                 .track_names
                 .get(&t.id)
                 .cloned()
-                .unwrap_or_else(|| Arc::from(t.name.as_str())),
+                .unwrap_or_else(|| Arc::from(t.display_name(track_idx).as_ref())),
             muted: t.muted,
             solo: t.solo,
             armed: t.armed,

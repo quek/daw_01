@@ -299,7 +299,8 @@ fn adding_a_track_supplies_builtins_in_the_same_undo_step() {
     app.handle_event(AppEvent::AddInstrumentTrack);
     let song = app.cur.song_doc.song();
     assert_eq!(song.tracks.len(), before + 1);
-    let new_track = song.tracks.iter().find(|t| t.devices.len() == 2 && t.name.ends_with(&(before + 1).to_string())).expect("新トラック");
+    // 追加直後のトラックはカーソルになる (`action_add_instrument_track`)。
+    let new_track = app.cursor_track_id().and_then(|id| song.track_by_id(id)).expect("新トラック");
     let kinds: Vec<(NativeKind, bool)> =
         new_track.devices.iter().filter_map(|d| d.as_native()).map(|n| (n.kind(), n.bypassed && n.builtin)).collect();
     assert_eq!(kinds, vec![(NativeKind::Comp, true), (NativeKind::Eq, true)], "末尾に Comp → EQ (bypass)");

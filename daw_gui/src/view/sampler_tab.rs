@@ -140,13 +140,13 @@ fn draw_header(app: &AppData, ui: &mut Ui<'_, AppData>, header: Rect) {
     let song = app.cur.song_doc.song();
     let mut items: Vec<String> = vec!["Master".to_string()];
     let mut sources: Vec<common::protocol::SamplerSource> = vec![common::protocol::SamplerSource::Master];
-    for t in &song.tracks {
+    for (i, t) in song.tracks.iter().enumerate() {
         for tp in [
             common::model::TapPoint::PreFx,
             common::model::TapPoint::PostFx,
             common::model::TapPoint::PostFader,
         ] {
-            items.push(format!("{} · {}", t.name, crate::handler::sampler::tap_point_label(tp)));
+            items.push(format!("{} · {}", t.display_name(i), crate::handler::sampler::tap_point_label(tp)));
             sources.push(common::protocol::SamplerSource::Track {
                 project: app.pk(),
                 tap: common::model::AudioTap::new(common::model::TapSource::Track(t.id), tp),
@@ -162,8 +162,7 @@ fn draw_header(app: &AppData, ui: &mut Ui<'_, AppData>, header: Rect) {
     {
         let name = tap
             .source_track()
-            .and_then(|id| ps.song_doc.song().track_by_id(id))
-            .map_or_else(|| "Track".to_string(), |t| t.name.clone());
+            .map_or_else(|| "Track".to_string(), |id| ps.song_doc.song().track_display_name(id).into_owned());
         items.push(format!(
             "[{}] {name} · {}",
             AppData::tab_label(ps),

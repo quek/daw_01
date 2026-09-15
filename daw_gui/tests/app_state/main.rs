@@ -17,6 +17,7 @@ mod support;
 
 mod clip_rename;
 mod dangling_routes;
+mod default_track_names;
 mod device_relocate;
 mod dirty_guard;
 mod group_track_lifecycle;

@@ -185,7 +185,7 @@ impl AppData {
         // 注意: ここで `ensure_first_track()` を呼んではいけない。 子プロセスの
         // 応答が Song の構造 (トラック) を作ると、 track を 1 本も持たず master fx
         // だけを持つプロジェクトを開いたときに、 その load 応答が幽霊トラック
-        // "Track 1" を生やして **開いただけで `*`** が付く (r.md #9)。
+        // トラックを生やして **開いただけで `*`** が付く (r.md #9)。
         // 空プロジェクトへの最初の 1 本はユーザー操作の側 (plugin picker) が作る。
 
         // resolve ports from the plugin DB (役割導出の入力)。 不在なら既存値を
@@ -623,14 +623,7 @@ impl AppData {
         else {
             return "(unknown)".into();
         };
-        if track_id == common::model::MASTER_TRACK_ID {
-            format!("Master / {name}")
-        } else {
-            match song.tracks.iter().find(|t| t.id == track_id) {
-                Some(t) => format!("{} / {}", t.name, name),
-                None => name,
-            }
-        }
+        format!("{} / {name}", song.track_display_name(track_id))
     }
 
     /// runner の frame loop から毎フレーム呼ぶ。plugin 追加 → load 完了で queue された
@@ -774,9 +767,9 @@ impl AppData {
         if track_id == common::model::MASTER_TRACK_ID {
             return;
         }
-        let Some(src) = self.cur.song_doc.song().track_by_id(track_id) else {
+        if self.cur.song_doc.song().track_by_id(track_id).is_none() {
             return;
-        };
+        }
         let Some(inst) = self.cur.song_doc.song().plugin_by_id(device_id) else {
             return;
         };
@@ -784,7 +777,8 @@ impl AppData {
         if count == 0 {
             return;
         }
-        let src_name = src.name.clone();
+        // 子の名前は説明的な派生名として焼く。元が未命名ならいまの表示名 (番号) を使う (r.md #133)。
+        let src_name = self.cur.song_doc.song().track_display_name(track_id).into_owned();
         // Snapshot the current routes + the set of live track ids so the loop
         // below can keep valid existing routes without re-borrowing `self.cur.song_doc.song()`
         // while it allocates ids / inserts tracks.

@@ -67,11 +67,7 @@ impl AppData {
                 let mut ids = Vec::with_capacity(n);
                 for _ in 0..n {
                     let id = song.alloc_track_id();
-                    let name = format!("Track {}", song.tracks.len() + 1);
-                    song.tracks.push(crate::app_types::track_with(|t| {
-                        t.id = id;
-                        t.name = name;
-                    }));
+                    song.tracks.push(crate::app_types::track_with(|t| t.id = id));
                     ids.push(id);
                 }
                 ids

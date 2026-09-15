@@ -215,11 +215,8 @@ fn draw_controls(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     x += field.w + PAD * 2.0;
 
     // ---- 宛先 (カーソルトラック = 選択中のトラック) ----
-    let target = app
-        .virtual_keyboard_target_track()
-        .and_then(|id| app.cur.song_doc.song().track_by_id(id));
-    let (text, color) = match target {
-        Some(t) => (format!("\u{2192} {}", t.name), p.text_dim),
+    let (text, color) = match app.virtual_keyboard_target_track() {
+        Some(id) => (format!("\u{2192} {}", app.cur.song_doc.song().track_display_name(id)), p.text_dim),
         None => ("トラックを選択してください".to_string(), p.text_error),
     };
     let max_w = (rect.x + rect.w - PAD - x).max(0.0);

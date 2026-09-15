@@ -411,9 +411,7 @@ fn source_label_short(song: &common::model::Song, source: SamplerSource) -> Stri
         SamplerSource::Track { tap, .. } => {
             let name = tap
                 .source_track()
-                .and_then(|id| song.track_by_id(id))
-                .map(|t| t.name.as_str())
-                .unwrap_or("Track");
+                .map_or(std::borrow::Cow::Borrowed("Track"), |id| song.track_display_name(id));
             let safe: String = name
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })

@@ -1195,45 +1195,35 @@ impl AppData {
         }
     }
 
+    /// トラック名の inline rename を開始する。未命名なら表示中の番号を初期値に入れる — 空欄から
+    /// 打ち直させると「いま何という名前なのか」が消える (列名の [`Self::begin_rename_scene`] と同じ)。
     pub(crate) fn begin_rename_track(&mut self, track_id: u32) {
-        let Some(name) = self
-            .cur.song_doc.song()
-            .tracks
-            .iter()
-            .find(|t| t.id == track_id)
-            .map(|t| t.name.clone())
-        else {
+        let song = self.cur.song_doc.song();
+        let Some(i) = song.track_index_by_id(track_id) else {
             return;
         };
-        self.cur.peph.track_rename_text = name;
+        self.cur.peph.track_rename_text = song.tracks[i].display_name(i).into_owned();
         self.cur.peph.track_rename_id = Some(track_id);
     }
 
+    /// トラック名の確定。空文字、またはいまの位置の自動名 (番号) と同じ文字列は「未命名へ戻す」
+    /// ([`common::model::normalize_committed_name`]、列名と同じ規則。r.md #133)。
+    /// 名前が変わらなければ編集を積まない (r.md #12 の sibling: dirty 化させない)。
     pub(crate) fn commit_rename_track(&mut self) {
-        let Some(track_id) = self.cur.peph.track_rename_id else {
+        let Some(track_id) = self.cur.peph.track_rename_id.take() else {
             return;
         };
-        self.cur.peph.track_rename_id = None;
-        let new_name = self.cur.peph.track_rename_text.trim().to_string();
-        self.cur.peph.track_rename_text.clear();
-        if new_name.is_empty() {
-            return;
-        }
-        // 同名なら no-op (r.md #12 の sibling: dirty 化させない)。
-        if self
-            .cur.song_doc
-            .song()
-            .tracks
-            .iter()
-            .find(|t| t.id == track_id)
-            .is_some_and(|t| t.name == new_name)
-        {
-            return;
-        }
-        self.edit_song(|song| {
-            if let Some(track) = song.tracks.iter_mut().find(|t| t.id == track_id) {
-                track.name = new_name;
+        let text = std::mem::take(&mut self.cur.peph.track_rename_text);
+        self.edit_song_checked(|song| {
+            let Some(i) = song.track_index_by_id(track_id) else {
+                return false;
+            };
+            let next = common::model::normalize_committed_name(&text, i);
+            if song.tracks[i].name == next {
+                return false;
             }
+            song.tracks[i].name = next;
+            true
         });
     }
 
@@ -1365,10 +1355,7 @@ impl AppData {
         if self.cur.song_doc.song().tracks.is_empty() {
             self.edit_song(|song| {
                 let id = song.alloc_track_id();
-                song.tracks.push(track_with(|t| {
-                    t.id = id;
-                    t.name = "Track 1".into();
-                }));
+                song.tracks.push(track_with(|t| t.id = id));
             });
             self.resize_track_peak_display();
         }

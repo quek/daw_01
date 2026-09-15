@@ -790,10 +790,7 @@ impl ProjectState {
         // row_key 0」規約と衝突する (= ランチャーの走行状態が 1 行も GUI へ
         // 届かず、セルの進捗が永久に出ない)。起動直後の 1 本目でそれを踏んでいた。
         let first_track_id = song.alloc_track_id();
-        song.tracks.push(track_with(|t| {
-            t.id = first_track_id;
-            t.name = "Track 1".into();
-        }));
+        song.tracks.push(track_with(|t| t.id = first_track_id));
         // 初期プロジェクトにも安定 project_id を採番する
         // (clipboard の同一プロジェクト判定用)。
         song.ensure_project_id();
