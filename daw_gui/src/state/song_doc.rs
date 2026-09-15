@@ -236,10 +236,10 @@ pub struct SongDoc {
 
     /// 直近 autosave 時刻。
     pub last_autosave: Instant,
-    /// Crash-recovery session id (uuid v4)。 起動時に 1 回生成、 未保存
-    /// プロジェクトの autosave file 名 (`<id>.autosave.daw`) と shutdown 時の
-    /// cleanup target に使う。
-    pub recovery_session_id: String,
+    /// この文書が per-user データフォルダに持つもの (未保存の間の autosave
+    /// `recovery/<id>.autosave.daw` と、取り込んだ素材の置き場) の名前と持ち主の記録
+    /// (`crate::unsaved_place`)。 recovery から復元すると、その recovery の id を引き継ぐ。
+    pub unsaved: crate::unsaved_place::UnsavedPlace,
 }
 
 impl SongDoc {
@@ -275,7 +275,7 @@ impl SongDoc {
             export_lock: false,
             rejection: None,
             last_autosave: Instant::now(),
-            recovery_session_id: common::recovery::new_session_id(),
+            unsaved: crate::unsaved_place::UnsavedPlace::new(),
         }
     }
 
@@ -760,12 +760,13 @@ impl SongDoc {
         self.bump_edit_epoch();
     }
 
-    /// 読み込み時の**不変条件の回復**で中身が変わったことを記録し、`*` (未保存) を立てる。
-    /// クリップの重なり解消 (`docs/plan_range_selection.md` §6.4) がこれを使う。
+    /// 読み込んだ中身が保存先のファイルと違うことを記録し、`*` (未保存) を立てる。
+    /// 読み込み時の**不変条件の回復**で中身が変わったとき (クリップの重なり解消、
+    /// `docs/plan_range_selection.md` §6.4 — 解消は冪等なので、一度保存すれば次に開いたときは
+    /// 立たない) と、保存先に書かれていない autosave を読む recovery の復元
+    /// (`AppData::restore_recovery`) が使う。
     ///
-    /// 履歴 (undo) は積まない — 「元に戻せる編集」 ではなく、不変条件を満たさない
-    /// ファイルを読み込んだ結果の修復だから。 解消は冪等なので、一度保存すれば
-    /// 次に開いたときは立たない。
+    /// 履歴 (undo) は積まない — 「元に戻せる編集」 ではなく、読み込んだ時点の中身そのものの性質だから。
     pub fn mark_dirty_after_load_fixup(&mut self) {
         self.state_id = self.alloc_state_id();
         self.bump_edit_epoch();

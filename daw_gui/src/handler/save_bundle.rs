@@ -3,46 +3,93 @@
 //! こちらは凍結済み snapshot を受け取ってからの後半。
 //!
 //! 順序 (どれも serialize 成功が前提):
-//! 1. 未保存キャッシュ → bundle の move を commit (snapshot 由来)
+//! 1. 未保存の置き場 → bundle の運搬を commit (snapshot 由来。 自分の置き場は move、
+//!    別の文書の置き場は copy。 Song が凍っている間は自分の置き場も copy)
 //! 2. Save As なら旧 bundle の参照ファイルを新 bundle へ複製
 //! 3. live と undo / redo 全段の path も bundle 相対へ書き換え (履歴側の
-//!    `Absolute(cache)` を残すと Undo で音源を見失う)
-//! 4. file_path 確定 → autosave 掃除 → recent 更新
-//! 5. bundle 内の未参照ファイルをゴミ箱へ (live + 履歴 + 進行中 render の予約が「参照」)
-//! 6. audio engine へ新 project_dir + song を流す
+//!    `Absolute(cache)` を残すと Undo で音源を見失う)。 運べなかったものは置き場を指したまま残す
+//! 4. file_path 確定 (運び切れなければ未保存のまま) → autosave 掃除 → recent 更新
+//! 5. bundle 内の未参照ファイルをゴミ箱へ (書いた snapshot + live + 履歴 + 進行中 render の予約が「参照」)
+//! 6. 何も指さなくなった未保存の置き場を消す
+//! 7. audio engine へ新 project_dir + song を流す
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use common::model::Song;
 
-use crate::import_audio;
-use crate::media_bundle;
+use crate::media_bundle::{self, TransferFailure};
 use crate::state::*;
 
 impl AppData {
-    /// `song` 内の未保存 import/bounce cache source を `<project_dir>/{samples,bounce,images}/`
-    /// へ移して path を `ProjectRelative` に書き換える。 save flow で **直列化する
-    /// snapshot と working state の live / 履歴のすべて** に適用する: ファイルは move
-    /// なので、 片方だけ移すと他方が移動後ファイルを見失う (= 初回呼び出しが move、
-    /// 2 回目以降は dst.exists で path 書換のみ)。 失敗しても save は続行し missing
-    /// source として扱う。 status へ最後の失敗メッセージを残す。
-    pub(crate) fn migrate_unsaved_sources(song: &mut Song, project_dir: &Path, status: &mut String) {
-        let moves = Self::plan_unsaved_migrations(song, project_dir);
-        if let Err(e) = import_audio::commit_migration(&moves) {
-            tracing::warn!(error = ?e, "未保存キャッシュ → bundle への移行で一部失敗");
-            *status = format!("メディアの bundle への移行で一部失敗: {e}");
+    /// serialize する `snapshot` の未保存の置き場の媒体を bundle 相対へ書き換え、 実ファイルの運び方を返す
+    /// (I/O なし)。 未保存の置き場は注入された `app_dirs` の下だけ (`crate::media_dest` と同じ解決) —
+    /// `app_dirs` が無ければ置き場へ取り込めていないので、 運ぶものも無い。
+    fn plan_unsaved_migrations(&self, snapshot: &mut Song, project_dir: &Path) -> Vec<media_bundle::MediaTransfer> {
+        let Some(dirs) = self.ui_prefs.app_dirs.as_ref() else { return Vec::new() };
+        media_bundle::plan_unsaved_migration(snapshot, project_dir, dirs, self.cur.song_doc.unsaved.id())
+    }
+
+    /// 書き出した保存のあとで、 live と undo / redo 全段が未保存の置き場を指す媒体を `project_dir` の bundle へ
+    /// 運び、 **運べたものだけ** bundle 相対へ書き換える ([`media_bundle::migrate_unsaved`])。 自分の置き場の
+    /// ファイルは移すので、 片方だけ書き換えると他方が移動後のファイルを見失う。 `failures` = この保存で
+    /// 運べなかったもの (試し直さず、 ここで増えた分も足す)。 運べなかったものは置き場を指したまま鳴り続ける。
+    ///
+    /// **Song が凍っている間 (オフライン描画中、 書き出しロック) は live を書き換えない** — 書き換えは epoch を
+    /// 進め、 描画中の engine へ全曲の `LoadSong` を送ってしまう。 live は置き場を指したまま残るので、 置き場の
+    /// 実体は移さずに複製する (移すと live が指す実体が消える)。 残った参照は sidecar の autosave の前
+    /// ([`Self::settle_unsaved_place_of_saved_doc`]) か次の保存で運ぶ。 書き換えられるときは運ぶものが無くても
+    /// `normalize_song` を通す — epoch が進み、 保存の最後の `flush_song_sync` が新しい project_dir を engine へ届ける。
+    fn migrate_doc_into_bundle(&mut self, project_dir: &Path, failures: &mut Vec<TransferFailure>) {
+        let unsaved = self.ui_prefs.app_dirs.clone().map(|d| (d, self.cur.song_doc.unsaved.id()));
+        let frozen = self.offline_render_busy();
+        if !frozen {
+            self.normalize_song(|song| {
+                if let Some((dirs, own)) = &unsaved {
+                    media_bundle::migrate_unsaved(song, project_dir, dirs, *own, false, failures);
+                }
+            });
+        }
+        if let Some((dirs, own)) = &unsaved {
+            self.cur.song_doc.rewrite_history(|song| {
+                media_bundle::migrate_unsaved(song, project_dir, dirs, *own, frozen, failures);
+            });
         }
     }
 
-    /// audio (`samples/`) / bounce (`bounce/`) / video (`samples/`) / image (`images/`)
-    /// の 4 プールぶんの plan を 1 本にまとめる (path 書換のみ、 I/O なし)。
-    fn plan_unsaved_migrations(song: &mut Song, project_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
-        let mut moves = import_audio::plan_unsaved_audio_migration(song, project_dir);
-        moves.extend(import_audio::plan_unsaved_bounce_migration(song, project_dir));
-        moves.extend(media_bundle::plan_unsaved_video_migration(song, project_dir));
-        moves.extend(media_bundle::plan_unsaved_image_migration(song, project_dir));
-        moves
+    /// 保存済みの文書がまだ未保存の置き場を指していれば、 bundle へ運んで何も指さなくなった置き場を消す。
+    /// 指したまま残るのは、 保存で運べなかったとき / オフライン描画中の保存で live を書き換えられなかったとき /
+    /// 未保存の間に始めた Bounce・Glue が保存の後に焼き上がったとき。
+    ///
+    /// **sidecar の autosave を書く前に呼ぶ** (`maybe_autosave`)。 置き場を残す持ち主の記録は起動中のロックと
+    /// recovery_dir の autosave だけ (`crate::unsaved_place`) で、 sidecar はそれにならない — sidecar に置き場の
+    /// パスを書いたまま落ちると、 次の起動の掃除が置き場を消し、 復元した文書の音源が無くなる。 Song が凍っている
+    /// 間は live を書き換えられないので運ばない。
+    pub(crate) fn settle_unsaved_place_of_saved_doc(&mut self) {
+        let (Some(dir), Some(dirs)) = (self.project_dir(), self.ui_prefs.app_dirs.clone()) else { return };
+        // 置き場を指す参照があるのは、 このプロセスが置き場へ書いた / 引き継いだ文書だけ。
+        if !self.cur.song_doc.unsaved.is_claimed() {
+            return;
+        }
+        if !self.offline_render_busy() && self.doc_references_inside(&self.own_unsaved_place_dirs(&dirs)) {
+            let mut failures = Vec::new();
+            self.migrate_doc_into_bundle(&dir, &mut failures);
+            Self::report_transfer_failures(&failures, &mut self.ui_ephemeral.status_message);
+        }
+        self.release_unsaved_place_if_unreferenced();
+    }
+
+    fn report_transfer_failures(failures: &[TransferFailure], status: &mut String) {
+        for f in failures {
+            tracing::warn!(detail = %f.message, "未保存の置き場 → bundle への運搬に失敗");
+        }
+        if let Some(last) = failures.last() {
+            *status = format!(
+                "メディア {} 件を bundle へ運べませんでした (未保存のまま残します): {}",
+                failures.len(),
+                last.message
+            );
+        }
     }
 
     /// 凍結済み `snapshot` をファイルへ書き出して保存を完了する。
@@ -64,8 +111,8 @@ impl AppData {
             return;
         };
         // serialize する snapshot の path を ProjectRelative に書き換え、 実ファイル
-        // 移動の plan を取る (= ここでは I/O しない、 破棄しても無害)。
-        let moves = Self::plan_unsaved_migrations(&mut snapshot, &dir);
+        // 運搬の plan を取る (= ここでは I/O しない、 破棄しても無害)。
+        let moves = self.plan_unsaved_migrations(&mut snapshot, &dir);
         // 現在の表示状態を同梱して保存する (snapshot は楽曲のみ凍結、
         // view は presentation なので保存実行時の live を採るので十分)。
         let view = self.snapshot_view_state();
@@ -81,11 +128,9 @@ impl AppData {
         // serialize 成功 → 破壊的 migration を確定する。 まず snapshot 由来の
         // ファイルを move (plan を commit)、 次に live / 履歴を migrate して
         // ProjectRelative + 自己完結にする (plan 済みファイルは dst.exists で
-        // dedup、 live 固有 source があれば move)。
-        if let Err(e) = import_audio::commit_migration(&moves) {
-            tracing::warn!(error = ?e, "bundle への移行確定で一部失敗");
-            self.ui_ephemeral.status_message = format!("メディアの bundle への移行で一部失敗: {e}");
-        }
+        // dedup、 live 固有 source があれば move)。 Song が凍っていて live を書き換えられない
+        // 間は移さずに複製する (`migrate_doc_into_bundle` の doc)。
+        let mut failures = media_bundle::commit_transfers(&moves, self.offline_render_busy());
         // Save As (保存先フォルダが変わった): 旧 bundle の参照ファイルを新 bundle へ
         // 複製する。 live と履歴の `ProjectRelative` はこの時点ではまだ旧 bundle 相対
         // なので、 file_path を差し替える **前** に旧 dir を読む。
@@ -97,17 +142,15 @@ impl AppData {
         // (下の live migration は「保存完了処理の正規化」 で epoch を進める
         // ため、 記録後に行う)。
         let edited_since_snapshot = self.cur.song_doc.edit_epoch() != snap_epoch;
-        let mut status = std::mem::take(&mut self.ui_ephemeral.status_message);
-        self.normalize_song(|song| Self::migrate_unsaved_sources(song, &dir, &mut status));
-        self.cur.song_doc.rewrite_history(|song| Self::migrate_unsaved_sources(song, &dir, &mut status));
-        self.ui_ephemeral.status_message = status;
+        self.migrate_doc_into_bundle(&dir, &mut failures);
         // serialize 成功時のみ file_path を確定する (旧契約)。
         self.cur.song_doc.file_path = Some(path.clone());
         // 保存が現在の live 内容を含む (= round-trip 中の編集なし) なら
         // clean。 編集が入っていれば dirty のまま (下の guard_after_save
         // 再保存 loop が残りを確定する)。 save 後も Undo できるよう履歴は
-        // 残す (replace_song は使わない)。
-        if !edited_since_snapshot {
+        // 残す (replace_song は使わない)。 bundle へ運べなかった媒体は保存したファイルに
+        // 入っていない (live は置き場を指して鳴り続ける) ので、 未保存のまま次の保存でやり直させる。
+        if !edited_since_snapshot && failures.is_empty() {
             self.cur.song_doc.mark_saved();
         }
         // 保存成功後、 この project の autosave (sidecar + 未保存→Save As
@@ -147,14 +190,19 @@ impl AppData {
         self.push_recent_saved(path.clone());
         // bundle 内の未参照ファイルをゴミ箱へ。 migration / 複製が済んで live と履歴の
         // 参照が全部この bundle 相対になった **後**、 engine へ流す前に行う。
-        self.sweep_bundle(&dir, &path);
+        self.sweep_bundle(&dir, &path, &snapshot);
+        // 未保存の間の置き場は、 中身が bundle へ移って何も指さなくなったら消す (同じく migration の後)。
+        self.release_unsaved_place_if_unreferenced();
+        // 運べなかった媒体は、 掃除の報告より優先して出す (文書が未保存のまま残る理由)。
+        Self::report_transfer_failures(&failures, &mut self.ui_ephemeral.status_message);
         // PR6: migration (直上の normalize) で audio_sources の path が
         // `Absolute(import_cache)` → `ProjectRelative(samples/)` に書き換わり、
         // project_dir も新たに確定した (file_path は上で path に設定済)。
         // normalize は必ず epoch を bump するので、 ここで flush_song_sync が
         // 最新 live song + project_dir (= file_path.parent()) を audio engine
         // へ届けて `AudioClipRenderer` を rebuild させる (SetProjectDir →
-        // LoadSong の順序保証つき)。 epoch bump 済なので no-op にならない。
+        // LoadSong の順序保証つき)。 epoch bump 済なので no-op にならない (Song が凍っている間は
+        // normalize を通さないので no-op — 描画中の engine を差し替えず、 描画の後の最初の同期が届ける)。
         self.flush_song_sync();
         // 「保存して続行」: この保存は成功した。 plugin state 待ちの間に live へ
         // 編集が入って dirty なら (co-temporal snapshot は編集前で凍結されている
@@ -163,7 +211,11 @@ impl AppData {
         // を実行する。 save 成功が分かるこの場所で判定するので、 失敗時の無限
         // 再保存ループに陥らない。
         if self.ui_ephemeral.guard_after_save.is_some() {
-            if self.cur.song_doc.is_dirty() {
+            if !failures.is_empty() {
+                // 媒体を運び切れなかった: 保留操作 (終了 / タブを閉じる) を実行すると置き場ごと消える。
+                // 再保存しても同じ理由で失敗し続けるので、 保存失敗と同じく保留を捨てる。
+                self.ui_ephemeral.guard_after_save = None;
+            } else if self.cur.song_doc.is_dirty() {
                 self.begin_save(path);
             } else if let Some(action) = self.ui_ephemeral.guard_after_save.take() {
                 self.perform_guard_action(action);
@@ -208,26 +260,31 @@ impl AppData {
         }
     }
 
-    /// 進行中の bounce / glue が名前を予約したファイル (project-relative)。 render が
-    /// 書き終わるまで song に載らないので、 参照集合に足さないと掃除が消してしまう。
-    fn in_flight_render_outputs(&self, project_dir: &Path) -> impl Iterator<Item = PathBuf> + '_ {
-        let bounce = self.cur.pipc.pending_clip_fx_bounce.as_ref().map(|p| p.out_path.clone());
+    /// 進行中の bounce / glue が名前を予約したファイル (絶対)。 render が書き終わるまで song に
+    /// 載らないので、 掃除 / 置き場の後始末はこれも「使用中」 に数える。
+    pub(crate) fn in_flight_render_paths(&self) -> impl Iterator<Item = &Path> + '_ {
+        let bounce = self.cur.pipc.pending_clip_fx_bounce.as_ref().map(|p| p.out_path.as_path());
         let glue = self
             .cur.pipc
             .pending_glue_bake
             .iter()
-            .flat_map(|p| p.jobs.iter().map(|j| j.out_path.clone()));
+            .flat_map(|p| p.jobs.iter().map(|j| j.out_path.as_path()));
+        bounce.into_iter().chain(glue)
+    }
+
+    /// [`Self::in_flight_render_paths`] のうち bundle 内のもの (project-relative)。
+    fn in_flight_render_outputs(&self, project_dir: &Path) -> impl Iterator<Item = PathBuf> + '_ {
         let dir = project_dir.to_path_buf();
-        bounce
-            .into_iter()
-            .chain(glue)
+        self.in_flight_render_paths()
             .filter_map(move |abs| abs.strip_prefix(&dir).ok().map(Path::to_path_buf))
     }
 
-    /// bundle 内の未参照ファイルをゴミ箱へ送る。 「参照」 = live + undo / redo 全段 +
-    /// 進行中 render の予約。 同じフォルダに別 project があれば見送る。
-    fn sweep_bundle(&mut self, project_dir: &Path, project_file: &Path) {
+    /// bundle 内の未参照ファイルをゴミ箱へ送る。 「参照」 = 書いた `snapshot` + live + undo / redo 全段 +
+    /// 進行中 render の予約。 同じフォルダに別 project があれば見送る。 `snapshot` を数えるのは、 live を
+    /// 書き換えられなかった保存 (オフライン描画中) では、 保存したファイルだけが bundle の複製を指すから。
+    fn sweep_bundle(&mut self, project_dir: &Path, project_file: &Path, snapshot: &Song) {
         let mut keep = self.bundle_refs(project_dir);
+        media_bundle::collect_bundle_refs(snapshot, project_dir, &mut keep);
         keep.extend(self.in_flight_render_outputs(project_dir));
         let orphans = match media_bundle::orphan_media_files(project_dir, project_file, &keep) {
             Ok(list) => list,

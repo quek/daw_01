@@ -1,6 +1,5 @@
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -84,14 +83,13 @@ pub fn save(path: impl AsRef<Path>, song: &Song) -> Result<()> {
 
 /// Save a project, optionally embedding GUI view state. `view` is
 /// written as `ProjectFile.view` (a sibling of `song`), so the Song / IPC
-/// layout is untouched. Atomic write via tmp → rename.
+/// layout is untouched. Atomic write via [`crate::atomic_file`] (tmp → sync → rename).
 pub fn save_project(
     path: impl AsRef<Path>,
     song: &Song,
     view: Option<&ViewState>,
 ) -> Result<()> {
     let path = path.as_ref();
-    let tmp = tmp_path(path);
 
     // Normalize for save (GC orphan content / audio / video / image
     // source-pool entries) so disk files stay tidy. Working on a clone —
@@ -106,22 +104,8 @@ pub fn save_project(
     let json = serde_json::to_string_pretty(&project)
         .context("failed to serialize project to JSON")?;
 
-    let mut file = fs::File::create(&tmp)
-        .with_context(|| format!("failed to create {}", tmp.display()))?;
-    file.write_all(json.as_bytes())
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync {}", tmp.display()))?;
-    drop(file);
-
-    fs::rename(&tmp, path).with_context(|| {
-        format!(
-            "failed to rename {} -> {}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
+    crate::atomic_file::write_replace(path, json.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// 旧 `InstrumentSource::Vocal { speaker_id, style_name }`
@@ -934,15 +918,10 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     Ok(LoadedProject { song, view, loop_region, hidden_automation_lanes, overlaps_resolved })
 }
 
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut os = path.as_os_str().to_os_string();
-    os.push(".tmp");
-    PathBuf::from(os)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use crate::model::{
         Clip, ClipContent, InstrumentSource, MidiContent, Note, TextContent, TextEvent, Track,
     };
@@ -1802,7 +1781,7 @@ mod tests {
         let path = dir.path().join("project.daw");
         save(&path, &Song::default()).unwrap();
         assert!(path.exists());
-        assert!(!tmp_path(&path).exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "一時ファイルを残さない");
     }
 
     #[test]
@@ -1816,7 +1795,7 @@ mod tests {
         save(&path, &song).unwrap();
 
         assert_eq!(load(&path).unwrap().bpm, 140.0);
-        assert!(!tmp_path(&path).exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "一時ファイルを残さない");
     }
 
     #[test]
@@ -1978,14 +1957,5 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("missing.daw");
         assert!(load(&path).is_err());
-    }
-
-    #[test]
-    fn tmp_path_appends_tmp_suffix() {
-        assert_eq!(
-            tmp_path(Path::new("project.daw")),
-            PathBuf::from("project.daw.tmp")
-        );
-        assert_eq!(tmp_path(Path::new("noext")), PathBuf::from("noext.tmp"));
     }
 }

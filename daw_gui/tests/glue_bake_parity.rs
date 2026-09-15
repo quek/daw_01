@@ -17,20 +17,8 @@
 //! Bounce (with FX) の「元と同じ音で鳴る」も同じ script の §10 で測る (焼く段はフェーダーを含まず、
 //! フェーダーは新しいトラックへ写す — pan 中央・偏り / volume ≠ 1 の 3 ケース)。
 
-use std::collections::HashSet;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-
-/// ディレクトリ直下のファイル一覧 (無ければ空)。テストが増やしたぶんだけ消すため。
-fn snapshot_dir(dir: Option<&Path>) -> HashSet<PathBuf> {
-    let Some(dir) = dir else {
-        return HashSet::new();
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return HashSet::new();
-    };
-    entries.filter_map(|e| e.ok().map(|e| e.path())).collect()
-}
+use std::path::Path;
 
 /// 16-bit PCM mono の WAV を書く。dev-dependency を増やさないため手書き
 /// (ヘッダ 44 byte + サンプル)。
@@ -80,13 +68,10 @@ fn glue_bake_keeps_audio_identical() {
         .join("scripts")
         .join("glue_bake_parity.js");
 
-    // 未保存プロジェクトの焼き込み先は **ユーザーのアプリデータ**
-    // (`%LOCALAPPDATA%/daw_01/bounce_cache`)。テストの残骸を置いていかないよう、
-    // 実行前後の差分を後で消す (実機の bounce 結果は消さない)。
-    let cache = std::env::var_os("LOCALAPPDATA")
-        .map(|p| Path::new(&p).join("daw_01").join("bounce_cache"));
-    let before = snapshot_dir(cache.as_deref());
-
+    // 未保存プロジェクトの焼き込み先は script mode の隔離 root の bounce_cache
+    // (`common::app_dirs::IsolatedAppDirs`、終了時に消える)。以前はユーザーの
+    // `%LOCALAPPDATA%/daw_01/bounce_cache` に焼き、実行前後の差分を消していた —
+    // 同じ時間にユーザーが Bounce した実データまで「差分」として消し得た。
     let output = std::process::Command::new(exe)
         .args([
             "--script",
@@ -96,10 +81,6 @@ fn glue_bake_keeps_audio_identical() {
         ])
         .output()
         .expect("spawn daw_gui");
-
-    for path in snapshot_dir(cache.as_deref()).difference(&before) {
-        let _ = std::fs::remove_file(path);
-    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -55,7 +55,9 @@ impl AppDirs {
         self.root.join("recent_saved.json")
     }
 
-    /// `<root>\recovery\` — autosave / crash-recovery ディレクトリ。
+    /// `<root>\recovery\` — autosave / crash-recovery ディレクトリ。 未保存の文書の
+    /// 素材の置き場を使用中と示すロック (`<id>.lock`) も同じ id でここに置く
+    /// ([`crate::recovery::lock_path_for`])。
     pub fn recovery_dir(&self) -> PathBuf {
         self.root.join("recovery")
     }
@@ -97,8 +99,15 @@ impl AppDirs {
     }
 
     /// `<root>\import_cache\` — **未保存プロジェクト**に取り込んだ素材
-    /// (audio / video / image) の置き場。 保存時に
-    /// `<project_dir>/samples/` へ移送される (`import_audio::migrate_*`)。
+    /// (audio / video / image) の置き場の親。 文書ごとに `<id>\` を切る
+    /// ([`crate::recovery::DocId`]、所有と後始末は `daw_gui::unsaved_place`)。 保存時に
+    /// `<project_dir>/{samples,images}/` へ移送される (`daw_gui::media_bundle`)。
+    /// 取り込み側は注入された `AppDirs` からだけ解決する (`daw_gui::media_dest`) —
+    /// ここを `production()` から直接引くと、テストも検証起動もユーザーの実データへ書く。
+    ///
+    /// 直下に文書の id を持たないファイルがあれば、文書ごとに切る前の版が置いたもの。
+    /// 旧版で未保存のまま動画 / 画像を取り込んでから保存したプロジェクト (当時は保存時に
+    /// 移していなかった) が絶対パスで指しているかもしれないので、掃除では触らない。
     ///
     /// 以前ここは `%LOCALAPPDATA%` の**環境変数直読み**で解決していた
     /// (r.md #81)。 make 経由だと env が丸ごと落ちるため
@@ -109,11 +118,49 @@ impl AppDirs {
         self.root.join("import_cache")
     }
 
-    /// `<root>\bounce_cache\` — **未保存プロジェクト**の Bounce 出力 WAV。
+    /// `<root>\bounce_cache\` — **未保存プロジェクト**の Bounce 出力 WAV の置き場の親
+    /// (文書ごとの `<id>\` は [`AppDirs::import_cache_dir`] と同じ)。
     /// 保存時に `<project_dir>/bounce/` へ移送される。
     /// [`AppDirs::import_cache_dir`] と同じ経緯で env 直読みから移した。
     pub fn bounce_cache_dir(&self) -> PathBuf {
         self.root.join("bounce_cache")
+    }
+}
+
+/// 検証用の起動 (`daw_gui --script` / `--smoke-test`) の per-user データ root。
+///
+/// これらは `cargo test` や agent の検証から起動され、**ユーザーが使っている daw_gui と
+/// 同時に**走る。production の root を使うと、ユーザーの recent / recovery / app_config を
+/// 読み書きし、未保存プロジェクトの取り込みキャッシュへテストの素材を置いていく
+/// (実際に `import_cache` / `bounce_cache` にテストの残骸が溜まっていた)。
+/// 起動ごとに一意な一時フォルダを root にし、drop で丸ごと消す (watchdog の
+/// `process::exit` などで drop を通らなかった回は残る — 一時フォルダの下なので害は無い)。
+///
+/// 対象は `AppDirs` が持つ per-user 状態だけ。ログ (`logging`)、プラグイン DB、VOICEVOX の
+/// エンジン設定 / 合成キャッシュは機械の設定 / 内容アドレスの共有物として従来どおり引く。
+pub struct IsolatedAppDirs {
+    dirs: AppDirs,
+}
+
+impl IsolatedAppDirs {
+    /// `<temp>/daw_01_<label>_<uuid>/` を作る。
+    pub fn create(label: &str) -> std::io::Result<Self> {
+        let root = std::env::temp_dir()
+            .join(format!("daw_01_{label}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { dirs: AppDirs::under(root) })
+    }
+
+    pub fn dirs(&self) -> &AppDirs {
+        &self.dirs
+    }
+}
+
+impl Drop for IsolatedAppDirs {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(self.dirs.root()) {
+            tracing::warn!(error = %e, root = %self.dirs.root().display(), "isolated app data root を消せない");
+        }
     }
 }
 

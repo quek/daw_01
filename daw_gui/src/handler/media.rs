@@ -3,9 +3,10 @@
 //! app.rs から機械分割した `impl AppData` メソッド群 (挙動は元と同一)。
 use crate::state::*;
 use crate::app_types::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use common::model::{AudioContent, AudioEvent, Clip, ClipContent};
 use crate::import_audio;
+use crate::media_dest::MediaPool;
 
 impl AppData {
     /// Import one or more audio files into the song (Phase 1 PR3).
@@ -75,7 +76,9 @@ impl AppData {
         if paths.is_empty() {
             return;
         }
-        let project_dir = self.project_dir();
+        let Some(dest) = self.media_dest(MediaPool::Samples, "Audio import") else {
+            return;
+        };
         // NewTrackBottom で新設する track 名は最初のファイル名 (stem) を使う。
         let new_track_name = paths
             .first()
@@ -90,7 +93,7 @@ impl AppData {
         let mut imported_ok = 0usize;
         let mut errors: Vec<String> = Vec::new();
         for path in paths {
-            let imported = match import_audio::import_one(&path, project_dir.as_deref()) {
+            let imported = match import_audio::import_one(&path, &dest) {
                 Ok(i) => i,
                 Err(e) => {
                     errors.push(format!("{}: {e}", path.display()));
@@ -112,14 +115,6 @@ impl AppData {
                 errors.join(" / ")
             ),
         };
-    }
-
-    /// 保存済みプロジェクトのディレクトリ (`samples/` の親)。未保存なら `None`。
-    pub(crate) fn project_dir(&self) -> Option<PathBuf> {
-        self.cur.song_doc
-            .file_path
-            .as_ref()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
     }
 
     /// 取り込んだ音声の配置先を確定する (1 drop 内の複数件で共有する走行状態)。
@@ -295,10 +290,9 @@ impl AppData {
         if paths.is_empty() {
             return;
         }
-        let project_dir: Option<PathBuf> = self
-            .cur.song_doc.file_path
-            .as_ref()
-            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let Some(dest) = self.media_dest(MediaPool::Samples, "Video import") else {
+            return;
+        };
 
         // 配置先 (image import と同じ解決): セルへの drop は安定 id → index、
         // 既存トラックへの drop は index、 それ以外は一番下に新規トラック。
@@ -326,10 +320,7 @@ impl AppData {
 
         for path in paths {
             let cell_idx = import_cell_index(target, cell_offset);
-            let imported = match crate::import_video::import_one_video(
-                &path,
-                project_dir.as_deref(),
-            ) {
+            let imported = match crate::import_video::import_one_video(&path, &dest) {
                 Ok(i) => i,
                 Err(e) => {
                     errors.push(format!("{}: {e}", path.display()));
@@ -465,10 +456,9 @@ impl AppData {
         if paths.is_empty() {
             return;
         }
-        let project_dir = self
-            .cur.song_doc.file_path
-            .as_ref()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        let Some(dest) = self.media_dest(MediaPool::Images, "Image import") else {
+            return;
+        };
 
         // drop が既存 track を指していれば (`Track(idx)`) その track に画像 clip を
         // 貼り付ける (= ドロップしたトラックに追加)。 track の無い下の余白 drop
@@ -502,10 +492,7 @@ impl AppData {
         // セルへの drop で 2 枚目以降を右の列へ送る量 (audio import と同じ役割)。
         let mut cell_offset = 0usize;
         for path in &paths {
-            let imported = match crate::import_image::import_one_image(
-                path,
-                project_dir.as_deref(),
-            ) {
+            let imported = match crate::import_image::import_one_image(path, &dest) {
                 Ok(i) => i,
                 Err(e) => {
                     errors.push(format!("{}: {e}", path.display()));
@@ -1353,7 +1340,7 @@ mod video_import_target_tests {
 
     use crate::app_types::{ImportTrackTarget, track_with};
     use crate::test_ffmpeg::{H264_ENCODER, locate_ffmpeg, skip_reason};
-    use crate::test_support::headless_app;
+    use crate::test_support::headless_app_with_data_root;
 
     /// 1 秒の映像 + 220Hz の音声を持つ mp4 を作る (音声が無いと対の行が生まれない)。
     fn video_with_audio(dir: &std::path::Path) -> Option<PathBuf> {
@@ -1390,7 +1377,8 @@ mod video_import_target_tests {
             eprintln!("{}", skip_reason("video_dropped_on_a_cell"));
             return;
         };
-        let mut app = headless_app();
+        // 未保存プロジェクトの取り込み先はテストごとの一時 root (ユーザーの import_cache ではない)。
+        let mut app = headless_app_with_data_root(&dir.path().join("appdata"));
         app.cur.song_doc.replace_song(common::model::Song {
             tracks: vec![
                 track_with(|t| { t.id = 10; t.name = "A".into(); }),
@@ -1430,7 +1418,7 @@ mod video_import_target_tests {
             eprintln!("{}", skip_reason("video_dropped_on_a_track"));
             return;
         };
-        let mut app = headless_app();
+        let mut app = headless_app_with_data_root(&dir.path().join("appdata"));
         app.cur.song_doc.replace_song(common::model::Song {
             tracks: vec![
                 track_with(|t| { t.id = 10; t.parent_group_id = Some(99); }),
@@ -1440,7 +1428,7 @@ mod video_import_target_tests {
         });
         app.action_import_video(vec![src], ImportTrackTarget::Track(0), Some(4.0));
         let song = app.cur.song_doc.song();
-        assert_eq!(song.tracks.len(), 3);
+        assert_eq!(song.tracks.len(), 3, "対の音声トラックが 1 本増える: {}", app.ui_ephemeral.status_message);
         assert_eq!(song.tracks[0].clips.len(), 1, "video clip は落とした行");
         assert_eq!(song.tracks[0].clips[0].start_beat, 4.0);
         assert_eq!(kind_of(&app, song.tracks[0].clips[0].content_id), "video");

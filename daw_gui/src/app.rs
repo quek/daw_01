@@ -283,6 +283,11 @@ impl AppData {
         // 同期されるので、 初回のみここで初期化する。
         let mut app = app;
         app.init_recent_labels();
+        // 持ち主の記録 (起動中の文書 / recovery ファイル / 別プロセスのロック) が無い未保存の
+        // 置き場を消す — 前回落ちて recovery も残っていないもの (`crate::unsaved_place`)。
+        if let Some(dirs) = app.ui_prefs.app_dirs.as_ref() {
+            crate::unsaved_place::sweep_orphans(dirs, &[app.cur.song_doc.unsaved.id()]);
+        }
         // Global Sampler は起動時から録り続ける (原典と同じ「常に背後で回っている」)。
         // 子プロセスが居ない経路 (test / script) では中で no-op。
         app.reopen_sampler_ring();

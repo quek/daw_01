@@ -66,7 +66,8 @@ pub fn save(path: impl AsRef<Path>, state: &WindowState) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(state)?;
-    std::fs::write(path, text)?;
+    // 終了時に書くので、ここで落ちても前の geometry が残るように (`common::atomic_file`)。
+    common::atomic_file::write_replace(path, text.as_bytes())?;
     Ok(())
 }
 

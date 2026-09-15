@@ -8,7 +8,7 @@
 //! 1. Compute SHA-256 of the source file (first 4 bytes → 8 hex chars).
 //! 2. Copy the file into `<project_dir>/samples/<basename>_<hash>.<ext>`
 //!    (`Absolute` cache path when there is no project_dir yet, same as
-//!    audio import).
+//!    audio import — [`crate::media_dest`]).
 //! 3. Probe metadata (width / height / framerate / duration / codec) via
 //!    `avformat`, decode a thumbnail frame via `avcodec`, and — when the file
 //!    carries an audio stream — extract the audio to a paired WAV file
@@ -20,7 +20,7 @@
 use std::ffi::CString;
 use std::path::Path;
 
-use common::model::{VideoSource, VideoSourcePath};
+use common::model::VideoSource;
 
 use rsmpeg::avcodec::AVCodecContext;
 use rsmpeg::avformat::AVFormatContextInput;
@@ -390,17 +390,14 @@ pub struct ImportedVideo {
 /// `import_audio::import_one` so the worker thread doesn't have to
 /// reach into individual helpers.
 ///
-/// `project_dir = Some(dir)`: video is copied to `<dir>/samples/...`,
-/// path stored as `VideoSourcePath::ProjectRelative("samples/...")`.
-/// `project_dir = None`: video goes to the unsaved-project import
-/// cache (shared with audio import via
-/// [`crate::import_audio::unsaved_import_cache_dir`]) and the path is
-/// stored as `VideoSourcePath::Absolute(absolute_cache_path)`.
+/// The video and its paired WAV go to `dest` ([`crate::media_dest::MediaDest`]):
+/// a saved project's `samples/` (`ProjectRelative("samples/...")`) or the
+/// unsaved-project import cache (`Absolute(absolute_cache_path)`).
 pub fn import_one_video(
     src: &Path,
-    project_dir: Option<&Path>,
+    dest: &crate::media_dest::MediaDest,
 ) -> Result<ImportedVideo, VideoImportError> {
-    use crate::import_audio::{copy_into_dir, decode_audio, unsaved_import_cache_dir};
+    use crate::import_audio::copy_into_dir;
     use common::model::AudioSource;
 
     // Read metadata BEFORE copying so unsupported / corrupt sources
@@ -415,71 +412,21 @@ pub fn import_one_video(
     // unsaved-project import cache). The audio extract below writes
     // into the same directory so all per-import artifacts cluster
     // together.
-    let (video_path_kind, target_dir) = match project_dir {
-        Some(dir) => {
-            let samples_dir = dir.join("samples");
-            copy_into_dir(src, &samples_dir, &video_filename).map_err(|e| {
-                VideoImportError::IoError(format!("copy video into samples/: {e}"))
-            })?;
-            (
-                VideoSourcePath::ProjectRelative(
-                    std::path::PathBuf::from("samples").join(&video_filename),
-                ),
-                samples_dir,
-            )
-        }
-        None => {
-            let cache = unsaved_import_cache_dir();
-            let dst = copy_into_dir(src, &cache, &video_filename).map_err(|e| {
-                VideoImportError::IoError(format!(
-                    "copy video into import_cache: {e}"
-                ))
-            })?;
-            (VideoSourcePath::Absolute(dst), cache)
-        }
-    };
+    let target_dir = dest.dir();
+    copy_into_dir(src, &target_dir, &video_filename).map_err(|e| {
+        VideoImportError::IoError(format!("copy video into {}: {e}", target_dir.display()))
+    })?;
 
     // Audio extract goes into a paired .wav next to the video, sharing
     // the same hash suffix so we can find / dedup it just like normal
     // audio imports.
-    let audio_filename = {
-        let stem = src
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("audio");
-        let sanitized: String = stem
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        format!("{sanitized}_{hash8}.wav")
-    };
-    let audio_dst = target_dir.join(&audio_filename);
-
-    let audio_info = extract_audio_to_wav(src, &audio_dst)?;
-    let audio = if let Some(info) = audio_info {
-        let buffer = decode_audio(&audio_dst).map_err(|e| {
-            VideoImportError::IoError(format!(
-                "decode extracted WAV {}: {e}",
-                audio_dst.display()
-            ))
-        })?;
-        let source_path = match project_dir {
-            Some(_) => common::model::AudioSourcePath::ProjectRelative(
-                std::path::PathBuf::from("samples").join(&audio_filename),
-            ),
-            None => common::model::AudioSourcePath::Absolute(audio_dst),
-        };
+    let audio_filename = samples_filename(&src.with_extension("wav"), &hash8);
+    let audio = extract_paired_audio(src, &target_dir.join(&audio_filename))?.map(|buffer| {
         let source = AudioSource {
-            path: source_path,
-            sample_rate: info.sample_rate,
-            channels: info.channels,
-            frames: info.frames,
+            path: dest.audio_path(&audio_filename),
+            sample_rate: buffer.sample_rate,
+            channels: buffer.channels,
+            frames: buffer.frames,
             original_bpm: None,
             root_key: None,
         };
@@ -488,21 +435,15 @@ pub fn import_one_video(
             .and_then(|s| s.to_str())
             .unwrap_or("Video Audio")
             .to_string();
-        Some(crate::import_audio::ImportedAudio {
+        crate::import_audio::ImportedAudio {
             buffer: std::sync::Arc::new(buffer),
             source,
             display_name,
-        })
-    } else {
-        // No audio stream in the source — leave any preemptively-
-        // created .wav in place is fine, but extract_audio_to_wav
-        // returns Ok(None) BEFORE opening the writer so no file
-        // exists to clean up here.
-        None
-    };
+        }
+    });
 
     let video_source = VideoSource {
-        path: video_path_kind,
+        path: dest.video_path(&video_filename),
         width: metadata.width,
         height: metadata.height,
         framerate: metadata.framerate,
@@ -533,6 +474,34 @@ pub fn import_one_video(
         display_name,
         audio,
         thumbnail,
+    })
+}
+
+/// 動画の対の WAV (`dst`) を抜き出して decode する。音声ストリームが無ければ `None`。
+///
+/// 取り込みのたびに抜き直し、一時ファイルへ書き切ってから `dst` を置き換える
+/// ([`common::atomic_file`])。以前は `dst` へ直接抜き出していたので、同じ動画を並行して
+/// 取り込むと (名前は動画の内容 hash なので同じ `dst`)、片方の `WavWriter::create` (truncate)
+/// がもう片方の書き終えた WAV を 0 byte に戻し、そちらの decode が 0 byte / 長さ欄 0 のヘッダを
+/// 読んで `no suitable format reader` / `wav: missing data chunk` で落ちるか、書きかけの途中まで
+/// を黙って短い音声として読んだ。
+///
+/// 既存の `dst` を完成品として使い回さないのは、中身が名前 (動画の hash) ではなく **抜き出し方**
+/// で決まる派生物だから — 旧版がクラッシュで残した書きかけや、抜き出し方を直す前の出力を
+/// 黙って掴み続けてしまう (`voicevox_cache::put_inner` と同じ理由)。
+fn extract_paired_audio(
+    src: &Path,
+    dst: &Path,
+) -> Result<Option<crate::audio_source_cache::AudioSourceBuffer>, VideoImportError> {
+    let pending = common::atomic_file::PendingFile::new(dst);
+    if extract_audio_to_wav(src, pending.path())?.is_none() {
+        return Ok(None);
+    }
+    pending
+        .publish_replace()
+        .map_err(|e| VideoImportError::IoError(format!("publish {}: {e}", dst.display())))?;
+    crate::import_audio::decode_audio(dst).map(Some).map_err(|e| {
+        VideoImportError::IoError(format!("decode extracted WAV {}: {e}", dst.display()))
     })
 }
 
@@ -721,7 +690,8 @@ mod tests {
             .expect("ffmpeg run");
         assert!(status.success());
 
-        let imported = import_one_video(&src, Some(&project)).unwrap();
+        let dest = crate::media_dest::MediaDest::bundle(&project, crate::media_dest::MediaPool::Samples);
+        let imported = import_one_video(&src, &dest).unwrap();
 
         // Video metadata round-tripped.
         assert_eq!(imported.video_source.width, 160);
@@ -733,7 +703,7 @@ mod tests {
         // chars get sanitized to `_` so the hash is the only varying
         // suffix.
         match &imported.video_source.path {
-            VideoSourcePath::ProjectRelative(p) => {
+            common::model::VideoSourcePath::ProjectRelative(p) => {
                 assert!(p.starts_with("samples"));
                 assert!(p.extension().unwrap() == "mp4");
             }
@@ -763,6 +733,62 @@ mod tests {
             }
             other => panic!("expected ProjectRelative, got {other:?}"),
         }
+    }
+
+    /// 1 秒の映像 + 220Hz mono 音声の mp4 を `path` に作る。
+    fn write_video_with_audio(ffmpeg: &Path, path: &Path) {
+        let status = std::process::Command::new(ffmpeg)
+            .args([
+                "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=30",
+                "-f", "lavfi", "-i", "sine=frequency=220:duration=1:sample_rate=48000",
+                "-c:v", H264_ENCODER, "-c:a", "aac", "-pix_fmt", "yuv420p", "-shortest", "-y",
+                path.to_str().unwrap(),
+            ])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg run");
+        assert!(status.success(), "ffmpeg failed to build mp4");
+    }
+
+    /// 対の WAV の名前に **読めないファイル** (旧版が抜き出し途中で落ちて残した、長さ欄 0 の
+    /// ヘッダだけの WAV) が居ても、完成品として掴まずに抜き直して置き換える。
+    #[test]
+    fn import_one_video_reextracts_an_unreadable_paired_wav() {
+        let Some(ffmpeg) = locate_ffmpeg() else {
+            eprintln!("{}", skip_reason("import_one_video_reextracts"));
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        write_video_with_audio(&ffmpeg, &src);
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let hash8 = file_hash8(&src).unwrap();
+        let paired = cache.join(samples_filename(&src.with_extension("wav"), &hash8));
+        // hound が finalize 前に置くのと同じ、RIFF / data の長さ欄が 0 の float mono ヘッダ
+        // (symphonia は `wav: missing data chunk` を返す = 観測した flake と同じ状態)。
+        let mut torn = Vec::new();
+        for part in [&b"RIFF"[..], &0u32.to_le_bytes(), b"WAVEfmt ", &16u32.to_le_bytes()] {
+            torn.extend_from_slice(part);
+        }
+        torn.extend_from_slice(&3u16.to_le_bytes()); // WAVE_FORMAT_IEEE_FLOAT
+        torn.extend_from_slice(&1u16.to_le_bytes());
+        torn.extend_from_slice(&48_000u32.to_le_bytes());
+        torn.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+        torn.extend_from_slice(&4u16.to_le_bytes());
+        torn.extend_from_slice(&32u16.to_le_bytes());
+        torn.extend_from_slice(b"data");
+        torn.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&paired, torn).unwrap();
+        assert!(crate::import_audio::decode_audio(&paired).is_err(), "前提: 読めない");
+
+        let imported =
+            import_one_video(&src, &crate::media_dest::MediaDest::unsaved(&cache)).unwrap();
+        let audio = imported.audio.expect("audio should be present");
+        assert!(audio.buffer.frames > 45_000, "抜き直した音声: {}", audio.buffer.frames);
+        let on_disk = crate::import_audio::decode_audio(&paired).expect("置き換え後は読める");
+        assert_eq!(on_disk.frames, audio.buffer.frames);
     }
 
     #[test]

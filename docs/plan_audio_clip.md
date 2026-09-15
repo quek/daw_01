@@ -970,8 +970,11 @@ import した WAV は `<project_dir>/samples/<sanitized_name>_<short_hash>.wav` 
   4. `AudioSourcePath::ProjectRelative(PathBuf::from("samples").join(filename))` で記録
 - **未保存プロジェクトの場合**:
   - 一時的に `%LOCALAPPDATA%/daw_01/import_cache/<session_id>/<filename>` にコピー
+    (2026-09-15 まで実装はフォルダを切らず全文書で共有していた。`<session_id>` =
+    `common::recovery::DocId`、持ち主と後始末は `daw_gui/src/unsaved_place.rs`)
   - `AudioSourcePath::Absolute(cache_path)` で記録
-  - save 時に project dir の `samples/` に移動 + `ProjectRelative` に変換 (autosave も同じ)
+  - save 時に project dir の `samples/` に移動 + `ProjectRelative` に変換 (autosave も同じ)。
+    別の文書の置き場を指すものは移さず複製する (`MediaPool::transfer_mode`)
 - **save as / move project** (`daw_gui/src/media_bundle.rs`、 2026-09-05 実装):
   - 旧 project dir の `samples/` `bounce/` `images/` のうち **live + undo/redo 全段が参照する
     ファイル**を新 project dir の同じ相対位置へコピー (= project 全体 portable、 元フォルダを

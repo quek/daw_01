@@ -1,11 +1,11 @@
 //! project bundle (`<project_dir>/{samples,bounce,images}/`) の **自己完結性**
 //! (`docs/plan_audio_clip.md` §13 Q2)。 保存フローの 3 つの責務をここに集める:
 //!
-//! 1. **未保存キャッシュの取り込み**: 未保存 project で import した video / image は
-//!    `import_cache` に `Absolute` で置かれる。 保存時に bundle へ移して
-//!    `ProjectRelative` に書き換える plan を作る (audio / bounce は
-//!    [`crate::import_audio`] の同名 plan、 commit も同じ
-//!    [`crate::import_audio::commit_migration`])。
+//! 1. **未保存キャッシュの取り込み**: 未保存 project で import / bounce した媒体は
+//!    その文書の置き場 ([`crate::media_dest`]) に `Absolute` で置かれる。 保存時に bundle へ
+//!    運んで `ProjectRelative` に書き換える ([`plan_unsaved_migration`] → [`commit_transfers`])。
+//!    自分の置き場のものは移し、別の文書の置き場のもの (文書ごとに分ける前の共有の置き場を含む)
+//!    は複製する。
 //! 2. **Save As の複製**: 旧 bundle が持つ参照中ファイルを新 bundle へコピーする plan。
 //!    これが無いと新しい `.daw` は `samples/...` を参照したまま実体が無く、 元フォルダを
 //!    消すと開けない。
@@ -13,16 +13,20 @@
 //!    live song + undo / redo 全段 + 進行中の bounce / glue の予約ファイル。 削除では
 //!    なくゴミ箱なので、 判定漏れがあっても戻せる。
 //!
-//! plan (path 書換のみ、 I/O なし) と commit (実ファイル操作) を分けるのは
-//! `import_audio` と同じ理由 — serialize が失敗したら plan を捨てるだけで無傷に戻る。
+//! plan (path 書換のみ、 I/O なし) と commit (実ファイル操作) を分けるのは、 serialize が失敗したら
+//! plan を捨てるだけで無傷に戻るから。 書き出した後の live / 履歴は、 運べたものだけを書き換える
+//! ([`migrate_unsaved`] — 運べなかったものは置き場を指したまま鳴り続ける)。
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use common::app_dirs::AppDirs;
+use common::atomic_file::Published;
 use common::model::{AudioSourcePath, ImageSourcePath, Song, VideoSourcePath};
+use common::recovery::DocId;
 
-use crate::import_audio::unsaved_import_cache_dir;
+use crate::media_dest::{MediaPool, TransferMode};
 
 /// bundle 内でメディアを置くサブフォルダ。 掃除の対象はここだけ (直下のファイルのみ、
 /// サブフォルダは辿らない)。 project file 本体・autosave sidecar・ユーザーが手で置いた
@@ -83,56 +87,179 @@ fn stays_inside_bundle(rel: &Path) -> bool {
     rel.components().all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
-/// 未保存 project で import した video (`Absolute(import_cache/..)`) を
-/// `<project_dir>/samples/` へ移す plan。 path を **その場で** `ProjectRelative` に
-/// 書き換え、 実ファイルの `(cache_abs, dst_abs)` を返す (I/O なし)。
-/// commit は [`crate::import_audio::commit_migration`]。
-pub fn plan_unsaved_video_migration(song: &mut Song, project_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let cache_root = unsaved_import_cache_dir();
-    let mut moves = Vec::new();
+/// 保存時に未保存の置き場から bundle へ運ぶ 1 ファイル。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaTransfer {
+    pub src: PathBuf,
+    pub dst: PathBuf,
+    pub mode: TransferMode,
+}
+
+/// bundle へ運べなかった 1 件。元 (`src`) は未保存の置き場に残っている。
+#[derive(Debug)]
+pub struct TransferFailure {
+    pub src: PathBuf,
+    pub message: String,
+}
+
+impl TransferFailure {
+    fn new(t: &MediaTransfer, e: &std::io::Error) -> Self {
+        Self { src: t.src.clone(), message: format!("{} → {}: {e}", t.src.display(), t.dst.display()) }
+    }
+}
+
+/// 未保存の置き場を指す `song` の媒体 (audio → `samples/`、 Bounce の出力 → `bounce/`、
+/// video → `samples/`、 image → `images/`) を `project_dir` の bundle 相対へ **その場で** 書き換え、
+/// 実ファイルの運び方を返す (I/O なし)。 自分 (`own`) の置き場のものは移し、 別の文書の置き場の
+/// ものは複製する ([`MediaPool::transfer_mode`])。 置き場の外 (bundle / 外部ファイルへの link) は
+/// 触らない。
+///
+/// path の書き換え (Song を捨てれば戻る) と実ファイル操作 (戻せない) を分けるので、 保存は
+/// project file を先に書き、 成功してから [`commit_transfers`] できる — 書き出しに失敗しても
+/// 置き場のファイルは半端に動かない。
+pub fn plan_unsaved_migration(
+    song: &mut Song,
+    project_dir: &Path,
+    dirs: &AppDirs,
+    own: DocId,
+) -> Vec<MediaTransfer> {
+    let mut plan = Vec::new();
+    rewrite_unsaved_sources(song, project_dir, dirs, own, |t| {
+        plan.push(t);
+        true
+    });
+    plan
+}
+
+/// project file を書き出した **後** に、 live / 履歴の 1 曲が未保存の置き場を指す媒体を bundle へ運び、
+/// **運べたものだけ** bundle 相対へ書き換える。 運べなかったもの (と、 この保存で既に運べなかった
+/// `failures` の元 — 試し直さない) は置き場を指したまま残す: 実体は置き場に残っているので鳴り続け、
+/// 次の保存でやり直せる。 失敗は `failures` に足す。
+///
+/// `keep_sources` = 自分の置き場の実体も移さずに複製する (置き場を指したまま書き換えられない参照が
+/// 残るとき — 移すとその参照の実体が消える)。
+pub fn migrate_unsaved(
+    song: &mut Song,
+    project_dir: &Path,
+    dirs: &AppDirs,
+    own: DocId,
+    keep_sources: bool,
+    failures: &mut Vec<TransferFailure>,
+) {
+    rewrite_unsaved_sources(song, project_dir, dirs, own, |t| {
+        if failures.iter().any(|f| f.src == t.src) {
+            return false;
+        }
+        match commit_one(&t, keep_sources) {
+            Ok(()) => true,
+            Err(e) => {
+                failures.push(TransferFailure::new(&t, &e));
+                false
+            }
+        }
+    });
+}
+
+/// 未保存の置き場を指す `song` の媒体を 1 件ずつ `transfer` に渡し、 `true` を返したものを bundle 相対へ
+/// 書き換える ([`plan_unsaved_migration`] / [`migrate_unsaved`] の走査の SSoT)。
+fn rewrite_unsaved_sources(
+    song: &mut Song,
+    project_dir: &Path,
+    dirs: &AppDirs,
+    own: DocId,
+    mut transfer: impl FnMut(MediaTransfer) -> bool,
+) {
+    for source in song.media.audio_sources.values_mut() {
+        let AudioSourcePath::Absolute(abs) = &source.path else { continue };
+        let Some((t, rel)) = MediaPool::of_unsaved_audio(abs, dirs)
+            .and_then(|pool| plan_cache_transfer(abs, pool, dirs, own, project_dir))
+        else {
+            continue;
+        };
+        if transfer(t) {
+            source.path = AudioSourcePath::ProjectRelative(rel);
+        }
+    }
     for source in song.media.video_sources.values_mut() {
         let VideoSourcePath::Absolute(abs) = &source.path else { continue };
-        let Some((dst, rel)) = plan_one(abs, &cache_root, project_dir, "samples") else {
+        let Some((t, rel)) = plan_cache_transfer(abs, MediaPool::Samples, dirs, own, project_dir)
+        else {
             continue;
         };
-        let abs = abs.clone();
-        source.path = VideoSourcePath::ProjectRelative(rel);
-        moves.push((abs, dst));
+        if transfer(t) {
+            source.path = VideoSourcePath::ProjectRelative(rel);
+        }
     }
-    moves
-}
-
-/// [`plan_unsaved_video_migration`] の image 版 (→ `images/`、 保存済 project への
-/// import 先 `import_image` と同じフォルダ)。
-pub fn plan_unsaved_image_migration(song: &mut Song, project_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
-    let cache_root = unsaved_import_cache_dir();
-    let mut moves = Vec::new();
     for source in song.media.image_sources.values_mut() {
         let ImageSourcePath::Absolute(abs) = &source.path else { continue };
-        let Some((dst, rel)) = plan_one(abs, &cache_root, project_dir, "images") else {
+        let Some((t, rel)) = plan_cache_transfer(abs, MediaPool::Images, dirs, own, project_dir)
+        else {
             continue;
         };
-        let abs = abs.clone();
-        source.path = ImageSourcePath::ProjectRelative(rel);
-        moves.push((abs, dst));
+        if transfer(t) {
+            source.path = ImageSourcePath::ProjectRelative(rel);
+        }
     }
-    moves
 }
 
-/// `abs` が `cache_root` 配下なら `(dst_abs, rel)` を返す。 配下でなければ `None`
-/// (= 外部ファイルへの link、 触らない)。
-fn plan_one(
+/// `song` の媒体が `dirs` (フォルダ) の中のファイルを絶対パスで指しているか (到達可能性ではなく pool 全体 —
+/// Undo で戻る参照も実体が要る)。
+pub fn references_inside(song: &Song, dirs: &[PathBuf]) -> bool {
+    let inside = |p: &Path| dirs.iter().any(|d| p.starts_with(d));
+    song.media.audio_sources.values().any(|s| matches!(&s.path, AudioSourcePath::Absolute(p) if inside(p)))
+        || song.media.video_sources.values().any(|s| matches!(&s.path, VideoSourcePath::Absolute(p) if inside(p)))
+        || song.media.image_sources.values().any(|s| matches!(&s.path, ImageSourcePath::Absolute(p) if inside(p)))
+}
+
+/// `abs` が `pool` の未保存の置き場にあれば、 bundle へ運ぶ手順と Song に記録する相対パス。
+fn plan_cache_transfer(
     abs: &Path,
-    cache_root: &Path,
+    pool: MediaPool,
+    dirs: &AppDirs,
+    own: DocId,
     project_dir: &Path,
-    dst_subdir: &str,
-) -> Option<(PathBuf, PathBuf)> {
-    if !abs.starts_with(cache_root) {
-        return None;
+) -> Option<(MediaTransfer, PathBuf)> {
+    let mode = pool.transfer_mode(abs, dirs, own)?;
+    let rel = PathBuf::from(pool.bundle_subdir()).join(abs.file_name()?);
+    Some((MediaTransfer { src: abs.to_path_buf(), dst: project_dir.join(&rel), mode }, rel))
+}
+
+/// [`plan_unsaved_migration`] の実ファイル操作。 project file の書き出しが **成功してから** 呼ぶ。
+/// 冪等: `dst` が既にあれば (同じ名前 = 同じ内容、 または同じ保存の先の plan が運び済み)、 移す側は
+/// 置き場のファイルを捨て、 複製する側は何もしない。 1 件失敗しても残りは続ける (1 つの壊れた
+/// ファイルが後ろの全部を置き場に取り残さない)。 `keep_sources` は [`migrate_unsaved`] と同じ。
+/// 戻り値は運べなかったもの (元は置き場に残る)。
+pub fn commit_transfers(plan: &[MediaTransfer], keep_sources: bool) -> Vec<TransferFailure> {
+    plan.iter()
+        .filter_map(|t| commit_one(t, keep_sources).err().map(|e| TransferFailure::new(t, &e)))
+        .collect()
+}
+
+fn commit_one(t: &MediaTransfer, keep_source: bool) -> std::io::Result<()> {
+    if let Some(dir) = t.dst.parent() {
+        fs::create_dir_all(dir)?;
     }
-    let filename = abs.file_name()?;
-    let rel = PathBuf::from(dst_subdir).join(filename);
-    Some((project_dir.join(&rel), rel))
+    match t.mode {
+        TransferMode::Move if keep_source => {
+            common::atomic_file::copy_new(&t.src, &t.dst)?;
+        }
+        TransferMode::Move if t.dst.exists() => {
+            let _ = fs::remove_file(&t.src);
+        }
+        // 同じボリューム内の rename は atomic。 失敗 (別ボリューム / 開いている読み手) は複製して
+        // 元を消す。 複製は書きかけを `dst` に出さない — 途中で落ちた `dst` を次の保存が上の
+        // `exists` で「移行済み」と見なすと、 置き場の原本を消して完成品がどこにも残らない。
+        TransferMode::Move => {
+            if fs::rename(&t.src, &t.dst).is_err() {
+                common::atomic_file::copy_new(&t.src, &t.dst)?;
+                let _ = fs::remove_file(&t.src);
+            }
+        }
+        TransferMode::Copy => {
+            common::atomic_file::copy_new(&t.src, &t.dst)?;
+        }
+    }
+    Ok(())
 }
 
 /// Save As: `old_dir` 側の参照ファイルを `new_dir` の同じ相対位置へ複製する plan
@@ -158,7 +285,9 @@ pub struct RelocationReport {
 }
 
 /// 複製を実行する。 dst が既にあればスキップ (同 hash 名 = 同内容の content
-/// addressing なので上書きしない)。 src が無ければ `missing` に記録して続行。
+/// addressing なので上書きしない)。 だから書きかけを dst に出さない — 複製中に落ちた
+/// dst は次の Save As でも「複製済み」と見なされ、壊れたまま残る ([`common::atomic_file`])。
+/// src が無ければ `missing` に記録して続行。
 pub fn commit_relocation(copies: &[(PathBuf, PathBuf)]) -> RelocationReport {
     let mut report = RelocationReport::default();
     for (src, dst) in copies {
@@ -172,9 +301,10 @@ pub fn commit_relocation(copies: &[(PathBuf, PathBuf)]) -> RelocationReport {
         let result = dst
             .parent()
             .map_or(Ok(()), fs::create_dir_all)
-            .and_then(|()| fs::copy(src, dst).map(|_| ()));
+            .and_then(|()| common::atomic_file::copy_new(src, dst));
         match result {
-            Ok(()) => report.copied += 1,
+            Ok(Published::Written) => report.copied += 1,
+            Ok(Published::AlreadyPresent) => {}
             Err(e) => report
                 .failures
                 .push(format!("{} → {}: {e}", src.display(), dst.display())),
@@ -452,43 +582,83 @@ mod tests {
         assert!(new.path().join("samples/a.wav").exists());
     }
 
+    /// plan は全プールの path を bundle 相対へ書き換えるが **ファイルを動かさない** (保存は
+    /// project file の書き出しが成功してから commit する)。自分の置き場は移す、別の文書の置き場と
+    /// 文書ごとに分ける前の共有の置き場は複製する、外部 link は触らない。
     #[test]
-    fn unsaved_video_and_image_plans_rewrite_paths_without_io() {
+    fn unsaved_plan_moves_own_place_copies_foreign_places_and_leaves_links() {
         let proj = tempdir().unwrap();
-        let cache = unsaved_import_cache_dir();
+        let data = tempdir().unwrap();
+        let dirs = AppDirs::under(data.path());
+        let (own, other) = (DocId::new(), DocId::new());
+        let mine = MediaPool::Samples.unsaved_dir(&dirs, own);
+        let theirs = MediaPool::Samples.unsaved_dir(&dirs, other);
+        let legacy = dirs.import_cache_dir();
+        let bounce = MediaPool::Bounce.unsaved_dir(&dirs, own);
         let mut song = Song::default();
-        song.media.video_sources.insert(
-            1,
-            video(VideoSourcePath::Absolute(cache.join("v_abcd1234.mp4"))),
-        );
-        song.media.image_sources.insert(
-            1,
-            image(ImageSourcePath::Absolute(cache.join("i_abcd1234.png"))),
-        );
-        song.media.image_sources.insert(
-            2,
-            image(ImageSourcePath::Absolute("C:/elsewhere/linked.png".into())),
-        );
-        let v = plan_unsaved_video_migration(&mut song, proj.path());
-        let i = plan_unsaved_image_migration(&mut song, proj.path());
+        song.media.audio_sources.insert(1, audio(AudioSourcePath::Absolute(mine.join("a_1.wav"))));
+        song.media.audio_sources.insert(2, audio(AudioSourcePath::Absolute(theirs.join("b_2.wav"))));
+        song.media.audio_sources.insert(3, audio(AudioSourcePath::Absolute(bounce.join("c_fx.wav"))));
+        song.media.video_sources.insert(1, video(VideoSourcePath::Absolute(legacy.join("v_3.mp4"))));
+        song.media.image_sources.insert(1, image(ImageSourcePath::Absolute(mine.join("i_4.png"))));
+        song.media
+            .image_sources
+            .insert(2, image(ImageSourcePath::Absolute("C:/elsewhere/linked.png".into())));
+
+        let mut plan = plan_unsaved_migration(&mut song, proj.path(), &dirs, own);
+        plan.sort_by(|a, b| a.dst.cmp(&b.dst));
+        let p = proj.path();
+        let t = |src: PathBuf, dst: PathBuf, mode| MediaTransfer { src, dst, mode };
         assert_eq!(
-            v,
-            vec![(cache.join("v_abcd1234.mp4"), proj.path().join("samples").join("v_abcd1234.mp4"))]
+            plan,
+            vec![
+                t(bounce.join("c_fx.wav"), p.join("bounce").join("c_fx.wav"), TransferMode::Move),
+                t(mine.join("i_4.png"), p.join("images").join("i_4.png"), TransferMode::Move),
+                t(mine.join("a_1.wav"), p.join("samples").join("a_1.wav"), TransferMode::Move),
+                t(theirs.join("b_2.wav"), p.join("samples").join("b_2.wav"), TransferMode::Copy),
+                t(legacy.join("v_3.mp4"), p.join("samples").join("v_3.mp4"), TransferMode::Copy),
+            ]
         );
         assert_eq!(
-            i,
-            vec![(cache.join("i_abcd1234.png"), proj.path().join("images").join("i_abcd1234.png"))]
+            song.media.audio_sources[&2].path,
+            AudioSourcePath::ProjectRelative(PathBuf::from("samples").join("b_2.wav"))
         );
         assert_eq!(
             song.media.video_sources[&1].path,
-            VideoSourcePath::ProjectRelative(PathBuf::from("samples").join("v_abcd1234.mp4"))
+            VideoSourcePath::ProjectRelative(PathBuf::from("samples").join("v_3.mp4"))
         );
-        assert_eq!(
-            song.media.image_sources[&1].path,
-            ImageSourcePath::ProjectRelative(PathBuf::from("images").join("i_abcd1234.png"))
-        );
-        // 外部 link は触らない。
         assert!(matches!(song.media.image_sources[&2].path, ImageSourcePath::Absolute(_)));
-        assert!(!proj.path().join("samples").exists(), "plan must not touch the filesystem");
+        assert!(!p.join("samples").exists(), "plan must not touch the filesystem");
+    }
+
+    /// commit: 移す側は置き場から消え、複製する側は持ち主の置き場に残る。同じ保存の 2 回目
+    /// (live / 履歴の migration) は運び済みなので何も壊さない。1 件の失敗で残りを止めない。
+    #[test]
+    fn commit_moves_copies_is_idempotent_and_continues_past_failures() {
+        let data = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        let (mine, theirs) = (data.path().join("mine"), data.path().join("theirs"));
+        touch(&mine.join("a.wav"));
+        touch(&theirs.join("b.wav"));
+        let p = proj.path().join("samples");
+        let plan = vec![
+            MediaTransfer { src: mine.join("gone.wav"), dst: p.join("gone.wav"), mode: TransferMode::Move },
+            MediaTransfer { src: mine.join("a.wav"), dst: p.join("a.wav"), mode: TransferMode::Move },
+            MediaTransfer { src: theirs.join("b.wav"), dst: p.join("b.wav"), mode: TransferMode::Copy },
+        ];
+        let failures = commit_transfers(&plan, false);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].src, mine.join("gone.wav"));
+        assert!(!mine.join("a.wav").exists() && p.join("a.wav").exists(), "own place: moved");
+        assert!(theirs.join("b.wav").exists() && p.join("b.wav").exists(), "foreign place: copied");
+
+        assert!(commit_transfers(&plan[1..], false).is_empty(), "second pass is a no-op");
+        assert!(p.join("a.wav").exists() && theirs.join("b.wav").exists());
+
+        // 置き場を指したまま書き換えられない参照が残るときは、自分の置き場の実体も移さない。
+        let kept = MediaTransfer { src: mine.join("c.wav"), dst: p.join("c.wav"), mode: TransferMode::Move };
+        touch(&kept.src);
+        assert!(commit_transfers(std::slice::from_ref(&kept), true).is_empty());
+        assert!(kept.src.exists() && kept.dst.exists(), "keep_sources: copied, not moved");
     }
 }

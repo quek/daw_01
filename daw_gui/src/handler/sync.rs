@@ -346,7 +346,11 @@ impl AppData {
                 bits_per_sample: 32,
                 sample_format: hound::SampleFormat::Float,
             };
-            let mut writer = hound::WavWriter::create(&path, spec)?;
+            // 名前は内容 hash なので、既にあれば完成品として ARA プラグインへ渡る。書きかけを
+            // 最終名に出さない — 途中で落ちると壊れた WAV が以後ずっと使われる
+            // ([`common::atomic_file`])。
+            let pending = common::atomic_file::PendingFile::new(&path);
+            let mut writer = hound::WavWriter::create(pending.path(), spec)?;
             let frames = buffer.frames as usize;
             let channels = buffer.samples.len().max(1);
             for frame in 0..frames {
@@ -361,6 +365,7 @@ impl AppData {
                 }
             }
             writer.finalize()?;
+            pending.publish_new()?;
             tracing::info!(source_id, path = %path.display(), "ARA: materialized generated source to WAV");
         }
         self.cur.pipc.ara_pcm_materialized.insert(source_id, path);

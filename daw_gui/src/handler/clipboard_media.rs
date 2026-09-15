@@ -24,13 +24,16 @@ impl AppData {
     /// 取り込む直前の正規化: 運んできた写しは絶対パスなので、**貼り先のフォルダ基準**へ
     /// 戻してから [`common::model::Song::import_media`] へ渡す (でないと同じ音源が
     /// `ProjectRelative` と `Absolute` の 2 本になる — 元のタブへ戻したときに必ず起きる)。
+    /// 別の文書の未保存の置き場にある媒体は、この文書の置き場へ複製してから指す
+    /// ([`Self::adopt_foreign_unsaved_media`] — 借りたままだと持ち主の保存 / 破棄で消える)。
     #[must_use]
     pub(crate) fn media_for_import(
-        &self,
+        &mut self,
         media: &common::model::MediaManifest,
     ) -> common::model::MediaManifest {
         let mut out = media.clone();
         out.relativize(self.project_dir().as_deref());
+        self.adopt_foreign_unsaved_media(&mut out);
         out
     }
 

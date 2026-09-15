@@ -1,4 +1,5 @@
 pub mod app_dirs;
+pub mod atomic_file;
 pub mod audio_bridge;
 pub mod audio_decode;
 pub mod audio_render;

@@ -41,7 +41,8 @@
   書き出しの間だけ止まり、終わると続きから走る。REAPER の render もモーダル。
 - タブ間の copy / paste は既存の clipboard envelope (`source_project_id` で link / copy を判定) が
   そのまま「別プロジェクトからの貼り付け = 独立コピー」になる。追加実装なし。
-- 自動保存 / 復旧候補はタブごと (`SongDoc::recovery_session_id` が既に per-doc)。
+- 自動保存 / 復旧候補はタブごと (`SongDoc::recovery_session_id` が既に per-doc。2026-09-15 に
+  未保存の素材の置き場の名前も兼ねる `SongDoc::unsaved` へ置き換えた)。
 - 同時に開けるタブは **32** (`MAX_PROJECTS`。`MAX_TRACKS` / `MAX_WORKERS` と同じ cap 思想)。
 
 ## 1. 識別子 — 3 プロセスを貫く住所
