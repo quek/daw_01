@@ -1112,22 +1112,8 @@ impl AppData {
                 }
             }
         }
-        // 後続の request が積まれていれば、 改めて `RequestAllStates` を発行して
-        // 次の応答待ちに入る。 ここで「直前の edit が走ったあとの最新 state」 を
-        // 再取得することで、 各 deferred edit が自前の knob snapshot を持つ。 さらに
-        // 新たな front が Save なら、 dispatch_front_state_request が **この瞬間**
-        // (= 先行 Deferred が live layout を確定させた直後) に live を凍結するので、
-        // その Save の snapshot は返ってくる state と同じ layout になる。
-        if !self.cur.pipc.pending_state_queue.is_empty() {
-            self.dispatch_front_state_request();
-        } else if let Some(action) = self.cur.pipc.guard_pending_action.take() {
-            // round-trip が全て drain した。 in-flight 中に保留していた
-            // ガード操作 (New/Open/Open Recent/終了) を、 deferred edit / save 反映後の
-            // **最新 dirty 状態で再評価** する (= clean なら実行、 dirty なら確認モーダル)。
-            // dirty は edit_epoch 由来の O(1) 派生なので明示的な recompute は不要。
-            // queue は空なので破壊操作も安全に走る。
-            self.request_guarded_action(action);
-        }
+        // 後続があれば次の往復へ、空になったら保留していたガード操作の再評価へ (`advance_state_queue`)。
+        self.advance_state_queue();
         // 「保存して終了」 の完了判定は `finish_save` (save 成否が分かる場所) が行う。
     }
 

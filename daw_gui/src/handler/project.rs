@@ -1413,6 +1413,12 @@ impl AppData {
                     .into();
             return;
         }
+        if !self.pin_front_history_jump() {
+            // 行き先の無い履歴ジャンプは往復を始めずに取り除き、次へ進む。
+            self.cur.pipc.pending_state_queue.pop_front();
+            self.advance_state_queue();
+            return;
+        }
         let needs_snapshot = matches!(
             self.cur.pipc.pending_state_queue.front(),
             Some(PendingStateRequest::Save { snapshot: None, .. })
@@ -1434,6 +1440,23 @@ impl AppData {
         // この瞬間から応答 (AllStatesReceived) までを on_tick の watchdog
         // が監視する。 host が hang して応答が来ないと永久ロックになるため。
         self.cur.pipc.state_request_sent_at = Some(std::time::Instant::now());
+    }
+
+    /// 待ち行列の先頭を済ませた (または往復を始めずに取り除いた) 後: 後続が積まれていれば、改めて `RequestAllStates` を
+    /// 発行して次の応答待ちに入る。ここで「直前の要求が走ったあとの最新 state」を再取得することで、各 deferred edit が
+    /// 自前の knob snapshot を持つ。さらに新たな先頭が Save なら、[`Self::dispatch_front_state_request`] が **この瞬間**
+    /// (= 先行 Deferred が live layout を確定させた直後) に live を凍結するので、その Save の snapshot は返ってくる state と
+    /// 同じ layout になる。
+    ///
+    /// 空になったら、round-trip 中に保留していたガード操作 (New / Open / Open Recent / 終了) を deferred edit / save 反映後の
+    /// **最新 dirty 状態で再評価** する (= clean なら実行、dirty なら確認モーダル)。dirty は edit_epoch 由来の O(1) 派生なので
+    /// 明示的な recompute は不要。queue は空なので破壊操作も安全に走る。
+    pub(crate) fn advance_state_queue(&mut self) {
+        if !self.cur.pipc.pending_state_queue.is_empty() {
+            self.dispatch_front_state_request();
+        } else if let Some(action) = self.cur.pipc.guard_pending_action.take() {
+            self.request_guarded_action(action);
+        }
     }
 
     /// in-flight な plugin-state round-trip を強制的に破棄する。 plugin host が

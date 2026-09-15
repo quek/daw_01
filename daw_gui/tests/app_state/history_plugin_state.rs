@@ -203,6 +203,51 @@ fn 往復待ちの削除の後に来た_undo_は削除を戻す() {
     assert_eq!(loaded_states(&drain(&mut plugin_rx), device_id), vec![Some(vec![7])]);
 }
 
+/// 往復待ちの削除の後ろに並んだ undo も、**自分の取り寄せを始めた時点**で行き先が決まる: その取り寄せを待つ間に入った
+/// 編集では「1 段前」がずれず、削除を戻す (ずれると、間に入った編集が戻って削除は戻らない)。
+#[test]
+fn 並んだ_undo_も自分の取り寄せの間に入った編集で行き先はずれない() {
+    let (mut app, _audio_rx, mut plugin_rx, _d) = build_app();
+    let base_volume = app.cur.song_doc.song().tracks[0].volume;
+    let (_track_id, device_id) = instrument(&mut app);
+    drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices { device_ids: vec![device_id] }));
+    app.handle_event(AppEvent::Undo);
+    drain(&mut plugin_rx);
+    respond(&mut app, device_id, &[7]);
+    assert!(app.cur.song_doc.song().plugin_by_id(device_id).is_none(), "削除が先");
+    assert_eq!(requests(&drain(&mut plugin_rx)), 1, "undo の取り寄せが始まった");
+    set_volume(&mut app, 0.5);
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+
+    let restored = app.cur.song_doc.song().plugin_by_id(device_id).expect("undo は削除を戻す");
+    assert_eq!(restored.state.as_deref(), Some(&[7_u8][..]));
+    assert_eq!(app.cur.song_doc.song().tracks[0].volume, base_volume, "間に入った編集は redo 側に残る");
+    assert!(app.cur.song_doc.can_redo());
+}
+
+/// 往復待ちの削除の後ろに並んだ redo は、削除が redo 側を捨てたので行き先が無い: 取り寄せを始めずに待ち行列から外れ、
+/// 後の操作を塞がない。
+#[test]
+fn 並んだ_redo_の行き先が消えたら往復せずに外れる() {
+    let (mut app, _audio_rx, mut plugin_rx, _d) = build_app();
+    let (_track_id, device_id) = instrument(&mut app);
+    set_volume(&mut app, 0.25);
+    app.handle_event(AppEvent::Undo);
+    assert!(app.cur.song_doc.can_redo());
+    drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices { device_ids: vec![device_id] }));
+    app.handle_event(AppEvent::Redo);
+    drain(&mut plugin_rx);
+    respond(&mut app, device_id, &[3]);
+    assert!(app.cur.song_doc.song().plugin_by_id(device_id).is_none());
+    assert_eq!(requests(&drain(&mut plugin_rx)), 0, "行き先の無い redo は取り寄せない");
+    assert!(app.cur.pipc.pending_state_queue.is_empty());
+    assert!(!app.cur.song_doc.can_redo());
+}
+
 /// 降ろす device の無い undo は往復を挟まず即時。
 #[test]
 fn 降ろす_device_の無い_undo_は同期のまま() {
@@ -230,6 +275,54 @@ fn 取り寄せが終わらなければ_undo_は適用しない() {
     app.poll_state_roundtrip_watchdog(Instant::now() + Duration::from_secs(120));
     assert!(app.cur.pipc.pending_state_queue.is_empty());
     assert_eq!(app.cur.song_doc.history_current(), current, "undo は適用しない");
+    assert!(app.cur.song_doc.song().plugin_by_id(device_id).is_some());
+    assert_eq!(removes(&drain(&mut plugin_rx), device_id), 0);
+}
+
+/// クリップの bounce を 1 本走らせている状態にする (engine の offline render を占有 = Song の凍結中)。
+fn start_bounce(app: &mut AppData) {
+    use daw_gui::app_types::{BounceMode, PendingClipFxBounce};
+    let source_track_id = app.cur.song_doc.song().tracks[0].id;
+    app.cur.pipc.pending_clip_fx_bounce = Some(PendingClipFxBounce {
+        mode: BounceMode::InPlace,
+        source_track: 0,
+        source_clip: 0,
+        source_track_id,
+        source_content_id: 0,
+        out_path: std::path::PathBuf::new(),
+        source_path: common::model::AudioSourcePath::Generated { id: 1 },
+        clip_name: String::new(),
+        clip_length_beats: 1.0,
+        start_beat: 0.0,
+        content_offset_beats: 0.0,
+        label: "バウンス",
+    });
+}
+
+/// bounce / 焼き込み / 書き出しの間は、編集と同じく履歴ジャンプも Song を動かさない (動かすと frame flush が render 中の
+/// song を差し替える)。取り寄せを待っていたジャンプも、待つ間に始まった bounce の最中に届いたら動かさない。
+#[test]
+fn bounce_の間は_undo_も_song_を動かさない() {
+    let (mut app, _audio_rx, mut plugin_rx, _d) = build_app();
+    let (_track_id, device_id) = instrument(&mut app);
+    set_volume(&mut app, 0.25);
+    drain(&mut plugin_rx);
+    let current = app.cur.song_doc.history_current();
+
+    start_bounce(&mut app);
+    app.handle_event(AppEvent::Undo);
+    assert_eq!(app.cur.song_doc.history_current(), current, "bounce の間の undo は拒否");
+    assert_eq!(app.cur.song_doc.song().tracks[0].volume, 0.25);
+    assert_eq!(app.ui_ephemeral.status_message, "書き出し中は編集できません");
+    app.cur.pipc.pending_clip_fx_bounce = None;
+
+    // 音量を戻す undo (即時) の次は plugin を降ろす undo: 取り寄せを待つ間に bounce が始まる。
+    app.handle_event(AppEvent::Undo);
+    app.handle_event(AppEvent::Undo);
+    assert_eq!(requests(&drain(&mut plugin_rx)), 1);
+    start_bounce(&mut app);
+    respond(&mut app, device_id, &[9]);
+    assert_eq!(app.cur.song_doc.history_current(), current - 1, "bounce の最中に届いたジャンプは動かさない");
     assert!(app.cur.song_doc.song().plugin_by_id(device_id).is_some());
     assert_eq!(removes(&drain(&mut plugin_rx), device_id), 0);
 }

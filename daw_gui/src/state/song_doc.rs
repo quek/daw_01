@@ -588,7 +588,14 @@ impl SongDoc {
     /// 履歴を `jump` の行き先へ動かす。undo / redo を必要段数ぶん繰り返すのと等価だが、中間 state を経由した
     /// 副作用 (epoch bump / 構造の観測) は出さず **1 回だけ** 出す (caller が 1 度 reconcile する)。行き先が無い
     /// (端 / 今の state / 履歴に居ない state) ときは `false` (no-op)。
+    ///
+    /// export 中は [`Self::edit`] と同じく **拒否** する (`false` + status message 予約) — 履歴ジャンプも live の
+    /// Song を差し替えるので、ここを素通しにすると render 中の song が入れ替わる (song 凍結の単一保証点)。
     pub fn jump(&mut self, jump: HistoryJump) -> bool {
+        if self.export_lock {
+            self.rejection = Some("書き出し中は編集できません");
+            return false;
+        }
         let Some(depth) = self.jump_depth(jump) else {
             return false;
         };

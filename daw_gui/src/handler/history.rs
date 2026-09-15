@@ -6,9 +6,11 @@
 //!
 //! 取り寄せ待ちの間に来たジャンプと、往復待ちの編集の後に来たジャンプは、発注の順に待ち行列 (`pending_state_queue`)
 //! で 1 つずつ処理する (取り寄せ → ジャンプ → 次)。待ちの間に来た待たない編集は、往復待ちの編集のときと同じく
-//! その場で live に入る — 待っているジャンプは発注した時点の行き先 (state の識別子) へ動くので、その編集は redo 側に
-//! 回る。往復がタイムアウト / host 切断で終わらなければ、往復待ちの編集と同じくジャンプは適用しない
-//! (`abort_state_roundtrip`)。
+//! その場で live に入る — 待っているジャンプは **自分の取り寄せを始めた時点** の行き先 (state の識別子) へ動くので、
+//! その取り寄せの間に入った編集は redo 側に回る (すぐ往復を始めるジャンプは発注の時点、前の要求の後ろに並んだ
+//! ジャンプは前が済んで往復を始める時点 — `pin_front_history_jump`)。往復がタイムアウト / host 切断で終わらなければ、
+//! 往復待ちの編集と同じくジャンプは適用しない (`abort_state_roundtrip`)。書き出し / 解析 / bounce / 焼き込みの間は
+//! 編集と同じく拒否する (`SongDoc::jump`)。
 //!
 //! plugin state は履歴に属さない (host が持つ最新が正で、undo でツマミは戻らない)。往復の応答は live と undo / redo の
 //! 全 Song へ書き戻す ([`PluginStateWriteBack`] / `SongDoc::write_back_plugin_state`) ので、次に同じ device を載せ直す
@@ -42,13 +44,21 @@ impl AppData {
 
     /// `jump` を今動かすか、plugin state の往復の後に回すか:
     /// - 待ち行列に Song を変える要求 (往復待ちの編集 / 履歴ジャンプ) が居る — 発注の順に処理する (削除の往復を
-    ///   待たずに undo すると、削除ではなくその前の操作が戻る)。行き先はそれが済むまで決まらないので、並んだ順に
-    ///   その時点から動かす。
+    ///   待たずに undo すると、削除ではなくその前の操作が戻る)。行き先はそれが済むまで決まらないので相対のまま並べ、
+    ///   前が済んで自分の往復を始める時点で固定する ([`Self::pin_front_history_jump`])。
     /// - このジャンプで host から降りる device がある (行き先の Song で [`compute_slot_removals`]、reconcile と同じ導出)
     ///   — 行き先は今決まっているので state の識別子で固定して並べる (往復待ちの編集が id で対象を指すのと同じく、
     ///   待つ間に入った編集で「1 段前」がずれない)。
     /// - どちらでもなければ即時。
+    ///
+    /// 書き出し / 解析 / bounce / 焼き込みの間 (Song の凍結中) は往復も始めず、編集と同じく拒否する (`SongDoc::jump`)。
     fn request_history_jump(&mut self, jump: HistoryJump) {
+        self.sync_export_lock();
+        if self.cur.song_doc.export_locked() {
+            // 動かさずに拒否の status を予約するのは `SongDoc::jump` (編集の拒否と同じ 1 箇所)。
+            self.execute_history_jump(jump);
+            return;
+        }
         let pipc = &self.cur.pipc;
         let ordered = pipc
             .pending_state_queue
@@ -70,8 +80,10 @@ impl AppData {
     }
 
     /// 履歴を動かし、session 状態と host を追従させる (即時か、往復の完了 `on_all_states_from_child`)。行き先が
-    /// もう無い (往復待ちの間の編集で redo 側が捨てられた) なら何もしない。
+    /// もう無い (往復待ちの間の編集で redo 側が捨てられた) なら何もしない。取り寄せを待つ間に bounce / 焼き込みが
+    /// 始まっていたら動かさない (編集と同じく、ロックは動かす直前に transport から同期する)。
     pub(crate) fn execute_history_jump(&mut self, jump: HistoryJump) {
+        self.sync_export_lock();
         // audio editor の対象は song を差し替えると消えている可能性があるので、**前** に key を退避して
         // `after_undo_redo` で引き直す。無効だったトラックも差し替える前に取る (有効に戻ったトラックの読み込みは
         // 再生を止めない、r.md #131)。
@@ -80,6 +92,22 @@ impl AppData {
         if self.cur.song_doc.jump(jump) {
             self.after_undo_redo(key, &disabled_before);
         }
+    }
+
+    /// 待ち行列の先頭が履歴ジャンプなら、その往復を始める **この瞬間** に行き先を state の識別子で固定する
+    /// (`dispatch_front_state_request` が送る直前に呼ぶ)。前に並んでいた要求は済んで行き先が決まったので、ここから
+    /// 応答までの間に入った編集で「1 段前」がずれない — すぐ往復を始めるジャンプを発注の時点で固定するのと同じ規則。
+    /// 行き先がもう無い (端 / 待つ間に redo 側が捨てられた) なら `false` — 往復を始めずに取り除く。
+    pub(crate) fn pin_front_history_jump(&mut self) -> bool {
+        let doc = &self.cur.song_doc;
+        let Some(PendingStateRequest::HistoryJump(jump)) = self.cur.pipc.pending_state_queue.front_mut() else {
+            return true;
+        };
+        let Some(pinned) = doc.pin_jump(*jump) else {
+            return false;
+        };
+        *jump = pinned;
+        true
     }
 }
 
