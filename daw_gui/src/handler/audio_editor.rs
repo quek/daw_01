@@ -4,7 +4,7 @@
 use crate::state::*;
 use crate::app_types::*;
 use crate::event::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use common::model::{AudioEvent};
 use crate::import_audio;
 
@@ -369,11 +369,11 @@ impl AppData {
             self.ui_ephemeral.status_message = "Audio Editor: 対象 clip が audio ではないため event 追加できません".into();
             return;
         }
-        let project_dir: Option<PathBuf> = self
-            .cur.song_doc.file_path
-            .as_ref()
-            .and_then(|p| p.parent().map(Path::to_path_buf));
-        let imported = match import_audio::import_one(&path, project_dir.as_deref()) {
+        let Some(dest) = self.media_dest(crate::media_dest::MediaPool::Samples, "Audio event 追加")
+        else {
+            return;
+        };
+        let imported = match import_audio::import_one(&path, &dest) {
             Ok(i) => i,
             Err(e) => {
                 self.ui_ephemeral.status_message = format!("Audio event 追加 失敗: {}: {e}", path.display());

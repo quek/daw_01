@@ -5,9 +5,9 @@
 //! 1. Compute SHA-256 of the source file (first 4 bytes → 8 hex chars
 //!    used as a dedup key in the `samples/` filename).
 //! 2. Copy the file into `<project_dir>/samples/<basename>_<hash>.<ext>`
-//!    if not already present. Unsaved projects fall back to a per-
-//!    session import_cache directory; saving the project later moves
-//!    those files into the real `samples/` dir.
+//!    if not already present. Unsaved projects use the per-user
+//!    import_cache directory ([`crate::media_dest`]); saving the project
+//!    later moves those files into the real `samples/` dir.
 //! 3. Decode via `common::audio_decode` (symphonia) into a planar
 //!    `AudioSourceBuffer` — WAV / AIFF / FLAC / MP3 / OGG / M4A (r.md #19).
 //! 4. Build the `AudioSource` model entry referencing
@@ -22,10 +22,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use common::app_dirs::AppDirs;
 use common::model::{AudioSource, AudioSourcePath};
 use sha2::{Digest, Sha256};
 
 use crate::audio_source_cache::AudioSourceBuffer;
+use crate::media_dest::{MediaDest, MediaPool};
 
 /// Maximum audio file size accepted on import (§7.2 = 4 GiB). Guards the
 /// whole-file decode-into-memory against a pathological source, for every
@@ -133,15 +135,16 @@ pub fn samples_filename(src: &Path, hash8: &str) -> String {
 /// Copy `src` into `<dest_dir>/<filename>` if not already present, and
 /// return the absolute destination path. `dest_dir` must already exist
 /// or be creatable (we `create_dir_all`).
+///
+/// 名前は内容 hash で決まるので、既にあれば完成品として使う。だから書きかけを最終名に
+/// 出してはいけない ([`common::atomic_file`]): 別プロセスの同じ取り込みが途中の複製を掴む上、
+/// 複製中に落ちると壊れたファイルが以後ずっと重複排除で再利用される。
 pub fn copy_into_dir(src: &Path, dest_dir: &Path, filename: &str) -> Result<PathBuf> {
     fs::create_dir_all(dest_dir)
         .with_context(|| format!("create_dir_all {}", dest_dir.display()))?;
     let dst = dest_dir.join(filename);
-    if !dst.exists() {
-        fs::copy(src, &dst).with_context(|| {
-            format!("copy {} -> {}", src.display(), dst.display())
-        })?;
-    }
+    common::atomic_file::copy_new(src, &dst)
+        .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
     Ok(dst)
 }
 
@@ -184,38 +187,11 @@ impl From<common::audio_decode::DecodeError> for ImportError {
     }
 }
 
-/// Where to copy import files when there is no project_dir yet. Callers
-/// are expected to thread the chosen directory through and migrate the
-/// files into `<project_dir>/samples/` on the next save (see
-/// [`plan_unsaved_audio_migration`] + [`commit_migration`]).
-///
-/// 置き場の SSoT は [`common::app_dirs::AppDirs`] (= `dirs::data_local_dir`
-/// = `SHGetKnownFolderPath`)。 **`LOCALAPPDATA` を直読みしない** — env は
-/// 起動経路によって丸ごと消えることがあり (r.md #81)、 消えたときの
-/// `std::env::temp_dir()` 送りが `make` 配下では `<repo>/target/tmp/...` を
-/// 指すため、 `make clean` が未保存プロジェクトの実データを消していた。
-/// `AppDirs::production()` が `None` を返す極端な環境の fallback は
-/// `common::logging` と同じ idiom で temp へ落とす。
-pub fn unsaved_import_cache_dir() -> PathBuf {
-    common::app_dirs::AppDirs::production()
-        .map(|d| d.import_cache_dir())
-        .unwrap_or_else(|| std::env::temp_dir().join("daw_01").join("import_cache"))
-}
-
-/// Where Bounce In Place / Bounce (with FX) write WAVs in unsaved
-/// projects. Mirror of [`unsaved_import_cache_dir`] for bounce output.
-/// Saving the project later moves the files into `<project_dir>/bounce/`
-/// (see [`plan_unsaved_bounce_migration`] + [`commit_migration`]).
-pub fn unsaved_bounce_cache_dir() -> PathBuf {
-    common::app_dirs::AppDirs::production()
-        .map(|d| d.bounce_cache_dir())
-        .unwrap_or_else(|| std::env::temp_dir().join("daw_01").join("bounce_cache"))
-}
-
 /// Plan an import_cache → samples/ (or bounce_cache → bounce/) migration for
 /// `song` **without touching the filesystem**. Walks every `AudioSource`,
-/// matches `Absolute` paths under `cache_root`, rewrites each to
-/// `ProjectRelative(dst_subdir / <filename>)` **in place**, and returns the
+/// matches `Absolute` paths under the pool's unsaved cache (resolved from the
+/// injected `dirs`, [`MediaPool::unsaved_dir`]), rewrites each to
+/// `ProjectRelative(<subdir> / <filename>)` **in place**, and returns the
 /// list of physical `(cache_abs, dst_abs)` moves that committing requires.
 ///
 /// Splitting the path rewrite (pure, reversible by dropping the song) from the
@@ -225,24 +201,28 @@ pub fn unsaved_bounce_cache_dir() -> PathBuf {
 pub fn plan_unsaved_audio_migration(
     song: &mut common::model::Song,
     project_dir: &Path,
+    dirs: &AppDirs,
 ) -> Vec<(PathBuf, PathBuf)> {
-    plan_unsaved_cache_migration(song, project_dir, &unsaved_import_cache_dir(), "samples")
+    plan_unsaved_cache_migration(song, project_dir, dirs, MediaPool::Samples)
 }
 
 /// [`plan_unsaved_audio_migration`] for the bounce cache (→ `bounce/`).
 pub fn plan_unsaved_bounce_migration(
     song: &mut common::model::Song,
     project_dir: &Path,
+    dirs: &AppDirs,
 ) -> Vec<(PathBuf, PathBuf)> {
-    plan_unsaved_cache_migration(song, project_dir, &unsaved_bounce_cache_dir(), "bounce")
+    plan_unsaved_cache_migration(song, project_dir, dirs, MediaPool::Bounce)
 }
 
 fn plan_unsaved_cache_migration(
     song: &mut common::model::Song,
     project_dir: &Path,
-    cache_root: &Path,
-    dst_subdir: &str,
+    dirs: &AppDirs,
+    pool: MediaPool,
 ) -> Vec<(PathBuf, PathBuf)> {
+    let cache_root = pool.unsaved_dir(dirs);
+    let dst_subdir = pool.bundle_subdir();
     let dst_dir = project_dir.join(dst_subdir);
     let mut moves = Vec::new();
     for source in song.media.audio_sources.values_mut() {
@@ -250,7 +230,7 @@ fn plan_unsaved_cache_migration(
             AudioSourcePath::Absolute(p) => p.clone(),
             _ => continue,
         };
-        if !abs.starts_with(cache_root) {
+        if !abs.starts_with(&cache_root) {
             continue;
         }
         let Some(filename) = abs.file_name().and_then(|s| s.to_str()) else {
@@ -284,8 +264,10 @@ pub fn commit_migration(moves: &[(PathBuf, PathBuf)]) -> Result<()> {
             let _ = fs::remove_file(abs);
         } else if fs::rename(abs, dst).is_err() {
             // rename within the same volume is atomic; fall back to
-            // copy + remove for cross-volume imports.
-            fs::copy(abs, dst).with_context(|| {
+            // copy + remove for cross-volume imports. 複製は書きかけを `dst` に出さない —
+            // 途中で落ちた `dst` を次の保存が上の `exists` で「移行済み」と見なすと、
+            // cache の原本を消して完成品がどこにも残らなくなる。
+            common::atomic_file::copy_new(abs, dst).with_context(|| {
                 format!("copy {} -> {}", abs.display(), dst.display())
             })?;
             let _ = fs::remove_file(abs);
@@ -296,14 +278,10 @@ pub fn commit_migration(moves: &[(PathBuf, PathBuf)]) -> Result<()> {
 
 /// One-shot helper: hash → copy → decode → build `AudioSource` model.
 ///
-/// `project_dir = Some(dir)`: copy goes to `<dir>/samples/`, recorded as
-/// `AudioSourcePath::ProjectRelative("samples/<filename>")`.
-/// `project_dir = None`: copy goes to the unsaved-project cache,
-/// recorded as `AudioSourcePath::Absolute(absolute_cache_path)`.
-pub fn import_one(
-    src: &Path,
-    project_dir: Option<&Path>,
-) -> Result<ImportedAudio, ImportError> {
+/// The copy goes to `dest` ([`MediaDest`]): a saved project's `samples/`
+/// (recorded as `ProjectRelative("samples/<filename>")`) or the unsaved-project
+/// cache (recorded as `Absolute(absolute_cache_path)`).
+pub fn import_one(src: &Path, dest: &MediaDest) -> Result<ImportedAudio, ImportError> {
     // Decode first so we surface format / size errors before we bother
     // hashing or copying anything.
     let mut buffer = decode_audio(src)?;
@@ -312,27 +290,10 @@ pub fn import_one(
         .map_err(|e| ImportError::IoError(format!("hash {}: {}", src.display(), e)))?;
     let filename = samples_filename(src, &hash8);
 
-    let (path_kind, resolved) = match project_dir {
-        Some(dir) => {
-            let samples_dir = dir.join("samples");
-            let dst = copy_into_dir(src, &samples_dir, &filename).map_err(|e| {
-                ImportError::IoError(format!(
-                    "copy into samples/: {e}",
-                ))
-            })?;
-            (
-                AudioSourcePath::ProjectRelative(PathBuf::from("samples").join(&filename)),
-                dst,
-            )
-        }
-        None => {
-            let cache = unsaved_import_cache_dir();
-            let dst = copy_into_dir(src, &cache, &filename).map_err(|e| {
-                ImportError::IoError(format!("copy into import_cache: {e}"))
-            })?;
-            (AudioSourcePath::Absolute(dst.clone()), dst)
-        }
-    };
+    let dest_dir = dest.dir();
+    let resolved = copy_into_dir(src, &dest_dir, &filename).map_err(|e| {
+        ImportError::IoError(format!("copy into {}: {e}", dest_dir.display()))
+    })?;
     // `origin` は「この source が **今どこに在るか**」= キャッシュ再利用の同一性。
     // decode 元はユーザーが選んだ元ファイルだが、import はそれを samples/ (or
     // 未保存 project の import cache) へ複製し、以後 Song はそちらを指す。
@@ -342,7 +303,7 @@ pub fn import_one(
     buffer.origin = resolved;
 
     let source = AudioSource {
-        path: path_kind,
+        path: dest.audio_path(&filename),
         sample_rate: buffer.sample_rate,
         channels: buffer.channels,
         frames: buffer.frames,
@@ -403,9 +364,11 @@ mod tests {
     /// 失敗時は plan を捨てれば import_cache のファイルが無傷で残る。
     #[test]
     fn plan_rewrites_paths_without_moving_files_then_commit_moves() {
-        let cache = tempdir().unwrap();
+        let data = tempdir().unwrap();
+        let dirs = AppDirs::under(data.path());
         let proj = tempdir().unwrap();
-        let src = cache.path().join("foo.wav");
+        fs::create_dir_all(dirs.import_cache_dir()).unwrap();
+        let src = dirs.import_cache_dir().join("foo.wav");
         write_test_wav(&src, 8, 1, 48_000);
 
         let mut song = common::model::Song::default();
@@ -413,8 +376,7 @@ mod tests {
             .insert(1, mk_source(AudioSourcePath::Absolute(src.clone())));
 
         // plan: path だけ書き換え、 ファイルは cache に残る (I/O なし)。
-        let moves =
-            plan_unsaved_cache_migration(&mut song, proj.path(), cache.path(), "samples");
+        let moves = plan_unsaved_audio_migration(&mut song, proj.path(), &dirs);
         assert_eq!(moves.len(), 1, "one move planned");
         assert!(src.exists(), "plan must NOT move the file");
         assert!(
@@ -489,7 +451,7 @@ mod tests {
         let src = dir.path().join("kick.wav");
         write_test_wav(&src, 512, 1, 44_100);
 
-        let imported = import_one(&src, Some(&project)).unwrap();
+        let imported = import_one(&src, &MediaDest::bundle(&project, MediaPool::Samples)).unwrap();
         // ProjectRelative path
         match &imported.source.path {
             AudioSourcePath::ProjectRelative(p) => {
@@ -515,8 +477,9 @@ mod tests {
         let src = dir.path().join("kick.wav");
         write_test_wav(&src, 256, 1, 44_100);
 
-        let _ = import_one(&src, Some(&project)).unwrap();
-        let _ = import_one(&src, Some(&project)).unwrap();
+        let dest = MediaDest::bundle(&project, MediaPool::Samples);
+        let _ = import_one(&src, &dest).unwrap();
+        let _ = import_one(&src, &dest).unwrap();
         // Two imports of the same file → still 1 entry in samples/
         let entries: Vec<_> = std::fs::read_dir(project.join("samples"))
             .unwrap()
@@ -529,11 +492,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let src = dir.path().join("kick.wav");
         write_test_wav(&src, 256, 1, 44_100);
+        // ユーザーの実 import_cache ではなく注入した per-user root の下に置く。
+        let dirs = AppDirs::under(dir.path().join("appdata"));
+        let dest = MediaDest::resolve(MediaPool::Samples, None, Some(&dirs)).unwrap();
 
-        let imported = import_one(&src, None).unwrap();
+        let imported = import_one(&src, &dest).unwrap();
         assert!(matches!(
-            imported.source.path,
-            AudioSourcePath::Absolute(_)
+            &imported.source.path,
+            AudioSourcePath::Absolute(p) if p.starts_with(dirs.import_cache_dir())
         ));
     }
 }

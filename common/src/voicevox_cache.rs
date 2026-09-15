@@ -89,9 +89,6 @@ static BYTES_SINCE_PRUNE: AtomicU64 = AtomicU64::new(u64::MAX);
 /// (前回終了時に上限を超えたまま終わっていても、そこで畳まれる)。
 const PRUNE_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 
-/// temp ファイル名のユニーク化カウンタ (同プロセス内の並行 put 衝突回避)。
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// キャッシュキーの世代。**合成結果の中身を決める定義を変えたら必ず +1 する**
 /// (query 文字列や scales に現れない変更 — engine へ注入するパラメータ、WAV の
 /// 後処理など — は key に自然には反映されないため)。旧 wav を黙って掴んで
@@ -262,18 +259,8 @@ impl VoiceVoxDiskCache {
         // 旧実装はここで早期 return していたため、**壊れたエントリを二度と直せなかった**
         // (しかも `get` が読めてしまう限り mtime が touch され続けて prune の対象にも
         // ならず、そのフレーズだけ毎回 HTTP で再合成し続ける)。
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let tmp = self.dir.join(format!(".{key:016x}.{pid}.{seq}.tmp"));
-        std::fs::write(&tmp, bytes)?;
-        // atomic rename。 同キー並行 put は last-writer-wins (内容は同一なので無害)。
-        match std::fs::rename(&tmp, &final_path) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
+        // 同キー並行 put は last-writer-wins (内容は同一なので無害)。
+        crate::atomic_file::write_replace(&final_path, bytes)
     }
 
     /// 総量が [`MAX_CACHE_BYTES`] を超えていたら mtime 最古から削除して収める。
@@ -338,6 +325,9 @@ fn touch_if_stale(path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// テスト用ディレクトリ名のユニーク化カウンタ。
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
     fn tempdir() -> PathBuf {
         // テスト隔離用の一意ディレクトリ (std::env::temp_dir 下)。 Date/random を

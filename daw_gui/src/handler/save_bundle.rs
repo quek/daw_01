@@ -14,6 +14,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use common::app_dirs::AppDirs;
 use common::model::Song;
 
 use crate::import_audio;
@@ -27,8 +28,13 @@ impl AppData {
     /// なので、 片方だけ移すと他方が移動後ファイルを見失う (= 初回呼び出しが move、
     /// 2 回目以降は dst.exists で path 書換のみ)。 失敗しても save は続行し missing
     /// source として扱う。 status へ最後の失敗メッセージを残す。
-    pub(crate) fn migrate_unsaved_sources(song: &mut Song, project_dir: &Path, status: &mut String) {
-        let moves = Self::plan_unsaved_migrations(song, project_dir);
+    pub(crate) fn migrate_unsaved_sources(
+        song: &mut Song,
+        project_dir: &Path,
+        app_dirs: Option<&AppDirs>,
+        status: &mut String,
+    ) {
+        let moves = Self::plan_unsaved_migrations(song, project_dir, app_dirs);
         if let Err(e) = import_audio::commit_migration(&moves) {
             tracing::warn!(error = ?e, "未保存キャッシュ → bundle への移行で一部失敗");
             *status = format!("メディアの bundle への移行で一部失敗: {e}");
@@ -37,11 +43,18 @@ impl AppData {
 
     /// audio (`samples/`) / bounce (`bounce/`) / video (`samples/`) / image (`images/`)
     /// の 4 プールぶんの plan を 1 本にまとめる (path 書換のみ、 I/O なし)。
-    fn plan_unsaved_migrations(song: &mut Song, project_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
-        let mut moves = import_audio::plan_unsaved_audio_migration(song, project_dir);
-        moves.extend(import_audio::plan_unsaved_bounce_migration(song, project_dir));
-        moves.extend(media_bundle::plan_unsaved_video_migration(song, project_dir));
-        moves.extend(media_bundle::plan_unsaved_image_migration(song, project_dir));
+    /// 未保存キャッシュは注入された `app_dirs` の下だけ (`crate::media_dest` と同じ解決)。
+    /// `app_dirs` が無ければキャッシュへ取り込めていないので、移すものも無い。
+    fn plan_unsaved_migrations(
+        song: &mut Song,
+        project_dir: &Path,
+        app_dirs: Option<&AppDirs>,
+    ) -> Vec<(PathBuf, PathBuf)> {
+        let Some(dirs) = app_dirs else { return Vec::new() };
+        let mut moves = import_audio::plan_unsaved_audio_migration(song, project_dir, dirs);
+        moves.extend(import_audio::plan_unsaved_bounce_migration(song, project_dir, dirs));
+        moves.extend(media_bundle::plan_unsaved_video_migration(song, project_dir, dirs));
+        moves.extend(media_bundle::plan_unsaved_image_migration(song, project_dir, dirs));
         moves
     }
 
@@ -65,7 +78,8 @@ impl AppData {
         };
         // serialize する snapshot の path を ProjectRelative に書き換え、 実ファイル
         // 移動の plan を取る (= ここでは I/O しない、 破棄しても無害)。
-        let moves = Self::plan_unsaved_migrations(&mut snapshot, &dir);
+        let app_dirs = self.ui_prefs.app_dirs.clone();
+        let moves = Self::plan_unsaved_migrations(&mut snapshot, &dir, app_dirs.as_ref());
         // 現在の表示状態を同梱して保存する (snapshot は楽曲のみ凍結、
         // view は presentation なので保存実行時の live を採るので十分)。
         let view = self.snapshot_view_state();
@@ -98,8 +112,11 @@ impl AppData {
         // ため、 記録後に行う)。
         let edited_since_snapshot = self.cur.song_doc.edit_epoch() != snap_epoch;
         let mut status = std::mem::take(&mut self.ui_ephemeral.status_message);
-        self.normalize_song(|song| Self::migrate_unsaved_sources(song, &dir, &mut status));
-        self.cur.song_doc.rewrite_history(|song| Self::migrate_unsaved_sources(song, &dir, &mut status));
+        let dirs = app_dirs.as_ref();
+        self.normalize_song(|song| Self::migrate_unsaved_sources(song, &dir, dirs, &mut status));
+        self.cur
+            .song_doc
+            .rewrite_history(|song| Self::migrate_unsaved_sources(song, &dir, dirs, &mut status));
         self.ui_ephemeral.status_message = status;
         // serialize 成功時のみ file_path を確定する (旧契約)。
         self.cur.song_doc.file_path = Some(path.clone());

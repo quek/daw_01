@@ -22,12 +22,13 @@
 //! Animated GIF / APNG / SVG / RAW are post-MVP.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use common::model::{ImageSource, ImageSourcePath};
+use common::model::ImageSource;
 
 use crate::import_audio::file_hash8;
+use crate::media_dest::MediaDest;
 
 #[derive(Debug)]
 pub enum ImageImportError {
@@ -116,22 +117,17 @@ pub fn is_supported_extension(path: &Path) -> bool {
 
 /// Decode + cache + return the BGRA8 buffer for one image file.
 ///
-/// `project_dir` is `Some` once the project has been saved; the file
-/// is copied into a sibling `images/` subdir and the returned
-/// `ImageSource.path` is `ProjectRelative`. When `project_dir` is
-/// `None` (= unsaved new project), the cache lands in
-/// [`crate::import_audio::unsaved_import_cache_dir`] — **the same
-/// unsaved-import cache audio and video already use** — and the path
-/// stored is `Absolute` so the project remains loadable after save-as.
+/// The file is copied to `dest` ([`MediaDest`], pool
+/// [`crate::media_dest::MediaPool::Images`]): a saved project's `images/`
+/// subdir (`ProjectRelative`) or — for an unsaved new project — **the same
+/// unsaved-import cache audio and video use** (`Absolute`, so the project
+/// remains loadable after save-as).
 ///
 /// 以前ここだけが無条件に `std::env::temp_dir()` を使っていて、 音声 /
 /// 動画 (`%LOCALAPPDATA%\daw_01\import_cache`) と置き場が食い違っていた
 /// (r.md #81)。 `make` 配下では `temp_dir()` が `<repo>/target/tmp` を指し、
 /// `make clean` (= `cargo clean`) が取り込んだ画像を黙って消していた。
-pub fn import_one_image(
-    src: &Path,
-    project_dir: Option<&Path>,
-) -> Result<ImportedImage> {
+pub fn import_one_image(src: &Path, dest: &MediaDest) -> Result<ImportedImage> {
     if !is_supported_extension(src) {
         let ext = src
             .extension()
@@ -151,35 +147,13 @@ pub fn import_one_image(
         .with_context(|| format!("hash {}", src.display()))?;
     let filename = images_filename(src, &hash);
 
-    // Resolve the cache location. Saved projects get a project-relative
-    // path; unsaved projects land in the shared unsaved-import cache
-    // (the same one `import_audio` / `import_video` use).
-    let (cache_path, path_variant) = match project_dir {
-        Some(dir) => {
-            let dest = dir.join("images").join(&filename);
-            (dest, PathVariant::ProjectRelative)
-        }
-        None => (
-            crate::import_audio::unsaved_import_cache_dir().join(&filename),
-            PathVariant::Absolute,
-        ),
-    };
-
-    if let Some(parent) = cache_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("create dir {}", parent.display())
-        })?;
-    }
-
-    if !cache_path.exists() {
-        fs::copy(src, &cache_path).with_context(|| {
-            format!(
-                "copy {} → {}",
-                src.display(),
-                cache_path.display()
-            )
-        })?;
-    }
+    let dir = dest.dir();
+    fs::create_dir_all(&dir).with_context(|| format!("create dir {}", dir.display()))?;
+    let cache_path = dir.join(&filename);
+    // 名前が内容 hash なので既存は完成品として使う。書きかけを最終名に出さない
+    // (並行する同じ取り込みが下の `image::open` で途中の複製を掴む)。
+    common::atomic_file::copy_new(src, &cache_path)
+        .with_context(|| format!("copy {} → {}", src.display(), cache_path.display()))?;
 
     // Decode via image crate. `image::open` sniffs the format from the
     // first few bytes (= robust against renamed extensions). Errors
@@ -214,19 +188,6 @@ pub fn import_one_image(
         px.swap(0, 2);
     }
 
-    let stored_path = match path_variant {
-        PathVariant::ProjectRelative => {
-            // Strip project_dir prefix → relative path.
-            let project_dir = project_dir.expect("project_dir present in this branch");
-            let rel = cache_path
-                .strip_prefix(project_dir)
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| cache_path.clone());
-            ImageSourcePath::ProjectRelative(rel)
-        }
-        PathVariant::Absolute => ImageSourcePath::Absolute(cache_path),
-    };
-
     // 表示用に import 元ファイルの元名 (拡張子込み、 sanitize / hash 前) を
     // 保持する。 on-disk `path` は content addressing で sanitize / hash
     // 済みなので、 inspector / 口パク mapping ドロップダウンが元名を出すには
@@ -239,7 +200,7 @@ pub fn import_one_image(
 
     Ok(ImportedImage {
         source: ImageSource {
-            path: stored_path,
+            path: dest.image_path(&filename),
             name: original_name,
             width: w,
             height: h,
@@ -249,16 +210,17 @@ pub fn import_one_image(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-enum PathVariant {
-    ProjectRelative,
-    Absolute,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media_dest::MediaPool;
+    use common::model::ImageSourcePath;
     use std::io::Write;
+
+    /// 保存済みプロジェクト `project_dir` の `images/`。
+    fn bundle(project_dir: &Path) -> MediaDest {
+        MediaDest::bundle(project_dir, MediaPool::Images)
+    }
 
     /// Generate a tiny 2×2 PNG with known colors and verify the
     /// `import_one_image` BGRA buffer matches.
@@ -278,8 +240,7 @@ mod tests {
         img.put_pixel(1, 1, image::Rgba([255, 255, 0, 128]));
         img.save(&png_path).expect("write png");
 
-        let imported = import_one_image(&png_path, Some(dir.path()))
-            .expect("import");
+        let imported = import_one_image(&png_path, &bundle(dir.path())).expect("import");
 
         assert_eq!(imported.source.width, 2);
         assert_eq!(imported.source.height, 2);
@@ -308,7 +269,7 @@ mod tests {
         let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
         img.save(&png_path).expect("write png");
 
-        let imported = import_one_image(&png_path, Some(dir.path())).expect("import");
+        let imported = import_one_image(&png_path, &bundle(dir.path())).expect("import");
 
         // name は元のファイル名 (拡張子込み、 sanitize 前) を保持。
         assert_eq!(imported.source.name, "あ.png");
@@ -332,7 +293,7 @@ mod tests {
             .expect("create")
             .write_all(b"not an image")
             .expect("write");
-        let err = import_one_image(&path, Some(dir.path())).unwrap_err();
+        let err = import_one_image(&path, &bundle(dir.path())).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("Unsupported image format"),
@@ -347,13 +308,16 @@ mod tests {
         let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
         img.save(&png_path).expect("write png");
 
-        let imported = import_one_image(&png_path, None).expect("import");
+        // ユーザーの実 import_cache ではなく注入した per-user root。
+        let dirs = common::app_dirs::AppDirs::under(dir.path().join("appdata"));
+        let dest = MediaDest::resolve(MediaPool::Images, None, Some(&dirs)).unwrap();
+        let imported = import_one_image(&png_path, &dest).expect("import");
         match imported.source.path {
             ImageSourcePath::Absolute(p) => {
                 // 部分文字列ではなく **音声 / 動画と同じ cache root の下か**
                 // を見る (r.md #81 で置き場を一本化した。substring 比較だと
                 // 置き場が別物に戻っても通ってしまう)。
-                let root = crate::import_audio::unsaved_import_cache_dir();
+                let root = MediaPool::Samples.unsaved_dir(&dirs);
                 assert!(
                     p.starts_with(&root),
                     "{} is not under the shared unsaved-import cache {}",

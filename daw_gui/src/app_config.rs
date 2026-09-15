@@ -207,7 +207,8 @@ pub fn save(path: impl AsRef<Path>, config: &AppConfig) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, text)?;
+    // 書き込み途中で落ちても前の設定が残るように (空 / 途中までの JSON を最終名に出さない)。
+    common::atomic_file::write_replace(path, text.as_bytes())?;
     Ok(())
 }
 

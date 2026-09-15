@@ -45,20 +45,19 @@ thread_local! {
 /// production binary が `--script <path>` で呼ばれたときの entry。
 /// `output_override` は `--output <path>` を script から `daw.scriptArgs.output`
 /// として参照可能にするため。 runtime 終了で exit code 0 / JS error で 1。
+/// `app_dirs` は main が作った隔離 root (`common::app_dirs::IsolatedAppDirs`)。
 pub fn run_scripted(
     bootstrap: Bootstrap,
     script_path: &Path,
     output_override: Option<&Path>,
     extra_args: &[(String, String)],
+    app_dirs: Option<common::app_dirs::AppDirs>,
 ) -> Result<()> {
     let source = std::fs::read_to_string(script_path)
         .with_context(|| format!("failed to read script {}", script_path.display()))?;
     HOST.with_borrow_mut(|h| {
-        *h = Some(ScriptHost::new(
-            bootstrap,
-            output_override.map(PathBuf::from),
-            extra_args.to_vec(),
-        ));
+        let output = output_override.map(PathBuf::from);
+        *h = Some(ScriptHost::new(bootstrap, output, extra_args.to_vec(), app_dirs));
     });
 
     let result = (|| -> Result<()> {
@@ -151,6 +150,7 @@ impl ScriptHost {
         bootstrap: Bootstrap,
         output: Option<PathBuf>,
         extra: Vec<(String, String)>,
+        app_dirs: Option<common::app_dirs::AppDirs>,
     ) -> Self {
         // AppData::new は audio_tx / plugin_tx の clone を要求する。
         // bootstrap 内の sender は production と同形なのでそのまま渡せる
@@ -177,8 +177,8 @@ impl ScriptHost {
             // 渡しても安全だが、 script 中に子プロセスが死ぬケースは
             // テスト・録画用途では発生しない前提なので None で十分。
             None,
-            // production と同じ実データディレクトリ (= 既存挙動を維持)。
-            common::app_dirs::AppDirs::production(),
+            // テスト / 検証の起動なので、ユーザーの実データではなく隔離 root。
+            app_dirs,
             // (A1 r.md #8) bootstrap が解決したデバイス実レート。
             bootstrap.sample_rate,
         );

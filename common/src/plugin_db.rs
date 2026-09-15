@@ -294,14 +294,12 @@ impl PluginDatabase {
             scanned_at: self.scanned_at,
             port_probe_version: self.port_probe_version,
         };
-        let tmp = path.with_extension("json.tmp");
         let data = serde_json::to_string_pretty(&persisted)
             .context("failed to serialize plugin database")?;
-        fs::write(&tmp, data)
-            .with_context(|| format!("failed to write {}", tmp.display()))?;
-        fs::rename(&tmp, path)
-            .with_context(|| format!("failed to rename {} to {}", tmp.display(), path.display()))?;
-        Ok(())
+        // 一時ファイル名は書き手ごとに別。以前の固定名 (`plugin_database.json.tmp`) は、
+        // 同時に起動した 2 つの daw_gui が同じ一時ファイルへ交互に書き、混ざった JSON を公開し得た。
+        crate::atomic_file::write_replace(path, data.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))
     }
 }
 

@@ -70,10 +70,12 @@ pub struct UiPrefs {
     pub is_about_open: bool,
 
     /// per-user データディレクトリ (recent / recent_saved / recovery /
-    /// window_state の永続化先) の **Single Source of Truth**。 production は
-    /// `AppDirs::production()` (= `%LOCALAPPDATA%/daw_01/`)、 test は
-    /// `AppDirs::under(tempdir)` か `None`。 `None` は「永続化しない」 を
-    /// 意味し、 実ユーザー状態を汚染しない (= dispatcher と同じ DI パターン)。
+    /// window_state の永続化先、未保存プロジェクトの取り込み / Bounce キャッシュ =
+    /// `crate::media_dest`) の **Single Source of Truth**。 対話起動は
+    /// `AppDirs::production()` (= `%LOCALAPPDATA%/daw_01/`)、 `--script` / `--smoke-test` は
+    /// `IsolatedAppDirs` の一時 root、 test は `AppDirs::under(tempdir)` か `None`。 `None` は
+    /// 「永続化しない」 (未保存プロジェクトへは取り込めない) を意味し、 実ユーザー状態を
+    /// 汚染しない (= dispatcher と同じ DI パターン)。
     pub app_dirs: Option<common::app_dirs::AppDirs>,
     /// 「最近開いたファイル」 (= Open ダイアログ / OpenRecent 経由で読み込んだ
     /// .daw)。 File メニュー「Open Recent ►」 に表示。 永続化先は

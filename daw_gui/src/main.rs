@@ -168,12 +168,26 @@ fn main() -> Result<std::process::ExitCode> {
         None
     };
 
+    // per-user データ root。検証用の起動 (`--script` / `--smoke-test[-text]`) はユーザーが使って
+    // いる daw_gui と並んで走るので、recent / recovery / 取り込みキャッシュを一時 root に隔離する
+    // (`IsolatedAppDirs` の doc)。drop で消えるので main の終わりまで持つ。
+    let isolated = if interactive {
+        None
+    } else {
+        let label = if cli.script.is_some() { "script" } else { "smoke_test" };
+        Some(common::app_dirs::IsolatedAppDirs::create(label)?)
+    };
+    let app_dirs = match &isolated {
+        Some(isolated) => Some(isolated.dirs().clone()),
+        None => common::app_dirs::AppDirs::production(),
+    };
+
     let bootstrap = bootstrap_subprocess()?;
 
     if let Some(script_path) = cli.script.as_ref() {
         tracing::info!(script = %script_path.display(), "headless script mode");
         #[cfg(feature = "script")]
-        return run_scripted(bootstrap, script_path, cli.output.as_deref(), &cli.extra)
+        return run_scripted(bootstrap, script_path, cli.output.as_deref(), &cli.extra, app_dirs)
             .map(|()| std::process::ExitCode::SUCCESS);
         // boa_engine (JS エンジン) は default ビルドのコールド時間短縮のため除外している。
         // --script を使う headless テストは `--features script` を付けてビルドすること。
@@ -191,15 +205,19 @@ fn main() -> Result<std::process::ExitCode> {
     }
 
     // `_singleton` は run_gui (= event loop) が返るまで保持し、 mutex を握り続ける。
-    let code = run_gui(bootstrap, cli.smoke_test, cli.smoke_test_text, singleton_primary)?;
+    let code =
+        run_gui(bootstrap, cli.smoke_test, cli.smoke_test_text, singleton_primary, app_dirs)?;
     Ok(std::process::ExitCode::from(code))
 }
 
+/// `app_dirs` は per-user データディレクトリの SSoT (window_state load / AppData の recent /
+/// recovery / 取り込みキャッシュが全てここから解決される)。smoke test では隔離 root。
 fn run_gui(
     mut bootstrap: Bootstrap,
     smoke_test_fixture: Option<PathBuf>,
     #[cfg_attr(not(windows), allow(unused_variables))] smoke_test_text: bool,
     singleton_primary: bool,
+    app_dirs: Option<common::app_dirs::AppDirs>,
 ) -> Result<u8> {
     tracing::info!("opening main window");
 
@@ -227,9 +245,6 @@ fn run_gui(
 
     // 前回終了時の window geometry を復元。 存在しなければ default (1280×800)。
     // 位置は physical (= screen 座標)、 サイズは logical (= DPI 差吸収) で保存。
-    // per-user データディレクトリの SSoT。 window_state load / AppData の
-    // recent / recovery 永続化が全てここから解決される。
-    let app_dirs = common::app_dirs::AppDirs::production();
     let saved_window = app_dirs
         .as_ref()
         .map(|d| d.window_state())

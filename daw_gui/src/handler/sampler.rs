@@ -230,7 +230,10 @@ impl AppData {
             source_label_short(self, self.sampler.source),
             chrono_stamp()
         );
-        let imported = match materialize_capture(&name, &frames, ring.sample_rate(), self.project_dir().as_deref()) {
+        let Some(dest) = self.media_dest(crate::media_dest::MediaPool::Samples, "Sampler") else {
+            return;
+        };
+        let imported = match materialize_capture(&name, &frames, ring.sample_rate(), &dest) {
             Ok(i) => i,
             Err(e) => {
                 self.ui_ephemeral.status_message = format!("Sampler: WAV を書けません ({e})");
@@ -471,13 +474,13 @@ fn local_utc_offset_secs() -> i64 {
 ///
 /// ファイル名 / 置き場 / `AudioSourcePath` の規約は `import_audio::import_one` と同じ
 /// (`<stem>_<sha256 先頭 8 桁>.wav`、保存済みなら `samples/` = `ProjectRelative`、
-/// 未保存なら import cache = `Absolute` で save 時に移動)。decode し直さないので
+/// 未保存なら import cache = `Absolute` で save 時に移動、[`crate::media_dest`])。decode し直さないので
 /// バッファはメモリ上の PCM から直接組む。
 fn materialize_capture(
     stem: &str,
     frames: &[[f32; 2]],
     sample_rate: u32,
-    project_dir: Option<&std::path::Path>,
+    dest: &crate::media_dest::MediaDest,
 ) -> anyhow::Result<crate::import_audio::ImportedAudio> {
     use sha2::{Digest, Sha256};
     let spec = hound::WavSpec {
@@ -498,26 +501,11 @@ fn materialize_capture(
     let digest = Sha256::digest(&bytes);
     let hash8: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
     let filename = format!("{stem}_{hash8}.wav");
-    let (path_kind, dst) = match project_dir {
-        Some(dir) => {
-            let samples_dir = dir.join("samples");
-            std::fs::create_dir_all(&samples_dir)?;
-            let dst = samples_dir.join(&filename);
-            (
-                common::model::AudioSourcePath::ProjectRelative(
-                    std::path::PathBuf::from("samples").join(&filename),
-                ),
-                dst,
-            )
-        }
-        None => {
-            let cache = crate::import_audio::unsaved_import_cache_dir();
-            std::fs::create_dir_all(&cache)?;
-            let dst = cache.join(&filename);
-            (common::model::AudioSourcePath::Absolute(dst.clone()), dst)
-        }
-    };
-    std::fs::write(&dst, &bytes)?;
+    let dir = dest.dir();
+    std::fs::create_dir_all(&dir)?;
+    let dst = dir.join(&filename);
+    // 名前が内容 hash なので、既にあれば同じ WAV。書きかけを最終名に出さない。
+    common::atomic_file::write_new(&dst, &bytes)?;
     let n = frames.len() as u64;
     let buffer = crate::audio_source_cache::AudioSourceBuffer {
         origin: dst,
@@ -532,7 +520,7 @@ fn materialize_capture(
     Ok(crate::import_audio::ImportedAudio {
         buffer: Arc::new(buffer),
         source: common::model::AudioSource {
-            path: path_kind,
+            path: dest.audio_path(&filename),
             sample_rate: sample_rate.max(1),
             channels: 2,
             frames: n,

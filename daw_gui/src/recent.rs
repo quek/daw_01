@@ -81,7 +81,8 @@ pub fn save(path: impl AsRef<Path>, list: &RecentFiles) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(list)?;
-    std::fs::write(path, text)?;
+    // 書き込み途中で落ちても前の履歴が残るように (`common::atomic_file`)。
+    common::atomic_file::write_replace(path, text.as_bytes())?;
     Ok(())
 }
 

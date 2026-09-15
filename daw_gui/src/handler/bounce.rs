@@ -6,7 +6,6 @@ use crate::app_types::*;
 use std::path::{PathBuf};
 use std::sync::{Arc};
 use common::protocol::{AudioCommand, PluginCommand, RenderScope};
-use crate::import_audio;
 
 impl AppData {
     pub(crate) fn set_clip_positions(&mut self, entries: &[(ClipKey, u32, f64)]) {
@@ -114,10 +113,7 @@ impl AppData {
             .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
             .collect();
         let safe_name = if safe_name.is_empty() { "bounce".into() } else { safe_name };
-        let project_dir = self
-            .cur.song_doc.file_path
-            .as_ref()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        let dest = self.media_dest(crate::media_dest::MediaPool::Bounce, "Bounce")?;
         // **空ファイルを作って名前を予約する。** `exists()` を見るだけでは足りない —
         // Glue は render を 1 本も走らせる前に全 job の path を採番するので、
         // まだ誰もファイルを書いていない時点で同じ名前を 2 回返してしまう。
@@ -144,31 +140,13 @@ impl AppData {
                 }
             }
         };
-        match project_dir.as_deref() {
-            Some(dir) => {
-                let bounce_dir = dir.join("bounce");
-                if let Err(e) = std::fs::create_dir_all(&bounce_dir) {
-                    self.ui_ephemeral.status_message = format!("Bounce: bounce/ 作成失敗: {e}");
-                    return None;
-                }
-                let filename = unique_in(&bounce_dir);
-                Some((
-                    bounce_dir.join(&filename),
-                    common::model::AudioSourcePath::ProjectRelative(
-                        std::path::PathBuf::from("bounce").join(&filename),
-                    ),
-                ))
-            }
-            None => {
-                let cache = import_audio::unsaved_bounce_cache_dir();
-                if let Err(e) = std::fs::create_dir_all(&cache) {
-                    self.ui_ephemeral.status_message = format!("Bounce: bounce_cache/ 作成失敗: {e}");
-                    return None;
-                }
-                let dst = cache.join(unique_in(&cache));
-                Some((dst.clone(), common::model::AudioSourcePath::Absolute(dst)))
-            }
+        let dir = dest.dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.ui_ephemeral.status_message = format!("Bounce: {} 作成失敗: {e}", dir.display());
+            return None;
         }
+        let filename = unique_in(&dir);
+        Some((dir.join(&filename), dest.audio_path(&filename)))
     }
 
     /// bounce のトリガ共通処理。対象クリップ 1 トラックだけを isolate した
