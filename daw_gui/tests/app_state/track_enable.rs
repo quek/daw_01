@@ -93,8 +93,10 @@ fn 無効化は_state_を書き戻してから降ろし_有効化と_undo_redo_�
     app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![track_id], enabled: true });
     let msgs = drain(&mut plugin_rx);
     assert_eq!(set_slot_states(&msgs, device_id), vec![Some(vec![7, 7, 7])], "{msgs:?}");
+    fake_plugin_loaded(&mut app, track_id, 0, "test.synth");
 
-    // undo (= 無効へ戻る): 応答待ちの load も居るべきでないので降ろす — 降ろす前に state の往復を挟む。
+    // undo (= 無効へ戻る): 読み込みが確定した device を降ろすので、降ろす前に state の往復を挟む
+    // (読み込み中の device だけなら失う state が無いので即時 — render_wait / picker_insert のテスト)。
     app.handle_event(AppEvent::Undo);
     let msgs = drain(&mut plugin_rx);
     assert!(msgs.iter().any(|m| matches!(m, PluginCommand::RequestAllStates { .. })), "{msgs:?}");
@@ -252,8 +254,9 @@ fn undo_redo_で有効へ戻るときも読み込み中を構造より先に届�
     let enabled = load_song_at(&msgs, track_id, true).expect("構造");
     assert!(loading_sets(&msgs).iter().any(|&(i, ref ids)| i < enabled && ids.contains(&device_id)), "{msgs:?}");
     assert!(position(&msgs, |m| matches!(m, AudioCommand::Stop { .. })).is_none(), "{msgs:?}");
+    fake_plugin_loaded(&mut app, track_id, 0, "test.synth");
 
-    // 無効へ戻る redo は plugin を降ろすので、state の往復の後に動く。
+    // 無効へ戻る redo は読み込み済みの plugin を降ろすので、state の往復の後に動く。
     app.handle_event(AppEvent::Redo);
     assert!(app.cur.song_doc.song().track_effectively_enabled(track_id), "取り寄せの間は動かさない");
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));

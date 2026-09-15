@@ -46,8 +46,8 @@ impl AppData {
     /// - 待ち行列に Song を変える要求 (往復待ちの編集 / 履歴ジャンプ) が居る — 発注の順に処理する (削除の往復を
     ///   待たずに undo すると、削除ではなくその前の操作が戻る)。行き先はそれが済むまで決まらないので相対のまま並べ、
     ///   前が済んで自分の往復を始める時点で固定する ([`Self::pin_front_history_jump`])。
-    /// - このジャンプで host から降りる device がある (行き先の Song で [`compute_slot_removals`]、reconcile と同じ導出)
-    ///   — 行き先は今決まっているので state の識別子で固定して並べる (往復待ちの編集が id で対象を指すのと同じく、
+    /// - このジャンプで host から降りる **読み込み済みの** device がある (行き先の Song で [`compute_slot_removals`]、
+    ///   reconcile と同じ導出。読み込み中の device は失う state が無いので数えない) — 行き先は今決まっているので state の識別子で固定して並べる (往復待ちの編集が id で対象を指すのと同じく、
     ///   待つ間に入った編集で「1 段前」がずれない)。
     /// - どちらでもなければ即時。
     ///
@@ -72,7 +72,12 @@ impl AppData {
         let Some(target) = doc.history_target(jump) else {
             return;
         };
-        if compute_slot_removals(target, &pipc.loaded_devices, &pipc.pending_plugin_loads).is_empty() {
+        // 取り寄せが要るのは **読み込みが確定した** device を降ろすときだけ。読み込み中の device は host に
+        // まだ居ない (state は載せるときに送ったもののまま) ので、降ろしても失う値が無い。
+        let removes_loaded = compute_slot_removals(target, &pipc.loaded_devices, &pipc.pending_plugin_loads)
+            .iter()
+            .any(|id| pipc.loaded_devices.contains_key(id));
+        if !removes_loaded {
             self.execute_history_jump(jump);
         } else if let Some(pinned) = doc.pin_jump(jump) {
             self.enqueue_state_request(PendingStateRequest::HistoryJump(pinned));
