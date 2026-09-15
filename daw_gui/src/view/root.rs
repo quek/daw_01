@@ -391,9 +391,10 @@ fn dispatch_range_nudge(app: &AppData, ui: &mut Ui<'_, AppData>, surface: Option
         let total = delta * n as f64;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             if is_resize {
+                // 範囲の右端だけ (選択の変更、Song は触らない)。
                 app.resize_time_selection(total);
             } else {
-                app.nudge_time_selection(total);
+                app.handle_event(AppEvent::Range(crate::event_range::RangeEvent::Nudge { delta_beats: total }));
             }
         }));
     }
@@ -1227,6 +1228,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         }
     }
 }
+
+#[cfg(test)]
+mod undo_event_tests;
 
 #[cfg(test)]
 mod tests {

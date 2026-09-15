@@ -50,7 +50,8 @@ pub struct ChainSlot {
 /// plugin の op を出すか: bypass 中は出さない。`scope` がトラックの fx を通さない (`RenderScope::Sources`) なら、
 /// 音声入力を持つ device (= 入ってくる音を加工する) も出さない — 音源 (音声入力を持たない device) は残す。
 /// op と latency の会計はどちらもこれを引く (出さない device の latency を PDC に数えない)。
-fn plugin_in_scope(p: &common::model::PluginInstance, scope: RenderScope) -> bool {
+/// r.md #131: 読み込み中の plugin がトラックを待たせるかもこれを引く (`compile::executable_tracks`)。
+pub(crate) fn plugin_in_scope(p: &common::model::PluginInstance, scope: RenderScope) -> bool {
     !p.bypassed && (scope.track_fx() || !p.ports.has_audio_input)
 }
 

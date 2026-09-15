@@ -444,6 +444,12 @@ fn deferred_delete_removes_all_selected_in_one_roundtrip_and_one_undo_step() {
         depth_before + 1,
         "deferred でも undo は 1 ステップ"
     );
+    let doc = &app.cur.song_doc;
+    assert_eq!(
+        doc.history_labels()[doc.history_current()],
+        "トラック削除",
+        "履歴の名前は完了を運ぶ IPC event ではなく、発注した操作の名前"
+    );
     assert!(app.cur.song_doc.undo(), "undo できる");
     assert_eq!(visible_ids(&app), before, "Undo 1 回で 2 本とも戻る");
 }

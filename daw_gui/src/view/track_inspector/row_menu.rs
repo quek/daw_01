@@ -11,6 +11,7 @@ use daw_ui_renderer::Rect;
 use crate::app::{
     AppData, AppEvent, ChainEntry, ChainRow, ChainRowKind, ColorPickerTarget, InsertAt, NativeRowEntry, RelocateDevices,
 };
+use crate::event_clipboard::ClipboardEvent;
 use crate::event_device::DeviceEvent;
 
 use super::chain_list::base_row_h;
@@ -197,8 +198,8 @@ fn apply_to_carried(app: &mut AppData, item: DeviceMenuItem, device_id: u64) {
             app.handle_event(AppEvent::Device(DeviceEvent::SetDevicesBypassed { device_ids: ids, bypassed }));
         }
         I::Group => app.handle_event(AppEvent::Device(DeviceEvent::GroupDevices { device_ids: ids })),
-        I::Copy => app.copy_devices(ids),
-        I::Cut => app.cut_devices(ids),
+        I::Copy => app.handle_event(AppEvent::Clipboard(ClipboardEvent::CopyDevices(ids))),
+        I::Cut => app.handle_event(AppEvent::Clipboard(ClipboardEvent::CutDevices(ids))),
         // 貼り付け位置は「この device の直前」。 選択をこの device 1 本にしてから
         // **Ctrl+V と同じ経路** を起こす。
         I::Paste => {

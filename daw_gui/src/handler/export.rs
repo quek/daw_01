@@ -352,6 +352,9 @@ impl AppData {
                 "音声エンジンが利用できないため Video export を開始できません".into();
             return;
         }
+        if self.reject_offline_render_while_loading("Video export") {
+            return;
+        }
         let temp_wav = std::env::temp_dir()
             .join(format!("daw01_export_audio_{}.wav", std::process::id()));
         self.cur.transport.pending_video_export = Some(output_path);
@@ -478,6 +481,9 @@ impl AppData {
                 if self.ipc.audio_tx.is_none() {
                     self.ui_ephemeral.status_message =
                         "音声エンジンが利用できないため WAV 書き出しを開始できません".into();
+                    return;
+                }
+                if self.reject_offline_render_while_loading("WAV 書き出し") {
                     return;
                 }
                 self.ui_ephemeral.status_message = "WAV 書き出し中...".to_string();

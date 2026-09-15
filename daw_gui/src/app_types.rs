@@ -1199,6 +1199,8 @@ pub struct PendingClipFxBounce {
     /// r.md #44: bounce 元 clip の内容窓 offset。 bounce 結果 (single event) を
     /// この位置に置くことで、窓 `[offset, offset + length)` と event が一致する。
     pub content_offset_beats: f64,
+    /// bounce を発注した操作の履歴ラベル (完了を運ぶ IPC event の名前で積まない)。
+    pub label: &'static str,
 }
 
 /// 歌唱 bounce の合成待ち (`PrepareVocalSynth` → `VocalSynthReady`) の退避 entry。
@@ -1210,6 +1212,8 @@ pub struct PendingVocalSynthBounce {
     pub track_id: u32,
     pub clip_id: u32,
     pub mode: BounceMode,
+    /// bounce を発注した操作の履歴ラベル ([`PendingClipFxBounce::label`] へ引き継ぐ)。
+    pub label: &'static str,
 }
 
 /// `Z` キーの段階ズームが復元用に積む arrangement の view 状態スナップショット。
@@ -1506,7 +1510,9 @@ pub enum PendingStateRequest {
     /// [`AppData::edit_song`](crate::state::AppData::edit_song) を通すことで、
     /// 削除直前の knob 値等を Undo で復元できる (undo snapshot はこの
     /// チョークポイントが無条件で積む、 不変条件 5)。
-    Deferred(DeferredEdit),
+    /// `label` は発注した操作の履歴ラベル (完了を運ぶ `AllPluginStates` の名前で積まない)。
+    /// 積むのは [`AppData::enqueue_deferred_edit`](crate::state::AppData::enqueue_deferred_edit)。
+    Deferred { edit: DeferredEdit, label: &'static str },
     /// copy (Ctrl+C)。state 書き戻し後の live song から対象を最新 plugin state
     /// 込みで serialize して `pending_clipboard_write` に積むだけ (Song 不変)。
     /// **undo snapshot は積まない** (copy は履歴を汚さない) ので `Deferred` とは

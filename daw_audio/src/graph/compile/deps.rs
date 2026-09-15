@@ -17,7 +17,8 @@ use crate::graph::schedule::SoloTables;
 
 /// `compile_schedule` の各段が共有する配線の表 (song-track index は `song.tracks` の並び)。
 ///
-/// r.md #131: **実効的に無効なトラック** (`Song::track_effectively_enabled`) はグラフに居ない。
+/// r.md #131: **いま実行しないトラック** (`Song::executable_mask` = 実効的に無効か、host への読み込み中の plugin を
+/// 持つ) はグラフに居ない。以下「無効」はこの意味。
 /// 音が流れる表 (`id_to_idx` / `children_of` / `incoming_sends` / `incoming_paraout`) は有効な
 /// トラック同士の辺だけを持つので、無効トラックの scratch を読む op は 1 つも出ない (合流 / send /
 /// パラアウト / サイドチェイン / follower の tap / PDC の fan-in)。役割の分類 (`is_group` /
@@ -27,7 +28,7 @@ pub(super) struct Topology {
     /// **有効な** `Track::id` → song-track index。id 0 (未採番) と無効トラックは載せない
     /// (tap / send / パラアウトの解決はここを引く = 無効トラックは dangling と同じ扱い)。
     pub(super) id_to_idx: HashMap<u32, u32>,
-    /// song-track index → 実効的に有効か (`Song::effectively_enabled_mask`)。
+    /// song-track index → いま実行するか (`Song::executable_mask`)。
     pub(super) enabled: Vec<bool>,
     /// 子を 1 つ以上持つ track の id (構造。子の有効 / 無効を問わない)。
     pub(super) is_group: HashSet<u32>,
@@ -46,7 +47,7 @@ pub(super) struct Topology {
 
 impl Topology {
     /// 存在しない track を親に指す track があれば `DanglingReference`。
-    /// `enabled` = `song.effectively_enabled_mask()` (compile が program の展開と共有する)。
+    /// `enabled` = `song.executable_mask(..)` (compile が program の展開と共有する)。
     pub(super) fn build(song: &Song, enabled: Vec<bool>) -> Result<Self, GraphError> {
         let n = song.tracks.len();
         // ---- track id → index, validate refs, validate kind ----

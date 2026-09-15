@@ -187,7 +187,7 @@ impl DeviceEvent {
             | E::SelectDevice { .. }
             | E::ReloadDevice { .. }
             | E::ToggleParallelNodeCollapsed { .. }
-            | E::ToggleRackPanel(_) => "編集",
+            | E::ToggleRackPanel(_) => crate::state::song_doc::GENERIC_UNDO_LABEL,
         }
     }
 }

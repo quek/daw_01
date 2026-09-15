@@ -7,7 +7,14 @@
 //! `ReleasedSessions` にまとめて **4 引数**。
 
 use super::*;
+use crate::event_range::{RangeEvent, RangeMoveMode, RowDest};
+use crate::event_section::SectionEvent;
 use daw_ui_core::PointerFrame;
+
+/// セクション帯の編集を `handle_event` に通す `Edit` (1 操作 = 1 undo step + 操作名)。
+fn section_edit(ev: SectionEvent) -> Edit<AppData> {
+    Edit::mutate(move |app: &mut AppData| app.handle_event(AppEvent::Section(ev)))
+}
 
 /// **`f` / `released` から旧引数名へ 1 度だけ束ね直してから本体に入る。**
 ///
@@ -890,7 +897,7 @@ pub(super) fn commit_releases(
                         let start = sd.anchor_press_beat.min(other);
                         let len = (sd.anchor_press_beat - other).abs();
                         if len >= SECTION_MIN_LEN_BEATS {
-                            ui.push_edit({ let v_start = start; let v_len = len; Edit::mutate(move |app: &mut AppData| { app.apply_create_section(v_start, v_len); }) });
+                            ui.push_edit(section_edit(SectionEvent::Create { start, len }));
                         }
                     }
                 }
@@ -912,12 +919,12 @@ pub(super) fn commit_releases(
                         // r.md #71 同件: 複製も overlay (ghost) と **同じ**
                         // `section_duplicate_dest` を通す。 close しない ぶん障害物の集合が
                         // 移動とは違う (全帯・現在位置のまま) だけで、解決自体は必要。
-                        let next_start = section_duplicate_dest(sections, &sd, delta);
-                        ui.push_edit({ let v_id = sd.section_id; let v_dest = next_start; Edit::mutate(move |app: &mut AppData| { app.apply_duplicate_section(v_id, v_dest); }) });
+                        let dest_start = section_duplicate_dest(sections, &sd, delta);
+                        ui.push_edit(section_edit(SectionEvent::Duplicate { id: sd.section_id, dest_start }));
                     } else {
                         // r.md #71: overlay (ghost) と **同じ** `section_move_dest`。
-                        let next_start = section_move_dest(sections, &sd, delta);
-                        ui.push_edit({ let v_id = sd.section_id; let v_ns = next_start; Edit::mutate(move |app: &mut AppData| { app.apply_move_section(v_id, v_ns); }) });
+                        let start = section_move_dest(sections, &sd, delta);
+                        ui.push_edit(section_edit(SectionEvent::Move { id: sd.section_id, start }));
                     }
                 }
                 SectionGesture::ResizeLeft => {
@@ -926,12 +933,12 @@ pub(super) fn commit_releases(
                     let next_start = (sd.anchor_start + delta)
                         .clamp(0.0, (right - SECTION_MIN_LEN_BEATS).max(0.0));
                     let next_len = (right - next_start).max(SECTION_MIN_LEN_BEATS);
-                    ui.push_edit({ let v_id = sd.section_id; let v_ns = next_start; let v_nl = next_len; Edit::mutate(move |app: &mut AppData| { app.apply_resize_section(v_id, v_ns, v_nl); }) });
+                    ui.push_edit(section_edit(SectionEvent::Resize { id: sd.section_id, start: next_start, len: next_len }));
                 }
                 SectionGesture::ResizeRight => {
                     // 右端 drag: len のみ変化 (start 固定)。
                     let next_len = (sd.anchor_len + delta).max(SECTION_MIN_LEN_BEATS);
-                    ui.push_edit({ let v_id = sd.section_id; let v_ns = sd.anchor_start; let v_nl = next_len; Edit::mutate(move |app: &mut AppData| { app.apply_resize_section(v_id, v_ns, v_nl); }) });
+                    ui.push_edit(section_edit(SectionEvent::Resize { id: sd.section_id, start: sd.anchor_start, len: next_len }));
                 }
             }
         }
@@ -953,7 +960,7 @@ pub(super) fn commit_releases(
                     .snap
                     .snap_beat(raw_beat, pointer.modifiers.alt, zoom_x_px_per_beat)
                     .max(0.0);
-                ui.push_edit({ let v_start = start; let v_len = beats_per_bar(view.time_sig); Edit::mutate(move |app: &mut AppData| { app.apply_create_section(v_start, v_len); }) });
+                ui.push_edit(section_edit(SectionEvent::Create { start, len: beats_per_bar(view.time_sig) }));
             }
         }
 
@@ -1183,8 +1190,8 @@ fn automation_clip_short_click(
 /// ネスト budget のため。中身は移動前と同じ)。
 ///
 /// 行き先は **可視行の index** で解く。`docs/plan_project_tabs.md` §5.6:
-/// 最終行より下 (= 行の無い余白) に落ちた行は「新しいトラック」で、id は編集の中で
-/// 採ってから解決する (Ableton Live と同じ。ゴースト `drag_preview_geometry` も
+/// 最終行より下 (= 行の無い余白) に落ちた行は「新しいトラック」([`RowDest::NewTrack`]) で、
+/// id は編集の中で採ってから解決する (Ableton Live と同じ。ゴースト `drag_preview_geometry` も
 /// 同じ行に描く)。上端だけは master 行 (クリップを持てない) を避けて clamp する。
 fn commit_clip_move(
     ui: &mut Ui<'_, AppData>,
@@ -1204,7 +1211,7 @@ fn commit_clip_move(
     let n_visible = visible_ids.len() as i32;
     // **中身を運ぶ行だけ**が新しいトラックを要る。範囲に入っているだけの空の行まで
     // 数えると、ゴーストには何も出ていないのに誰も使わないトラックが増える
-    // (行き先の無い空の行は `resolve_track_map` が元の行に留める)。
+    // (行き先の無い空の行は `resolve_row_dests` が元の行に留める)。
     let carries = |track: u32| -> bool {
         nd.anchors.iter().any(|a| a.key.track_id == track)
             || nd.automation_anchors.iter().any(|a| a.key.track == track)
@@ -1239,41 +1246,32 @@ fn commit_clip_move(
     // それ以外 → 移動。`last_ctrl` / `last_shift` は overlay と同じ真値を読むので、release
     // frame の OS event 順序問題に依存せず確定する。Alt は直交 (snap 一時無効のみ) で、
     // 既に `compute_clip_drag_beat_delta` で適用済。
-    let (ctrl, shift) = (nd.last_ctrl, nd.last_shift);
-    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        // 行の無い余白へ落ちた行のぶんだけトラックを作ってから動かす。足す編集と
-        // 動かす編集は **1 undo 手** に束ねる (ユーザーの操作は 1 回の drop)。
-        let save = app.cur.song_doc.enter_own_gesture();
-        let created = app.append_empty_tracks_ids(new_tracks);
-        if created.len() == new_tracks {
-            let track_map = resolve_track_map(&dest_rows, &visible_ids, &created);
-            if ctrl {
-                app.copy_time_range(ra, rb, beat_delta, &track_map, shift);
-            } else {
-                app.move_time_range(ra, rb, beat_delta, &track_map);
-            }
-        }
-        app.cur.song_doc.leave_own_gesture(save);
-    }));
+    let mode = match (nd.last_ctrl, nd.last_shift) {
+        (false, _) => RangeMoveMode::Move,
+        (true, false) => RangeMoveMode::CopyLinked,
+        (true, true) => RangeMoveMode::CopyUnique,
+    };
+    // 行の無い余白へ落ちた行のぶんだけトラックを作ってから動かす。足す編集と動かす編集は
+    // 1 event = **1 undo 手** (ユーザーの操作は 1 回の drop)。
+    let rows = resolve_row_dests(&dest_rows, &visible_ids, new_tracks);
+    let ev = RangeEvent::Move { range: (ra, rb), delta_beats: beat_delta, rows, mode };
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| app.handle_event(AppEvent::Range(ev))));
 }
 
-/// 行き先の可視行 index を track id へ解く。可視行を超えた index は、この drop で
-/// 作った新しいトラック (`created`) の何本目かを指す。
-fn resolve_track_map(
-    dest_rows: &[(u32, i32)],
-    visible_ids: &[u32],
-    created: &[u32],
-) -> Vec<(u32, u32)> {
+/// 行き先の可視行 index を行き先へ解く。可視行を超えた index は、この drop で作る
+/// 新しいトラック (`new_tracks` 本) の何本目か。それも超える行 (中身を運ばない行) は元の行に留まる。
+fn resolve_row_dests(dest_rows: &[(u32, i32)], visible_ids: &[u32], new_tracks: usize) -> Vec<(u32, RowDest)> {
     dest_rows
         .iter()
         .map(|&(from, idx)| {
             #[allow(clippy::cast_sign_loss)]
             let i = idx.max(0) as usize;
-            let to = match visible_ids.get(i) {
-                Some(id) => *id,
-                None => created.get(i - visible_ids.len()).copied().unwrap_or(from),
+            let dest = match visible_ids.get(i) {
+                Some(id) => RowDest::Track(*id),
+                None if i - visible_ids.len() < new_tracks => RowDest::NewTrack(i - visible_ids.len()),
+                None => RowDest::Track(from),
             };
-            (from, to)
+            (from, dest)
         })
         .collect()
 }

@@ -54,6 +54,9 @@ impl AppData {
                 "音声エンジンが利用できないためラウドネス解析を開始できません".into();
             return;
         }
+        if self.reject_offline_render_while_loading("ラウドネス解析") {
+            return;
+        }
         // 空範囲は測るものが無い (engine 側でも 0 フレームになる)。
         if let Some((s, e)) = range
             && e - s <= f64::EPSILON

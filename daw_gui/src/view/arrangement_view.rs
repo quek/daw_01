@@ -11,6 +11,7 @@ use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent, ClipKey, ColorPickerTarget, ImportTrackTarget, InsertAt};
 use crate::event_device::DeviceEvent;
+use crate::event_section::SectionEvent;
 use crate::theme::Theme;
 use crate::view::track_color;
 use crate::view::snap::{self, SNAP_LABELS};
@@ -1057,8 +1058,8 @@ fn render_section_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
                         app.open_color_picker(ColorPickerTarget::Section(section_id), anchor);
                     }
                     2 => app.apply_loop_section(section_id),
-                    3 => app.apply_delete_section_band(section_id),
-                    4 => app.apply_delete_section_range(section_id),
+                    3 => app.handle_event(AppEvent::Section(SectionEvent::DeleteBand(section_id))),
+                    4 => app.handle_event(AppEvent::Section(SectionEvent::DeleteRange(section_id))),
                     _ => {}
                 }
                 app.cur.peph.section_menu = None;

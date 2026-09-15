@@ -162,6 +162,7 @@ impl AppData {
             // 開いたままでも engine 側は Song に居ない device を schedule しない。
             // pending だけ解放して終了。
             self.cur.pipc.pending_plugin_loads.remove(&device_id);
+            self.settle_loading_device(device_id);
             tracing::warn!(device_id, %id, "SlotPluginLoaded for a device no longer in the song");
             return;
         };
@@ -238,8 +239,11 @@ impl AppData {
             })
             .is_some();
         if !placed {
-            // track id が Vec に無い (load 中に track 削除された等)。 master でも
-            // なく該当 track も居ないので、 従来どおり finalize せず early return。
+            // 書き出し中で Song を書き換えられない (device の所在は上の `coords` で確かめてある)。instance の
+            // 再構築と finalize はしないが、読み込み自体は確定している (host に載り、engine に登録を送った) ので
+            // 応答待ちからは外す — 外さないと r.md #131 の「読み込み中」が残り、このトラックが鳴らないままになる。
+            self.cur.pipc.pending_plugin_loads.remove(&device_id);
+            self.settle_loading_device(device_id);
             return;
         }
 
@@ -275,6 +279,8 @@ impl AppData {
         // A7: this load is done. If Play was queued waiting for the
         // last plugin to register on the audio side, fire it now.
         self.cur.pipc.pending_plugin_loads.remove(&device_id);
+        // r.md #131: 登録 (上の `OpenPluginShmem`) の後に engine の「読み込み中」から外す = このトラックはここから鳴る。
+        self.settle_loading_device(device_id);
         if self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.pending_play.is_some() {
             self.ui_ephemeral.status_message.clear();
             self.fire_pending_play();
@@ -338,6 +344,8 @@ impl AppData {
             "plugin load failed (notified by plugin host)"
         );
         self.cur.pipc.pending_plugin_loads.remove(&device_id);
+        // r.md #131: 読み込みは失敗で確定した — engine の「読み込み中」から外し、この device は素通しで鳴る。
+        self.settle_loading_device(device_id);
         // 失敗を「そのセッション中ずっと無音」で終わらせない: device を
         // 「未ロード」としてインスペクタに出し、 明示的な再 load
         // (`DeviceEvent::ReloadDevice`) の対象にする。 自動リトライはしない
@@ -393,6 +401,7 @@ impl AppData {
             inst.id,
             &inst.plugin_id,
             inst.state.as_deref().map(<[u8]>::to_vec),
+            LoadPlayback::Pause,
         ) {
             self.ui_ephemeral.status_message = format!("再読込中: {name}");
         } else {
@@ -879,9 +888,7 @@ impl AppData {
             self.remove_devices_inner(&device_ids);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::RemoveDevices {
-            device_ids,
-        }));
+        self.enqueue_deferred_edit(DeferredEdit::RemoveDevices { device_ids });
     }
 
     /// 単一デバイスチェーン: 指定 device を所属チェーンから `Vec::remove` する。
@@ -1079,11 +1086,14 @@ impl AppData {
                 Self::apply_plugin_states_to(&mut snapshot, &states);
                 self.finish_save(snapshot, path, snap_epoch);
             }
-            PendingStateRequest::Deferred(edit) => {
+            PendingStateRequest::Deferred { edit, label } => {
                 // ここで初めて Undo snapshot を push する。 Song に
                 // 最新 state が入った状態を捕まえるため (plugin が
                 // 削除される編集を Undo すると knob 値が復元される)。
+                // 発注した操作の名前で独立した 1 step (進行中のドラッグの bracket には入れない)。
+                let gesture = self.cur.song_doc.enter_own_gesture(label);
                 self.execute_deferred_edit(edit);
+                self.cur.song_doc.leave_own_gesture(gesture);
             }
             PendingStateRequest::CopyToClipboard(req) => {
                 // copy は Song 不変なので undo を積まない。最新 state

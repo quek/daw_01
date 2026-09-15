@@ -335,10 +335,10 @@ impl AppData {
     /// 解除する (待受けたまま忘れて、 音作りでツマミをいじっただけで繋がる事故を
     /// 防ぐ)。 待受中でなければ何もしない。
     ///
-    /// 呼び出し元は 2 つで、 **到達範囲が違う**:
+    /// 入口は `AppEvent::ConnectArmedModSource` 1 本で、発行元は 2 つ (**到達範囲が違う**):
     /// - `handler/ipc.rs` の `PluginParamTouched` … プラグイン自身の窓の中の
     ///   ツマミ (daw_gui が overlay を描けない唯一の領域)。
-    /// - `view/modulation.rs` の depth ドラッグ終端 … daw_gui が描いているツマミ
+    /// - `view/scrub_gesture.rs` の depth ドラッグ終端 … daw_gui が描いているツマミ
     ///   (ドラッグ量がそのまま depth になるので、 ここでは解除だけ担う)。
     pub(crate) fn connect_armed_mod_source_to(
         &mut self,

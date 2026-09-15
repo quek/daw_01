@@ -70,6 +70,7 @@ impl AppData {
                 None
             }
         };
+        let live_before = self.live_before();
         let Some(group_id) = self.edit_song(|song| song.alloc_track_id()) else {
             return;
         };
@@ -100,6 +101,10 @@ impl AppData {
         // plugin の lookup は壊れない。
         let insert_at = top_child_idx.min(self.cur.song_doc.song().tracks.len());
         self.edit_song(|song| song.tracks.insert(insert_at, group_track));
+        // r.md #131: 親の違うトラックをまとめると新しい group は根に置かれ、無効な group から出た子は実効的に有効へ
+        // 戻る — その plugin を載せる (engine への構造の同期も `follow_live_devices` が音の決まる順に流す)。
+        // まとめる先は無効にならない (共通の親が無効なら子は元から無効) ので、降ろす device は無い。
+        self.follow_live_devices(&live_before);
         // 新規 group track を選択状態に (Live 互換: グループ化直後は
         // 親 group が selection cursor になる)。 明示的なトラック面操作なので
         // last-wins タグも Tracks に倒す。
@@ -174,6 +179,8 @@ impl AppData {
     ///
     /// - `plan`: 外す**前**の Song から組んだ device teardown の IPC 列 ([`Self::plan_track_removal_ipc`])。
     /// - `audio_editor_key`: 外す前に退避した audio editor の対象 (`audio_editor_target_key`)。
+    /// - `live_before`: 外す前の [`AppData::live_before`]。外したことで実効的に有効へ戻ったトラック (無効な group を
+    ///   解いた子) の plugin を載せる。
     ///
     /// 消えた id を指す session 状態 (device 選択 / SC Listen / MIDI Learn 待ち / last touched) は、外した編集の
     /// 口 (`edit_song`) の後の `reconcile_song_refs` が済ませている。トラック選択の倒し先は経路ごとに違うので
@@ -182,7 +189,13 @@ impl AppData {
         &mut self,
         plan: &[TrackRemovalIpc],
         audio_editor_key: Option<common::model::ClipKey>,
+        live_before: &super::track_enable::LiveBefore,
     ) {
+        // トラックを外した構造 (LoadSong) を plugin を降ろすより先に engine へ届ける (各経路の doc の「song update →
+        // LoadSong → plugin destroy」)。後だと、まだトラックが居る古い構造の上で登録を失った device が素通しで鳴る。
+        // 構造の同期は `follow_live_devices` が持つ: 有効へ戻った子の plugin を「読み込み中」として構造より先に届けて
+        // から LoadSong を送る (先に構造が届くと、子が読み込み中を知らないまま素通しの音で鳴る)。
+        self.follow_live_devices(live_before);
         self.reap_orphan_lipsync();
         // ClosePluginShmem → RemoveSlotPlugin の順序は plan が持つ (audio worker が destroyed plugin を
         // dispatch しないよう、audio 側の mapping を先に落とす)。
@@ -226,11 +239,7 @@ impl AppData {
             self.action_ungroup_tracks_inner(track_ids);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(
-            DeferredEdit::UngroupTracks {
-                track_ids: track_ids.to_vec(),
-            },
-        ));
+        self.enqueue_deferred_edit(DeferredEdit::UngroupTracks { track_ids: track_ids.to_vec() });
     }
 
     pub(crate) fn action_ungroup_tracks_inner(&mut self, track_ids: &[u32]) {
@@ -266,7 +275,7 @@ impl AppData {
         // plan が空になり IPC が 1 通も出ない = 無言で壊れる)。
         let removal_plan =
             Self::plan_track_removal_ipc(self.cur.song_doc.song(), &groups_to_ungroup);
-        let live_before = self.hosted_device_ids();
+        let live_before = self.live_before();
         // group がクリップを持つこともある (group は「子を持つトラック」の暗黙の役割)。
         let audio_editor_key = self.audio_editor_target_key();
 
@@ -306,9 +315,8 @@ impl AppData {
         // 直接 ClosePluginShmem を送って `plugin_refs` から stale entry を
         // 削除させ、 audio worker が destroyed plugin を dispatch しないように
         // する。 順序は `plan_track_removal_ipc` が持っている。
-        self.after_tracks_removed(&removal_plan, audio_editor_key);
-        // r.md #131: 無効だった group を解くと子が実効的に有効へ戻る = その plugin を載せる。
-        self.follow_live_devices(&live_before);
+        // r.md #131: 無効だった group を解くと子が実効的に有効へ戻る = その plugin を載せる (`after_tracks_removed`)。
+        self.after_tracks_removed(&removal_plan, audio_editor_key, &live_before);
         // selection: ungroup 後は元 group の子を選択 (Live 互換)。 明示的な
         // トラック面操作なので last-wins タグも Tracks に倒す。
         if !new_selection.is_empty() {
@@ -330,11 +338,7 @@ impl AppData {
         let into_disabled = parent_id.is_some_and(|p| !self.cur.song_doc.song().track_effectively_enabled(p));
         if into_disabled && self.song_has_plugin() {
             let track_ids = track_ids.to_vec();
-            self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::MoveTracks {
-                track_ids,
-                parent_id,
-                anchor_after,
-            }));
+            self.enqueue_deferred_edit(DeferredEdit::MoveTracks { track_ids, parent_id, anchor_after });
             return;
         }
         self.action_move_tracks_inner(track_ids, parent_id, anchor_after);
@@ -348,7 +352,7 @@ impl AppData {
         anchor_after: Option<u32>,
     ) {
         let mut rejected = false;
-        let live_before = self.hosted_device_ids();
+        let live_before = self.live_before();
         let moved = self.edit_song_checked(|song| match song.move_tracks(track_ids, parent_id, anchor_after) {
             Ok(changed) => changed,
             Err(common::routing_deps::DependencyCycle) => {
@@ -363,9 +367,8 @@ impl AppData {
         }
         if moved {
             tracing::info!(?track_ids, ?parent_id, ?anchor_after, "tracks moved");
-            // r.md #131: 無効な group へ入れた / 出したトラックの plugin を host に追従させる (engine へ構造を届けてから)。
-            // 待機とセルは `Song::move_tracks` が同じ undo step で降ろしている。
-            self.flush_song_sync();
+            // r.md #131: 無効な group へ入れた / 出したトラックの plugin を host に追従させる (engine への構造の同期も
+            // `follow_live_devices` が音の決まる順に流す)。待機とセルは `Song::move_tracks` が同じ undo step で降ろしている。
             self.follow_live_devices(&live_before);
             self.silence_monitor_notes_on_disabled_tracks();
         }
@@ -383,6 +386,7 @@ impl AppData {
         };
         let removal_plan = Self::plan_track_removal_ipc(self.cur.song_doc.song(), &[last_id]);
         let audio_editor_key = self.audio_editor_target_key();
+        let live_before = self.live_before();
         // PR2.1: pop() の前に id を保存し、 IPC は id で送る。
         let Some(Some(removed)) = self.edit_song(|song| song.tracks.pop()) else {
             return;
@@ -396,7 +400,7 @@ impl AppData {
         );
         // この経路は以前 `ClosePluginShmem` を送っておらず (= 順序仕様が守られていなかった)、
         // plan 経由に統一したことで穴も塞がる。
-        self.after_tracks_removed(&removal_plan, audio_editor_key);
+        self.after_tracks_removed(&removal_plan, audio_editor_key, &live_before);
         // selected_track_ids は id ベース。 削除対象 track id を除外
         // (Vec の index で持つ subtree とは異なり id 直接判定)。 残りが
         // 空なら最後尾にフォールバック。

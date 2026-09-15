@@ -178,7 +178,7 @@ pub fn cells_from_clips(clips: &[ClipCopy]) -> Vec<LauncherCellCopy> {
 
 /// 正規化済み device。`order` は選択群内の相対順 (上から 0,1,2...) で、貼り付けで
 /// 相対順を保つ。`device.id` は **0 に落として運ぶ** (貼り先で必ず新採番する)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeviceCopy {
     pub order: usize,
     /// コピー元の所属トラック。貼り付け先が同じなら ARA アーカイブを引き継ぐ
@@ -192,7 +192,7 @@ pub struct DeviceCopy {
 /// 正規化済みオートメーション点。`value_norm` は target 非依存の 0..=1 normalized
 /// (paste 先 lane の値域へ `norm_to_plain` で復元)。`time_beat` は選択群の最早を
 /// 0 とした相対拍。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CopiedPoint {
     pub time_beat: f64,
     pub value_norm: f32,
@@ -203,7 +203,7 @@ pub struct CopiedPoint {
 /// トラック index、`start_beat` は最早クリップ start を 0 とした相対拍。
 /// `content` は cross-project 独立復元用に inline、`content_id` は同一プロジェクト
 /// リンク共有用。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClipCopy {
     pub track_offset: i64,
     pub start_beat: f64,
@@ -255,7 +255,7 @@ pub struct ClipCopy {
 /// `points` から独立採番する)。 これは MIDI clip paste (`ClipCopy`) が同一プロジェクトで
 /// content_id を流用してソースとリンクするのと異なり、 REAPER / Ableton の envelope
 /// copy 同様「コピー元から切り離した独立コピー」 を作る方針。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutomationClipCopy {
     pub start_beat: f64,
     pub length_beats: f64,
@@ -276,7 +276,7 @@ pub struct AutomationClipCopy {
 /// 同じ [`ClipCopy`] / [`AutomationClipCopy`] をそのまま使う — セルは
 /// 「アレンジと同じ中身を別の入れ物に置いたもの」 なので、正規化の規則を
 /// 二重に持たない。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LauncherCellCopy {
     /// 選択群の最上段行を 0 とした相対行 index。
     pub row_offset: i64,
@@ -289,7 +289,7 @@ pub struct LauncherCellCopy {
 
 /// [`LauncherCellCopy`] の中身。トラック行のセルとオートメーションレーン行の
 /// セルで型が違う (それぞれ `Clip` / `AutomationClip`)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LauncherCellPayload {
     Track(ClipCopy),
     Lane(AutomationClipCopy),
@@ -303,7 +303,7 @@ pub enum LauncherCellPayload {
 /// そのまま持ち込むと意味の違う列を指す。貼り先の列を決められるのは
 /// 「元で何列目だったか」だけなので、id → 表示 index を解く表をコピー側で
 /// 1 度だけ載せる (トラックごとに持たせると同じ表が N 本に複製される)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TracksCopy {
     pub tracks: Vec<TrackCopy>,
     /// コピー元 `Song.scenes` の id を **表示順**に並べたもの。`0` は
@@ -317,14 +317,14 @@ pub struct TracksCopy {
 /// `contents` は track の clips / automation lanes / **ランチャーのセル** が参照する
 /// content payload を cross-project 独立復元のため同梱する
 /// (数え上げは `Track::all_clips` / `AutomationLane::all_clips` を通すこと)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackCopy {
     pub order: usize,
     pub track: Track,
     pub contents: Vec<ContentEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContentEntry {
     pub content_id: ContentId,
     pub content: ClipContent,

@@ -20,6 +20,7 @@ use common::protocol::PluginCommand;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use daw_gui::app::{AppData, AppEvent};
+use daw_gui::event_range::{RangeEvent, RangeMoveMode, RowDest};
 use daw_gui::event_split::{SplitAt, SplitJoinEvent, SplitSurface};
 
 use super::support::{build_app, drain};
@@ -115,10 +116,14 @@ fn 読み上げは最初の片だけが読み_動かしても読み直さず_glu
     let marks: Vec<bool> = text_events(&app).iter().map(|e| e.continuation).collect();
     assert_eq!(marks, vec![false, true, true, true], "続きの片は読み上げない印を持つ");
 
-    // 続きの片 (拍 4〜6) を拍 16 へ動かしても、動かした先で読み直さない (クリップヘッダの drag と同じ口。
-    // dispatch と同じく event の境界を置いて、1 回の undo でこの移動だけを戻せるようにする)。
-    app.cur.song_doc.begin_event("範囲の移動");
-    app.move_time_range(4.0, 6.0, 12.0, &[(TRACK, TRACK)]);
+    // 続きの片 (拍 4〜6) を拍 16 へ動かしても、動かした先で読み直さない (クリップヘッダの drag の確定と同じ
+    // event なので、1 回の undo でこの移動だけが戻る)。
+    app.handle_event(AppEvent::Range(RangeEvent::Move {
+        range: (4.0, 6.0),
+        delta_beats: 12.0,
+        rows: vec![(TRACK, RowDest::Track(TRACK))],
+        mode: RangeMoveMode::Move,
+    }));
     assert!(app.cur.song_doc.song().tracks[0].clips.iter().any(|c| c.start_beat == 16.0), "前提: 片が動いた");
     assert_eq!(readings(&synced(&mut app, &mut rx, &mut last).1), once, "動かした続きの片は読まない");
     app.cur.song_doc.undo();
@@ -164,7 +169,12 @@ fn 歌唱の片を動かしても隠れている前後のノートを歌わな�
     // 2 拍ごとに割り (跨ぐ「あ」は「あ」+「ー」)、拍 4〜8 の片を拍 12 へ。 残った片は「あ」「ー」、
     // 動かした片は「い」「う」だけを動かした先で歌う (content は共有したまま、窓の外は歌わない)。
     split_clip_on_grid(&mut app);
-    app.move_time_range(4.0, 8.0, 8.0, &[(TRACK, TRACK)]);
+    app.handle_event(AppEvent::Range(RangeEvent::Move {
+        range: (4.0, 8.0),
+        delta_beats: 8.0,
+        rows: vec![(TRACK, RowDest::Track(TRACK))],
+        mode: RangeMoveMode::Move,
+    }));
     let after = sung(&synced(&mut app, &mut rx, &mut last).0);
     assert_eq!(
         after,

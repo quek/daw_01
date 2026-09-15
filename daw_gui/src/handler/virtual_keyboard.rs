@@ -152,7 +152,8 @@ impl AppData {
 
     /// 押している音 (PC キー + マウス) を全部止める。 窓を閉じる / 窓が非アクティブに
     /// なる (Alt+Tab、 winit は synthetic な release しか送らず runner がそれを捨てる) とき。
-    pub(crate) fn virtual_keyboard_release_all(&mut self) {
+    /// 録音中は押していたノートを確定する編集になるので、外からは `VirtualKeyboardEvent::ReleaseAll` で呼ぶ。
+    fn virtual_keyboard_release_all(&mut self) {
         for (_, pitch) in std::mem::take(&mut self.virtual_keyboard.held) {
             self.virtual_keyboard_note_off(pitch);
         }

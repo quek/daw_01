@@ -338,8 +338,12 @@ impl AppData {
 
 
 impl AppData {
-    /// AppEvent dispatcher。view から `Edit::mutate` 経由で、background thread
+    /// AppEvent の入口。view から `Edit::mutate` 経由で、background thread
     /// から `EventLoopProxy<AppEvent>` 経由で呼ばれる。
+    ///
+    /// **Song を変えるユーザー操作は必ずここを通す** — 1 操作 = 1 undo step と履歴の
+    /// 操作名は、ここで開いて閉じる event の scope (`SongDoc::begin_event` / `end_event`)
+    /// が決める。view から handler を直に呼んだ編集は操作名を持たない別 step になる。
     pub fn handle_event(&mut self, event: AppEvent) {
         // (r.md #61) 終了シーケンス中は **全 event を捨てる**。
         //
@@ -369,7 +373,22 @@ impl AppData {
         // 1 undo step に squash、 Begin*/End* gesture 中は drag 全体で 1 step)。
         // 同時に、 この event が snapshot を積んだときの履歴リスト用ラベル
         // (r.md #29) を event 種から確定して渡す。
-        self.cur.song_doc.begin_event(event.undo_label());
+        // handler の中から呼ばれた (入れ子の) event は外側の操作の step に入る (`SongDoc::begin_event`)。
+        let project = self.cur.key;
+        let opened = self.cur.song_doc.begin_event(event.undo_label());
+        self.dispatch_app_event(event);
+        // 閉じる (arm の途中 return でも必ず通るよう、match の外で)。 event の中でタブが
+        // 切り替わっていたら、開いたタブの文書を閉じる (閉じたタブなら何もしない)。
+        self.with_project(project, |app| app.cur.song_doc.end_event(opened));
+        // edit_song が export 中拒否を予約していたら status に表示する
+        // (song 凍結の単一保証点は SongDoc::edit、 旧 allow-list gate の置換)。
+        if let Some(msg) = self.cur.song_doc.take_rejection() {
+            self.ui_ephemeral.status_message = msg.into();
+        }
+    }
+
+    /// [`Self::handle_event`] の本体 (event 種ごとの handler への振り分け)。
+    fn dispatch_app_event(&mut self, event: AppEvent) {
         // Export gate (positive-default + block-list)。
         //
         // 旧構造は negative-default の allow-list だった (export 中は列挙した少数
@@ -503,9 +522,10 @@ impl AppData {
                 if (self.cur.song_doc.song().bpm - clamped).abs() > f32::EPSILON {
                     let old_bpm = self.cur.song_doc.song().bpm;
                     // scrub の連続 commit は stream gesture で 1 undo step に
-                    // squash する (dirty / autosave は epoch bump が担う)。
-                    let scope = self.cur.song_doc.stream_scope(StreamGesture::BpmScrub);
-                    self.cur.song_doc.edit(scope, |song| song.bpm = clamped);
+                    // squash する (dirty / autosave は epoch bump が担う)。 Raw クリップの追従も
+                    // 同じ step に入るよう、 event の scope ごと張る。
+                    self.cur.song_doc.use_stream_scope(StreamGesture::BpmScrub);
+                    self.edit_song(|song| song.bpm = clamped);
                     self.cur.peph.bpm_edit_text = format!("{:.1}", clamped);
                     // Raw audio clip を秒固定スケール (r.md #7)。Raw clip があれば
                     // LoadSong (decode 再利用で軽量) で再生 window を追従させ、
@@ -518,8 +538,8 @@ impl AppData {
             AppEvent::SetSongTimeSigNumFromScrub(next) => {
                 let clamped = next.clamp(1, 32);
                 if self.cur.song_doc.song().time_sig.0 != clamped {
-                    let scope = self.cur.song_doc.stream_scope(StreamGesture::TimeSigScrub);
-                    self.cur.song_doc.edit(scope, |song| song.time_sig.0 = clamped);
+                    self.cur.song_doc.use_stream_scope(StreamGesture::TimeSigScrub);
+                    self.edit_song(|song| song.time_sig.0 = clamped);
                     self.cur.peph.time_sig_num_edit_text = clamped.to_string();
                     self.send_audio(AudioCommand::SetSongTimeSigNumerator { project: self.pk(), num: clamped });
                 }
@@ -1014,9 +1034,6 @@ impl AppData {
             } => {
                 self.resize_clip(target, start_beat, length, stretch);
             }
-            AppEvent::SetClipPositions(entries) => {
-                self.set_clip_positions(&entries);
-            }
             AppEvent::CreateClip { track, start_beat } => {
                 self.create_clip(track, start_beat);
             }
@@ -1205,6 +1222,7 @@ impl AppData {
                 target,
                 source_id,
             } => self.remove_mod_routing(track_id, target, source_id),
+            AppEvent::ConnectArmedModSource { track_id, target } => self.connect_armed_mod_source_to(track_id, target),
             AppEvent::SetModRoutingDepth {
                 track_id,
                 target,
@@ -1899,6 +1917,9 @@ impl AppData {
                 }
             }
             AppEvent::SplitJoin(ev) => self.handle_split_join_event(ev),
+            AppEvent::Clipboard(ev) => self.handle_clipboard_event(ev),
+            AppEvent::Range(ev) => self.handle_range_event(ev),
+            AppEvent::Section(ev) => self.handle_section_event(ev),
             // PR-V4: SynthesizeVocal / VocalSynthCompleted は削除済。
             // vocal track は builtin VOICEVOX plugin が自動 synth する
             // (= sync_vocal_metadata 経由で歌詞 / note を flush →
@@ -2040,12 +2061,6 @@ impl AppData {
             AppEvent::ArrangeZoomBack => {
                 self.arrange_zoom_back();
             }
-            AppEvent::CloneClipsLinked(entries) => {
-                self.clone_clips_linked(&entries);
-            }
-            AppEvent::CloneClipsIndependent(entries) => {
-                self.clone_clips_independent(&entries);
-            }
             AppEvent::MakeClipUnique(target) => {
                 self.make_clip_unique(target);
             }
@@ -2067,11 +2082,6 @@ impl AppData {
             AppEvent::ToggleFoldToScale => {
                 self.cur.view.piano_roll_fold = !self.cur.view.piano_roll_fold;
             }
-        }
-        // edit_song が export 中拒否を予約していたら status に表示する
-        // (song 凍結の単一保証点は SongDoc::edit、 旧 allow-list gate の置換)。
-        if let Some(msg) = self.cur.song_doc.take_rejection() {
-            self.ui_ephemeral.status_message = msg.into();
         }
     }
 }

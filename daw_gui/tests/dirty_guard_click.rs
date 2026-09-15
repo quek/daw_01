@@ -109,7 +109,7 @@ fn 保存せず終了を押すと次の未保存タブの確認が続けて出�
     app.cur.song_doc.normalize(|_| {});
     app.handle_event(AppEvent::Tab(TabEvent::New));
 
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
     assert_eq!(app.pk(), a, "表示順の最初の未保存タブを前面に出す");
     assert_eq!(
         app.ui_ephemeral.dirty_guard,

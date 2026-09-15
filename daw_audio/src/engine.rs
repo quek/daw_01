@@ -845,9 +845,11 @@ impl ProjectRt {
                 // Play は **現在の playhead からそのまま再生する** (頭出しは
                 // しない)。「どこから再生するか」「停止でどこへ戻すか」は GUI 側
                 // が所有する (モデル A = Pro Tools / Ableton 流)。
+                // `pending_offs` は捨てない: process される行は毎 buffer の頭で drain 済み (= 空) で、残っているのは
+                // 実行から外れている行 (r.md #131 の読み込み待ち) の予約だけ。その行の plugin は凍った voice を持った
+                // まま戻るので、捨てると A7 の停止 → 読み込み → 再生開始の後に鳴りっぱなしになる。
                 for s in self.scratch.iter_mut() {
                     s.state.active_notes.clear();
-                    s.state.pending_offs.clear();
                 }
             }
             (true, PlaybackCommand::Stop) => {
@@ -1790,7 +1792,20 @@ mod bundle_install_tests {
 
     /// `reset_song_scoped_state` を明示する版 (project 切替相当)。
     fn make_bundle_with_reset(song: &Arc<Song>, reset: bool) -> RtBundle {
-        let schedule = compile_schedule(song, &test_latencies(), 48_000, 0, common::protocol::RenderScope::Mix).unwrap();
+        make_bundle_loading(song, reset, &[])
+    }
+
+    /// `loading` = host への読み込み中の device (r.md #131、それを持つトラックは実行しない)。
+    fn make_bundle_loading(song: &Arc<Song>, reset: bool, loading: &[u64]) -> RtBundle {
+        let schedule = compile_schedule(
+            song,
+            &test_latencies(),
+            &loading.iter().copied().collect(),
+            48_000,
+            0,
+            common::protocol::RenderScope::Mix,
+        )
+        .unwrap();
         RtBundle {
             song: Some(Arc::clone(song)),
             song_index: Arc::new(SongIndex::build(song)),
@@ -2241,6 +2256,43 @@ mod bundle_install_tests {
         assert_eq!(on.state.active_notes.len(), 1, "有効な行の台帳は触らない");
     }
 
+    /// r.md #131: 読み込み待ちで実行から外れた行は、**載ったままの plugin** (楽器) の voice が止まった時間の
+    /// まま凍る。戻ったときに外れる前から鳴っていた音を必ず止める — 外れている間に来るはずだった note-off は
+    /// 二度と出ないので、止めないと鳴りっぱなしになる。A7 の停止が同じ buffer に届いても (差し込みが transport
+    /// より先)、読み込みの後の再生開始をまたいでも、止める予約は捨てない。
+    #[test]
+    fn 実行から外れた行で鳴っていた音は戻ったときに止める() {
+        let song = Arc::new(Song { tracks: vec![latent_track(1), track(2)], ..Song::default() });
+        let offs = |local: &ProjectRt| local.scratch[0].state.pending_offs.clone();
+        for with_stop in [false, true] {
+            let (mut local, mut bundle_tx, _recycle_rx) = harness();
+            bundle_tx.push(make_bundle(&song)).unwrap();
+            local.refresh_bundle();
+            local.shared.playback.store(PlaybackCommand::Play as u8, Ordering::Release);
+            local.consume_transport_requests();
+            let voice = local.scratch[0].state.active_notes.note_on(7, 3, 60, 0).expect("voice");
+
+            // 読み込み中の plugin を持つ行は外れる (A7 なら停止も同じ buffer の頭で消費される)。
+            bundle_tx.push(make_bundle_loading(&song, false, &[LATENT_DEVICE_ID])).unwrap();
+            if with_stop {
+                local.shared.playback.store(PlaybackCommand::Stop as u8, Ordering::Release);
+            }
+            local.refresh_bundle();
+            local.consume_transport_requests();
+            assert_eq!(local.cached_schedule.track_programs[0].pass1_role, crate::graph::program::Pass1Role::Disabled);
+            if with_stop {
+                local.shared.playback.store(PlaybackCommand::Play as u8, Ordering::Release);
+                local.consume_transport_requests();
+            }
+
+            // 読み込みが確定して戻る: 外れる前の音の note-off が frame 0 で出る予約のまま。
+            bundle_tx.push(make_bundle(&song)).unwrap();
+            local.refresh_bundle();
+            assert_eq!(offs(&local), vec![(voice, 60)], "停止を挟む: {with_stop}");
+            assert!(local.scratch[0].state.active_notes.is_empty());
+        }
+    }
+
     /// 組み込み Comp / EQ を持つ 2 track + 組み込み Bus Comp / Tone EQ の master。track 1 には追加の Comp も。
     fn native_song(added_comps: u64) -> Arc<Song> {
         use common::model::{Device, NativeDevice, NativeKind};
@@ -2493,8 +2545,15 @@ mod multi_project_tests {
             song_bounds: SongBounds::of(Some(song), 48_000),
             tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(song)),
             schedule: Some(
-                crate::graph::compile_schedule(song, &HashMap::new(), 48_000, 256, common::protocol::RenderScope::Mix)
-                    .unwrap(),
+                crate::graph::compile_schedule(
+                    song,
+                    &HashMap::new(),
+                    &crate::graph::LoadingDevices::new(),
+                    48_000,
+                    256,
+                    common::protocol::RenderScope::Mix,
+                )
+                .unwrap(),
             ),
             reset_song_scoped_state: false,
             input_delay_replacements: Vec::new(),

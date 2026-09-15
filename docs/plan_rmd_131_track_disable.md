@@ -44,6 +44,16 @@
   読まない**ことを保証できる形を選ぶ。
 - **注意**: engine はプラグイン登録の無い device を「音声素通り」にする (`execute.rs:129-130`)。アンロードしただけで
   グラフから外さないと、無音ではなく素通しで鳴る。
+- **有効に戻したトラックは読み込みが確定するまで無効と同じ** (残件修正): 同じ素通し規則で、読み込み中の FX を持つ
+  トラックが dry で鳴っていた。Song は意図 (有効) を持ったまま、engine のグラフだけが `Song::executable_mask`
+  (実効的に有効 ∧ 自分と祖先が host への読み込み中の plugin を持たない) で決まる。読み込み中の所有者は daw_gui の
+  `pending_plugin_loads` で、`AudioCommand::SetLoadingDevices` が写しを engine へ届ける (live / export の compile が同じ表を
+  読む)。順序は GUI が守る: 増える分は `LoadSong` より前、確定した分は `OpenPluginShmem` の後、消えた分は `LoadSong` の後
+  (`AppData::sync_loading_devices` / `apply_slot_reconcile_actions`)。失敗で確定した device は表から外れて従来どおり素通し、
+  映像 device は host に載らないので関係しない。有効に戻したトラックの読み込みは A7 の一時停止をしない (`LoadPlayback`)。
+  待たせるのはその描画で op を出す plugin だけ (`daw_audio::graph::executable_tracks`: bypass 中 / Sources scope の FX は待たない)。
+  待っている行は plugin が載ったまま凍るので、外れる瞬間に鳴っている音を止める予約にする (`mixer::silence_disabled_rows`)。
+  オフライン描画 (書き出し / 解析 / Bounce / Glue) は読み込みが全部確定してからしか始めない (`reject_offline_render_while_loading`)。
 - 無効トラックだけが参照する音声素材はデコード / 常駐しない (`compile_audio_schedule` `audio_clip_renderer.rs:309-371`)。
 - 無効化・有効化は構造変更として LoadSong で届く (device bypass と同じ)。
 

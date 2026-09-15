@@ -492,6 +492,7 @@ impl ProjectCtl {
                 Some(s) => match compile_schedule(
                     s,
                     &self.shared.device_latencies.load(), // arch-lint: allow-arcswap-load (off-RT: recv loop の compile)
+                    &self.shared.loading_devices.load(), // arch-lint: allow-arcswap-load (off-RT: recv loop の compile)
                     sample_rate,
                     buffer_frames,
                     common::protocol::RenderScope::Mix,
@@ -819,6 +820,9 @@ pub fn handle_project_command(
         AudioCommand::SetDeviceLatency { device_id, samples, .. } => {
             set_device_latency(ctl, device_id, samples, engine_shared, session_sample_rate, phase_tables);
         }
+        AudioCommand::SetLoadingDevices { device_ids, .. } => {
+            set_loading_devices(ctl, device_ids.into_iter().collect(), engine_shared, session_sample_rate, phase_tables);
+        }
         AudioCommand::OpenPluginShmem { device_id, shmem_id, token, .. } => {
             // v29: 配置 (どの track のどの位置か) は Song 側の
             // `PluginInstance::id` が SSoT なので、 ここでは device_id →
@@ -1142,6 +1146,41 @@ fn set_device_latency(
     }
 }
 
+/// `SetLoadingDevices` (r.md #131): 読み込み中の device の表を差し替え、**実行するトラックが変わるときだけ**
+/// schedule を組み直す。1 つのトラックに plugin が複数あれば最後の 1 つの読み込みが済むまで実行は変わらないので、
+/// 曲を開いた直後の load 応答のたびに再 compile しない (`set_device_latency` の「値が変わらないなら組み直さない」と同じ)。
+fn set_loading_devices(
+    ctl: &mut ProjectCtl,
+    next: crate::graph::LoadingDevices,
+    engine_shared: &EngineShared,
+    session_sample_rate: u32,
+    phase_tables: &ModPhaseTableBuilder,
+) {
+    let shared = Arc::clone(&ctl.shared);
+    let current = shared.loading_devices.load_full(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
+    if *current == next {
+        return;
+    }
+    let next = Arc::new(next);
+    shared.loading_devices.store(Arc::clone(&next));
+    // song が届く前の宣言もある (曲を開くとき GUI は `LoadSong` の前に送る) — その場合は表だけ更新し、LoadSong の compile が拾う。
+    let song = shared.song.load_full(); // arch-lint: allow-arcswap-load (off-RT: recv loop)
+    let Some(s) = song.as_deref() else { return };
+    let mix = common::protocol::RenderScope::Mix;
+    if crate::graph::executable_tracks(s, &current, mix) == crate::graph::executable_tracks(s, &next, mix) {
+        return;
+    }
+    tracing::info!(project = shared.key.0, loading = next.len(), "loading devices changed (実行するトラックの再 compile)");
+    ctl.publish_bundle(
+        engine_shared,
+        song,
+        session_sample_rate,
+        // 同じ曲の再 compile。走行状態 (DelayLine / FollowerSlot) は引き継ぐ。
+        Topology::Recompile { reset_song_scoped_state: false },
+        phase_tables,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,6 +1258,56 @@ mod tests {
         assert_eq!(Arc::strong_count(&old_renderer), 2, "旧 renderer は RT ではなく recycle ring が持っている");
         ctl.housekeeping(&engine, sr, &phase_tables, None);
         assert_eq!(Arc::strong_count(&old_renderer), 1, "housekeeping (off-thread) が捨てる");
+    }
+
+    /// r.md #131: 読み込み中の device の表 (`SetLoadingDevices`) は compile の入力。曲より先に届いた表も `LoadSong` の
+    /// compile が拾い、読み込み中の plugin を持つトラックは RT の schedule で実行されない。実行するトラックが変わる
+    /// ときだけ組み直した schedule を送る (plugin を 2 つ持つトラックは 2 つ目の読み込みが済むまで変わらない)。
+    #[test]
+    fn 読み込み中の_device_を持つトラックは_rt_で実行されず_確定した便で戻る() {
+        use crate::graph::program::Pass1Role;
+        use common::model::{Device, PluginInstance, Song, Track};
+        let engine = EngineShared::new();
+        let bridge = AudioBridgeHandle::create(&format!("daw01_test_ctl_loading_{}", std::process::id())).unwrap();
+        let (mut project_tx, mut project_rx) = rtrb::RingBuffer::new(4);
+        let mut projects = HashMap::new();
+        assert!(open_project(ProjectKey(1), &mut projects, &engine, &bridge, &mut project_tx));
+        let Ok(ProjectDelivery::Open(mut rt)) = project_rx.pop() else { panic!("Open 便") };
+        let ctl = projects.get_mut(&ProjectKey(1)).expect("ctl");
+        let phase_tables = ModPhaseTableBuilder::spawn();
+        let (mut cmd_tx, _cmd_rx) = EngineCommandSender::channel();
+        let (decode_tx, _decode_rx) = std::sync::mpsc::channel();
+        let sr = 48_000;
+        let project = ProjectKey(1);
+        let fx = |id: u64| {
+            Device::Plugin(PluginInstance {
+                id,
+                ..PluginInstance::with_ports(
+                    format!("test.fx{id}"),
+                    common::plugin_format::PluginFormat::Clap,
+                    common::port_config::PortConfig { has_audio_input: true, has_audio_output: true, ..Default::default() },
+                )
+            })
+        };
+        let song = Song {
+            project_id: 7,
+            tracks: vec![Track { id: 1, devices: vec![fx(10), fx(11)], ..Track::default() }, Track { id: 2, ..Track::default() }],
+            ..Song::default()
+        };
+        let mut send = |ctl: &mut ProjectCtl, cmd| handle_project_command(ctl, cmd, &engine, sr, &mut cmd_tx, &decode_tx, &phase_tables);
+        let roles = |rt: &ProjectRt| rt.cached_schedule.track_programs.iter().map(|p| p.pass1_role).collect::<Vec<_>>();
+
+        send(ctl, AudioCommand::SetLoadingDevices { project, device_ids: vec![10, 11] });
+        assert_eq!(rt.bundle_rx.slots(), 0, "曲が無いうちは表を持つだけ");
+        send(ctl, AudioCommand::LoadSong { project, song });
+        rt.refresh_bundle();
+        assert_eq!(roles(&rt), vec![Pass1Role::Disabled, Pass1Role::Leaf], "読み込み中の plugin を持つトラックは実行しない");
+
+        send(ctl, AudioCommand::SetLoadingDevices { project, device_ids: vec![11] });
+        assert_eq!(rt.bundle_rx.slots(), 0, "実行するトラックが変わらない差し替えでは組み直さない");
+        send(ctl, AudioCommand::SetLoadingDevices { project, device_ids: Vec::new() });
+        rt.refresh_bundle();
+        assert_eq!(roles(&rt), vec![Pass1Role::Leaf, Pass1Role::Leaf], "読み込みが確定した便で実行に戻る");
     }
 
     /// BundlePublisher の drop-oldest: ring が full のとき新しい bundle が
