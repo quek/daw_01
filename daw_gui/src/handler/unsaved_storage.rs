@@ -99,16 +99,30 @@ impl AppData {
         }
     }
 
-    /// 保存が済んで live と履歴の参照が bundle へ移った後: この文書の未保存の置き場を消す。
-    /// 進行中の Bounce / Glue が置き場へ書いている間は残す (出来上がった出力は次の保存で移り、
-    /// そこで消える。保存しなければ閉じるときに消える)。
-    pub(crate) fn release_unsaved_place_after_save(&mut self) {
-        let Some(dirs) = self.ui_prefs.app_dirs.clone() else { return };
+    /// この文書の未保存の置き場のフォルダ (作ってあるかは問わない)。
+    pub(crate) fn own_unsaved_place_dirs(&self, dirs: &AppDirs) -> Vec<PathBuf> {
         let id = self.cur.song_doc.unsaved.id();
-        let place: Vec<PathBuf> =
-            MediaPool::UNSAVED_ROOTS.iter().map(|pool| pool.unsaved_dir(&dirs, id)).collect();
+        MediaPool::UNSAVED_ROOTS.iter().map(|pool| pool.unsaved_dir(dirs, id)).collect()
+    }
+
+    /// live か undo / redo のどれかの媒体が `place` の中のファイルを指しているか。
+    pub(crate) fn doc_references_inside(&self, place: &[PathBuf]) -> bool {
+        let doc = &self.cur.song_doc;
+        std::iter::once(doc.song())
+            .chain(doc.history_songs())
+            .any(|song| crate::media_bundle::references_inside(song, place))
+    }
+
+    /// 保存済みの文書の未保存の置き場を、live / undo / redo のどれも指さず、進行中の Bounce / Glue も書いて
+    /// いなければ消す (保存の後 / [`Self::settle_unsaved_place_of_saved_doc`])。指すものが残っていれば置き場ごと
+    /// 残す — 保存で運べなかった実体 (Bounce / Sampler の出力はほかに実体が無い) や、オフライン描画中の保存で
+    /// 書き換えられなかった live の参照先。残った参照は sidecar の autosave の前か次の保存で運ばれ、保存せずに
+    /// 閉じれば置き場ごと消える。
+    pub(crate) fn release_unsaved_place_if_unreferenced(&mut self) {
+        let Some(dirs) = self.ui_prefs.app_dirs.clone() else { return };
+        let place = self.own_unsaved_place_dirs(&dirs);
         let writing = self.in_flight_render_paths().any(|p| place.iter().any(|d| p.starts_with(d)));
-        if !writing {
+        if !writing && !self.doc_references_inside(&place) {
             self.cur.song_doc.unsaved.release(&dirs);
         }
     }
@@ -147,7 +161,7 @@ mod tests {
     use common::model::{AudioSourcePath, ClipKey};
     use common::recovery::{DocId, lock_path_for, recovery_path_for};
 
-    use crate::app_types::ImportTrackTarget;
+    use crate::app_types::{BounceMode, ImportTrackTarget};
     use crate::media_dest::MediaPool;
     use crate::state::AppData;
     use crate::test_support::headless_app_with_data_root;
@@ -315,6 +329,74 @@ mod tests {
         let key = app.cur.key;
         app.close_tab_now(key);
         assert!(!autosave.exists() && !imported.exists() && !place_exists(&dirs, id));
+    }
+
+    /// 保存で bundle へ運べなかった素材 (保存先の容量不足など) は置き場に残し、live も置き場を指したまま
+    /// にする (鳴り続け、`*` のまま次の保存でやり直す)。置き場ごと消すと、Bounce / Sampler の出力のように
+    /// ほかに実体の無いものが消える。
+    #[test]
+    fn media_that_fails_to_reach_the_bundle_stays_in_the_place_and_keeps_playing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wav = tmp.path().join("clap.wav");
+        write_wav(&wav);
+        let dirs = AppDirs::under(tmp.path().join("appdata"));
+        let mut app = headless_app_with_data_root(dirs.root());
+        let id = app.cur.song_doc.unsaved.id();
+        let in_place = import(&mut app, &wav);
+        let proj = tmp.path().join("p");
+        // `samples/` をファイルにして、bundle へ運べない保存先にする。
+        let blocker = touch(proj.join("samples"));
+        save(&mut app, &proj.join("p.daw"));
+        assert!(in_place.exists(), "運べなかった実体は置き場に残る");
+        assert_eq!(source_path(&app), in_place, "live は置き場を指したまま (鳴り続ける)");
+        assert!(app.cur.song_doc.is_dirty(), "保存したファイルには入っていない");
+
+        std::fs::remove_file(blocker).unwrap();
+        save(&mut app, &proj.join("p.daw"));
+        assert!(proj.join("samples").join(in_place.file_name().unwrap()).exists());
+        assert!(!place_exists(&dirs, id), "運べたら置き場は消える");
+        assert!(!app.cur.song_doc.is_dirty());
+    }
+
+    /// Bounce の最中に保存した: Song が凍っていて live を書き換えられないので、置き場の実体は移さずに複製する
+    /// (保存したファイルは bundle の複製を、live は置き場の実体を指して鳴り、bundle の掃除も複製を消さない)。
+    /// 焼き上がった出力も含めて、sidecar の autosave を書く前に bundle へ移って置き場が消える — sidecar に
+    /// 置き場のパスを書くと、落ちた後の起動時の掃除が復元先の音源を消す。
+    #[test]
+    fn saving_during_a_bounce_settles_the_place_before_the_sidecar_autosave() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wav = tmp.path().join("ride.wav");
+        write_wav(&wav);
+        let dirs = AppDirs::under(tmp.path().join("appdata"));
+        let mut app = headless_app_with_data_root(dirs.root());
+        let id = app.cur.song_doc.unsaved.id();
+        let in_place = import(&mut app, &wav);
+        let track = &app.cur.song_doc.song().tracks[0];
+        let key = ClipKey { track_id: track.id, clip_id: track.clips[0].id };
+        app.start_clip_bounce(key, BounceMode::InPlace, "Bounce In Place");
+        let out = app.cur.pipc.pending_clip_fx_bounce.as_ref().expect("bounce started").out_path.clone();
+        assert!(out.starts_with(MediaPool::Bounce.unsaved_dir(&dirs, id)), "{}", out.display());
+
+        let (proj, daw) = (tmp.path().join("p"), tmp.path().join("p").join("p.daw"));
+        save(&mut app, &daw);
+        assert!(proj.join("samples").join(in_place.file_name().unwrap()).exists(), "保存したファイルの参照先");
+        assert!(crate::import_audio::decode_audio(&source_path(&app)).is_ok(), "live が指す実体も残っている");
+
+        write_wav(&out); // engine の offline render が書き終えた
+        app.handle_bounce_clip_fx_complete(out, key.track_id, key.clip_id, None, 4_800);
+        assert!(app.cur.song_doc.is_dirty(), "焼き上がりは保存していない編集");
+        app.cur.song_doc.last_autosave = Instant::now() - Duration::from_secs(61);
+        app.maybe_autosave();
+        let sidecar = common::project::load_project(common::recovery::sidecar_for(&daw)).unwrap().song;
+        for song in [app.cur.song_doc.song(), &sidecar] {
+            for source in song.media.audio_sources.values() {
+                let AudioSourcePath::ProjectRelative(rel) = &source.path else {
+                    panic!("still outside the bundle: {:?}", source.path);
+                };
+                assert!(proj.join(rel).exists(), "{}", rel.display());
+            }
+        }
+        assert!(!place_exists(&dirs, id), "置き場は消えた: {}", app.ui_ephemeral.status_message);
     }
 
     #[test]

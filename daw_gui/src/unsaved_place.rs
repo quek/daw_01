@@ -8,9 +8,12 @@
 //! - **落ちた後**: `recovery/<id>.autosave.daw` が残っている。復元した文書が id ごと引き継ぐ
 //!   (`AppData::restore_recovery`)。
 //!
-//! どちらも無い置き場は誰のものでもない。消す時機は、保存して中身が bundle へ移ったとき
-//! (`finish_save`)、保存せずに閉じた / 終了したとき (recovery ファイルと一緒に)、recovery を
-//! 破棄したとき、起動時に持ち主の記録が無いものを見つけたとき ([`sweep_orphans`])。
+//! どちらも無い置き場は誰のものでもない。消す時機は、保存して中身が bundle へ移り、live / 履歴の
+//! どれも指さなくなったとき (`AppData::release_unsaved_place_if_unreferenced`)、保存せずに閉じた /
+//! 終了したとき (recovery ファイルと一緒に)、recovery を破棄したとき、起動時に持ち主の記録が無い
+//! ものを見つけたとき ([`sweep_orphans`])。保存済みの文書の sidecar autosave は持ち主の記録に
+//! ならないので、sidecar を書く前に置き場を指す参照を bundle へ運ぶ
+//! (`AppData::settle_unsaved_place_of_saved_doc`)。
 //!
 //! 消し方は **直接削除** (ゴミ箱を経由しない)。置き場は持ち主の autosave (recovery ファイル、
 //! これも直接削除) に従属する per-user のキャッシュで、持ち主の有無という構造で消すかが決まる。
@@ -81,6 +84,12 @@ impl UnsavedPlace {
     #[must_use]
     pub fn id(&self) -> DocId {
         self.id
+    }
+
+    /// このプロセスがこの置き場へ書いた / 引き継いだまま、まだ消していないか (= 中身があり得る)。
+    #[must_use]
+    pub fn is_claimed(&self) -> bool {
+        self.lock.is_some()
     }
 
     /// 置き場へ書く前に呼ぶ: このプロセスが使っていると記録する。2 回目以降は何もしない。

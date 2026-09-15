@@ -15,6 +15,11 @@ impl AppData {
             return;
         }
 
+        // sidecar に未保存の置き場のパスを書かない (置き場は sidecar を持ち主と見なさないので、
+        // 落ちた後の起動時の掃除に消される。 `settle_unsaved_place_of_saved_doc` の doc)。
+        if self.cur.song_doc.file_path.is_some() {
+            self.settle_unsaved_place_of_saved_doc();
+        }
         // 保存先決定: file_path Some なら sidecar、 None なら recovery_dir。
         let autosave_path = match self.cur.song_doc.file_path.as_ref() {
             Some(orig) => common::recovery::sidecar_for(orig),
