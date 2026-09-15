@@ -65,7 +65,7 @@ impl SamplerEvent {
         match self {
             Self::Drop { .. } => "Sampler から切り出し",
             Self::MidiDrop { .. } => "MIDI Capture から切り出し",
-            _ => "編集",
+            _ => crate::state::song_doc::GENERIC_UNDO_LABEL,
         }
     }
 }

@@ -1153,13 +1153,6 @@ impl AppData {
         }
     }
 
-    /// ウィンドウを閉じる要求 (`WindowEvent::CloseRequested` = ✕ / Alt+F4 /
-    /// システムメニュー / タスクバー) のエントリ。 r.md #61 で終了経路が
-    /// 増えたので、実体は [`AppData::request_quit`] (全経路の合流点)。
-    pub fn request_close(&mut self) {
-        self.request_quit(crate::shutdown::QuitRequest::USER);
-    }
-
     /// **アクティブなタブ** を破棄する操作 (終了 / タブを閉じる) のエントリ。
     /// 未保存変更があれば確認モーダルを開き、 無ければ即 `action` を実行する。
     /// ふつうの DAW と同じく「破棄する前に保存するか確認」 する。
@@ -1401,6 +1394,13 @@ impl AppData {
         if was_idle {
             self.dispatch_front_state_request();
         }
+    }
+
+    /// plugin state の往復を待ってから走らせる編集を積む。いま dispatch 中の操作の履歴ラベルを
+    /// 控え、完了時 (`on_all_states_from_child`) にその名前の独立した 1 undo step で適用する。
+    pub(crate) fn enqueue_deferred_edit(&mut self, edit: DeferredEdit) {
+        let label = self.cur.song_doc.event_label();
+        self.enqueue_state_request(PendingStateRequest::Deferred { edit, label });
     }
 
     /// queue 先頭 request の state 収集を開始する (= `RequestAllStates` 送信)。

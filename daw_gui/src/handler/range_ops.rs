@@ -8,6 +8,7 @@
 //! - content の分割 = [`common::model::Song::split_content_at_points`] (共有されていれば CoW)
 
 use crate::event::AppEvent;
+use crate::event_range::{RangeEvent, RangeMoveMode, RowDest};
 use crate::state::*;
 use common::model::{ClipKey, LaneRef, TimeSelection};
 
@@ -272,6 +273,68 @@ impl AppData {
 }
 
 impl AppData {
+    /// [`RangeEvent`] の処理 (`AppEvent::Range` の 1 arm)。
+    pub(crate) fn handle_range_event(&mut self, ev: RangeEvent) {
+        match ev {
+            RangeEvent::Mute => self.apply_mute_time_selection(),
+            RangeEvent::Nudge { delta_beats } => self.nudge_time_selection(delta_beats),
+            RangeEvent::Duplicate { unique } => self.duplicate_time_selection(unique),
+            RangeEvent::Move { range, delta_beats, rows, mode } => self.move_range_to_rows(range, delta_beats, &rows, mode),
+        }
+    }
+
+    /// アレンジャーの `D` / `Alt+D` = **範囲を 1 つ後ろへ複製**する
+    /// (`docs/plan_range_selection.md` §6)。
+    ///
+    /// 送る量は範囲の長さ。 行き先は上書き規則で削られるので、複製後の範囲には
+    /// **複製したものしか居ない** — 次の `D` が元から居たクリップを巻き込まない。
+    /// 選択中の automation クリップ (範囲に畳まれていない唯一の面) は同じ step で別に複製する。
+    fn duplicate_time_selection(&mut self, unique: bool) {
+        // 範囲を張り替える前に控える (`set_time_selection` が automation の選択を剪定する)。
+        let automation = self.cur.selection.selected_automation_clips.clone();
+        let Some(sel) = self.time_selection() else {
+            return;
+        };
+        let (a, b) = (sel.start_beat, sel.end_beat);
+        let map: Vec<(u32, u32)> = sel.track_row_ids().map(|id| (id, id)).collect();
+        self.copy_time_range(a, b, b - a, &map, unique);
+        match (automation.is_empty(), unique) {
+            (true, _) => {}
+            (false, true) => self.duplicate_automation_clips_unique(&automation),
+            (false, false) => self.duplicate_automation_clips_shared(&automation),
+        }
+    }
+
+    /// クリップヘッダのドラッグの確定: 範囲の中身を行ごとの行き先へ動かす / 複製する。
+    /// 行の無い余白へ落ちた行 ([`RowDest::NewTrack`]) のぶんだけ先にトラックを作る
+    /// (作れなければ何もしない)。
+    fn move_range_to_rows(&mut self, (a, b): (f64, f64), delta_beats: f64, rows: &[(u32, RowDest)], mode: RangeMoveMode) {
+        let new_tracks = rows
+            .iter()
+            .filter_map(|(_, dest)| match dest {
+                RowDest::NewTrack(i) => Some(i + 1),
+                RowDest::Track(_) => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let created = self.append_empty_tracks_ids(new_tracks);
+        if created.len() != new_tracks {
+            return;
+        }
+        let map: Vec<(u32, u32)> = rows
+            .iter()
+            .map(|&(from, dest)| match dest {
+                RowDest::Track(to) => (from, to),
+                RowDest::NewTrack(i) => (from, created[i]),
+            })
+            .collect();
+        match mode {
+            RangeMoveMode::Move => self.move_time_range(a, b, delta_beats, &map),
+            RangeMoveMode::CopyLinked => self.copy_time_range(a, b, delta_beats, &map, false),
+            RangeMoveMode::CopyUnique => self.copy_time_range(a, b, delta_beats, &map, true),
+        }
+    }
+
     /// 範囲がアクティブなときの ←→ = **範囲内の素材をナッジ**する
     /// (Live §6.9 "You can nudge a selection of material using the left and right
     /// arrow keys")。 範囲そのものも同じ量だけ動く。

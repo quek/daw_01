@@ -9,6 +9,8 @@ pub mod bounce;
 /// r.md #129: `Q` の宛先 (Mixer 帯 / マスターパネルの hover → device / Limiter)。
 pub mod bypass_target;
 pub mod clip_events;
+/// `AppEvent::Clipboard(..)` の入口 (貼り付け / カット / コピー)。
+pub mod clipboard_event;
 pub mod clipboard_media;
 pub mod clips;
 pub mod colors;
@@ -53,6 +55,8 @@ pub mod recovery;
 /// r.md #129: Rack の Par パネルの開閉 (見方の都合)。
 pub mod rack_view;
 pub mod save_bundle;
+/// `AppEvent::Section(..)` の入口 (Arranger セクション帯の編集)。
+pub mod section_event;
 /// r.md #129: SC Listen (聴き方の都合、Song に書かない) の唯一の口。
 pub mod sc_listen;
 pub mod select_all;

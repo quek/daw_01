@@ -36,9 +36,7 @@ impl AppData {
             self.delete_tracks_inner(&ids);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::DeleteTracks {
-            track_ids: ids,
-        }));
+        self.enqueue_deferred_edit(DeferredEdit::DeleteTracks { track_ids: ids });
     }
 
     /// 複数トラック削除の本体。 呼び出し側で undo snapshot 済み (deferred 経由 or
@@ -85,9 +83,7 @@ impl AppData {
             self.cut_tracks_inner(&track_ids);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::CutTracks {
-            track_ids,
-        }));
+        self.enqueue_deferred_edit(DeferredEdit::CutTracks { track_ids });
     }
 
     /// copy 本体。最新 state 込みの live song から該当トラックを serialize して
@@ -702,10 +698,7 @@ impl AppData {
             self.duplicate_tracks_inner(&track_ids, linked);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::DuplicateTracks {
-            track_ids,
-            linked,
-        }));
+        self.enqueue_deferred_edit(DeferredEdit::DuplicateTracks { track_ids, linked });
     }
 
     /// 複製本体。呼び出し側で最新 plugin state 反映済み (deferred 経由 or 即時 fallback)。

@@ -226,11 +226,7 @@ impl AppData {
             self.action_ungroup_tracks_inner(track_ids);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(
-            DeferredEdit::UngroupTracks {
-                track_ids: track_ids.to_vec(),
-            },
-        ));
+        self.enqueue_deferred_edit(DeferredEdit::UngroupTracks { track_ids: track_ids.to_vec() });
     }
 
     pub(crate) fn action_ungroup_tracks_inner(&mut self, track_ids: &[u32]) {
@@ -330,11 +326,7 @@ impl AppData {
         let into_disabled = parent_id.is_some_and(|p| !self.cur.song_doc.song().track_effectively_enabled(p));
         if into_disabled && self.song_has_plugin() {
             let track_ids = track_ids.to_vec();
-            self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::MoveTracks {
-                track_ids,
-                parent_id,
-                anchor_after,
-            }));
+            self.enqueue_deferred_edit(DeferredEdit::MoveTracks { track_ids, parent_id, anchor_after });
             return;
         }
         self.action_move_tracks_inner(track_ids, parent_id, anchor_after);

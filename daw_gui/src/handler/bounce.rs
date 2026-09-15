@@ -178,7 +178,8 @@ impl AppData {
     /// 「新トラック + 元クリップのミュート」([`common::model::Song::place_bounce_with_fx`]) する。
     /// Audio / MIDI / 歌唱クリップが対象 (= 旧 is-Audio guard を撤去し「全く無反応」 を解消)。完了通知の `flush_song_sync` が full song を再
     /// LoadSong して engine state を復元する。歌唱の合成待ちは `request_bounce` が前段で行う。
-    pub(crate) fn start_clip_bounce(&mut self, target: ClipKey, mode: BounceMode) {
+    /// `label` = 発注した操作の履歴ラベル (完了時の 1 undo step の名前)。
+    pub(crate) fn start_clip_bounce(&mut self, target: ClipKey, mode: BounceMode, label: &'static str) {
         // Glue の焼き込みも同じ offline render を使う (engine は同時 1 本)。
         if self.cur.pipc.pending_clip_fx_bounce.is_some() || self.cur.pipc.pending_glue_bake.is_some() {
             self.ui_ephemeral.status_message = "Bounce: 既に bounce 中です。 完了をお待ちください".into();
@@ -240,6 +241,7 @@ impl AppData {
             clip_length_beats: clip.length_beats,
             start_beat: clip.start_beat,
             content_offset_beats: clip.content_offset_beats,
+            label,
         });
         // SetRenderMode(Offline) → LoadSong(isolated) → BounceClipFxOnline。完了通知で
         // Realtime に戻し、restore_engine_song_after_bounce が full song を再 LoadSong
@@ -323,9 +325,10 @@ impl AppData {
                 let clip_id = t.clip_by_id(target.clip_id)?.id;
                 Some((plugin_id, t.id, clip_id))
             });
+        let label = self.cur.song_doc.event_label();
         if let Some((device_id, track_id, clip_id)) = vocal {
             self.cur.pipc.pending_vocal_synth_bounce =
-                Some(PendingVocalSynthBounce { track_id, clip_id, mode });
+                Some(PendingVocalSynthBounce { track_id, clip_id, mode, label });
             // r.md #27: bounce は合成完了 (`VocalSynthReady`) を待つので、metadata が
             // 前回送信と不変でも必ず再送して synth 世代を進める。差分キャッシュを迂回
             // するため該当 device の entry を落としてから flush する (= 直前の合成が
@@ -336,7 +339,7 @@ impl AppData {
             self.ui_ephemeral.status_message = "Bounce: 歌唱を合成中...".into();
             return;
         }
-        self.start_clip_bounce(target, mode);
+        self.start_clip_bounce(target, mode, label);
     }
 
     /// PR-C: plugin chain 込みで render し、 結果を **新 track + 新 Clip**
@@ -448,6 +451,8 @@ impl AppData {
         let source_content_id = pending.source_content_id;
         let track_name = format!("{} (FX)", pending.clip_name);
         let (content_name, new_track_name) = (format!("{} (bounced FX)", pending.clip_name), track_name.clone());
+        // 発注した操作の名前で独立した 1 step (進行中のドラッグの bracket には入れない)。
+        let gesture = self.cur.song_doc.enter_own_gesture(pending.label);
         let placed = self.edit_song(move |song| {
             let (source_id, content) = song.add_baked_audio(wav, window, offset);
             let content = common::model::ClipContent::Audio(content);
@@ -468,6 +473,7 @@ impl AppData {
             }
             Some(source_id)
         });
+        self.cur.song_doc.leave_own_gesture(gesture);
         let Some(Some(source_id)) = placed else {
             return;
         };

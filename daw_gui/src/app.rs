@@ -338,8 +338,12 @@ impl AppData {
 
 
 impl AppData {
-    /// AppEvent dispatcher。view から `Edit::mutate` 経由で、background thread
+    /// AppEvent の入口。view から `Edit::mutate` 経由で、background thread
     /// から `EventLoopProxy<AppEvent>` 経由で呼ばれる。
+    ///
+    /// **Song を変えるユーザー操作は必ずここを通す** — 1 操作 = 1 undo step と履歴の
+    /// 操作名は、ここで開いて閉じる event の scope (`SongDoc::begin_event` / `end_event`)
+    /// が決める。view から handler を直に呼んだ編集は操作名を持たない別 step になる。
     pub fn handle_event(&mut self, event: AppEvent) {
         // (r.md #61) 終了シーケンス中は **全 event を捨てる**。
         //
@@ -369,7 +373,21 @@ impl AppData {
         // 1 undo step に squash、 Begin*/End* gesture 中は drag 全体で 1 step)。
         // 同時に、 この event が snapshot を積んだときの履歴リスト用ラベル
         // (r.md #29) を event 種から確定して渡す。
+        let project = self.cur.key;
         self.cur.song_doc.begin_event(event.undo_label());
+        self.dispatch_app_event(event);
+        // 閉じる (arm の途中 return でも必ず通るよう、match の外で)。 event の中でタブが
+        // 切り替わっていたら、開いたタブの文書を閉じる (閉じたタブなら何もしない)。
+        self.with_project(project, |app| app.cur.song_doc.end_event());
+        // edit_song が export 中拒否を予約していたら status に表示する
+        // (song 凍結の単一保証点は SongDoc::edit、 旧 allow-list gate の置換)。
+        if let Some(msg) = self.cur.song_doc.take_rejection() {
+            self.ui_ephemeral.status_message = msg.into();
+        }
+    }
+
+    /// [`Self::handle_event`] の本体 (event 種ごとの handler への振り分け)。
+    fn dispatch_app_event(&mut self, event: AppEvent) {
         // Export gate (positive-default + block-list)。
         //
         // 旧構造は negative-default の allow-list だった (export 中は列挙した少数
@@ -1218,6 +1236,7 @@ impl AppData {
                 target,
                 source_id,
             } => self.remove_mod_routing(track_id, target, source_id),
+            AppEvent::ConnectArmedModSource { track_id, target } => self.connect_armed_mod_source_to(track_id, target),
             AppEvent::SetModRoutingDepth {
                 track_id,
                 target,
@@ -1911,6 +1930,9 @@ impl AppData {
                 }
             }
             AppEvent::SplitJoin(ev) => self.handle_split_join_event(ev),
+            AppEvent::Clipboard(ev) => self.handle_clipboard_event(ev),
+            AppEvent::Range(ev) => self.handle_range_event(ev),
+            AppEvent::Section(ev) => self.handle_section_event(ev),
             // PR-V4: SynthesizeVocal / VocalSynthCompleted は削除済。
             // vocal track は builtin VOICEVOX plugin が自動 synth する
             // (= sync_vocal_metadata 経由で歌詞 / note を flush →
@@ -2079,11 +2101,6 @@ impl AppData {
             AppEvent::ToggleFoldToScale => {
                 self.cur.view.piano_roll_fold = !self.cur.view.piano_roll_fold;
             }
-        }
-        // edit_song が export 中拒否を予約していたら status に表示する
-        // (song 凍結の単一保証点は SongDoc::edit、 旧 allow-list gate の置換)。
-        if let Some(msg) = self.cur.song_doc.take_rejection() {
-            self.ui_ephemeral.status_message = msg.into();
         }
     }
 }

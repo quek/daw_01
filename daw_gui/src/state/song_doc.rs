@@ -32,6 +32,11 @@ const UNDO_LIMIT: usize = 200;
 /// Recovery の直後に確定する baseline state の名前。
 pub const BASELINE_LABEL: &str = "初期状態";
 
+/// 操作名を持たない編集の履歴ラベル。 [`crate::event::AppEvent::undo_label`] の既定
+/// (Song を変えない event) と、 dispatch の外で走った編集 ([`SongDoc::end_event`]) が使う。
+/// gesture の squash 中は、後から来た具体的な名前がこれを置き換える ([`SongDoc::edit`])。
+pub const GENERIC_UNDO_LABEL: &str = "編集";
+
 /// 連続 stream 編集 (MIDI CC / BPM scrub / automation 録音等、 Begin/End
 /// bracket を持たない編集源) の gesture を「時間ギャップ」 で区切る閾値。
 /// 最終編集からこれ以上空いたら新しい undo step を始める。
@@ -49,11 +54,12 @@ pub enum EditScope {
     Gesture(u64),
 }
 
-/// [`SongDoc::enter_own_gesture`] が退避した bracket 状態。
+/// [`SongDoc::enter_own_gesture`] が退避した bracket 状態 (と、その間だけ差し替えた履歴ラベル)。
 #[derive(Debug, Clone, Copy)]
 pub struct GestureSave {
     gesture: Option<u64>,
     scope: EditScope,
+    label: &'static str,
 }
 
 /// Begin/End bracket を持たない連続編集源の識別子
@@ -192,7 +198,7 @@ impl SongDoc {
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             current_label: BASELINE_LABEL,
-            pending_label: "編集",
+            pending_label: GENERIC_UNDO_LABEL,
             last_gesture: None,
             next_gesture_id: 1,
             active_gesture: None,
@@ -265,8 +271,12 @@ impl SongDoc {
             // redo 履歴を消さない)。
             self.redo_stack.clear();
             // 新しい live state を生んだのは今回の編集イベント。 そのラベルを
-            // current に昇格する (gesture squash 中は同 event 種なので同値)。
-            self.current_label = self.pending_label;
+            // current に昇格する。 gesture の squash 中は **最初に名前を持った event が
+            // step の名前** で、後から同じ step へ書いた event は上書きしない (録音 take を
+            // 停止 / tick で閉じても「MIDI 入力」 が別の名前に化けない)。
+            if !squash || self.current_label == GENERIC_UNDO_LABEL {
+                self.current_label = self.pending_label;
+            }
             self.last_gesture = match scope {
                 EditScope::Discrete => None,
                 EditScope::Gesture(id) => Some(id),
@@ -665,8 +675,27 @@ impl SongDoc {
         };
         self.event_scope = EditScope::Gesture(id);
         // この event が edit() で snapshot を積んだら、 この label が新 step の
-        // 名前になる。 編集しない event では未使用のまま次 event で上書きされる。
+        // 名前になる。 編集しない event では未使用のまま [`Self::end_event`] で汎用へ戻る。
         self.pending_label = label;
+    }
+
+    /// AppEvent dispatch の末尾で呼ぶ: この event の scope とラベルを閉じる。
+    ///
+    /// 閉じないと、dispatch の **外** で走った編集 (view が handler を直接呼ぶ等) が
+    /// 直前の event の scope とラベルを引き継ぎ、その event の undo step に黙って
+    /// 吸収される (1 操作 = 1 undo が崩れ、undo 1 回で 2 つの操作が戻る)。閉じた後の
+    /// 編集は独立した step ([`GENERIC_UNDO_LABEL`]) になる。Begin/End bracket の最中なら
+    /// その bracket に入る (bracket は event を跨いで続くもの)。
+    pub fn end_event(&mut self) {
+        self.event_scope = self.active_gesture.map_or(EditScope::Discrete, EditScope::Gesture);
+        self.pending_label = GENERIC_UNDO_LABEL;
+    }
+
+    /// 現在 dispatch 中 event の履歴ラベル。完了を待つ操作 (plugin state の往復待ちの
+    /// 編集 / 焼き込みの適用) が **発注した時点で** 控え、完了時に
+    /// [`Self::enter_own_gesture`] へ渡す (完了を運ぶ IPC event の名前で積まない)。
+    pub fn event_label(&self) -> &'static str {
+        self.pending_label
     }
 
     /// 現在 dispatch 中 event の ambient scope。
@@ -693,26 +722,29 @@ impl SongDoc {
         self.active_gesture.is_some()
     }
 
-    /// **進行中の Begin/End bracket を壊さずに**、以後の編集を 1 undo step へ束ねる。
-    /// 戻り値を [`Self::leave_own_gesture`] へ渡して必ず閉じること。
+    /// **進行中の Begin/End bracket を壊さずに**、以後の編集を `label` の名前の
+    /// 1 undo step へ束ねる。戻り値を [`Self::leave_own_gesture`] へ渡して必ず閉じること。
     ///
     /// `begin_gesture` / `end_gesture` を直に使うと、**非同期の完了ハンドラ**
     /// (Glue の焼き込み適用など、ユーザー操作と無関係な時点で走るもの) が
     /// ユーザーのドラッグ中の bracket を横取りして閉じてしまい、以降のドラッグが
     /// 1 フレーム 1 undo step に割れる。ここは前の状態を退避して必ず戻す。
+    /// `label` は発注した操作の名前 ([`Self::event_label`] で控えたもの)。
     #[must_use]
-    pub fn enter_own_gesture(&mut self) -> GestureSave {
-        let save = GestureSave { gesture: self.active_gesture, scope: self.event_scope };
+    pub fn enter_own_gesture(&mut self, label: &'static str) -> GestureSave {
+        let save = GestureSave { gesture: self.active_gesture, scope: self.event_scope, label: self.pending_label };
         let id = self.alloc_gesture();
         self.active_gesture = Some(id);
         self.event_scope = EditScope::Gesture(id);
+        self.pending_label = label;
         save
     }
 
-    /// [`Self::enter_own_gesture`] の対。退避しておいた bracket を戻す。
+    /// [`Self::enter_own_gesture`] の対。退避しておいた bracket とラベルを戻す。
     pub fn leave_own_gesture(&mut self, save: GestureSave) {
         self.active_gesture = save.gesture;
         self.event_scope = save.scope;
+        self.pending_label = save.label;
     }
 
     /// Begin/End bracket を持たない連続編集源 (MIDI CC / BPM scrub /
@@ -875,6 +907,29 @@ mod tests {
         doc.edit(EditScope::Gesture(7), |s| s.bpm = 132.0);
         assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "音量変更"]);
         assert_eq!(doc.history_current(), 1);
+    }
+
+    /// event を閉じた後の編集 (dispatch の外) は、直前の event の step に吸収されない。
+    /// Begin/End bracket の最中は bracket に入り、step の名前は最初に名前を持った event のまま。
+    #[test]
+    fn edit_after_end_event_is_its_own_step() {
+        let mut doc = SongDoc::new(Song::default());
+        doc.begin_event("テンポ変更");
+        doc.edit(doc.event_scope(), |s| s.bpm = 140.0);
+        doc.end_event();
+        doc.edit(doc.event_scope(), |s| s.bpm = 150.0);
+        assert_eq!(doc.history_labels(), vec![BASELINE_LABEL, "テンポ変更", GENERIC_UNDO_LABEL]);
+
+        doc.begin_event("MIDI 入力");
+        doc.begin_gesture();
+        doc.edit(doc.event_scope(), |s| s.bpm = 160.0);
+        doc.end_event();
+        doc.edit(doc.event_scope(), |s| s.bpm = 161.0);
+        doc.begin_event("オートメーション録音");
+        doc.edit(doc.event_scope(), |s| s.bpm = 162.0);
+        doc.end_gesture();
+        assert_eq!(doc.history_current(), 3, "bracket の中は 1 step");
+        assert_eq!(doc.history_labels()[3], "MIDI 入力");
     }
 
     /// undo/redo は current index とラベル対応を保ちつつ live state を戻す。

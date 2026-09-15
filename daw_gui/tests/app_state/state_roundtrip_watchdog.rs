@@ -59,7 +59,7 @@ fn hang_during_save_and_quit_reasks_the_guard() {
     load_instrument(&mut app);
     app.cur.song_doc.file_path = Some(path.clone());
     app.cur.song_doc.normalize(|_| {});
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
 
     // 「保存して終了」: plugin 有りなので state 取得待ちの非同期保存 (round-trip in flight)。
     app.handle_event(AppEvent::DirtyGuardSave);

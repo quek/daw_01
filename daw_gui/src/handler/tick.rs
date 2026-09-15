@@ -243,6 +243,12 @@ impl AppData {
         if recording.is_empty() {
             return 0;
         }
+        // 録音 1 回ぶん (レーン / クリップの自動生成 + 打った点) を 1 undo step に畳む。 ツマミを
+        // 掴んでいる間はその drag の bracket に入れ (値の変更と打った点が 1 step)、離した後の
+        // Latch / Write の継続は tick の途切れまでを 1 step にする。
+        if !self.cur.song_doc.gesture_active() {
+            self.cur.song_doc.use_stream_scope(crate::state::StreamGesture::AutomationRecord);
+        }
 
         const THIN_INTERVAL_BEATS: f64 = 1.0 / 64.0;
         let mut inserted = 0usize;
@@ -464,12 +470,9 @@ impl AppData {
         const THIN_EPSILON_PLAIN: f64 = 0.005;
         // 録音 gesture 途中で crash しても、 挿入済の点が autosave に乗るよう
         // dirty を立てる (= edit が epoch を bump)。 GUI tick 経路 (= audio
-        // callback でない) なので RT 制約に抵触しない。 連続する record tick は
-        // AutomationRecord stream gesture で 1 undo step に squash する。
-        let scope = self
-            .cur.song_doc
-            .stream_scope(crate::state::StreamGesture::AutomationRecord);
-        self.cur.song_doc.edit_checked(scope, move |song| {
+        // callback でない) なので RT 制約に抵触しない。 undo step の畳み方は呼び出し側
+        // (`record_automation_points_for_tick`) が張った event の scope に従う。
+        self.edit_song_checked(move |song| {
             let entry = song.clip_contents.entry(content_id).or_insert_with(|| {
                 common::model::ClipContent::Automation(common::model::AutomationContent::default())
             });
@@ -485,7 +488,7 @@ impl AppData {
                 THIN_EPSILON_PLAIN,
             );
             true
-        }) == Some(true)
+        })
     }
 
     /// `song.bpm` を変更した後に呼ぶ共通処理。Raw audio clip を「実時間 (秒)

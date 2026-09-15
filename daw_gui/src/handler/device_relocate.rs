@@ -39,9 +39,7 @@ impl AppData {
             self.relocate_devices_inner(&req);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(
-            DeferredEdit::RelocateDevices(req),
-        ));
+        self.enqueue_deferred_edit(DeferredEdit::RelocateDevices(req));
     }
 
     /// 運搬の本体。 **Song の書き換えは 1 回の `edit_song` に閉じ込める**
@@ -185,9 +183,7 @@ impl AppData {
             self.cut_devices_inner(&device_ids);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::CutDevices {
-            device_ids,
-        }));
+        self.enqueue_deferred_edit(DeferredEdit::CutDevices { device_ids });
     }
 
     /// copy 本体。最新 state 込みの live song から該当 device を serialize して

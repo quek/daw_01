@@ -124,7 +124,7 @@ fn dispatch_toggle_mute(app: &AppData, ui: &mut Ui<'_, AppData>, is_pianoroll_ac
         // (Live §6.9 "deactivates a selection of material"、
         // `docs/plan_range_selection.md` §8)。
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
-            app.apply_mute_time_selection();
+            app.handle_event(AppEvent::Range(crate::event_range::RangeEvent::Mute));
         }));
     } else {
         let targets: Vec<crate::app::ClipKey> = if is_pianoroll_active {

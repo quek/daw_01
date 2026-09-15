@@ -799,7 +799,8 @@ impl Runner {
                 // winit は focus 喪失時に synthetic な key release しか送らず、 それは上で
                 // 捨てている (`is_synthetic: true`) ので、 ここで明示的に全部離す。
                 if !focused {
-                    state.app.virtual_keyboard_release_all();
+                    // 録音中なら押していたノートを確定する編集になるので event で流す。
+                    state.app.handle_event(AppEvent::VirtualKeyboard(crate::event_virtual_keyboard::VirtualKeyboardEvent::ReleaseAll));
                 }
             }
             _ => {}
@@ -980,7 +981,7 @@ impl ApplicationHandler<AppEvent> for Runner {
                 // 畳む)。未保存変更があれば確認モーダルを開いて終了を保留し、
                 // 無ければ即シャットダウンシーケンスに入る。
                 if let Some(state) = self.state.as_mut() {
-                    state.app.request_close();
+                    state.app.handle_event(AppEvent::Quit(crate::shutdown::QuitRequest::USER));
                 }
                 self.drive_shutdown(event_loop);
             }
