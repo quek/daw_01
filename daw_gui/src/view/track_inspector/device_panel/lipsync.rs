@@ -34,13 +34,9 @@ pub(super) fn draw_lipsync_target(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: 
         let mut candidate_ids: Vec<u32> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
         labels.push("(なし)".into());
-        for t in app.cur.song_doc.song().tracks.iter().filter(|t| t.id != self_id) {
+        for (i, t) in app.cur.song_doc.song().tracks.iter().enumerate().filter(|(_, t)| t.id != self_id) {
             candidate_ids.push(t.id);
-            labels.push(if t.name.is_empty() {
-                format!("Track {}", t.id)
-            } else {
-                t.name.clone()
-            });
+            labels.push(t.display_name(i).into_owned());
         }
         ui.label_at(
             ("inspector_lipsync_target_label", device_id),

@@ -56,7 +56,7 @@ Bitwig のスクリーンショットから導出して**質問せずに決め�
 /// ランチャーの 1 列。Song 内で安定 id。Arranger セクションとは無関係。
 pub struct Scene {
     pub id: u32,                      // Song::alloc_scene_id、0 は sentinel
-    pub name: String,                 // 空 = 表示側が "Scene N" を自動生成
+    pub name: String,                 // 空 = 表示側が並び順の番号を自動生成 (r.md #133)
     pub color: Option<[f32; 3]>,      // None = パレット既定
     pub follow: FollowAction,         // シーンのフォローアクション (Live 12 相当)
 }
@@ -260,7 +260,7 @@ LauncherStopped: 無音 (オートメーションはレーン既定値)
   コントラストを保証する (`feedback_ui_indicator_contrast_on_variable_bg`)。
 - 空セル: アーム中なら録音● / 非アームなら停止■。
 - グループ行: 子のクリップ色の縞 + シーン名。押すとそのシーンの子セルを一斉発火。
-- シーン見出し: ▶ + 名前 (未入力は "Scene N") + 色ストライプ。ドラッグで並べ替え。
+- シーン見出し: ▶ + 名前 (未入力は並び順の番号、r.md #133) + 色ストライプ。ドラッグで並べ替え。
 - ランチャー主導の行は**アレンジ側のクリップを減光** (Q6)。既存のミュートクリップ減光と同じ語彙。
 
 ### 3.3 選択と編集

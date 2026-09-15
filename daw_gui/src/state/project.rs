@@ -102,8 +102,10 @@ pub struct ProjectIpc {
     /// The editor *windows* are now created and owned by the plugin-host process
     /// (so JUCE cascade sub-menus work); daw_gui only tracks open/closed
     /// state here for toggle / dedup / cleanup. Not `#[cfg(windows)]` because
-    /// it's a plain id set — the window FFI lives in the plugin-host process.
-    pub open_plugin_guis: std::collections::HashSet<u64>,
+    /// it's a plain id map — the window FFI lives in the plugin-host process.
+    /// 値はその窓へ最後に送ったタイトル: 表示名 (r.md #133 の並び順の番号) やプロジェクト名が
+    /// 開いた後に変わったら `AppData::sync_plugin_editor_titles` が差分だけ送り直す。
+    pub open_plugin_guis: std::collections::HashMap<u64, String>,
     /// v29: `device_id → 要求 generation`。 `SetSlotPlugin` を送ったが
     /// `SlotPluginLoaded` / `SlotPluginLoadFailed` がまだの device 集合。
     /// While non-empty, Play is queued so the audio engine doesn't
@@ -572,6 +574,11 @@ pub struct ProjectEphemeral {
     /// waveform 領域外なら `None`。 E キー (split) と将来の波形クリック
     /// 系操作で「マウス位置を cursor として使う」 ために保持する。
     pub audio_editor_hover_beat_in_clip: Option<f64>,
+    /// r.md #132: Audio Editor の波形の横倍率 (px / 拍)。 audio_editor.rs が毎フレーム mirror
+    /// する session-only 値 (`0.0` = まだ描かれていない)。 倍率は波形領域の px 幅から決まる
+    /// ので **view しか知らない**が、`Shift+E` のグリッド単位 (Adaptive はズームで変わる) は
+    /// handler が求めるので、ここへ写す (`pianoroll_viewport` と同じ理由)。
+    pub audio_editor_zoom_x: f32,
     /// `Z` キーの段階ズーム履歴。 1 回目 push で横ズーム前の view、
     /// 2 回目 push で縦ズーム前の view を積む。 `X` が pop して 1 段ずつ戻し、
     /// 空になったら全体フィットに落ちる。 load / new / recovery で clear。
@@ -790,10 +797,7 @@ impl ProjectState {
         // row_key 0」規約と衝突する (= ランチャーの走行状態が 1 行も GUI へ
         // 届かず、セルの進捗が永久に出ない)。起動直後の 1 本目でそれを踏んでいた。
         let first_track_id = song.alloc_track_id();
-        song.tracks.push(track_with(|t| {
-            t.id = first_track_id;
-            t.name = "Track 1".into();
-        }));
+        song.tracks.push(track_with(|t| t.id = first_track_id));
         // 初期プロジェクトにも安定 project_id を採番する
         // (clipboard の同一プロジェクト判定用)。
         song.ensure_project_id();
@@ -874,7 +878,7 @@ impl ProjectState {
                 pending_glue_bake: None,
                 pending_vocal_synth_bounce: None,
                 pending_vocal_synth_export: std::collections::HashSet::new(),
-                open_plugin_guis: std::collections::HashSet::new(),
+                open_plugin_guis: std::collections::HashMap::new(),
                 pending_plugin_loads: std::collections::HashMap::new(),
                 failed_plugin_loads: std::collections::HashMap::new(),
                 pending_added_plugin_finalize: std::collections::HashMap::new(),
@@ -971,6 +975,7 @@ impl ProjectState {
                 audio_editor_clip: None,
                 pianoroll_focus_clip: None,
                 audio_editor_hover_beat_in_clip: None,
+                audio_editor_zoom_x: 0.0,
                 arrange_zoom_history: Vec::new(),
                 arrange_zoom_anchor: None,
                 zoom_lane_fill: None,

@@ -389,25 +389,17 @@ impl AppData {
 
     // -------- Aux send / return -------------------------------------------
 
-    /// Ableton "Add Return" 相当。 master 直下の通常 track を 1 本作って
-    /// `"Return N"` と命名し、 track が選択中ならその track に新リターン宛て
+    /// Ableton "Add Return" 相当。 master 直下の通常 track を 1 本 (未命名 = 並び順の番号で表示、
+    /// r.md #133) 作り、 track が選択中ならその track に新リターン宛て
     /// の send を 1 本足して即座に効果が聞こえるようにする。 構造変化なので
     /// `flush_song_sync` で full-song resend (= schedule 再 compile)。
     /// `action_add_instrument_track` を mirror した構成。
     pub(crate) fn action_add_return_track(&mut self) {
-        // 既存リターン数 + 1 で命名 (= 派生集合の cardinality)。
-        let existing_returns = self
-            .cur.song_doc.song()
-            .tracks
-            .iter()
-            .filter(|t| self.is_return_track(t.id))
-            .count();
         let Some(id) = self.edit_song(|song| song.alloc_track_id()) else {
             return;
         };
         let track = track_with(|t| {
             t.id = id;
-            t.name = format!("Return {}", existing_returns + 1);
             // リターンは master 直下に流す。
             t.parent_group_id = None;
         });

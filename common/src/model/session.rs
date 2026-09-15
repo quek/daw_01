@@ -18,7 +18,7 @@
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-use super::{AutomationClip, Clip, ClipKey, LaneRef, Song};
+use super::{AutomationClip, Clip, ClipKey, LaneRef, Song, positional_auto_name};
 
 /// ランチャーの 1 列。`Song.scenes` に `Vec` 順 = 表示順で保持する
 /// (並べ替えは `Vec` 内の move、 参照は常に `id`)。
@@ -27,7 +27,7 @@ pub struct Scene {
     /// Song 内で安定な id (`Song::alloc_scene_id` で採番、`0` は未採番 sentinel —
     /// `Song::ensure_scene_ids` が load 時に採番する)。
     pub id: u32,
-    /// 表示名。**空 = 未命名**で、 表示側が `Scene N` を並び順から作る
+    /// 表示名。**空 = 未命名**で、 表示側が番号 (`1` / `2` …) を並び順から作る
     /// (自動名を焼き込まないので、 並べ替えても番号が追従する)。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
@@ -46,11 +46,11 @@ impl Scene {
         Self { id, name: String::new(), color: None, follow: FollowAction::default() }
     }
 
-    /// 表示名。未命名なら並び順から `Scene N` を作る (`index` は 0 始まり)。
+    /// 表示名。未命名なら並び順の番号 ([`positional_auto_name`]、トラックと同じ) を作る (`index` は 0 始まり)。
     #[must_use]
     pub fn display_name(&self, index: usize) -> String {
         if self.name.is_empty() {
-            format!("Scene {}", index + 1)
+            positional_auto_name(index)
         } else {
             self.name.clone()
         }
@@ -943,8 +943,8 @@ mod tests {
     #[test]
     fn 未命名シーンは並び順から名前を作る() {
         let s = Scene::new(7);
-        assert_eq!(s.display_name(0), "Scene 1");
-        assert_eq!(s.display_name(4), "Scene 5");
+        assert_eq!(s.display_name(0), "1");
+        assert_eq!(s.display_name(4), "5");
         let named = Scene { name: "サビ".into(), ..Scene::new(7) };
         assert_eq!(named.display_name(0), "サビ");
     }

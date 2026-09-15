@@ -983,6 +983,12 @@ impl PluginHost {
             PluginCommand::CloseSlotGui { device } => {
                 self.close_slot_gui(device);
             }
+            // 窓が既に閉じている (✕ と行き違い) なら何もしない — 閉じた窓を開き直す理由にはしない。
+            PluginCommand::SetSlotGuiTitle { device, title } => {
+                if let Some(editor) = self.instances.get(&device).and_then(|rec| rec.editor.as_ref()) {
+                    editor.set_title(&title);
+                }
+            }
             // r.md #55: 開いている窓は host 自身が知っている。daw_gui から
             // device を並べてもらう形にすると、open 応答が返る前の窓が
             // 列挙から漏れて閉じ残る (UnloadAllPlugins と同じ理由)。

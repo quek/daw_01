@@ -1574,6 +1574,7 @@ impl Runner {
         // plugin 追加 → load 完了で queue された GUI auto-open 要求を処理する (#6)。
         // window 生成を frame loop に置くことで headless test では window を作らない。
         state.app.drain_pending_gui_opens();
+        state.app.sync_all_plugin_editor_titles(); // 表示名 / プロジェクト名が変わった窓だけタイトルを送り直す
         state.app.sync_device_scopes(); // r.md #129: 開いている EQ Par のスペクトラム要求 (差分だけ送る)
 
         // IME 差分反映。

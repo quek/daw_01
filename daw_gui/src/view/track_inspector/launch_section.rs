@@ -123,7 +123,7 @@ fn draw_scene_follow_rows(
         return y;
     }
     let scene_follow = fold_scene_follow(app, scene_ids).unwrap_or_default();
-    // 見出しに **列の名前** を出す (無名なら "Scene N")。列を直接選んだときはペインの
+    // 見出しに **列の名前** を出す (無名なら並び順の番号)。列を直接選んだときはペインの
     // タイトルがトラック名のままなので、ここが「どの列をいじっているか」の唯一の手掛かり。
     let song = app.cur.song_doc.song();
     let names: Vec<String> = song

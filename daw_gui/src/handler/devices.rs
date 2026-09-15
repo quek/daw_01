@@ -166,8 +166,10 @@ impl AppData {
             return;
         };
         if let Some(reason) = state_load_error {
+            // 利用者に見せる文言なのでトラックは表示名で出す (id はヘッダのどこにも出ていない、r.md #133)。
             let msg = format!(
-                "Plugin state 復元失敗 (track {track_id} device {index}, id={id}): {reason}"
+                "Plugin state 復元失敗 (トラック「{}」 device {index}, id={id}): {reason}",
+                self.cur.song_doc.song().track_display_name(track_id)
             );
             tracing::error!(track = track_id, index, %id, %reason, "state_load failed (notified by plugin host)");
             self.ui_ephemeral.status_message = msg;
@@ -185,7 +187,7 @@ impl AppData {
         // 注意: ここで `ensure_first_track()` を呼んではいけない。 子プロセスの
         // 応答が Song の構造 (トラック) を作ると、 track を 1 本も持たず master fx
         // だけを持つプロジェクトを開いたときに、 その load 応答が幽霊トラック
-        // "Track 1" を生やして **開いただけで `*`** が付く (r.md #9)。
+        // トラックを生やして **開いただけで `*`** が付く (r.md #9)。
         // 空プロジェクトへの最初の 1 本はユーザー操作の側 (plugin picker) が作る。
 
         // resolve ports from the plugin DB (役割導出の入力)。 不在なら既存値を
@@ -510,10 +512,10 @@ impl AppData {
             return;
         }
         // 既に開いていれば閉じる (toggle)。開いていなければ open_slot_gui で開く。
-        // open 状態は open_plugin_guis (id set) で追跡。実 window は
+        // open 状態は open_plugin_guis (id → 送ったタイトル) で追跡。実 window は
         // plugin-host プロセスが所有するので、close は CloseSlotGui を送って
-        // B 側に破棄させ、SlotGuiClosed の受信で set から除去する。
-        let is_open = self.cur.pipc.open_plugin_guis.contains(&device_id);
+        // B 側に破棄させ、SlotGuiClosed の受信で map から除去する。
+        let is_open = self.cur.pipc.open_plugin_guis.contains_key(&device_id);
         // r.md #65: 「GUI ボタンが押された」を 1 行で残す。押すたびに open / close が
         // 交互になるので、**このログが 2 行連続で出れば人が 2 回押した**と確定する
         // (= 自動で開き直っているのではない)。
@@ -537,16 +539,16 @@ impl AppData {
         // 原因がまったく別になるのに、ログからは区別できなかった。
         tracing::info!(
             device_id,
-            already_open = self.cur.pipc.open_plugin_guis.contains(&device_id),
+            already_open = self.cur.pipc.open_plugin_guis.contains_key(&device_id),
             caller = %std::panic::Location::caller(),
             "open_slot_gui"
         );
         #[cfg(windows)]
         {
-            if self.cur.pipc.open_plugin_guis.contains(&device_id) {
+            if self.cur.pipc.open_plugin_guis.contains_key(&device_id) {
                 return;
             }
-            let label = self.device_display_name(device_id);
+            let title = self.plugin_editor_title(device_id);
             // the editor's top-level window is created by the
             // plugin-host process (so JUCE cascade sub-menus work). daw_gui
             // only records open state and passes the window title.
@@ -581,13 +583,10 @@ impl AppData {
                     "opening plugin editor without an owner window (main window not ready)"
                 );
             }
-            self.cur.pipc.open_plugin_guis.insert(device_id);
-            // `docs/plan_project_tabs.md` Q6: 背景タブの窓も開いたままなので、どのタブの
-            // プラグインかをタイトルで見分ける。
-            let project = Self::tab_label(&self.cur);
+            self.cur.pipc.open_plugin_guis.insert(device_id, title.clone());
             self.send_plugin(PluginCommand::OpenSlotGuiEmbedded {
                 device: self.dev(device_id),
-                title: format!("Plugin — {label} [{project}]"),
+                title,
                 // r.md #65: 前回このプロジェクトで閉じたときの窓の位置 / サイズ。
                 // 位置は常に、サイズは plugin が resizable のときだけ plugin-host が使う。
                 geometry: self.cur.view.plugin_editor_windows.get(&device_id).copied(),
@@ -610,26 +609,40 @@ impl AppData {
         }
     }
 
-    /// エディタ窓のタイトルに出す表示名 (`"Master / Comp"` / `"Bass / Serum"`)。
-    /// 所属 track は `find_device_by_id` で毎回引き直す (r.md #71 プラグインの
+    /// エディタ窓のタイトル (`"Plugin — Master / Comp [曲]"` / `"Plugin — 3 / Serum [曲]"`)。
+    /// 開くとき ([`Self::open_slot_gui`]) と開いた後の追従 ([`Self::sync_plugin_editor_titles`]) の
+    /// 両方がここで作る。所属 track は `find_device_by_id` で毎回引き直す (r.md #71 プラグインの
     /// コピー / 移動: device は別トラックへ移動しうるので保持しない)。
-    #[cfg(windows)]
-    fn device_display_name(&self, device_id: u64) -> String {
+    fn plugin_editor_title(&self, device_id: u64) -> String {
         let song = self.cur.song_doc.song();
-        let Some((track_id, _)) = find_device_by_id(song, device_id) else {
-            return "(unknown)".into();
-        };
-        let Some(name) = song.plugin_by_id(device_id).map(|p| self.resolve_name(&p.plugin_id))
-        else {
-            return "(unknown)".into();
-        };
-        if track_id == common::model::MASTER_TRACK_ID {
-            format!("Master / {name}")
-        } else {
-            match song.tracks.iter().find(|t| t.id == track_id) {
-                Some(t) => format!("{} / {}", t.name, name),
-                None => name,
+        let label = match (find_device_by_id(song, device_id), song.plugin_by_id(device_id)) {
+            (Some((track_id, _)), Some(p)) => {
+                format!("{} / {}", song.track_display_name(track_id), self.resolve_name(&p.plugin_id))
             }
+            _ => "(unknown)".into(),
+        };
+        // `docs/plan_project_tabs.md` Q6: 背景タブの窓も開いたままなので、どのタブの
+        // プラグインかをタイトルで見分ける。
+        format!("Plugin — {label} [{}]", Self::tab_label(&self.cur))
+    }
+
+    /// `cur` のタブで開いているエディタ窓のタイトルを今の Song / プロジェクト名から作り直し、
+    /// 最後に送ったものと違う窓にだけ `SetSlotGuiTitle` を送る (差分が無ければ何も送らない)。
+    /// 未命名トラックの表示名は並び順の番号 (r.md #133) なので、上にトラックを足す・並べ替える・
+    /// 消すだけで変わる。改名・別トラックへの移動・名前を付けて保存も同じ経路で追従する。
+    /// frame 末に全タブ分を回すのは [`Self::sync_all_plugin_editor_titles`]。
+    pub fn sync_plugin_editor_titles(&mut self) {
+        let changed: Vec<(u64, String)> = self
+            .cur.pipc.open_plugin_guis
+            .iter()
+            .filter_map(|(&device_id, sent)| {
+                let title = self.plugin_editor_title(device_id);
+                (title != *sent).then_some((device_id, title))
+            })
+            .collect();
+        for (device_id, title) in changed {
+            self.send_plugin(PluginCommand::SetSlotGuiTitle { device: self.dev(device_id), title: title.clone() });
+            self.cur.pipc.open_plugin_guis.insert(device_id, title);
         }
     }
 
@@ -774,9 +787,9 @@ impl AppData {
         if track_id == common::model::MASTER_TRACK_ID {
             return;
         }
-        let Some(src) = self.cur.song_doc.song().track_by_id(track_id) else {
+        if self.cur.song_doc.song().track_by_id(track_id).is_none() {
             return;
-        };
+        }
         let Some(inst) = self.cur.song_doc.song().plugin_by_id(device_id) else {
             return;
         };
@@ -784,7 +797,8 @@ impl AppData {
         if count == 0 {
             return;
         }
-        let src_name = src.name.clone();
+        // 子の名前は説明的な派生名として焼く。元が未命名ならいまの表示名 (番号) を使う (r.md #133)。
+        let src_name = self.cur.song_doc.song().track_display_name(track_id).into_owned();
         // Snapshot the current routes + the set of live track ids so the loop
         // below can keep valid existing routes without re-borrowing `self.cur.song_doc.song()`
         // while it allocates ids / inserts tracks.
@@ -973,7 +987,7 @@ impl AppData {
     /// `shift_slot_gui_keys` は不変条件 1 が禁じる貼り替え補償コードだった)。
     #[cfg(windows)]
     pub(crate) fn cleanup_slot_gui(&mut self, device_id: u64) {
-        if self.cur.pipc.open_plugin_guis.remove(&device_id) {
+        if self.cur.pipc.open_plugin_guis.remove(&device_id).is_some() {
             self.send_plugin(PluginCommand::CloseSlotGui { device: self.dev(device_id) });
         }
     }

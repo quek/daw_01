@@ -44,6 +44,7 @@ pub use clip_window::*;
 pub use master_limiter::*;
 pub use media_manifest::*;
 pub use content::*;
+pub use content_split::split_boundaries;
 pub use device::*;
 pub use ids::*;
 pub use midi_bind::*;
@@ -984,6 +985,21 @@ impl Song {
 
     pub fn track_by_id_mut(&mut self, track_id: u32) -> Option<&mut Track> {
         self.tracks.iter_mut().find(|t| t.id == track_id)
+    }
+
+    /// `track_id` の表示名 — **トラック名を画面に出す口はこれと [`Track::display_name`] の 2 本だけ** (r.md #133)。
+    /// 未命名は並び順の番号、`MASTER_TRACK_ID` は `Master`。無いトラック (削除済みを指したまま) は
+    /// `(削除済み)` — 空を返すと「名前の無い行」になって、何を指していたのかが追えない。
+    #[must_use]
+    pub fn track_display_name(&self, track_id: u32) -> std::borrow::Cow<'_, str> {
+        if track_id == MASTER_TRACK_ID {
+            return std::borrow::Cow::Borrowed("Master");
+        }
+        self.tracks
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.id == track_id)
+            .map_or(std::borrow::Cow::Borrowed("(削除済み)"), |(i, t)| t.display_name(i))
     }
 
     /// [`ClipKey`] が指すクリップ。 アレンジのクリップとランチャーのセルの

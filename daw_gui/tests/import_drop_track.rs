@@ -24,7 +24,7 @@ use image::{ImageBuffer, Rgba};
 use tempfile::TempDir;
 
 /// headless な `AppData` + import 先の temp project。 TempDir は返して生かして
-/// おく (drop すると samples/ の書き込み先が消える)。 既定 Song は "Track 1" を
+/// おく (drop すると samples/ の書き込み先が消える)。 既定 Song は未命名のトラックを
 /// 1 本 (clip 0 個) 持つ。
 fn build_app() -> (
     AppData,

@@ -1045,26 +1045,25 @@ impl AppData {
         let Some(i) = self.cur.song_doc.song().scene_index(scene_id) else {
             return;
         };
-        // 未命名なら表示中の自動名 ("Scene N") を初期値に入れる — 空欄から
+        // 未命名なら表示中の自動名 (番号) を初期値に入れる — 空欄から
         // 打ち直させると「いま何という名前なのか」が消える。
         self.cur.launcher.scene_rename_text = self.cur.song_doc.song().scenes[i].display_name(i);
         self.cur.launcher.scene_rename_id = Some(scene_id);
     }
 
-    /// 列名の確定。空文字は「未命名へ戻す」 (= 自動名 "Scene N" に戻る)。
+    /// 列名の確定。空文字は「未命名へ戻す」 (= 自動名の番号に戻る)。
     pub fn commit_rename_scene(&mut self) {
         let Some(scene_id) = self.cur.launcher.scene_rename_id.take() else {
             return;
         };
         let text = std::mem::take(&mut self.cur.launcher.scene_rename_text);
-        let name = text.trim().to_string();
         self.edit_song_checked(|song| {
             let Some(i) = song.scene_index(scene_id) else {
                 return false;
             };
-            // 自動名をそのまま確定したときは「未命名のまま」にする — 焼き込むと
+            // 自動名 (番号) をそのまま確定したときは「未命名」にする — 焼き込むと
             // 並べ替えても番号が追従しなくなる (`Scene::display_name` の契約)。
-            let next = if name == song.scenes[i].display_name(i) { String::new() } else { name };
+            let next = common::model::normalize_committed_name(&text, i);
             if song.scenes[i].name == next {
                 return false;
             }

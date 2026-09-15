@@ -117,7 +117,7 @@ fn reopening_project_with_plugin_latency_stays_clean() {
 }
 
 /// トラックを 1 本も持たず master fx だけを持つプロジェクト。plugin host からの
-/// load 応答が Song の構造 (= 幽霊トラック "Track 1") を作ってはいけない。
+/// load 応答が Song の構造 (= 幽霊トラック) を作ってはいけない。
 #[test]
 fn reopening_master_only_project_does_not_grow_a_ghost_track() {
     let dir = tempfile::tempdir().unwrap();

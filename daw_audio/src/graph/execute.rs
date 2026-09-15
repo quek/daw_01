@@ -1536,7 +1536,7 @@ mod render_master_tests {
                 &mut MasterLimiterState::new(),
                 NativeIo::default(),
             );
-            scratch.iter().take(3).map(|s| s.state.active_notes.iter().map(|&(_, key)| key).collect()).collect::<Vec<Vec<u8>>>()
+            scratch.iter().take(3).map(|s| s.state.active_notes.iter().map(|n| n.key).collect()).collect::<Vec<Vec<u8>>>()
         };
         let none = std::collections::HashSet::new();
         assert_eq!(render(&song, &none), vec![vec![62], vec![60], vec![60]]);

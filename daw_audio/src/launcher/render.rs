@@ -16,6 +16,7 @@ use common::song_index::{LaneView, SongIndex};
 
 use super::{RowPhase, RowTimeSource, for_each_segment};
 use crate::audio_clip_renderer::{AudioClipRenderer, ClipRenderState, render_audio_events};
+use crate::note_ledger::NoteLedger;
 use crate::sequencer::{TimedNoteEvent, collect_events_for_buffer};
 
 /// この行の MIDI イベントを 1 buffer 分集める。
@@ -38,7 +39,7 @@ pub fn collect_row_midi(
     // (移調は曲のタイムラインのパラメーターで、セルの位相には依らない)。
     transpose: i32,
     out: &mut Vec<TimedNoteEvent>,
-    active_notes: &mut Vec<(u32, u8)>,
+    active_notes: &mut NoteLedger,
 ) {
     let Some(song) = song else { return };
     let Some(track) = song.tracks.get(track_idx as usize) else { return };
@@ -150,17 +151,17 @@ pub fn render_row_audio(
 
 /// 鳴っている note を `at` frame で全部止める (区間の切れ目の始末)。
 ///
-/// Off は note-on と同じ `note_id` を運ぶ (CLAP / VST3 は id 一致で voice を探す。
+/// Off は note-on で振った voice id と送った鍵盤を運ぶ (CLAP / VST3 は id 一致で voice を探す。
 /// `process_track_owned` の `pending_offs` と同じ約束)。 RT 安全: `out` の容量を超える分は
 /// 捨てる (再確保しない。 `copy_midi` と同じ規約)。
-fn flush_active(out: &mut Vec<TimedNoteEvent>, active_notes: &mut Vec<(u32, u8)>, at: u32) {
-    for &(note_id, key) in active_notes.iter() {
+fn flush_active(out: &mut Vec<TimedNoteEvent>, active_notes: &mut NoteLedger, at: u32) {
+    for s in active_notes.iter() {
         if out.len() >= out.capacity() {
             break;
         }
         out.push(TimedNoteEvent {
             time: at,
-            event: crate::sequencer::NoteTransition::Off { note_id, key },
+            event: crate::sequencer::NoteTransition::Off { note_id: s.voice_id, key: s.key },
         });
     }
     active_notes.clear();
@@ -391,7 +392,7 @@ mod tests {
         // playhead 3.99 の buffer は 3.99..4.0113 で、4 拍セルのループ端 (4.0) を跨ぐ。
         let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
         let mut out = Vec::with_capacity(256);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
         collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 3.99, 120.0, 512, 0, &mut out, &mut active);
 
         let ons: Vec<u32> = out
@@ -434,7 +435,7 @@ mod tests {
         let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
         // 撃った直後の buffer: On が出る。
         let mut out = Vec::with_capacity(256);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
         collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, 0, &mut out, &mut active);
         assert!(
             out.iter().any(|e| matches!(
@@ -483,7 +484,7 @@ mod tests {
         // 120 BPM / 48 kHz / 512 frame = 0.0213333… 拍。
         let bpf = 512.0 * 120.0 / (60.0 * 48_000.0);
         let index = SongIndex::build(&song);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
         let mut ons = 0usize;
         let mut beat = launch;
         // 3 周ぶん (原点は 0 / 4 / 8 拍の 3 回) 刻む。11 拍で止めるのは、
@@ -530,13 +531,13 @@ mod tests {
             }),
         );
         let mut out = Vec::with_capacity(256);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
 
         // 1 buffer 目: セルが鳴り出す。
         let playing = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
         collect_row_midi(Some(&song), &SongIndex::build(&song), 0,playing, 48_000, 0.0, 120.0, 512, 0, &mut out, &mut active);
         assert_eq!(active.len(), 1, "セルの note が鳴っていない: {out:?}");
-        assert_eq!(active[0].1, 60, "セルの note が鳴っていない: {out:?}");
+        assert_eq!(active.iter().next().map(|s| s.key), Some(60), "セルの note が鳴っていない: {out:?}");
 
         // 2 buffer 目: 先頭ちょうどでアレンジへ返す (`switch_frame == 0`)。
         out.clear();
@@ -558,13 +559,66 @@ mod tests {
         assert!(active.is_empty(), "鳴っている note が残った: {active:?}");
     }
 
+    /// r.md #132 が引き継いだ欠陥 (ランチャー側): 撃ったセルで鳴っている note を再生中に E で割ると、前半の片の
+    /// Off はもう窓を過ぎていて出ず、後ろの片は chase で同じ鍵盤をもう一度 On していた。今は割った次の区間の
+    /// 先頭で前半の片を止めて後ろの片を鳴らし、セルのループ端を跨いでも鳴っている数と On / Off の差が合う。
+    /// 移調 (r.md #130) が掛かっていても、止めるのは台帳の鍵盤。
+    #[test]
+    fn セルで鳴っている_note_を再生中に割っても鳴り残らない() {
+        let mut song = song_with_cell();
+        let cid = song.tracks[0].session_clips[0].clip.content_id;
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Midi(MidiContent {
+                notes: vec![Note { id: 1, start_beat: 0.0, duration_beats: 4.0, pitch: 60, ..Note::default() }],
+                next_note_id: 2,
+            }),
+        );
+        let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(0.0));
+        let bpf = 512.0 * 120.0 / (60.0 * 48_000.0);
+        let mut active = NoteLedger::default();
+        let (mut ons, mut offs) = (0usize, 0usize);
+        let mut split_done = false;
+        let mut beat = 0.0_f64;
+        // ループ端 (4 拍) を越えて 2 周目の頭まで。
+        while beat < 4.5 {
+            let split_now = !split_done && beat >= 2.0;
+            if split_now {
+                let Some(ClipContent::Midi(m)) = song.clip_contents.get_mut(&cid) else { panic!("Midi") };
+                assert_eq!(m.split_notes(|_| vec![1.0], 0.0), 1);
+                split_done = true;
+            }
+            let mut out = Vec::with_capacity(256);
+            collect_row_midi(Some(&song), &SongIndex::build(&song), 0, src, 48_000, beat, 120.0, 512, 2, &mut out, &mut active);
+            let trans: Vec<(u32, bool, u8)> = out
+                .iter()
+                .map(|e| match e.event {
+                    crate::sequencer::NoteTransition::On { key, .. } => (e.time, true, key),
+                    crate::sequencer::NoteTransition::Off { key, .. } => (e.time, false, key),
+                })
+                .collect();
+            if split_now {
+                assert_eq!(trans, vec![(0, false, 62), (0, true, 62)], "割った次の区間で前半を止めて後ろを鳴らす");
+            }
+            assert!(active.len() <= 1, "同じ鍵盤が二重に鳴っている: {active:?}");
+            ons += trans.iter().filter(|t| t.1).count();
+            offs += trans.iter().filter(|t| !t.1).count();
+            beat += bpf;
+        }
+        assert!(split_done);
+        // 元の発音 / 後ろの片 / 2 周目の頭の片 (1 拍) の 3 回鳴り、2 周目の片だけが鳴っている。
+        assert_eq!(ons, 3, "{active:?}");
+        assert_eq!(ons - offs, active.len(), "On と Off の差が鳴っている数と合わない");
+        assert_eq!(active.iter().map(|s| s.key).collect::<Vec<_>>(), vec![62]);
+    }
+
     /// アレンジ行はセルを 1 つも見ない (= 供給元の切り替えが効いている)。
     #[test]
     fn アレンジ行はセルの_note_を出さない() {
         let song = song_with_cell();
         let src = RowTimeSource::uniform(RowKey::track(1), RowPhase::Arranger);
         let mut out = Vec::with_capacity(256);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
         collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, 0, &mut out, &mut active);
         assert!(out.is_empty(), "アレンジには clip が無いのに鳴った: {out:?}");
     }
@@ -574,7 +628,7 @@ mod tests {
         let song = song_with_cell();
         let src = RowTimeSource::uniform(RowKey::track(1), RowPhase::Silent);
         let mut out = Vec::with_capacity(256);
-        let mut active = Vec::with_capacity(256);
+        let mut active = NoteLedger::default();
         collect_row_midi(Some(&song), &SongIndex::build(&song), 0,src, 48_000, 0.0, 120.0, 512, 0, &mut out, &mut active);
         assert!(out.is_empty());
     }
@@ -678,7 +732,7 @@ mod tests {
             let mut rt = LauncherRuntime::for_song(&song);
             let mut trace: Vec<(usize, u32, u8, bool)> = Vec::new();
             let mut out = Vec::with_capacity(256);
-            let mut active = Vec::with_capacity(256);
+            let mut active = NoteLedger::default();
             let mut beat = 0.0_f64;
             for buf in 0..400usize {
                 let span = BufferSpan::new(beat, 120.0, 48_000, 512);
@@ -793,7 +847,7 @@ mod rt_assert_tests {
         let mut rt = LauncherRuntime::for_song(&song);
         // 事前確保は off-RT (live では publish 側 / export では walk の頭)。
         let mut out = Vec::with_capacity(4096);
-        let mut active = Vec::with_capacity(1024);
+        let mut active = NoteLedger::default();
         let renderer = AudioClipRenderer::empty();
         let mut accum: Vec<(u64, f64)> = Vec::with_capacity(8);
         let mut engines = Vec::new();
@@ -815,6 +869,15 @@ mod rt_assert_tests {
 
         // 索引は live では song と同じ便で届く (off-RT で作る)。
         let index = common::song_index::SongIndex::build(&song);
+        // 再生中の分割 (r.md #132) を検査に入れるための「note を割った」曲。セルの id は同じなので走行状態は
+        // `song` のまま、MIDI の源だけを途中で差し替える (台帳の突き合わせで前半の片を止め、後ろの片を追う)。
+        let mut split_song = song.clone();
+        for content in split_song.clip_contents.values_mut() {
+            if let ClipContent::Midi(m) = content {
+                m.split_notes(|n| vec![n.start_beat + n.duration_beats * 0.5], 0.0);
+            }
+        }
+        let split_index = common::song_index::SongIndex::build(&split_song);
         // 1 buffer 目は行の生成 (`Vec::push`) を含むので検査の外で回す。
         rt.update(&song, &index, BufferSpan::new(0.0, 120.0, 48_000, 512), LaunchQuantize::Off, true);
 
@@ -846,8 +909,9 @@ mod rt_assert_tests {
                 out.clear();
                 // r.md #130: 移調を途中で何度も変えて、鳴っている note の鳴らし直しも検査に入れる。
                 let transpose = if (i / 16) % 2 == 0 { 0 } else { 3 };
+                let (midi_song, midi_index) = if (i / 24) % 2 == 0 { (&song, &index) } else { (&split_song, &split_index) };
                 collect_row_midi(
-                    Some(&song), &index, 0, src, 48_000, beat, 120.0, 512, transpose, &mut out, &mut active,
+                    Some(midi_song), midi_index, 0, src, 48_000, beat, 120.0, 512, transpose, &mut out, &mut active,
                 );
                 render_row_audio(
                     &renderer,

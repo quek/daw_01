@@ -8,7 +8,7 @@ use common::model::{AudioEvent, InstrumentSource};
 
 impl AppData {
     pub(crate) fn action_add_instrument_track(&mut self) {
-        let index = self.cur.song_doc.song().tracks.len() + 1;
+        // 名前は付けない (空 = 未命名、表示は並び順の番号。r.md #133)。
         // 挿入位置は「選択中で最上段の track の直上」 (純ロジックは
         // add_track_insert_index)。 選択が無いときだけ従来どおり末尾。
         let insert_at = add_track_insert_index(&self.cur.song_doc.song().tracks, &self.cur.selection.selected_track_ids);
@@ -21,7 +21,6 @@ impl AppData {
             let id = song.alloc_track_id();
             let track = track_with(|t| {
                 t.id = id;
-                t.name = format!("Track {index}");
                 t.source = InstrumentSource::None;
                 t.clips = Vec::new();
                 t.parent_group_id = parent_group_id;

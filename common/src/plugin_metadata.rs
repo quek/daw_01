@@ -7,10 +7,11 @@
 //! の引数として「note_id → metadata」 を渡す**専用経路**を builtin
 //! plugin だけ持たせる (CLAP / VST3 plugin は default no-op)。
 //!
-//! `note_id` は audio engine が plugin に渡す MIDI events の note 識別子
-//! と一致させる必要がある。両者は [`sing_note_id`] という **同じ式** で
-//! `(clip_id, note.id)` から決定論的に導出する (r.md #75。旧「track 内 note
-//! 通し index」は片方だけ数え方がずれると壊れる欠陥があった)。
+//! `note_id` は audio engine が plugin に渡す MIDI events の note 識別子の既定値と
+//! 一致させる。両者は [`sing_note_id`] という **同じ式** で `(clip_id, note.id)` から
+//! 決定論的に導出する (r.md #75。旧「track 内 note 通し index」は片方だけ数え方がずれると
+//! 壊れる欠陥があった)。 同時に鳴る音と重なるときだけ engine が別の voice id を振る
+//! (r.md #132、daw_audio `note_ledger`)。
 //!
 //! `lyric` は VOICEVOX の `singing_query` API が要求する「1 note = 1
 //! 音節」 の歌詞。 通常 1 文字 (例: `あ`)、 `っ` など促音は前 note の
@@ -40,10 +41,11 @@ pub struct NoteMetadata {
     /// `TimedNoteEvent` stream and the host-side metadata flush.
     ///
     /// 値は [`sing_note_id`]`(clip_id, note.id)` — **安定 id** (アーキ不変条件 1)。
-    /// daw_gui の `sync_vocal_metadata` と daw_audio の `sequencer` が
+    /// daw_gui の `sync_vocal_metadata` と daw_audio の `sequencer` (note-on の既定 id) が
     /// **同じ関数**で同じ値を作るので、clip の追加 / 削除 / 並べ替え / muted で
     /// 番号がずれない。旧実装は「track 内 note 通し index」で、両者が独立に
     /// 数え直していたため、クリップ先頭に 1 音足すと以降の全 note_id がずれた。
+    /// 同時に鳴る音と既定 id が重なるときだけ sequencer は別の id で鳴らす ([`sing_note_id`])。
     pub note_id: u32,
     /// Note start in beats relative to the song timeline (NOT clip-
     /// relative). Builtins use this to compute frame offsets for the
@@ -150,14 +152,17 @@ pub const MAX_CLIPS_PER_TRACK_FOR_NOTE_ID: u32 = 16_384;
 
 /// (sing) `(clip_id, note.id)` から決定論的に `note_id` を導出する。
 ///
-/// flush (daw_gui `sync_vocal_metadata`) と再生トリガ (daw_audio `sequencer`) が
-/// **同じ式**で計算するので、「クリップ先頭に 1 音足すと以降の全 note_id がずれる」
-/// という旧「トラック内通し index」の欠陥が構造的に消える (アーキ不変条件 1)。
+/// flush (daw_gui `sync_vocal_metadata`) のメタデータの鍵であり、再生トリガ (daw_audio
+/// `sequencer`) が note-on に振る voice id の**既定値**でもある。 どちらも同じ式なので、
+/// 「クリップ先頭に 1 音足すと以降の全 note_id がずれる」という旧「トラック内通し index」の
+/// 欠陥が構造的に消える (アーキ不変条件 1)。
 ///
 /// 値域は `[0, TALK_EVENT_ID_BASE)` に**必ず**収まる (= talk の high band を侵さない)。
-/// clip / note が基数を超えた場合は剰余で畳むので、極端な project では 2 note が同じ
-/// id を共有し得る (= 停止中プレビューがもう一方の位置から鳴る)。再生・書き出しには
-/// 影響しない縮退で、現実的な曲では起きない。
+/// clip / note の id は再利用されない単調増加なので、基数を超えると剰余で畳まれて **2 note が
+/// 同じ値になる** (グリッド分割を undo と繰り返すだけで 1 content の累積採番は基数を超える)。
+/// 同時に鳴る音の衝突は daw_audio の発音台帳 (`note_ledger`) が note-on のときに別の voice id を
+/// 振って避けるので、再生・書き出しには影響しない。 メタデータの鍵としての衝突は停止中の
+/// プレビュー (`note_offsets`) だけに効く。
 #[must_use]
 pub fn sing_note_id(clip_id: u32, note_id: u32) -> u32 {
     (clip_id % MAX_CLIPS_PER_TRACK_FOR_NOTE_ID) * MAX_NOTES_PER_CLIP

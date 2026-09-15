@@ -613,12 +613,12 @@ impl AppData {
                 source: None,
             });
         }
-        for t in &song.tracks {
+        for (i, t) in song.tracks.iter().enumerate() {
             if Some(t.id) == cursor_id {
                 continue;
             }
             choices.push(SidechainSourceChoice {
-                label: format!("{} (id {})", t.name, t.id),
+                label: t.display_name(i).into_owned(),
                 source: Some(common::model::TapSource::Track(t.id)),
             });
         }
@@ -637,11 +637,11 @@ impl AppData {
     pub fn paraout_dest_choices(&self) -> Vec<(String, Option<u32>)> {
         let cursor_id = self.cursor_track_id();
         let mut out = vec![("—".to_string(), None)];
-        for t in &self.cur.song_doc.song().tracks {
+        for (i, t) in self.cur.song_doc.song().tracks.iter().enumerate() {
             if Some(t.id) == cursor_id || t.id == MASTER_TRACK_ID {
                 continue;
             }
-            out.push((format!("{} (id {})", t.name, t.id), Some(t.id)));
+            out.push((t.display_name(i).into_owned(), Some(t.id)));
         }
         out
     }

@@ -919,7 +919,6 @@ impl EditorWindow {
         tracing::debug!(resizable, "editor window style updated after attach");
     }
 
-    #[allow(dead_code)]
     pub fn set_title(&self, title: &str) {
         let title_utf16: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {

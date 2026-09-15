@@ -79,9 +79,11 @@
   publish された値面で変調込み) / `TransposeCurve`・`TrackTranspose` (オフライン、変調は焼かない) /
   `Song::track_follows_transpose` / `sounding_key`。engine は `daw_audio::automation::resolve_song_transpose` が
   置き場の索引で lane / routing を引いて呼ぶ。追従の実効値は `SongIndex::follows_transpose` に焼く (RT で祖先を辿らない)。
-- **発音台帳** (`sequencer::Ledger`): 照合は note_id だけ、鍵盤は送った値。窓ごとに「まだ鳴るべき」印を付け、
-  印の無い発音 (再生中にミュート / 削除 / 後ろへ移動 / clip ごと外れた note) は窓の先頭で止める
-  (同じ根 = 「台帳を今の Song と突き合わせない」の同件として一緒に直した)。
+- **発音台帳**は #132 の `daw_audio::note_ledger::NoteLedger` 1 本 (統合時に #130 の台帳を載せ替えた): 照合は note の
+  住所 `(clip_id, note_id)`、voice id は台帳が note-on ごとに振り、鍵盤は送った値 (移調込み)。窓ごとに「まだ鳴るべき」
+  印を付け、印の無い発音 (再生中の E / Shift+E で前半の片が短くなった / 短くした / 削除 / ミュート / trim や移動で
+  窓の外 / clip ごと外れた note) は窓の先頭で止める (同じ根 = 「台帳を今の Song と突き合わせない」)。同じ窓で外した
+  発音の voice id は、その Off の frame より前に始まる On へ渡さない (走査は content の並び順で、Off の時刻順ではない)。
 - **オーディオ**: 移調されうる event (`RenderedEvent::transposable` = 追従トラック && `Song::transpose_can_be_nonzero`)
   だけに compile 時にスペクトルエンジンを用意し、tape / slice は移調 0 の間は完全バイパスのまま。
 - **ランチャーのセルの VOICEVOX 歌唱 / 口パク**: 曲の位置を持たないので曲の基準値 `Song::transpose` で解く

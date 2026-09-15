@@ -5,7 +5,7 @@
 //!
 //! 分割の実体は 2 本だけ:
 //! - 窓 (クリップ) の分割 = [`common::model::carve_range`] (非重なり規則と同じ 1 本)
-//! - content の分割 = [`common::model::Song::split_content_at`] (共有されていれば CoW)
+//! - content の分割 = [`common::model::Song::split_content_at_points`] (共有されていれば CoW)
 
 use crate::event::AppEvent;
 use crate::state::*;
@@ -60,7 +60,7 @@ fn group_lanes(sel: &TimeSelection) -> LaneGroups {
 /// クリップの content を範囲の両端で切り、切り終えた `content_id` を返す。
 ///
 /// 範囲は song 絶対拍で渡し、clip の窓 (`song_to_content_beat`) で content-local へ
-/// 換算する。content が共有されていれば [`Song::split_content_at`] が CoW で fork
+/// 換算する。content が共有されていれば [`Song::split_content_at_points`] が CoW で fork
 /// するので、linked clip は影響を受けない。クリップの `content_id` も貼り替える。
 /// 返り値は `(content_id, content-local の範囲)`。
 fn cut_content_at_range(
@@ -76,9 +76,7 @@ fn cut_content_at_range(
     if b <= a {
         return None;
     }
-    let cid = clip.content_id;
-    let cid = song.split_content_at(cid, a);
-    let cid = song.split_content_at(cid, b);
+    let cid = song.split_content_at_points(clip.content_id, &[a, b]);
     if let Some(clip) = song.clip_by_key_mut(key) {
         clip.content_id = cid;
     }
@@ -183,41 +181,21 @@ impl AppData {
 
 /// 1 トラックのクリップを `beat` で分割する (content の切り口も揃える)。
 ///
-/// 範囲操作 (Delete / ミュート / `J`) が範囲の両端で共有する 1 本。
+/// 範囲操作 (Delete / ミュート / `J`) が範囲の両端で共有する 1 本。 窓の割り方は
+/// `E` / `Shift+E` と同じ [`super::split::split_clip_window`]。
 pub(crate) fn split_track_at(song: &mut common::model::Song, track_id: u32, beat: f64) {
-    let targets: Vec<(u32, f64, f64, f64, common::model::ContentId)> = song
+    let targets: Vec<u32> = song
         .track_by_id(track_id)
         .map(|t| {
             t.clips
                 .iter()
                 .filter(|c| c.start_beat < beat - EPS && c.start_beat + c.length_beats > beat + EPS)
-                .map(|c| {
-                    (c.id, c.start_beat, c.length_beats, c.content_offset_beats, c.content_id)
-                })
+                .map(|c| c.id)
                 .collect()
         })
         .unwrap_or_default();
-    for (id, start, len, off, cid) in targets {
-        let cut = beat - start;
-        let cid = song.split_content_at(cid, off + cut);
-        let Some(track) = song.track_by_id_mut(track_id) else {
-            return;
-        };
-        let Some(mut right) = track.clip_by_id(id).cloned() else {
-            continue;
-        };
-        if let Some(front) = track.clip_by_id_mut(id) {
-            front.content_id = cid;
-            front.length_beats = cut;
-        }
-        right.id = 0;
-        right.content_id = cid;
-        right.start_beat = beat;
-        right.length_beats = len - cut;
-        right.content_offset_beats = off + cut;
-        right.auto_lipsync = false;
-        right.lipsync_gen = 0;
-        track.place_clip(right);
+    for clip_id in targets {
+        super::split::split_clip_window(song, ClipKey { track_id, clip_id }, &[beat]);
     }
 }
 

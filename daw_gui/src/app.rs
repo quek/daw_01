@@ -1896,12 +1896,7 @@ impl AppData {
                     }
                 }
             }
-            AppEvent::SplitClipAtPlayhead { snap } => {
-                self.action_split_clips_at_cursor(snap);
-            }
-            AppEvent::GlueSelectedClips => {
-                self.action_glue_selected_clips();
-            }
+            AppEvent::SplitJoin(ev) => self.handle_split_join_event(ev),
             // PR-V4: SynthesizeVocal / VocalSynthCompleted は削除済。
             // vocal track は builtin VOICEVOX plugin が自動 synth する
             // (= sync_vocal_metadata 経由で歌詞 / note を flush →

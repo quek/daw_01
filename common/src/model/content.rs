@@ -1372,4 +1372,12 @@ impl crate::model::ClipWindow for Clip {
     fn set_window_offset(&mut self, v: f64) {
         self.content_offset_beats = v;
     }
+    fn clear_overhang(&mut self, lead: bool, tail: bool) {
+        if lead {
+            self.xfade_lead_beats = 0.0;
+        }
+        if tail {
+            self.xfade_tail_beats = 0.0;
+        }
+    }
 }

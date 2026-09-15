@@ -645,8 +645,10 @@ impl AppData {
         (id & 0x00FF_FFFF) as usize
     }
 
-    /// `resolve_note_overlaps` がクリップ `slot` に返した remap を、packed な
-    /// `selected_notes` のうち当該クリップ部分にだけ適用する (他クリップは不変)。
+    /// `resolve_note_overlaps` がクリップ `slot` の content に返した remap を、packed な
+    /// `selected_notes` のうち **その content を見せている全クリップ** の部分にだけ適用する
+    /// (linked clip を同時に表示していれば、そちらの packed id も同じ content の index なので
+    /// 一緒に写す。 別の content は不変)。
     /// `remap[old_local] = Some(new_local)` は追従、None / 範囲外は選択から落とす。
     /// `prev` は **編集前** に読んだ選択 (packed id)。 選択は範囲からの導出なので、
     /// ノートが動いた後に読むと「動く前の範囲」で解決してしまい、移動・移調のたびに
@@ -657,17 +659,26 @@ impl AppData {
         remap: &[Option<u32>],
         prev: &[u32],
     ) {
-        let mut out = Vec::with_capacity(prev.len());
-        for &packed in prev {
-            if Self::note_id_clip_slot(packed) == slot {
-                let local = Self::note_id_local_index(packed);
-                if let Some(Some(new_local)) = remap.get(local) {
-                    out.push(Self::pack_note_id(slot, *new_local as usize));
+        let out = {
+            let shown = self.shown_pianoroll_clips();
+            let song = self.cur.song_doc.song();
+            let content_of =
+                |s: usize| shown.get(s).and_then(|k| song.clip_by_key(*k)).map(|c| c.content_id);
+            let edited = content_of(slot);
+            let mut out = Vec::with_capacity(prev.len());
+            for &packed in prev {
+                let s = Self::note_id_clip_slot(packed);
+                if edited.is_some() && content_of(s) == edited {
+                    let local = Self::note_id_local_index(packed);
+                    if let Some(Some(new_local)) = remap.get(local) {
+                        out.push(Self::pack_note_id(s, *new_local as usize));
+                    }
+                } else {
+                    out.push(packed);
                 }
-            } else {
-                out.push(packed);
             }
-        }
+            out
+        };
         self.set_note_selection(&(out));
     }
 
@@ -703,12 +714,17 @@ impl AppData {
             .unwrap_or(0.0)
     }
 
-    /// packed note id を持つ `entries` を **所属クリップ (clip_slot) ごと** に
-    /// グルーピングし、各クリップで `per_clip(self, slot, ClipKey, &[(local_index, payload)])` を
-    /// 呼ぶ。範囲外 slot / ロック中クリップは飛ばす (ロックは widget が hit 除外済だが二重防御)。
+    /// packed note id を持つ `entries` を **所属 content ごと** にグルーピングし、各 content で
+    /// `per_clip(self, slot, ClipKey, &[(local_index, payload)])` を **1 回だけ** 呼ぶ。
+    /// 範囲外 slot / ロック中クリップの entry は飛ばす (ロックは widget が hit 除外済だが二重防御)。
     /// payload は handler ごとに異なる (移動=(beat,pitch)、リサイズ=(beat,len)、velocity=u8、
-    /// 削除/複製=`()` 等)。複数クリップ note 編集 handler の共通ディスパッチ。slot 昇順で適用
-    /// するので、各クリップ内 index ベースの remove も安定する。
+    /// 削除/複製=`()` 等)。複数クリップ note 編集 handler の共通ディスパッチ。
+    ///
+    /// **content 単位なのが要点** ([`Self::resolve_note_entries`])。 slot 単位で回すと linked
+    /// clip を同時に表示したとき同じ content に編集が 2 回走り、1 回目の削除 / 並べ替えで index が
+    /// ずれた後に 2 回目が**別のノート**を消す / 動かす / 結合する。 ここで content ごとに 1 回へ
+    /// 畳み、同じノートの重複 entry は先に来たものを採る。 `slot` / `ClipKey` はその content を
+    /// 見せている最小の slot (= 座標系の代表)。 slot 昇順で適用する。
     pub(crate) fn for_each_note_clip_group<T>(
         &mut self,
         entries: impl IntoIterator<Item = (u32, T)>,
@@ -717,18 +733,14 @@ impl AppData {
         let shown = self.shown_pianoroll_clips();
         let mut groups: std::collections::BTreeMap<usize, Vec<(usize, T)>> =
             std::collections::BTreeMap::new();
-        for (id, payload) in entries {
-            groups
-                .entry(Self::note_id_clip_slot(id))
-                .or_default()
-                .push((Self::note_id_local_index(id), payload));
+        let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for e in self.resolve_note_entries(&shown, entries) {
+            if seen.insert((e.rep_slot, e.local)) {
+                groups.entry(e.rep_slot).or_default().push((e.local, e.payload));
+            }
         }
         for (slot, items) in groups {
-            let Some(&r) = shown.get(slot) else { continue };
-            if self.is_pianoroll_clip_locked_in(&shown, r) {
-                continue;
-            }
-            per_clip(self, slot, r, &items);
+            per_clip(self, slot, shown[slot], &items);
         }
     }
 
@@ -872,11 +884,10 @@ impl AppData {
         if !self.is_pianoroll_clip_locked(r) {
             return false;
         }
-        let name = self
-            .cur.song_doc
-            .song()
+        let song = self.cur.song_doc.song();
+        let name = song
             .track_by_id(r.track_id)
-            .map_or_else(String::new, |t| format!("「{}」 ", t.name));
+            .map_or_else(String::new, |_| format!("「{}」 ", song.track_display_name(r.track_id)));
         self.ui_ephemeral.status_message =
             format!("{name}トラックはロック中です (凡例の L で解除)");
         true

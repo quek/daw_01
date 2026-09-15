@@ -278,7 +278,7 @@ fn track0_y_top() -> f32 {
 
 fn add_midi_track_with_clip(app: &mut AppData, track_id: u32, clip_id: u32, start: f64, len: f64) {
     app.edit_song(|song| {
-        // AppData::new の既定 "Track 1" を除去し、追加 track を row 0 (master 直下) に固定する。
+        // AppData::new の既定の 1 本を除去し、追加 track を row 0 (master 直下) に固定する。
         song.tracks.clear();
         let cid: ContentId = song.alloc_content_id();
         song.clip_contents.insert(

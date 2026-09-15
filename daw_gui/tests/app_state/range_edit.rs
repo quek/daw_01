@@ -18,6 +18,13 @@ fn key(clip_id: u32) -> ClipKey {
     ClipKey { track_id: TRACK, clip_id }
 }
 
+/// アレンジの `J` (範囲を 1 クリップへ焼き込む)。
+fn glue() -> AppEvent {
+    AppEvent::SplitJoin(daw_gui::event_split::SplitJoinEvent::Join {
+        surface: daw_gui::event_split::SplitSurface::Clips,
+    })
+}
+
 /// `(id, start, len)` のクリップを並べたトラックを作る。 中身は 1 拍ごとの
 /// C4 ノート (窓を切ったときに「何が残ったか」が数えられる)。
 fn app_with_clips(specs: &[(u32, f64, f64)]) -> AppData {
@@ -98,7 +105,7 @@ fn 範囲の_j_は結果クリップが範囲そのものになる() {
     // 素材は 6〜10 にしか無いが、範囲 4〜12 で結合すると前後に空白が付く。
     let mut app = app_with_clips(&[(1, 6.0, 4.0)]);
     set_range(&mut app, 4.0, 12.0);
-    app.handle_event(AppEvent::GlueSelectedClips);
+    app.handle_event(glue());
     assert_eq!(spans(&app), vec![(4.0, 8.0)], "結果クリップ = 範囲そのもの");
     // 素材は content の 2〜6 拍目 (= song 6〜10) に居る。
     let song = app.cur.song_doc.song();
@@ -113,7 +120,7 @@ fn 範囲の_j_ははみ出した部分を分割して残す() {
     // A [0,16) に範囲 4〜12 → 0-4 / 4-12 (結合) / 12-16 の 3 つ。
     let mut app = app_with_clips(&[(1, 0.0, 16.0)]);
     set_range(&mut app, 4.0, 12.0);
-    app.handle_event(AppEvent::GlueSelectedClips);
+    app.handle_event(glue());
     assert_eq!(spans(&app), vec![(0.0, 4.0), (4.0, 8.0), (12.0, 4.0)]);
 }
 
