@@ -10,6 +10,8 @@ use crate::view::resource_monitor::load_color;
 /// 常駐リソースメーターのバッジ幅。 左側テキストの clip 幅を先に決めるため、
 /// 描画側とここで同じ値を使う (定数 1 つを共有 = 値の二重化を作らない)。
 const RESMON_BADGE_W: f32 = 248.0;
+/// 読み込み待ちの Bounce / Glue の「キャンセル」ボタン幅。
+const RENDER_WAIT_CANCEL_W: f32 = 72.0;
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ステータスバーはクロームのバー類 (= transport / menu bar と同じ層)。
@@ -61,6 +63,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // 続く MIDI / file 行を待受表示の右へずらす (重ねない)。
         left_x += w + 16.0;
     }
+    left_x = draw_render_wait(app, ui, area, left_x, meters_left, line_y);
 
     let left = format!(
         "MIDI: {} \u{2502} file: {}",
@@ -208,4 +211,26 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             );
         }
     }
+}
+
+/// plugin の読み込み待ちで開始を預かっている Bounce / Glue の待機表示 + 「キャンセル」。書き出し / 解析は画面を
+/// 塞ぐ自前の表示 (進捗オーバーレイ / レポート窓) が出すのでここには出さない。`status_message` は後の操作で
+/// 上書きされるので、待っている間ずっと見えるよう状態から描く (変調ソースの待受表示と同じ)。戻り値 = 次の要素の左端。
+fn draw_render_wait(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, left_x: f32, right: f32, line_y: f32) -> f32 {
+    let Some(render) = app.cur.transport.pending_render.as_ref().filter(|r| !r.blocks_screen()) else {
+        return left_x;
+    };
+    let p = &app.theme.core;
+    let text = format!(
+        "{}: プラグインの読み込みを待っています (残 {})",
+        render.name(),
+        app.cur.pipc.pending_plugin_loads.len()
+    );
+    let w = ui.measure_text(&text, 11.0).min((right - left_x - RENDER_WAIT_CANCEL_W - 6.0).max(0.0));
+    ui.label_at_clipped("status_render_wait", &text, Rect { x: left_x, y: line_y, w, h: 11.0 * 1.2 }, 11.0, p.text);
+    let button = Rect { x: left_x + w + 6.0, y: area.y + 3.0, w: RENDER_WAIT_CANCEL_W, h: area.h - 6.0 };
+    if ui.button_at_clicked_sized("status_render_wait_cancel", "キャンセル", button, 11.0) {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::CancelPendingRender)));
+    }
+    button.x + button.w + 16.0
 }

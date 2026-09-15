@@ -7,16 +7,19 @@
 //!   (`AudioRender`)、後段 = 映像フレーム render (`VideoRender`)。どちらも
 //!   determinate 進捗 + Cancel。
 //!
-//! `export_stage` が `Some` の間だけ dismissable でない true modal として表示し、
+//! `export_stage` が `Some` の間 (と、plugin の読み込み待ちで書き出しの開始を待っている間 =
+//! `TransportState::pending_render`) だけ dismissable でない true modal として表示し、
 //! 下の UI 操作（再生・編集・FX 追加）をブロックする。Esc / Cancel ボタンのみ
 //! 中断要求になる（Esc / 外クリックでは閉じない）。Cancel は AudioRender なら
-//! daw_audio へ IPC で、VideoRender なら in-process flag で render を中断させる。
+//! daw_audio へ IPC で、VideoRender なら in-process flag で render を中断させ、読み込み待ちなら
+//! 預かった書き出しを捨てる。
 
 use daw_ui_core::{Edit, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, ExportStage};
+use crate::state::PendingRender;
 
 const PANEL_W: f32 = 420.0;
 const PANEL_H: f32 = 150.0;
@@ -29,10 +32,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     // ブロックする。`ui.modal` は真のモーダルで pointer 入力を遮断する
     // (gui_01 `pointer_blocked_by_modal_popup`)。
     let stage = app.cur.transport.export_stage;
+    // plugin の読み込みが確定するのを待っている書き出し (まだ stage は立っていない)。
+    let waiting = app.cur.transport.pending_render.as_ref().filter(|r| r.is_export());
+    let waiting_loads = waiting.map(|_| app.cur.pipc.pending_plugin_loads.len());
     // `pending_video_export` だけ立って stage 未設定の窓は実際には起きない
     // (`action_begin_export_mp4` が AudioRender を同時に立てる) が、防御的に
     // active 判定へ含めて取りこぼしを防ぐ。
-    let active = stage.is_some() || app.cur.transport.pending_video_export.is_some();
+    let active = stage.is_some() || app.cur.transport.pending_video_export.is_some() || waiting.is_some();
     if !active {
         if ui.is_modal_open("export_progress") {
             ui.close_modal("export_progress");
@@ -42,9 +48,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     if !ui.is_modal_open("export_progress") {
         ui.open_modal("export_progress");
     }
-    // タイトル: video export (前段の音声フェーズ含む) か、標準 WAV export か。
+    // タイトル: video export (前段の音声フェーズ・読み込み待ちを含む) か、標準 WAV export か。
     let is_video = app.cur.transport.pending_video_export.is_some()
-        || matches!(stage, Some(ExportStage::VideoRender { .. }));
+        || matches!(stage, Some(ExportStage::VideoRender { .. }))
+        || matches!(waiting, Some(PendingRender::Video { .. }));
     let title = if is_video {
         "Video export 中..."
     } else {
@@ -75,8 +82,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     app.handle_event(AppEvent::CancelExport)
                 }));
             }
-            match stage {
-                Some(ExportStage::VideoRender { done, total }) => {
+            match (stage, waiting_loads) {
+                (Some(ExportStage::VideoRender { done, total }), _) => {
                     let pct = fraction(done, total);
                     draw_progress(
                         ui,
@@ -85,7 +92,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                         pct,
                     );
                 }
-                Some(ExportStage::AudioRender { done, total }) => {
+                (Some(ExportStage::AudioRender { done, total }), _) => {
                     let pct = fraction(done, total);
                     // total==0 (空 song 等) では割合が無意味なのでパーセント非表示。
                     let count_text = if total > 0 {
@@ -95,7 +102,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                     };
                     draw_progress(ui, panel, &count_text, pct);
                 }
-                None => {
+                // plugin の読み込みが確定したら書き出しが始まる (キャンセルは預かった書き出しを捨てる)。
+                (None, Some(remaining)) => {
+                    let text = format!("プラグインの読み込みを待っています... (残 {remaining})");
+                    draw_progress(ui, panel, &text, 0.0);
+                }
+                (None, None) => {
                     // pending_video_export だけ立っている理論上の窓
                     // (= AudioRender が立つ前)。indeterminate 表示。
                     ui.label_at(

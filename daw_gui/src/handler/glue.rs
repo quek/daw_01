@@ -254,9 +254,15 @@ impl AppData {
             self.ui_ephemeral.status_message = "Glue: 範囲を選択してください".to_string();
             return;
         };
-        if self.cur.pipc.pending_glue_bake.is_some() || self.cur.pipc.pending_clip_fx_bounce.is_some() {
-            self.ui_ephemeral.status_message =
-                "Glue: 焼き込み中です。 完了をお待ちください".into();
+        let label = self.cur.song_doc.event_label();
+        self.glue_selection(sel, label);
+    }
+
+    /// `sel` を結合する本体 (`J` と、読み込み待ちからの再開の共通の口)。`label` = `J` の履歴ラベル。
+    /// audio を焼くときは plugin の読み込みが残っていれば確定を待つ (`PendingRender::Glue`) — 再開時はそのときの
+    /// Song で `sel` の中身を集め直す。
+    pub(crate) fn glue_selection(&mut self, sel: TimeSelection, label: &'static str) {
+        if self.refuse_render_while_another("Glue") {
             return;
         }
         let refs_by_track = self.glue_refs_by_track(&sel, false);
@@ -271,7 +277,6 @@ impl AppData {
             .map(|(id, _)| *id)
             .collect();
         if audio_tracks.is_empty() {
-            let label = self.cur.song_doc.event_label();
             self.apply_glue(&sel, &BTreeMap::new(), label);
             return;
         }
@@ -280,10 +285,10 @@ impl AppData {
             self.ui_ephemeral.status_message = "Glue: 無効なトラックの audio は焼けません (有効にしてから)".into();
             return;
         }
-        if self.reject_offline_render_while_loading("Glue") {
-            return;
+        if self.plugin_loads_pending() {
+            return self.defer_render(PendingRender::Glue { sel, label });
         }
-        self.start_glue_bake(sel, &audio_tracks);
+        self.start_glue_bake(sel, &audio_tracks, label);
     }
 
     /// 選択範囲 × レーンに掛かるクリップをトラック別 (開始拍順) に集める。
@@ -325,7 +330,7 @@ impl AppData {
     }
 
     /// audio トラックの焼き込みキューを組んで 1 本目の render を撃つ。
-    fn start_glue_bake(&mut self, sel: TimeSelection, tracks: &[u32]) {
+    fn start_glue_bake(&mut self, sel: TimeSelection, tracks: &[u32], label: &'static str) {
         let refs_by_track = self.glue_refs_by_track(&sel, false);
         let mut jobs: Vec<GlueBakeJob> = Vec::with_capacity(tracks.len());
         for &track_id in tracks {
@@ -352,7 +357,6 @@ impl AppData {
         }
         self.ui_ephemeral.status_message =
             format!("Glue: {} トラックを焼き込み中...", jobs.len());
-        let label = self.cur.song_doc.event_label();
         self.cur.pipc.pending_glue_bake = Some(PendingGlueBake { sel, jobs, current: 0, label });
         if !self.send_glue_bake(0) {
             self.abort_glue_bake("Glue: 焼き込みを開始できませんでした".into());

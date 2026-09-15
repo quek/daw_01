@@ -34,6 +34,10 @@ impl AppData {
     /// (ユーザーが後で並び替える)。builtin VOICEVOX を挿したときだけ vocal track
     /// 化する特例 (`source = Vocal`) は維持する。
     pub(crate) fn select_plugin_from_db(&mut self, id: String, keep_open: bool, open_gui: bool) {
+        // picker を開いた chain は **picker が開いている間だけ** の挿入先。閉じた後に同じ event で足す口
+        // (インスペクタの「+ 字幕デバイス」) が、前に picker を開いた chain へ挿さないようにする。
+        let picker_target =
+            if self.ui_ephemeral.is_plugin_picker_open { self.ui_ephemeral.plugin_picker_target } else { None };
         // 無修飾 / Shift は選択で閉じる。 Ctrl (keep_open) は開いたまま連続追加
         // できる。
         if !keep_open {
@@ -44,13 +48,7 @@ impl AppData {
         // 内蔵は Shift なし (= GUI を開く) なら Par を開く。
         let native = common::model::NativeKind::from_picker_id(&id);
         if id == common::plugin_db::PARALLEL_PICKER_ID || native.is_some() {
-            self.ensure_first_track();
-            let Some(track_id) = self.cursor_track_id() else { return };
-            let dest = self
-                .ui_ephemeral
-                .plugin_picker_target
-                .filter(|c| self.cur.song_doc.song().chain_devices(*c).is_some())
-                .unwrap_or(common::model::ChainRef::Track(track_id));
+            let Some(dest) = self.plugin_insert_chain(picker_target) else { return };
             let ev = match native {
                 Some(kind) => DeviceEvent::AddNative { chain: dest, kind, open_panel: open_gui },
                 None => DeviceEvent::AddParallel { chain: dest, at: InsertAt::Default },
@@ -72,15 +70,11 @@ impl AppData {
         // daw_audio に運ぶ (= daw_audio が DB なしに役割を導出できる SSoT)。
         let ports = port_config_of(entry);
         let is_voicevox = entry_id.as_str() == common::plugin_db::BUILTIN_ID_VOICEVOX;
-        self.ensure_first_track();
-
-        // master bus 選択時は track Vec ではなく Song.master_fx_chain を対象に
-        // する (= 音源境界なしの全 audio FX、 末尾 append)。
-        let track_id = match self.cursor_track_id() {
-            Some(id) => id,
-            None => return,
-        };
-        let is_master = track_id == common::model::MASTER_TRACK_ID;
+        // r.md #110: 挿入先は picker を開いた chain (`+ Plugin` の行が指す chain)。無指定 / 消えていれば cursor
+        // track (master なら `Song.master_fx_chain`)。音源トラック化 / Transform の既定値 / 有効かどうかは、cursor では
+        // なく **挿す chain の持ち主** のトラックで決める (picker を別トラックの chain で開いていても取り違えない)。
+        let Some(dest) = self.plugin_insert_chain(picker_target) else { return };
+        let Some(owner) = self.cur.song_doc.song().chain_owner_track(dest) else { return };
 
         // 内蔵映像効果は GUI 描画パスで処理する device。plugin_host に
         // load せず (load_builtin に該当無し)、モデルへ append するだけ。engine の
@@ -95,7 +89,7 @@ impl AppData {
 
         let is_video = ports.is_video();
         // r.md #131: 無効なトラックへ足した plugin は Song に置くだけ (有効に戻したとき reconcile が載せる)。
-        if !is_video && self.cur.song_doc.song().track_effectively_enabled(track_id) {
+        if !is_video && self.cur.song_doc.song().track_effectively_enabled(owner) {
             // ユーザーが手動追加した plugin は load 完了時に daw_audio 再 sync +
             // (open_gui なら) GUI 自動 open する (project-load の一斉復元はこの
             // 集合に積まれない)。 Shift (open_gui=false) でも sync は必要なので
@@ -110,25 +104,13 @@ impl AppData {
             id: device_id,
             ..common::model::PluginInstance::with_ports(entry_id, entry_format, ports)
         };
-        // r.md #110: 挿入先は picker を開いた chain (`+ Plugin` の行が指す chain)。
-        // 無指定 / 消えていれば cursor track の top-level 末尾。
-        let dest = self
-            .ui_ephemeral
-            .plugin_picker_target
-            .filter(|c| self.cur.song_doc.song().chain_devices(*c).is_some())
-            .unwrap_or(common::model::ChainRef::Track(track_id));
         // r.md #129 (Q6): 挿す位置は組み込みの手前。closure の中 (実行時の Song) で解決する。
-        if is_master {
-            self.edit_song(move |song| {
-                let at = song.default_insert_index(dest).unwrap_or(0);
-                song.insert_device(dest, at, common::model::Device::Plugin(new_device));
-            });
-        } else if let Some(track_idx) = self.cursor_track_index() {
-            self.edit_song(move |song| {
+        self.edit_song(move |song| {
             let added_transform = new_device.plugin_id == common::video_fx::TRANSFORM_ID;
             let at = song.default_insert_index(dest).unwrap_or(0);
             song.insert_device(dest, at, common::model::Device::Plugin(new_device));
-            let track = &mut song.tracks[track_idx];
+            // master (`master_fx_chain`) にはトラックとしての印が無い。
+            let Some(track) = song.track_by_id_mut(owner) else { return };
             // Transform 配置 device を刺したら group_transform を有効化
             // (resolve_track_transform は device-gate + group_transform 値。未初期化なら
             // identity 配置で no-op になり、inspector で編集を始められない)。
@@ -146,8 +128,25 @@ impl AppData {
                 // 「VOICEVOX で鳴らす」 印 (unit marker) のみ持つ。
                 track.source = InstrumentSource::Vocal;
             }
-            });
+        });
+    }
+
+    /// picker で選んだ device を挿す chain。picker を開いた chain (まだ在れば) > cursor のトラック (master を含む)。
+    ///
+    /// どちらも無く、曲にトラックが 1 本も無ければ **トラックを足してそこへ挿す** (足したトラックが cursor になる)
+    /// — 挿す先が無いのに選べた「追加」を、空のトラックだけ残して捨てない。足すのは device の追加と同じ event の中
+    /// なので、トラックと device は 1 undo step。master 宛て (master の chain で picker を開いた / cursor が master) は
+    /// そのまま master に挿し、トラックは足さない。
+    fn plugin_insert_chain(&mut self, picker_target: Option<common::model::ChainRef>) -> Option<common::model::ChainRef> {
+        let song = self.cur.song_doc.song();
+        let exists = |c: &common::model::ChainRef| song.chain_devices(*c).is_some();
+        let existing = picker_target
+            .filter(exists)
+            .or_else(|| self.cursor_track_id().map(common::model::ChainRef::Track).filter(exists));
+        if existing.is_some() || !song.tracks.is_empty() {
+            return existing;
         }
+        self.action_add_instrument_track().map(common::model::ChainRef::Track)
     }
 
     // PR-V4: 旧 VOICEVOX synth path (begin_vocal_synth /

@@ -29,6 +29,52 @@ pub enum LoadPlayback {
     KeepPlaying,
 }
 
+/// plugin の読み込みが確定するのを待ってから始めるオフライン描画 ([`TransportState::pending_render`])。
+///
+/// 再生の A7 ([`TransportState::pending_play`]) と同じ規則: 読み込み中の plugin を鳴らすトラックは engine のグラフに
+/// 入らない (r.md #131) ので、そのまま焼くとそのトラックは無音になる。要求は **入口の引数** として持ち、読み込みが
+/// 確定したら同じ入口から始め直す (対象が消えていないか / 音声エンジンがあるか、の入口の検査も通り直す)。
+#[derive(Debug, Clone)]
+pub enum PendingRender {
+    /// Export WAV の保存先を選んだ後 ([`crate::app::AppData::export_wav_to`])。
+    Wav { path: std::path::PathBuf, range: Option<(f64, f64)> },
+    /// Export Video の保存先を選んだ後 ([`crate::app::AppData::action_begin_export_mp4`])。
+    Video { output_path: std::path::PathBuf, range_beats: Option<(f64, f64)>, resolution: (u32, u32), framerate: f32 },
+    /// 範囲ラウドネス解析 ([`crate::app::AppData::begin_loudness_analysis`])。
+    Loudness { range: Option<(f64, f64)> },
+    /// Bounce In Place / with FX ([`crate::app::AppData::request_bounce`])。`label` = 発注した操作の履歴ラベル。
+    Bounce { target: common::model::ClipKey, mode: crate::app_types::BounceMode, label: &'static str },
+    /// `J` の audio 焼き込み ([`crate::app::AppData::glue_selection`])。`sel` = `J` を押した時点の範囲。
+    Glue { sel: common::model::TimeSelection, label: &'static str },
+}
+
+impl PendingRender {
+    /// 利用者に見せる操作名。
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Wav { .. } => "WAV 書き出し",
+            Self::Video { .. } => "Video export",
+            Self::Loudness { .. } => "ラウドネス解析",
+            Self::Bounce { .. } => "Bounce",
+            Self::Glue { .. } => "Glue",
+        }
+    }
+
+    /// 書き出し (進捗オーバーレイが出す) か。
+    #[must_use]
+    pub fn is_export(&self) -> bool {
+        matches!(self, Self::Wav { .. } | Self::Video { .. })
+    }
+
+    /// 待っている間も、走っている間と同じく画面を塞いで再生を止めるか (書き出し / 解析)。Bounce / Glue は走っている
+    /// 間も画面を塞がないので、待っている間も編集と再生を続けられる (歌唱の合成待ちと同じ)。
+    #[must_use]
+    pub fn blocks_screen(&self) -> bool {
+        matches!(self, Self::Wav { .. } | Self::Video { .. } | Self::Loudness { .. })
+    }
+}
+
 /// r.md #129 (§11.1): GR を出す内蔵 device の GR 表示値 (**正の減衰量 dB**)。
 ///
 /// 読み手 (Rack 行 / Par / Mixer 帯 / マスターパネル) は device id で引く。engine の GR 面は
@@ -174,8 +220,13 @@ pub struct TransportState {
     /// カーソルをボイスごとに描くのに使う。
     pub track_voices: Vec<(u32, common::audio_bridge::VoiceSnapshot)>,
     /// `start_transport` が読み込み待ち (`pending_plugin_loads` / asset decode) で queue した
-    /// 再生要求。 `Some(どこから)` の間は最後の load 完了で `fire_pending_play` が再発火する。
+    /// 再生要求。 `Some(どこから)` の間は、読み込みと decode が揃った event の終わりに
+    /// `resume_after_plugin_loads` が再発火する。
     pub pending_play: Option<PlayFrom>,
+    /// plugin の読み込みが確定するのを待っているオフライン描画 ([`PendingRender`])。同時に 1 つ (engine の offline
+    /// render は 1 本なので、待っている間はほかの描画を始めない)。読み込みが全部確定した event の終わりに
+    /// `resume_after_plugin_loads` が入口から始め直す。
+    pub pending_render: Option<PendingRender>,
     /// queue された要求が「録音の開始」だったか、だとすれば count-in の長さ
     /// (samples、`0` = count-in 無し)。 録音開始が読み込み待ちで queue された
     /// とき、再発火でも録音と count-in を落とさないために覚えておく (r.md #51)。
@@ -244,6 +295,7 @@ impl TransportState {
             track_voices: Vec::new(),
             pending_play: None,
             pending_play_record: None,
+            pending_render: None,
             export_stage: None,
             export_progress_at: None,
             export_cancel: None,

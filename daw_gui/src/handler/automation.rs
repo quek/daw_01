@@ -7,7 +7,8 @@ use crate::event::*;
 use common::model::{AudioEvent, InstrumentSource};
 
 impl AppData {
-    pub(crate) fn action_add_instrument_track(&mut self) {
+    /// 足したトラックの id を返す (Song を編集できなければ `None`)。
+    pub(crate) fn action_add_instrument_track(&mut self) -> Option<u32> {
         // 名前は付けない (空 = 未命名、表示は並び順の番号。r.md #133)。
         // 挿入位置は「選択中で最上段の track の直上」 (純ロジックは
         // add_track_insert_index)。 選択が無いときだけ従来どおり末尾。
@@ -28,7 +29,7 @@ impl AppData {
             song.tracks.insert(insert_at, track);
             id
         }) else {
-            return;
+            return None;
         };
         // 追加直後はこの新 track を唯一の選択 + カーソルにする (次の操作の対象)。
         // 明示的なトラック面操作なので last-wins タグも Tracks に倒す (= 直後の
@@ -36,6 +37,7 @@ impl AppData {
         self.set_track_selection(vec![id]);
         self.resize_track_peak_display();
         tracing::info!(insert_at, ?parent_group_id, "added instrument track");
+        Some(id)
     }
 
     // ----------------------------------------------------------------

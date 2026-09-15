@@ -379,7 +379,13 @@ impl AppData {
         self.dispatch_app_event(event);
         // 閉じる (arm の途中 return でも必ず通るよう、match の外で)。 event の中でタブが
         // 切り替わっていたら、開いたタブの文書を閉じる (閉じたタブなら何もしない)。
-        self.with_project(project, |app| app.cur.song_doc.end_event(opened));
+        // plugin の読み込み待ちで預かった再生 / オフライン描画は、一番外の操作の副作用が全部済んだここで出す。
+        self.with_project(project, |app| {
+            if opened.is_outermost() {
+                app.resume_after_plugin_loads();
+            }
+            app.cur.song_doc.end_event(opened);
+        });
         // edit_song が export 中拒否を予約していたら status に表示する
         // (song 凍結の単一保証点は SongDoc::edit、 旧 allow-list gate の置換)。
         if let Some(msg) = self.cur.song_doc.take_rejection() {
@@ -645,7 +651,9 @@ impl AppData {
             AppEvent::SetNoteVelocities(updates) => {
                 self.set_note_velocities(&updates);
             }
-            AppEvent::AddInstrumentTrack => self.action_add_instrument_track(),
+            AppEvent::AddInstrumentTrack => {
+                self.action_add_instrument_track();
+            }
             // 前面化は runner の user_event が window へ直接行うため、
             // ここには届かない。 match 網羅のための no-op。
             AppEvent::RaiseMainWindow => {}
@@ -1593,22 +1601,10 @@ impl AppData {
                     }
                 }
             }
-            AppEvent::CancelExport => match self.cur.transport.export_stage {
-                // 映像フェーズは daw_gui プロセス内の render thread。in-process の
-                // atomic flag で次フレーム中断させる。
-                Some(ExportStage::VideoRender { .. }) => {
-                    if let Some(flag) = &self.cur.transport.export_cancel {
-                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                        self.ui_ephemeral.status_message = "Video export をキャンセル中...".into();
-                    }
-                }
-                // 音声 freewheel は daw_audio プロセス。IPC で cancel を送り、
-                // freewheel ループが次 buffer で中断 → `ExportWavComplete
-                // { error: None, cancelled: true }` が返る (cancel は typed flag で
-                // 伝わる)。標準 WAV export / video 前段のどちらでも有効。
-                Some(ExportStage::AudioRender { .. }) => self.cancel_audio_render(),
-                None => {}
-            },
+            AppEvent::CancelExport => self.cancel_export(),
+            AppEvent::CancelPendingRender => {
+                self.cancel_pending_render(|_| true);
+            }
             AppEvent::SetClipReversed { target, reversed } => {
                 self.set_clip_audio_event_reversed(target, reversed);
             }

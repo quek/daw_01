@@ -24,14 +24,7 @@ impl AppData {
     /// 解析 → 「ラウドネス解析...」 / ルーラー右クリック / マスターパネルの
     /// 「解析」 / `Ctrl+L`。 範囲ピッカーを開く (既定 = ループ範囲)。
     pub(crate) fn open_loudness_range_picker(&mut self) {
-        if self.cur.loudness.phase.is_busy() {
-            self.ui_ephemeral.status_message = "ラウドネス解析を実行中です".into();
-            return;
-        }
-        if self.cur.transport.export_stage.is_some() {
-            self.ui_ephemeral.status_message = "書き出し中はラウドネス解析を開始できません".into();
-            return;
-        }
+        // 走っている / 読み込み待ちの描画があれば断る判断は `open_export_range_picker` が持つ。
         self.open_export_range_picker(ExportRangeKind::Loudness);
     }
 
@@ -39,22 +32,18 @@ impl AppData {
     ///
     /// レポート窓を**先に**開いて、その中に進捗と中止ボタンを出す
     /// (grill-me 2026-08-16 で確定: 解析中は背景を暗転して操作を遮断し、
-    /// 完了したら暗転が消えて窓だけ残る)。
+    /// 完了したら暗転が消えて窓だけ残る)。plugin の読み込みが残っていれば、窓を開いて
+    /// 確定を待ってから走査を始める (`PendingRender::Loudness`、読み込み待ちからの再開もここ)。
     pub(crate) fn begin_loudness_analysis(&mut self, range: Option<(f64, f64)>) {
         // 走査は engine の `export_running` を書き出しと共有する。二重起動は
         // engine 側でも弾かれるが、GUI 側でも状態を壊さないようここで止める
         // (「測り直す」など、ピッカーを経由しない経路の唯一の防波堤)。
-        if self.offline_render_busy() {
-            self.ui_ephemeral.status_message =
-                "オフライン処理の実行中は解析を開始できません".into();
+        if self.refuse_render_while_another("ラウドネス解析") {
             return;
         }
         if self.ipc.audio_tx.is_none() {
             self.ui_ephemeral.status_message =
                 "音声エンジンが利用できないためラウドネス解析を開始できません".into();
-            return;
-        }
-        if self.reject_offline_render_while_loading("ラウドネス解析") {
             return;
         }
         // 空範囲は測るものが無い (engine 側でも 0 フレームになる)。
@@ -70,6 +59,9 @@ impl AppData {
         // 前回の結果は残さない (新しい範囲の途中経過と混ざって「どの範囲の値か」
         // が分からなくなる)。
         self.cur.loudness.report = None;
+        if self.plugin_loads_pending() {
+            return self.defer_render(PendingRender::Loudness { range });
+        }
 
         // **先に停止してから編集を止める**。stop() は録音セッションのクローズ
         // (押しっぱなしノートの長さ確定 = Song 編集) を含むので、順序を逆にすると
@@ -107,6 +99,10 @@ impl AppData {
 
     /// 中止 (レポート窓の「中止」ボタン / 解析中の Esc)。
     pub(crate) fn cancel_loudness_analysis(&mut self) {
+        // 読み込み待ち = まだ何も始めていない。預かった要求を捨てるだけ。
+        if self.cancel_pending_render(|r| matches!(r, PendingRender::Loudness { .. })) {
+            return;
+        }
         match self.cur.loudness.phase {
             // まだ engine へ投げていない = その場で畳む。
             LoudnessPhase::AwaitingReinit { .. } => {

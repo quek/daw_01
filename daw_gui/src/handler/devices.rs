@@ -185,7 +185,7 @@ impl AppData {
                 token,
             },
         );
-        // 注意: ここで `ensure_first_track()` を呼んではいけない。 子プロセスの
+        // 注意: ここでトラックを足してはいけない。 子プロセスの
         // 応答が Song の構造 (トラック) を作ると、 track を 1 本も持たず master fx
         // だけを持つプロジェクトを開いたときに、 その load 応答が幽霊トラック
         // トラックを生やして **開いただけで `*`** が付く (r.md #9)。
@@ -276,14 +276,13 @@ impl AppData {
             self.cur.pipc.gui_open_requests.push(device_id);
         }
 
-        // A7: this load is done. If Play was queued waiting for the
-        // last plugin to register on the audio side, fire it now.
+        // A7: this load is done. 読み込み待ちの再生 / オフライン描画は、全部揃ったらこの event の終わりに
+        // `resume_after_plugin_loads` が出す。
         self.cur.pipc.pending_plugin_loads.remove(&device_id);
         // r.md #131: 登録 (上の `OpenPluginShmem`) の後に engine の「読み込み中」から外す = このトラックはここから鳴る。
         self.settle_loading_device(device_id);
         if self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.pending_play.is_some() {
             self.ui_ephemeral.status_message.clear();
-            self.fire_pending_play();
         } else if !self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.pending_play.is_some() {
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
@@ -312,7 +311,8 @@ impl AppData {
     /// entry が plugin_host 側で消費されないと、 「プラグイン読み込み
     /// 中...」 status のまま `pending_play` が永久に flush されない
     /// (= 再生不能) になる。 失敗 = ロード round-trip 完了 と等価
-    /// 扱いで pending を解放し、 必要なら queue Play を flush する。
+    /// 扱いで pending を解放する (queue した再生 / オフライン描画はこの event の
+    /// 終わりに `resume_after_plugin_loads` が出す)。
     ///
     /// Song の slot は touch しない: 旧 plugin が居れば継続再生、 reconcile
     /// 由来で旧無し → slot 空のまま。 ユーザーには status_message でエラー
@@ -354,12 +354,11 @@ impl AppData {
         // load 失敗時は finalize 予約も取り消す (stale entry が後の project-load で
         // 誤 sync / 誤 open しないように)。
         self.cur.pipc.pending_added_plugin_finalize.remove(&device_id);
-        // pending_play 解放: A7 と同じロジック (`on_plugin_loaded_from_child`
-        // と対称)。 失敗で空になったタイミングで queue Play を flush する。
+        // 失敗も確定 (`on_plugin_loaded_from_child` と対称): 失敗で空になったら、読み込み待ちの再生 / オフライン描画は
+        // この event の終わりに `resume_after_plugin_loads` が出す。
         if self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.pending_play.is_some() {
             self.ui_ephemeral.status_message =
                 format!("プラグイン読み込み失敗: {plugin_id} ({reason})");
-            self.fire_pending_play();
         } else if !self.cur.pipc.pending_plugin_loads.is_empty() && self.cur.transport.pending_play.is_some() {
             // まだ他の load が走っているなら、 残数表示を更新しつつエラーは
             // 上書き (最新の状況をユーザーに見せる)。

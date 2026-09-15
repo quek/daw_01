@@ -59,9 +59,9 @@ impl AppData {
     }
 
     /// picker の内蔵 4 種 (`DeviceEvent::AddNative`)。chain の既定位置 (Q6) へ追加分として挿す。
-    /// 位置・id・番号はすべて closure の中で **実行時の Song** から求める。
+    /// 位置・id・番号はすべて closure の中で **実行時の Song** から求める。挿す chain は呼び出し側が決める
+    /// (picker は `select_plugin_from_db` が、トラックが無ければ足してから渡す)。無い chain なら何もしない。
     pub(crate) fn add_native(&mut self, chain: ChainRef, kind: NativeKind, open_panel: bool) {
-        self.ensure_first_track();
         let mut created = None;
         self.edit_song_checked(|song| {
             let Some(owner) = song.chain_owner_track(chain) else {

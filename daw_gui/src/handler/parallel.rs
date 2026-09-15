@@ -14,9 +14,9 @@ impl AppData {
     // -------- 作る / 壊す ---------------------------------------------------
 
     /// `chain` の `at` に空の Parallel (chain 1 本) を挿す (picker の 「Parallel」)。
-    /// `at` は closure の中 (実行時の Song) で解決する。
+    /// `at` は closure の中 (実行時の Song) で解決する。挿す chain は呼び出し側が決める (picker は
+    /// `select_plugin_from_db` が、トラックが無ければ足してから渡す)。無い chain なら何もしない。
     pub(crate) fn add_parallel(&mut self, chain: ChainRef, at: InsertAt) {
-        self.ensure_first_track();
         self.edit_song_checked(move |song| {
             let Some(index) = at.resolve(song, chain) else {
                 return false;

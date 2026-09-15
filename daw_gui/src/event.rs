@@ -1411,8 +1411,12 @@ pub enum AppEvent {
         result: Result<PathBuf, String>,
     },
     /// 進捗オーバーレイの Cancel ボタン → 実行中 export の `export_cancel`
-    /// フラグを立てる（render loop が次フレームで中断）。非 undoable。
+    /// フラグを立てる（render loop が次フレームで中断）。読み込み待ちの書き出しなら
+    /// 預かった要求を捨てる。非 undoable。
     CancelExport,
+    /// plugin の読み込み待ちで開始を預かっているオフライン描画 (`TransportState::pending_render`) を
+    /// 取り消す (ステータスバーの「キャンセル」)。非 undoable。
+    CancelPendingRender,
 
     // -------- Split / Glue -------------------------------------------------
     /// r.md #132: 分割 (`E` / `Alt+E` / `Shift+E`) と結合 (`J`)。 ノート / クリップ /

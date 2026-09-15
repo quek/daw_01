@@ -57,7 +57,7 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // r.md #54: 解析の走査中は他の floating window を出さない。これらは
     // `with_floating_region` で raw pointer に戻すので、暗転の下でも押せてしまう
     // (編集履歴の行を click すると走査中に Song が飛ぶ)。
-    let floating_ok = !app.cur.loudness.phase.is_busy();
+    let floating_ok = !app.loudness_in_progress();
     if floating_ok {
         undo_history::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
         // r.md #48: 設定 window も同じ true-floating 機構 (背景を暗転しないので、
@@ -211,7 +211,7 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // (背景描画の後 = z-order 最前面)。 pointer 占有予約は build_root 冒頭の
     // `undo_history::reserve`。
     // r.md #54: 走査中は描かない (reserve と対) — 暗転の下に操作可能な窓を残さない。
-    if !app.cur.loudness.phase.is_busy() {
+    if !app.loudness_in_progress() {
         undo_history::draw(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });
 
         // 設定 window (r.md #48): 同上、 背景描画の後 = z-order 最前面。
@@ -517,8 +517,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // (= プラグイン再初期化) を送ってしまう (undo / redo は `edit_song` を通らない
     // ので編集ロックでも止まらない)。Ctrl+E は走査中に `ReinitAllPlugins` を撃つ。
     // 書き出しは `export_overlay` が真のモーダル (capture_keyboard) なので同じ
-    // 事故が起きない — 解析だけがこの保護を欠いていた。
-    if app.cur.loudness.phase.is_busy() {
+    // 事故が起きない — 解析だけがこの保護を欠いていた。plugin の読み込み待ちで解析の開始を
+    // 待っている間も同じ (Esc = 預かった解析を捨てる)。
+    if app.loudness_in_progress() {
         if ui.take_shortcut("escape") {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelLoudnessAnalysis)
