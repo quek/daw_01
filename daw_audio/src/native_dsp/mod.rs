@@ -19,7 +19,7 @@ mod tone_eq;
 #[cfg(test)]
 mod tests;
 
-use common::dsp::{Biquad, BiquadState};
+use common::dsp::{Biquad, BiquadState, StereoBiquad};
 use common::model::{NativeKind, NativeParams};
 
 pub use limiter::MasterLimiterState;
@@ -108,7 +108,7 @@ fn block_len(l: &[f32], r: &[f32], n: usize) -> usize {
 }
 
 /// バイクワッドを直列に並べた段の共通処理 (EQ / Tone EQ)。`active` の bit が立っている段だけを
-/// サンプルごとに回し、素通し ([`Biquad::IDENTITY`]) の段は回さない (§8.8-3)。
+/// サンプルごとに回し (L / R 同時、[`StereoBiquad`])、素通し ([`Biquad::IDENTITY`]) の段は回さない (§8.8-3)。
 ///
 /// 回さない段も、遅延状態だけは「素通しを回した場合」と同じ値に揃える (末尾 2 サンプルを
 /// IDENTITY で通す)。これで段が後から有効になった瞬間の出力は、全段を常に回していた旧実装と
@@ -123,10 +123,7 @@ fn run_stages<const N: usize>(
 ) {
     for (k, (st, c)) in state.iter_mut().zip(coeffs).enumerate() {
         if active & (1 << k) != 0 {
-            for i in 0..n {
-                l[i] = st[0].process(c, l[i]);
-                r[i] = st[1].process(c, r[i]);
-            }
+            StereoBiquad::run(st, c, l, r, n);
         } else {
             for i in n.saturating_sub(2)..n {
                 let _ = st[0].process(&Biquad::IDENTITY, l[i]);

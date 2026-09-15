@@ -604,17 +604,25 @@ fn mix_chain_into_sum(
     cs: &mut ChainScratch,
     rs: &mut ParallelScratch,
 ) {
-    for i in 0..n {
-        // pan 則はトラックと同じ (中央 0 dB の等パワー則。空 chain 1 本の Parallel は素通しと同じ音量)。
-        let (pl, pr) = common::audio_render::pan_gains(cs.pan_ramp[i]);
-        let g = cs.gain_ramp[i];
-        let (l, r) = if effective_mute { (0.0, 0.0) } else { (bus_l[i] * pl * g, bus_r[i] * pr * g) };
-        if snapshot_post_fader {
-            cs.post_fader_l[i] = l;
-            cs.post_fader_r[i] = r;
+    let ChainScratch { gain_ramp, pan_ramp, post_fader_l, post_fader_r, .. } = cs;
+    let mut post_fader = snapshot_post_fader.then_some((post_fader_l, post_fader_r));
+    let frame = |i: usize, (pl, pr): (f32, f32)| {
+        let g = gain_ramp[i];
+        if effective_mute { (0.0, 0.0) } else { (bus_l[i] * pl * g, bus_r[i] * pr * g) }
+    };
+    let mut put = |i: usize, (l, r): (f32, f32)| {
+        if let Some((fl, fr)) = post_fader.as_mut() {
+            fl[i] = l;
+            fr[i] = r;
         }
         rs.sum_l[i] += l;
         rs.sum_r[i] += r;
+    };
+    // pan 則はトラックと同じ (中央 0 dB の等パワー則。空 chain 1 本の Parallel は素通しと同じ音量)。
+    // 一定の buffer では三角関数をループの外で 1 回だけ計算する。
+    match common::audio_render::constant_pan_gains(&pan_ramp[..n]) {
+        Some(pan) => (0..n).for_each(|i| put(i, frame(i, pan))),
+        None => (0..n).for_each(|i| put(i, frame(i, common::audio_render::pan_gains(pan_ramp[i])))),
     }
 }
 

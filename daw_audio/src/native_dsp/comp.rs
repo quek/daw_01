@@ -3,7 +3,7 @@
 //! 検出 → SC フィルタ → 静的カーブ → アタック/リリース平滑 → 利得適用。検出信号は
 //! [`NativeBlock::sidechain`] が `Some` ならその音、無ければ自分の入力。
 
-use common::dsp::{Biquad, BiquadState, db_to_amp, sc_filter, smoothing_coeff};
+use common::dsp::{Biquad, BiquadState, Stereo, StereoBiquad, db_to_amp, sc_filter, smoothing_coeff};
 use common::model::{COMP_KNEE_DB, CompSettings};
 
 use super::{NativeBlock, block_len, comp_gain_step, sc_sample};
@@ -37,6 +37,8 @@ impl CompState {
         let knee_floor_amp = db_to_amp(s.threshold_db - COMP_KNEE_DB * 0.5);
         let makeup_amp = db_to_amp(s.makeup_db);
         let mut worst = 0.0_f32;
+        let [sc_l, sc_r] = &mut self.sc;
+        let mut sc_filter = self.sc_coeff.as_ref().map(|c| StereoBiquad::load(sc_l, sc_r, c));
 
         for i in 0..n {
             // ---- 検出信号 (SC フィルタが OFF なら素の信号) ----
@@ -44,8 +46,11 @@ impl CompState {
                 Some(sc) => sc_sample(sc, i),
                 None => (l[i], r[i]),
             };
-            let (dl, dr) = match &self.sc_coeff {
-                Some(c) => (self.sc[0].process(c, xl), self.sc[1].process(c, xr)),
+            let (dl, dr) = match &mut sc_filter {
+                Some(f) => {
+                    let d = f.tick(Stereo::new(xl, xr));
+                    (d.l(), d.r())
+                }
                 None => (xl, xr),
             };
             if let Some((ll, lr)) = listen_out.as_mut()
@@ -64,6 +69,9 @@ impl CompState {
             let g = if self.gain_db == 0.0 { makeup_amp } else { db_to_amp(self.gain_db + s.makeup_db) };
             l[i] *= g;
             r[i] *= g;
+        }
+        if let Some(f) = &sc_filter {
+            f.store(sc_l, sc_r);
         }
         if !self.gain_db.is_finite() {
             self.gain_db = 0.0;

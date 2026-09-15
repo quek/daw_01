@@ -66,6 +66,15 @@ pub fn pan_gains(pan: f32) -> (f32, f32) {
     (c - s, c + s)
 }
 
+/// pan の per-sample ramp が buffer 内で一定 (全サンプルがビット単位で同じ値) なら、その [`pan_gains`]。
+/// 一定の間 (automation も変調も動いていない、ほとんどの buffer) は三角関数を buffer に 1 回だけ計算する。
+/// 値がビット単位で同じなので、サンプルごとに計算したのと同じ係数になる。空なら `None`。
+#[must_use]
+pub fn constant_pan_gains(pans: &[f32]) -> Option<(f32, f32)> {
+    let first = pans.first()?.to_bits();
+    pans.iter().all(|p| p.to_bits() == first).then(|| pan_gains(f32::from_bits(first)))
+}
+
 /// Fade カーブそのもの: 正規化した進度 `progress` (0 = fade 開始 = 無音、
 /// 1 = fade 終了 = フル) を 0..=1 のゲインへ写す。 **fade の形を決める唯一の式**。
 ///

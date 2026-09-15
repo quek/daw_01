@@ -20,7 +20,7 @@
 //! サンプルループに入れない)。 状態は再 compile を跨いで `adopt_state_from` で移送する
 //! (捨てると編集のたびにクリックが乗る)。 RT 規約: 確保・ロック・I/O なし。
 
-use common::dsp::{Biquad, BiquadState};
+use common::dsp::{Biquad, BiquadState, Stereo, StereoBiquad};
 use common::model::{SPLIT_FREQ_RANGE, Split, SplitBand};
 
 use crate::graph::selector_split::SelectorSplit;
@@ -215,21 +215,27 @@ impl BandSplit {
         }
         let (low, high) = (self.low_ramp[n - 1], self.high_ramp[n - 1]);
         self.set_frequencies(sample_rate, low, high);
-        for (ch, input) in [in_l, in_r].into_iter().enumerate() {
-            let st = &mut self.state[ch];
-            let out = &mut self.out[ch];
-            for i in 0..n {
-                let x = input[i];
-                let lo = st[0].process(&self.lp_lo, x);
-                let lo = st[1].process(&self.lp_lo, lo);
-                let hi = st[2].process(&self.hp_lo, x);
-                let hi = st[3].process(&self.hp_lo, hi);
-                out[0][i] = st[4].process(&self.ap_hi, lo);
-                let mid = st[5].process(&self.lp_hi, hi);
-                out[1][i] = st[6].process(&self.lp_hi, mid);
-                let top = st[7].process(&self.hp_hi, hi);
-                out[2][i] = st[8].process(&self.hp_hi, top);
-            }
+        let coeffs = [self.lp_lo, self.lp_lo, self.hp_lo, self.hp_lo, self.ap_hi, self.lp_hi, self.lp_hi, self.hp_hi, self.hp_hi];
+        let [st_l, st_r] = &mut self.state;
+        // L / R を同時に進める (段の番号は `STAGES` の並び)。
+        let mut st: [StereoBiquad; STAGES] = std::array::from_fn(|k| StereoBiquad::load(&st_l[k], &st_r[k], &coeffs[k]));
+        let [[lo_l, mid_l, top_l], [lo_r, mid_r, top_r]] = &mut self.out;
+        let (in_l, in_r, lo_l, lo_r) = (&in_l[..n], &in_r[..n], &mut lo_l[..n], &mut lo_r[..n]);
+        let (mid_l, mid_r, top_l, top_r) = (&mut mid_l[..n], &mut mid_r[..n], &mut top_l[..n], &mut top_r[..n]);
+        let [lp_lo1, lp_lo2, hp_lo1, hp_lo2, ap_hi, lp_hi1, lp_hi2, hp_hi1, hp_hi2] = &mut st;
+        for i in 0..n {
+            let x = Stereo::new(in_l[i], in_r[i]);
+            let lo = lp_lo2.tick(lp_lo1.tick(x));
+            let hi = hp_lo2.tick(hp_lo1.tick(x));
+            let lo = ap_hi.tick(lo);
+            let mid = lp_hi2.tick(lp_hi1.tick(hi));
+            let top = hp_hi2.tick(hp_hi1.tick(hi));
+            (lo_l[i], lo_r[i]) = (lo.l(), lo.r());
+            (mid_l[i], mid_r[i]) = (mid.l(), mid.r());
+            (top_l[i], top_r[i]) = (top.l(), top.r());
+        }
+        for (k, s) in st.iter().enumerate() {
+            s.store(&mut st_l[k], &mut st_r[k]);
         }
     }
 

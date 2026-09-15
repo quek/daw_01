@@ -23,6 +23,9 @@ use crate::model::{
     EQ_Q_MAX, EQ_Q_MIN, EQ_SHELF_Q, EqBand, EqSettings, ToneEqBand, ToneEqSettings,
 };
 
+mod stereo;
+pub use stereo::{Stereo, StereoBiquad};
+
 /// 正規化済み (a0 = 1) のバイクワッド係数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Biquad {
@@ -313,16 +316,23 @@ pub fn smoothing_coeff(ms: f32, sample_rate: f32) -> f32 {
     (-1.0 / (ms * 0.001 * sample_rate)).exp()
 }
 
-/// 線形振幅 → dBFS (無音は `-120`)。
+/// dB = `DB_PER_NEPER` × ln(振幅)、ln(振幅) = `NEPER_PER_DB` × dB。
+const DB_PER_NEPER: f32 = 20.0 / std::f32::consts::LN_10;
+const NEPER_PER_DB: f32 = std::f32::consts::LN_10 / 20.0;
+
+/// 線形振幅 → dBFS (無音は `-120`)。コンプの検出でサンプルごとに呼ぶので、`log10` ではなく自然対数に定数を
+/// 掛けて速く求める (数学的には同じ値で、f32 の丸めで末尾の桁だけが変わりうる)。
 #[must_use]
+#[inline]
 pub fn amp_to_db(amp: f32) -> f32 {
-    if amp <= 1e-6 { -120.0 } else { 20.0 * amp.log10() }
+    if amp <= 1e-6 { -120.0 } else { amp.ln() * DB_PER_NEPER }
 }
 
-/// dB → 線形振幅。
+/// dB → 線形振幅。コンプの利得適用でサンプルごとに呼ぶので、`powf` ではなく `exp` で求める。
 #[must_use]
+#[inline]
 pub fn db_to_amp(db: f32) -> f32 {
-    10f32.powf(db / 20.0)
+    (db * NEPER_PER_DB).exp()
 }
 
 /// Tone EQ の 3 段 ([`ToneEqBand::ALL`] と同順)。

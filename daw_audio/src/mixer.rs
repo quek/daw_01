@@ -267,27 +267,13 @@ pub fn apply_strip(scratch: &mut TrackScratch, n: usize, muted: bool, effective_
         .min(scratch.volume_per_sample.len())
         .min(scratch.pan_per_sample.len());
     scratch.effective_mute = effective_mute;
-    let mut peak_l = 0.0_f32;
-    let mut peak_r = 0.0_f32;
-    for i in 0..n {
-        // pan 則の SSoT は `common::audio_render::pan_gains` (audio event の pan も同じ式)。
-        let (pan_l, pan_r) = common::audio_render::pan_gains(scratch.pan_per_sample[i]);
-        let vol = scratch.volume_per_sample[i];
-        let gain_l = pan_l * vol;
-        let gain_r = pan_r * vol;
-        let l = scratch.track_l[i] * gain_l;
-        let r = scratch.track_r[i] * gain_r;
-        scratch.track_l[i] = l;
-        scratch.track_r[i] = r;
-        if l.abs() > peak_l {
-            peak_l = l.abs();
-        }
-        if r.abs() > peak_r {
-            peak_r = r.abs();
-        }
-    }
-    scratch.peak_l = peak_l;
-    scratch.peak_r = peak_r;
+    // pan 則の SSoT は `common::audio_render::pan_gains` (audio event の pan も同じ式)。
+    let (track_l, track_r) = (&mut scratch.track_l[..n], &mut scratch.track_r[..n]);
+    let (vols, pans) = (&scratch.volume_per_sample[..n], &scratch.pan_per_sample[..n]);
+    (scratch.peak_l, scratch.peak_r) = match common::audio_render::constant_pan_gains(pans) {
+        Some(g) => strip_gains(track_l, track_r, vols, |_| g),
+        None => strip_gains(track_l, track_r, vols, |i| common::audio_render::pan_gains(pans[i])),
+    };
     if muted {
         scratch.track_l[..n].fill(0.0);
         scratch.track_r[..n].fill(0.0);
@@ -296,6 +282,30 @@ pub fn apply_strip(scratch: &mut TrackScratch, n: usize, muted: bool, effective_
         scratch.peak_l = 0.0;
         scratch.peak_r = 0.0;
     }
+}
+
+/// [`apply_strip`] の本体: `track_l/r[i]` に pan `pan_at(i)` × volume `vols[i]` を掛け、(L, R) の peak を返す。
+/// pan が一定の buffer と動く buffer で別々に単態化させる (一定なら三角関数がループから消える)。
+#[inline(always)]
+fn strip_gains(track_l: &mut [f32], track_r: &mut [f32], vols: &[f32], pan_at: impl Fn(usize) -> (f32, f32)) -> (f32, f32) {
+    let mut peak_l = 0.0_f32;
+    let mut peak_r = 0.0_f32;
+    for (i, ((tl, tr), &vol)) in track_l.iter_mut().zip(track_r.iter_mut()).zip(vols).enumerate() {
+        let (pan_l, pan_r) = pan_at(i);
+        let gain_l = pan_l * vol;
+        let gain_r = pan_r * vol;
+        let l = *tl * gain_l;
+        let r = *tr * gain_r;
+        *tl = l;
+        *tr = r;
+        if l.abs() > peak_l {
+            peak_l = l.abs();
+        }
+        if r.abs() > peak_r {
+            peak_r = r.abs();
+        }
+    }
+    (peak_l, peak_r)
 }
 
 /// フェーダーを掛けない strip (`ChainProgram::fader == false` = 焼き込みの `RenderScope::Sources` / `PostFx`): 音はそのまま残し、

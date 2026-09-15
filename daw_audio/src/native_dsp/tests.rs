@@ -1,4 +1,4 @@
-//! r.md #129 §15.3 T1: 移植した内蔵 DSP が旧 strip DSP の golden (`golden_v38.txt`) と一致する。
+//! r.md #129 §15.3 T1: 内蔵 DSP が golden (`golden_v38.txt`、旧 strip DSP のシナリオ) と一致する。
 //!
 //! 刺激・窓統計・形式は `crate::dsp_golden` (記録側と同じコード)。ここは比較側で、各シナリオの meta
 //! から内蔵 device と Limiter の設定を組み、**本番と同じ経路** (`build_program` → `run_chain_program`
@@ -315,28 +315,16 @@ fn master_limiter_does_not_allocate() {
     });
 }
 
-/// golden の `limiter.on = true` のシナリオ (master_full) の窓を、直した Limiter で取り直す。
-/// それ以外のシナリオと meta は変えない。ヘッダの記録条件の行も合わせて書き換える (冪等)。
+/// golden の全シナリオの窓を今の実装 ([`render`]) で取り直す。音を意図して変えたときだけ回し、変えた理由と日付を
+/// ファイル先頭の `記録:` 行へ書き足す (header と meta はそのまま残す)。
 #[test]
-#[ignore = "r.md #129 E: Limiter の修正後に golden の master_full を取り直す"]
-fn rerecord_limiter_scenarios() {
+#[ignore = "音を意図して変えたときに golden を取り直す"]
+fn rerecord_golden() {
     let path = dsp_golden::golden_path();
     let text = std::fs::read_to_string(&path).expect("golden_v38.txt を読めない");
     let mut golden = dsp_golden::parse(&text).expect("golden を解釈できない");
-    let mut rerecorded = 0usize;
     for s in &mut golden.scenarios {
-        if s.meta("limiter.on") == Some("true") {
-            s.windows = render(s);
-            rerecorded += 1;
-        }
-    }
-    assert!(rerecorded > 0);
-    for h in &mut golden.header {
-        if h.starts_with("記録:") {
-            *h = "記録: 旧 DSP の記録器 (旧 mixer/channel_strip.rs の tests) は旧型と一緒に削除済み。limiter.on=true の窓の取り直しは cargo test -p daw_audio --bin daw_audio -- --ignored rerecord_limiter_scenarios (native_dsp/tests.rs)。".to_string();
-        } else if h.starts_with("kind=master_full:") {
-            *h = "kind=master_full: ブロックごとに process_pre → process_limiter (HEAD の render_master_buffer と同じ順。master_fx_chain は空・master_gain は 1.0 なので間に処理は無い)。limiter.on=true = HEAD でリミッターの先読み遅延が乗る状態。gr = gain_reduction_db().0、lim_gr = .1。**この kind の窓だけは r.md #129 E で直した Limiter (native_dsp/limiter.rs、先読み窓の中で必要ゲインの最小値を保持) から取り直した** — 旧 Limiter は先読みしている間にリリースで利得が戻り、孤立インパルスで ceiling を超えていた (peak 1.003 > −1 dBFS)。Bus Comp / Tone EQ の部分は旧 DSP と同じ。".to_string();
-        }
+        s.windows = render(s);
     }
     let out = dsp_golden::format(&golden);
     assert_eq!(dsp_golden::parse(&out).as_ref(), Ok(&golden), "書いた値を読み戻せない");

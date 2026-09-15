@@ -541,7 +541,7 @@ fn push_clip_events(
             event.event_length_beats,
             song.bpm,
         );
-        let gain_lin = 10f32.powf(event.gain_db / 20.0);
+        let gain_lin = common::dsp::db_to_amp(event.gain_db);
         if event.muted {
             continue;
         }
