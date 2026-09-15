@@ -50,6 +50,7 @@ pub mod status_bar;
 pub mod tab_strip;
 pub mod strip_sections;
 pub mod track_color;
+pub mod track_header_menu;
 pub mod undo_history;
 /// r.md #113: 仮想鍵盤ウィンドウ (true-floating)。
 pub mod virtual_keyboard;

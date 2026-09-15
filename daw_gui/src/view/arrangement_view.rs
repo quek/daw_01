@@ -662,87 +662,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 
     device_drag_over_headers(app, ui, &resp);
 
-    // track header の右クリックメニュー (Rename / Delete) を widget 外で重ねる。
-    // widget は track_header_rects の収集までを担い、 メニュー項目の発行は view 側。
-    // rename mode 中の track には text_input を rect に重ね描きする。
-    // rename 対象は安定 ID で直接持つ (index 経由の解決はしない = reorder/delete で
-    // 別 track にすり替わらない、 SSoT)。
-    let renaming_track_id = app.cur.peph.track_rename_id;
-    for (track_id, rect) in &resp.track_header_rects {
-        let track_id = *track_id;
-        let rect = *rect;
-        ui.context_menu_for(
-            rect,
-            &[
-                "Rename",
-                "複製 (独立)",
-                "複製 (リンク)",
-                "色...",
-                "クリップ色をトラックに揃える",
-                "Delete",
-            ],
-            move |idx, ui| {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    // 複製 (r.md #30) / 削除 (r.md #43) の対象: 右クリック track が
-                    // 選択集合に含まれるなら選択全体、 含まれないなら右クリック track
-                    // 単独 (REAPER / Ableton 流)。 メニュー内で規則を割らない。
-                    let target_ids = || {
-                        if app.cur.selection.selected_track_ids.contains(&track_id) {
-                            app.cur.selection.selected_track_ids.clone()
-                        } else {
-                            vec![track_id]
-                        }
-                    };
-                    match idx {
-                        0 => app.handle_event(AppEvent::BeginRenameTrack(track_id)),
-                        // 独立複製 (Alt+D 相当): 元と切り離した別コピー。
-                        1 => app.handle_event(AppEvent::DuplicateTracksUnique(target_ids())),
-                        // リンク複製 (D 相当): クリップ中身を元と content_id 共有。
-                        2 => app.handle_event(AppEvent::DuplicateTracksShared(target_ids())),
-                        // v18 (`docs/plan_track_clip_color.md`): color_picker を開く
-                        // (anchor = 右クリックした track header rect)。
-                        3 => app.open_color_picker(ColorPickerTarget::Track(track_id), rect),
-                        // Ableton 流: track の全 clip の色上書きを外して track 色継承に戻す。
-                        4 => app.handle_event(AppEvent::ResetTrackClipColors {
-                            track: track_id,
-                        }),
-                        5 => app.handle_event(AppEvent::DeleteTracks(target_ids())),
-                        _ => {}
-                    }
-                }));
-            },
-        );
-
-        if Some(track_id) == renaming_track_id {
-            // text_input は track header rect の上端に被せる (M/S トグル等は隠れる)。
-            // text_input widget が click で focus を取る。Enter で commit、Esc は
-            // root の escape shortcut handler が CancelRenameTrack を発行する。
-            let input_rect = Rect {
-                x: rect.x + 2.0,
-                y: rect.y + 2.0,
-                w: rect.w - 4.0,
-                h: 22.0,
-            };
-            let resp = ui.text_input_at_focused(
-                ("track_rename", track_id),
-                input_rect,
-                &app.cur.peph.track_rename_text,
-                &ui.text_input_style(),
-                |new| {
-                    Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::RenameTrackChanged(new.clone()));
-                    })
-                },
-            );
-            // Enter (committed) でも外クリック (blurred = focus loss) でも確定する。
-            // Esc は root の escape handler が CancelRenameTrack を出す (blurred には乗らない)。
-            if resp.committed || resp.blurred {
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.handle_event(AppEvent::CommitRenameTrack);
-                }));
-            }
-        }
-    }
+    // track header の右クリックメニューと改名 overlay (widget 外で重ねる)。
+    crate::view::track_header_menu::draw(app, ui, &resp);
 
     // v18 (`docs/plan_track_clip_color.md`, gui_01 #058): color_picker overlay。
     // `color_picker_target` が Some の間 1 フレームごとに `ui.color_picker` を
