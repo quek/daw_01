@@ -773,6 +773,12 @@ pub struct AudioEvent {
     /// 編集が続く。 片の中身の比較 (Glue でつなげるか) にも入る。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub take_id: u32,
+    /// v43: この event の take を **写して作った元の take** (近い順、`TAKE_ORIGIN_DEPTH` まで)。 ARA の audio
+    /// modification (content と take と素材ごと) を document に新しく作るとき、その編集を写して始める元の候補
+    /// (`crate::ara_ids`)。 複製 (独立コピー / 貼り付け / 複製) が付け ([`AudioEvent::record_copied_from`])、分割の片は
+    /// 継ぐ。 別のプロジェクトから来た take は元のプロジェクトの [`TakeOrigin::project_id`] で指す。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub take_origins: Vec<TakeOrigin>,
 
     pub gain_db: f32,
     pub pan: f32,
@@ -838,6 +844,7 @@ impl Default for AudioEvent {
             take_head_beats: 0.0,
             take_tail_beats: 0.0,
             take_id: 0,
+            take_origins: Vec::new(),
             gain_db: 0.0,
             pan: 0.0,
             pitch_semitones: 0.0,
@@ -862,6 +869,19 @@ impl Default for AudioEvent {
             beat_markers: Vec::new(),
         }
     }
+}
+
+/// 写して作った take の元 1 つ ([`AudioEvent::take_origins`])。 元の take の ARA audio modification の persistent
+/// id は `crate::ara_ids::origin_modification_id`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+pub struct TakeOrigin {
+    /// 元の take が居たプロジェクト (`Song::project_id`)。
+    pub project_id: u64,
+    pub content: ContentId,
+    /// 元の take の id (`AudioEvent::take_key`)。
+    pub take: u32,
+    /// 元の event の素材 (別のプロジェクトへ貼ると素材の id は取り込みで変わるので、元の側の id を持つ)。
+    pub source: AudioSourceId,
 }
 
 /// [`AudioEvent::pitch_semitones`] の絶対値上限 (半音)。Bitwig の audio event

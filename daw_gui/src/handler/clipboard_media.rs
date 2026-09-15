@@ -21,6 +21,34 @@ impl AppData {
         crate::clipboard::ClipboardEnvelope::new(song.project_id, payload).with_media(media)
     }
 
+    /// OS クリップボードへ書いた envelope `json` が運ぶ audio の take の Melodyne の編集を、**写した時点の状態** で
+    /// plug-in host に取っておかせる (`PluginCommand::SnapshotAraClipboard`)。 元のプロジェクトを閉じた後に貼っても、
+    /// 貼った take は写した元の編集から始まる。 写しの event は先頭の `take_origins` が写した元 (このプロジェクトの
+    /// take) を指している (写す側が付ける、`ClipContent::copied_from`)。 audio の take を運ばない写しでは何も送らない。
+    pub fn snapshot_ara_for_clipboard(&self, json: &str) {
+        let Some(envelope) = crate::clipboard::ClipboardEnvelope::from_json(json) else {
+            return;
+        };
+        let project_id = self.cur.song_doc.song().project_id;
+        let mut modifications: Vec<String> = envelope
+            .payload
+            .audio_events()
+            .into_iter()
+            .filter_map(|e| e.take_origins.first())
+            .filter(|o| o.project_id == project_id)
+            .map(common::ara_ids::origin_modification_id)
+            .collect();
+        modifications.sort_unstable();
+        modifications.dedup();
+        if !modifications.is_empty() {
+            self.send_plugin(common::protocol::PluginCommand::SnapshotAraClipboard {
+                project: self.pk(),
+                project_id,
+                modifications,
+            });
+        }
+    }
+
     /// 取り込む直前の正規化: 運んできた写しは絶対パスなので、**貼り先のフォルダ基準**へ
     /// 戻してから [`common::model::Song::import_media`] へ渡す (でないと同じ音源が
     /// `ProjectRelative` と `Absolute` の 2 本になる — 元のタブへ戻したときに必ず起きる)。

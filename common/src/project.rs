@@ -74,6 +74,12 @@ const LANE_VISIBILITY_IN_VIEW_STATE_VERSION: u32 = 37;
 /// ファイルの ARA アーカイブは旧 id で書かれているので、`ara_ids::migrate_legacy_archives` が読み替え表を作る。
 const ARA_STABLE_ID_VERSION: u32 = 42;
 
+/// v43 (r.md #132 残件、ARA のコピー) で写した元を take ごと (`AudioEvent::take_origins`) に持ち、アーカイブの
+/// 目次 (`PluginInstance::ara_archive_ids`) を持つようにした。 この版未満のファイルは v42 の
+/// `Song::content_forked_from` を deserialize 前に event へ移し ([`migrate_forked_contents_to_take_origins`])、目次の
+/// 無いアーカイブに目次を作る (`ara_ids::migrate_archive_contents`)。
+const ARA_TAKE_ORIGIN_VERSION: u32 = 43;
+
 /// v30 (§10) で `ClipContent` を `#[serde(untagged)]` から tagged (`type` field) 化した。
 /// この版未満のファイルは content を untagged (flat `{"notes":[...]}` 等) で保存しているので、
 /// `migrate_clip_content_add_tag` で `type` を注入してから deserialize する。
@@ -792,8 +798,44 @@ type Migration<T> = (u32, fn(&mut T));
 /// tagged ClipContent の `type` 注入等、型 deserialize の前提を作るものを置く。
 /// version 非依存 (idempotent) な前処理 (`migrate_vocal_source_to_clips`) は
 /// gate せず `load_project` 冒頭で無条件に呼ぶ。
-const VALUE_MIGRATIONS: &[Migration<serde_json::Value>] =
-    &[(CLIP_CONTENT_TAG_VERSION, migrate_clip_content_add_tag)];
+const VALUE_MIGRATIONS: &[Migration<serde_json::Value>] = &[
+    (CLIP_CONTENT_TAG_VERSION, migrate_clip_content_add_tag),
+    (ARA_TAKE_ORIGIN_VERSION, migrate_forked_contents_to_take_origins),
+];
+
+/// v42 の `song.content_forked_from` (共有を解いた audio content → 複製元) を撤去し、複製の各 event の
+/// `take_origins` に「複製元の同じ take から写した」を 1 段書く (`AudioEvent::record_copied_from` と同じ中身)。
+/// 複製元のプロジェクトは自分 (`song.project_id`)。
+fn migrate_forked_contents_to_take_origins(value: &mut serde_json::Value) {
+    use serde_json::{Value, json};
+    let Some(song) = value.get_mut("song").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(Value::Object(forked)) = song.remove("content_forked_from") else {
+        return;
+    };
+    let project_id = song.get("project_id").and_then(Value::as_u64).unwrap_or(0);
+    let Some(contents) = song.get_mut("clip_contents").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for (copy, origin) in forked {
+        let Some(origin) = origin.as_u64() else { continue };
+        let Some(events) = contents
+            .get_mut(&copy)
+            .filter(|c| c.get("type").and_then(Value::as_str) == Some("Audio"))
+            .and_then(|c| c.get_mut("events"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for event in events {
+            let field = |key: &str| event.get(key).and_then(Value::as_u64).unwrap_or(0);
+            let take = if field("take_id") == 0 { field("id") } else { field("take_id") };
+            let source = field("source_id");
+            event["take_origins"] = json!([{ "project_id": project_id, "content": origin, "take": take, "source": source }]);
+        }
+    }
+}
 
 /// deserialize 後の `Song` へ当てる version-gated migration の表。`< CURRENT_VERSION` で
 /// gate してはならない (version bump のたびに一つ前のバージョンのファイルへ誤再適用される)。
@@ -806,6 +848,9 @@ const SONG_MIGRATIONS: &[Migration<Song>] = &[
     // (v42) 位置由来の ARA persistent id で書かれたアーカイブに、今の id への読み替え表を持たせる。
     // 保存時点の並び (clip id / event の位置) で旧 id を作るので、正規化 (重なり解消等) より前に走る。
     (ARA_STABLE_ID_VERSION, crate::ara_ids::migrate_legacy_archives),
+    // (v43) 目次の無い (v42 の今の id で書いた) ARA アーカイブに、トラックの document から目次を作る。 v41 以前の
+    // 読み替え (上) が作った目次には触らないので、その後に走る。
+    (ARA_TAKE_ORIGIN_VERSION, crate::ara_ids::migrate_archive_contents),
 ];
 
 /// Load a project including optional GUI view state. The returned
@@ -1235,7 +1280,7 @@ mod tests {
     /// 開き直しても残り (v42 の file では作り直さない)、v42 のアーカイブには作らない。
     #[test]
     fn v41_の_ara_アーカイブは旧_id_から今の_id_への読み替え表を持って開く() {
-        use crate::ara_ids::{AraIdAlias, modification_id, source_id};
+        use crate::ara_ids::{AraArchiveEntry, modification_id, source_id};
         use crate::model::{AudioContent, AudioEvent, Device, PluginInstance};
         let dir = tempdir().unwrap();
         let mut song = Song::default();
@@ -1264,12 +1309,13 @@ mod tests {
         assert_eq!(clips[0].content_id, linked);
         let unshared = clips[1].content_id;
         assert_ne!(unshared, linked, "旧版でクリップごとだった編集を分けるため、2 本目は content を分ける");
-        assert_eq!(loaded.clip_contents[&unshared], loaded.clip_contents[&linked], "音は変わらない");
+        assert_eq!(loaded.clip_contents[&unshared], loaded.clip_contents[&linked], "音は変わらない (写した元も付けない)");
+        let ClipContent::Audio(split) = &loaded.clip_contents[&unshared] else { panic!("audio") };
         assert!(
-            !loaded.content_forked_from.contains_key(&unshared),
+            split.events.iter().all(|e| e.take_origins.is_empty()),
             "分けた content の編集はアーカイブの自分の旧 id にあるので、複製元の編集を写す元にしない"
         );
-        let alias = |archived: String, current: String| AraIdAlias { archived, current };
+        let alias = |archived: String, current: String| AraArchiveEntry { current, archived: Some(archived) };
         let expected = vec![
             alias("7:10:0".into(), source_id(7)),
             alias("7:10:0/mod".into(), modification_id(linked, &event(1, 0.0))),
@@ -1280,19 +1326,67 @@ mod tests {
         let device = |song: &Song| song.plugin_by_id(50).expect("device").clone();
         assert_eq!(device(&loaded).ara_archive_ids, expected, "素材の source は最初の 1 つ、modification はクリップと take ごと");
 
-        // 保存 (v42) して開き直しても表は残り、content を分け直さない。
+        // 保存して開き直しても表は残り、content を分け直さない。
         let resaved = dir.path().join("resaved.daw");
         save(&resaved, &loaded).unwrap();
         let reopened = load_project(&resaved).unwrap().song;
         assert_eq!(device(&reopened).ara_archive_ids, expected);
         assert_eq!(reopened.tracks[0].clips[1].content_id, unshared);
 
-        // v42 で書いたアーカイブ (今の id) には表を作らない。
+        // v42 で書いたアーカイブ (今の id) は読み替えず、トラックの document の object を目次にする。
+        let v42 = dir.path().join("v42.daw");
+        write_project_with_version(&v42, &song, 42);
+        let fresh = load_project(&v42).unwrap().song;
+        let stored = |id: String| AraArchiveEntry::stored(id);
+        assert_eq!(
+            device(&fresh).ara_archive_ids,
+            vec![
+                stored(source_id(7)),
+                stored(modification_id(linked, &event(1, 0.0))),
+                stored(modification_id(pair, &event(3, 0.0))),
+                stored(modification_id(pair, &event(4, 2.0))),
+            ],
+            "窓に見えている take と素材"
+        );
+        assert_eq!(fresh.tracks[0].clips[1].content_id, linked, "v42 の linked clip は共有のまま");
+
+        // 今の版のファイルは目次をそのまま読む (空の目次 = アーカイブに object が無い)。
         let current = dir.path().join("current.daw");
         write_project_with_version(&current, &song, CURRENT_VERSION);
-        let fresh = load_project(&current).unwrap().song;
-        assert!(device(&fresh).ara_archive_ids.is_empty());
-        assert_eq!(fresh.tracks[0].clips[1].content_id, linked, "v42 の linked clip は共有のまま");
+        assert!(device(&load_project(&current).unwrap().song).ara_archive_ids.is_empty());
+    }
+
+    /// v42 の `content_forked_from` (共有を解いた audio content → 複製元) は、開くと複製の各 event の
+    /// `take_origins` (複製元の同じ take) になる。 audio でない content の記録は捨てる。
+    #[test]
+    fn v42_の複製元の記録は複製の_event_の写した元になる() {
+        use crate::model::{AudioContent, AudioEvent, TakeOrigin};
+        let dir = tempdir().unwrap();
+        let mut song = Song { project_id: 99, ..Song::default() };
+        let pieces = vec![
+            AudioEvent { id: 1, source_id: 5, event_length_beats: 2.0, ..AudioEvent::default() },
+            AudioEvent { id: 2, take_id: 1, source_id: 5, event_start_in_clip_beats: 2.0, event_length_beats: 2.0, ..AudioEvent::default() },
+        ];
+        let origin = song.alloc_content(ClipContent::Audio(AudioContent { events: pieces.clone(), next_event_id: 3 }), String::new());
+        let copy = song.alloc_content(ClipContent::Audio(AudioContent { events: pieces, next_event_id: 3 }), String::new());
+        let clip = |id: u32, content_id| Clip { id, start_beat: 8.0 * f64::from(id), length_beats: 4.0, content_id, ..Clip::default() };
+        song.tracks = vec![Track { id: 1, clips: vec![clip(1, origin), clip(2, copy)], next_clip_id: 3, ..Track::default() }];
+        let mut value = serde_json::json!({ "version": 42, "song": serde_json::to_value(&song).unwrap() });
+        value["song"]["content_forked_from"] = serde_json::json!({ copy.to_string(): origin });
+        let path = dir.path().join("forked.daw");
+        std::fs::write(&path, value.to_string()).unwrap();
+
+        let loaded = load_project(&path).unwrap().song;
+        let ClipContent::Audio(audio) = &loaded.clip_contents[&copy] else { panic!("audio") };
+        let from = TakeOrigin { project_id: 99, content: origin, take: 1, source: 5 };
+        assert!(audio.events.iter().all(|e| e.take_origins == vec![from]), "片は同じ take の元を持つ");
+        let ClipContent::Audio(original) = &loaded.clip_contents[&origin] else { panic!("audio") };
+        assert!(original.events.iter().all(|e| e.take_origins.is_empty()), "複製元には付けない");
+
+        // 今の版で保存して開き直しても写した元は残る (ARA トラックに載る前に保存したコピーも、後で元の編集から始まる)。
+        let resaved = dir.path().join("resaved.daw");
+        save(&resaved, &loaded).unwrap();
+        assert_eq!(load_project(&resaved).unwrap().song.clip_contents[&copy], loaded.clip_contents[&copy]);
     }
 
     /// 旧 `save` (= `save_project(.., None)` への委譲) は view を書かない。

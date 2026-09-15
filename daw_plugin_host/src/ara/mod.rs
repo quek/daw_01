@@ -18,12 +18,23 @@ pub mod extension;
 pub mod graph_plan;
 pub mod host_controllers;
 pub mod session;
+pub mod states;
 pub mod vst3_ara;
 
 use anyhow::Result;
 
-use crate::ara::session::AraSession;
+use crate::ara::session::{AraSession, Retired, StartTable};
 pub use crate::ara::session::SavedArchive;
+
+/// One `SetupAraDocument` edit handed to a plug-in's ARA session ([`AraSession::set_clips`]).
+pub struct AraEdit<'a> {
+    pub clips: &'a [common::protocol::AraClipSpec],
+    pub bpm: f64,
+    pub time_sig: (u16, u16),
+    pub archive: Option<SavedArchive<'a>>,
+    /// How each created modification starts ([`states::AraStates::resolve_starts`]).
+    pub starts: &'a StartTable,
+}
 
 /// Backend hooks for the shared ARA lifecycle dance ([`run_setup_ara`] /
 /// [`run_clear_ara`]). CLAP / VST3 は「deactivate → set_clips → restore →
@@ -43,32 +54,28 @@ pub trait AraLifecycleHost {
 /// Shared `setup_ara`: ARA の `addPlaybackRegion` / region detach は instance
 /// inactive を要求するので、更新の前後で deactivate → reactivate する。bind
 /// 自体は load 時 (`bind_ara_if_capable`) に済んでいる。グラフの差分編集と、
-/// 新しく作った object へのアーカイブの restore は [`AraSession::set_clips`]。
-/// ARA 非 bind の instance は `Ok(false)`。
-pub fn run_setup_ara(
-    host: &mut dyn AraLifecycleHost,
-    clips: &[common::protocol::AraClipSpec],
-    bpm: f64,
-    time_sig: (u16, u16),
-    archive: Option<SavedArchive<'_>>,
-) -> Result<bool> {
-    if host.ara_session().is_none() {
-        return Ok(false);
-    }
+/// 新しく作った object の状態の restore は [`AraSession::set_clips`]。 戻り値 = destroy した modification の状態
+/// (host が取っておく。 reactivate に失敗しても document の編集は済んでいるので返す)。 ARA 非 bind の instance は
+/// `None`。
+pub fn run_setup_ara(host: &mut dyn AraLifecycleHost, edit: AraEdit<'_>) -> Option<Retired> {
+    host.ara_session()?;
     let was_active = host.is_active();
     let restore = host.last_activate_params();
     if was_active {
         host.do_deactivate();
     }
-    if let Some(session) = host.ara_session_mut().as_mut() {
-        session.set_clips(clips, bpm, time_sig, archive);
-    }
+    let retired = host
+        .ara_session_mut()
+        .as_mut()
+        .map(|session| session.set_clips(edit.clips, edit.bpm, edit.time_sig, edit.archive, edit.starts))
+        .unwrap_or_default();
     if was_active
         && let Some((sample_rate, min_frames, max_frames)) = restore
+        && let Err(e) = host.do_activate(sample_rate, min_frames, max_frames)
     {
-        host.do_activate(sample_rate, min_frames, max_frames)?;
+        tracing::error!(error = ?e, "setup_ara: reactivate failed");
     }
-    Ok(true)
+    Some(retired)
 }
 
 /// Shared `clear_ara`: session を drop する間 instance を inactive にし、

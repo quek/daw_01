@@ -685,17 +685,17 @@ pub trait LoadedPlugin: Send {
         Ok(false)
     }
 
-    /// Update the bound ARA document to expose `clips` (deactivate →
+    /// Update the bound ARA document to expose `edit.clips` (deactivate →
     /// set_clips (graph diff + restore into the created objects) → reactivate は
-    /// [`crate::ara::run_setup_ara`] に一本化)。
-    fn setup_ara(
-        &mut self,
-        _clips: &[common::protocol::AraClipSpec],
-        _bpm: f64,
-        _time_sig: (u16, u16),
-        _archive: Option<crate::ara::SavedArchive<'_>>,
-    ) -> Result<bool> {
-        Ok(false)
+    /// [`crate::ara::run_setup_ara`] に一本化)。 戻り値 = destroy した modification の状態、
+    /// ARA 非対応なら `None`。
+    fn setup_ara(&mut self, _edit: crate::ara::AraEdit<'_>) -> Option<crate::ara::session::Retired> {
+        None
+    }
+
+    /// This instance's live ARA session, if any (read by the host to copy states between documents).
+    fn ara_session(&self) -> Option<&crate::ara::session::AraSession> {
+        None
     }
 
     /// Update only the placement / stretch of existing ARA regions
@@ -711,12 +711,12 @@ pub trait LoadedPlugin: Send {
 
     /// Whether this instance currently holds a live ARA session.
     fn has_ara_session(&self) -> bool {
-        false
+        self.ara_session().is_some()
     }
 
-    /// Serialise this instance's ARA edit state for project save.
-    fn store_ara_archive(&self) -> Option<Vec<u8>> {
-        None
+    /// Serialise this instance's ARA edit state (with its table of contents) for project save.
+    fn store_ara_archive(&self) -> Option<common::protocol::AraArchive> {
+        self.ara_session().and_then(crate::ara::session::AraSession::store_archive)
     }
 
     // --- embedded Win32 GUI (plugin-main thread) --------------------------

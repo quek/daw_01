@@ -1217,14 +1217,12 @@ impl LoadedPlugin for Vst3Plugin {
         Ok(true)
     }
 
-    fn setup_ara(
-        &mut self,
-        clips: &[common::protocol::AraClipSpec],
-        bpm: f64,
-        time_sig: (u16, u16),
-        archive: Option<crate::ara::SavedArchive<'_>>,
-    ) -> Result<bool> {
-        crate::ara::run_setup_ara(self, clips, bpm, time_sig, archive)
+    fn setup_ara(&mut self, edit: crate::ara::AraEdit<'_>) -> Option<crate::ara::session::Retired> {
+        crate::ara::run_setup_ara(self, edit)
+    }
+
+    fn ara_session(&self) -> Option<&crate::ara::session::AraSession> {
+        self.ara.as_ref()
     }
 
     fn clear_ara(&mut self) {
@@ -1241,14 +1239,6 @@ impl LoadedPlugin for Vst3Plugin {
         if let Some(session) = self.ara.as_ref() {
             session.notify_model_updates();
         }
-    }
-
-    fn has_ara_session(&self) -> bool {
-        self.ara.is_some()
-    }
-
-    fn store_ara_archive(&self) -> Option<Vec<u8>> {
-        self.ara.as_ref().and_then(|session| session.store_archive())
     }
 
     fn enumerate_params(&self) -> Vec<common::protocol::PluginParamInfo> {

@@ -383,9 +383,10 @@ impl AppData {
     /// playback region per **piece shown in a clip's window** (r.md #132 残件 —
     /// an event hidden outside the window is not heard, and the window's edges
     /// crop the region), on the audio modification of its content and take and
-    /// the audio source of its file (`common::ara_ids`). Times convert from
-    /// beats to seconds (ARA playback time is in seconds). File sources resolve
-    /// to an absolute path; `Generated` resolves to its materialized WAV.
+    /// the audio source of its file (`common::ara_ids`), with the takes it was
+    /// copied from (`AudioEvent::take_origins`, resolved to the tab they live in).
+    /// Times convert from beats to seconds (ARA playback time is in seconds). File
+    /// sources resolve to an absolute path; `Generated` resolves to its materialized WAV.
     pub(crate) fn collect_ara_clips_for_track(
         &self,
         track: &common::model::Track,
@@ -411,13 +412,28 @@ impl AppData {
                     source_wav,
                     source_id: common::ara_ids::source_id(event.source_id),
                     modification_id: common::ara_ids::modification_id(clip.content_id, event),
-                    modification_origin: common::ara_ids::modification_origin(song, clip.content_id, event),
+                    modification_origins: event.take_origins.iter().map(|o| self.ara_origin(o)).collect(),
                     region_key: common::ara_ids::region_key(clip.id, event.id),
                     placement: ara_region_placement(clip, &piece, sample_rate, bpm),
                 });
             }
         }
         out
+    }
+
+    /// 写した元の take `origin` を plug-in host が引ける形にする: 元のプロジェクトが開いているタブ (いまのタブを先に)。
+    fn ara_origin(&self, origin: &common::model::TakeOrigin) -> common::protocol::AraModificationOrigin {
+        let here = self.cur.song_doc.song().project_id == origin.project_id;
+        let project = if here {
+            Some(self.pk())
+        } else {
+            self.tabs.parked.iter().find(|p| p.song_doc.song().project_id == origin.project_id).map(|p| p.key)
+        };
+        common::protocol::AraModificationOrigin {
+            project,
+            project_id: origin.project_id,
+            modification_id: common::ara_ids::origin_modification_id(origin),
+        }
     }
 
     /// ARA に渡す素材 `source_id` の絶対 WAV path と sample rate。 解決できなければ `None`。

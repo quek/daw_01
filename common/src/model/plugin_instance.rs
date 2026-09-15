@@ -78,12 +78,14 @@ pub struct PluginInstance {
     /// D2 (r.md #8): `Arc<[u8]>` で保持し undo snapshot 間で共有 (Melodyne 等の
     /// ARA アーカイブは MB 級で undo の編集対象でないため)。
     pub ara_archive: Option<std::sync::Arc<[u8]>>,
-    /// v42 (r.md #132 残件): `ara_archive` が **旧 persistent id** で書かれているときの、旧 id → 今の id の表
-    /// (`crate::ara_ids` の doc、旧ファイルの読み込みで作る)。 document を組むときに `SetupAraDocument.archive_ids`
-    /// で送り、restore の filter で読み替える。 新しいアーカイブは今の id で書かれるので、アーカイブと必ず一緒に
-    /// 置き換える / 捨てる ([`Self::set_ara_archive`] / [`Self::drop_ara_archive`])。 wire (LoadSong) には載せない。
+    /// v43 (r.md #132 残件): `ara_archive` の **目次** — 中にある object (audio source / audio modification) の
+    /// 今の id と、アーカイブに書かれている id (`crate::ara_ids::AraArchiveEntry`)。 plug-in host がアーカイブと
+    /// 一緒に報告し、旧ファイルの読み込みで作る (v41 以前は旧 persistent id の読み替え、v42 はトラックの document
+    /// から)。 document を組むときに `SetupAraDocument.archive_ids` で送り、目次にある object だけをアーカイブから
+    /// restore する (無い object は写した元から始められる)。 アーカイブと必ず一緒に置き換える / 捨てる
+    /// ([`Self::set_ara_archive`] / [`Self::drop_ara_archive`])。 wire (LoadSong) には載せない。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ara_archive_ids: Vec<crate::ara_ids::AraIdAlias>,
+    pub ara_archive_ids: Vec<crate::ara_ids::AraArchiveEntry>,
     /// r.md #36: このプラグインのエディタ窓では **キーを一切横取りしない**
     /// (= REAPER の 「Send all keyboard input to plug-in」)。
     ///
@@ -123,10 +125,10 @@ impl PluginInstance {
         }
     }
 
-    /// プラグインが今書いた ARA アーカイブで置き換える (今の persistent id で書かれているので読み替え表は捨てる)。
-    pub fn set_ara_archive(&mut self, archive: std::sync::Arc<[u8]>) {
+    /// プラグインが今書いた ARA アーカイブ (中にある object の今の persistent id `ids`) で置き換える。
+    pub fn set_ara_archive(&mut self, archive: std::sync::Arc<[u8]>, ids: Vec<String>) {
         self.ara_archive = Some(archive);
-        self.ara_archive_ids.clear();
+        self.ara_archive_ids = ids.into_iter().map(crate::ara_ids::AraArchiveEntry::stored).collect();
     }
 
     /// ARA アーカイブを捨てる (読み替え表も一緒に)。 捨てたら `true`。

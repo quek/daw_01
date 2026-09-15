@@ -110,7 +110,9 @@ impl Song {
             }
             if let Some(content) = self.clip_contents.get(&cid) {
                 let name = self.clip_content_names.get(&cid).cloned().unwrap_or_default();
-                out.contents.insert(cid, (content.clone(), name));
+                // 写しから content を作る貼り付け (別のプロジェクト / 元が消えた後) は、audio の take を元の編集から
+                // 始める (`AudioEvent::take_origins`)。 現物を共有する貼り付けは写しを使わない。
+                out.contents.insert(cid, (content.copied_from(self.project_id, cid), name));
             }
         }
         out.media = self.media_manifest_for(out.contents.values().map(|(c, _)| c));

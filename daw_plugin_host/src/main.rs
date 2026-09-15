@@ -13,6 +13,7 @@
 //! 持たない (処理順は daw_audio の schedule が Song から compile する)。
 
 mod ara;
+mod ara_host;
 mod builtin;
 mod clap_scan;
 mod plugin_paths;
@@ -440,7 +441,7 @@ fn ara_selftest(path: &std::path::Path, target_id: &str, wav: Option<&str>) -> R
                         1,
                         &common::model::AudioEvent { id: 1, source_id: 1, ..Default::default() },
                     ),
-                    modification_origin: None,
+                    modification_origins: Vec::new(),
                     region_key: common::ara_ids::region_key(1, 1),
                     placement: common::protocol::AraRegionPlacement {
                         start_in_playback_seconds: 0.0,
@@ -454,7 +455,8 @@ fn ara_selftest(path: &std::path::Path, target_id: &str, wav: Option<&str>) -> R
             None => Vec::new(),
         };
         step(&format!("calling setup_ara with {} clip(s)", clips.len()));
-        let _ = plugin.setup_ara(&clips, 120.0, (4, 4), None);
+        let starts = crate::ara::session::StartTable::new();
+        let _ = plugin.setup_ara(crate::ara::AraEdit { clips: &clips, bpm: 120.0, time_sig: (4, 4), archive: None, starts: &starts });
         step("setup_ara returned");
 
         // Activate AFTER the ARA bind + region setup, mirroring the real
@@ -698,6 +700,8 @@ struct PluginHost {
     /// 開いているプロジェクト (= タブ) の帳簿。instance は `DeviceAddr.project` で
     /// 帰属するので、ここには project 単位の情報だけ。
     projects: HashMap<ProjectKey, ProjectCtx>,
+    /// document の外に取っておく ARA の状態 (コピーが写す元、`ara::states`)。
+    ara_states: ara::states::AraStates,
 }
 
 impl PluginHost {
@@ -717,6 +721,7 @@ impl PluginHost {
             worker_pool: None,
             wedged: Vec::new(),
             projects: HashMap::new(),
+            ara_states: ara::states::AraStates::default(),
         }
     }
 
@@ -939,6 +944,7 @@ impl PluginHost {
                     .collect();
                 ids.sort_unstable();
                 tracing::info!(?project, count = ids.len(), "UnloadProject");
+                self.ara_states.close_project(project);
                 for id in ids {
                     self.teardown_device(id, true);
                 }
@@ -1048,62 +1054,11 @@ impl PluginHost {
                 }
             }
             PluginCommand::SetupAraDocument { device, clips, bpm, time_sig, archive, archive_ids } => {
-                // setup_ara は内部で deactivate→activate するので quiesce 契約。
-                let Ok(saved) = self.detach_and_quiesce(device) else { return };
-                let published = saved.is_some();
-                let archive = archive.as_deref().map(|bytes| crate::ara::SavedArchive { bytes, ids: &archive_ids });
-                match self.instances.get_mut(&device) {
-                    Some(rec) => {
-                        if published {
-                            rec.plugin.stop_processing();
-                        }
-                        match rec.plugin.setup_ara(&clips, bpm, time_sig, archive) {
-                            Ok(true) => {
-                                tracing::info!(?device, n = clips.len(), "ARA document set up");
-                            }
-                            Ok(false) => {
-                                tracing::warn!(
-                                    ?device,
-                                    "SetupAraDocument: plugin is not ARA-capable, ignoring"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(error = ?e, ?device, "ARA setup failed");
-                            }
-                        }
-                        if published
-                            && let Err(e) = rec.plugin.start_processing()
-                        {
-                            tracing::error!(error = ?e, ?device, "SetupAraDocument: start_processing failed");
-                        }
-                    }
-                    None => {
-                        tracing::warn!(?device, "SetupAraDocument: no plugin for ?device");
-                    }
-                }
-                if let Some(entry) = saved {
-                    self.republish(device, entry);
-                }
+                self.setup_ara_document(device, &clips, bpm, time_sig, archive.as_deref(), &archive_ids);
             }
-            PluginCommand::ClearAraDocument { device } => {
-                // clear_ara も deactivate→activate を伴うので同じ quiesce 契約。
-                let Ok(saved) = self.detach_and_quiesce(device) else { return };
-                let published = saved.is_some();
-                if let Some(rec) = self.instances.get_mut(&device) {
-                    if published {
-                        rec.plugin.stop_processing();
-                    }
-                    rec.plugin.clear_ara();
-                    if published
-                        && let Err(e) = rec.plugin.start_processing()
-                    {
-                        tracing::error!(error = ?e, ?device, "ClearAraDocument: start_processing failed");
-                    }
-                    tracing::info!(?device, "ARA document cleared");
-                }
-                if let Some(entry) = saved {
-                    self.republish(device, entry);
-                }
+            PluginCommand::ClearAraDocument { device } => self.clear_ara_document(device),
+            PluginCommand::SnapshotAraClipboard { project, project_id, modifications } => {
+                self.snapshot_ara_clipboard(project, project_id, &modifications);
             }
             PluginCommand::UpdateAraRegions { device, regions } => {
                 match self.instances.get(&device) {
@@ -1343,6 +1298,8 @@ impl PluginHost {
     /// 事実で、daw_audio が旧 mapping を掴んだまま新 instance と食い違うのを
     /// 防ぐのはこちらの責務 (protocol の doc 参照)。
     fn teardown_device(&mut self, device: DeviceAddr, emit_unloaded: bool) {
+        // 降ろす ARA document の状態を取っておく (そこに居たクリップを後で別のトラックへ写せる)。
+        self.keep_ara_document(device);
         let Some(mut rec) = self.instances.remove(&device) else {
             return;
         };
@@ -2055,6 +2012,9 @@ impl PluginHost {
         //     daw_gui も同時に畳まれている。
         let ids: Vec<DeviceAddr> = self.instances.keys().copied().collect();
         tracing::info!(count = ids.len(), "shutdown: tearing down all devices");
+        for project in ids.iter().map(|d| d.project) {
+            self.ara_states.close_project(project);
+        }
         for id in ids {
             self.teardown_device(id, false);
         }

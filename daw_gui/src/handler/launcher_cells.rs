@@ -1133,7 +1133,8 @@ fn fork_automation_clip_content(song: &mut Song, lane_key: AutomationLaneKey, cl
 }
 
 /// セルの中身を **独立コピー**にする (`Ctrl+Shift` ドロップ / `Alt+D` 複製)。
-/// `content_id` を採り直して中身を複製するので、以後の編集は元と連動しない。
+/// `content_id` を採り直して中身を複製するので、以後の編集は元と連動しない ([`Song::fork_content`] =
+/// Make Unique と同じ 1 式: audio の take は元の Melodyne の編集から始める)。
 pub(crate) fn make_cell_content_unique(song: &mut Song, row: LauncherRow, clip_id: u32) {
     let Some(old) = (match row {
         LauncherRow::Track(id) => song
@@ -1147,13 +1148,7 @@ pub(crate) fn make_cell_content_unique(song: &mut Song, row: LauncherRow, clip_i
     }) else {
         return;
     };
-    let content = song.clip_contents.get(&old).cloned().unwrap_or_default();
-    let name = song.clip_content_names.get(&old).cloned();
-    let new_id = song.alloc_content_id();
-    song.clip_contents.insert(new_id, content);
-    if let Some(n) = name {
-        song.clip_content_names.insert(new_id, n);
-    }
+    let new_id = song.fork_content(old);
     match row {
         LauncherRow::Track(id) => {
             if let Some(t) = song.track_by_id_mut(id)

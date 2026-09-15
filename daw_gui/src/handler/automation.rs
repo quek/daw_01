@@ -836,10 +836,16 @@ impl AppData {
         let clip = track.clip_by_id(r.clip_id)?;
         let content = self.cur.song_doc.song().clip_contents.get(&clip.content_id)?;
         let events = content.audio_events()?;
+        // 貼った take は元の take の編集から始める (`AudioEvent::take_origins`)。
+        let project_id = self.cur.song_doc.song().project_id;
         let mut copied: Vec<AudioEvent> = self
             .selected_audio_event_indices()
             .iter()
             .filter_map(|i| events.get(*i).cloned())
+            .map(|mut e| {
+                e.record_copied_from(project_id, clip.content_id);
+                e
+            })
             .collect();
         if copied.is_empty() {
             return None;
@@ -971,12 +977,10 @@ impl AppData {
         let base = if earliest.is_finite() { earliest } else { 0.0 };
         let mut clips = Vec::with_capacity(resolved.len());
         for (ti, c) in &resolved {
-            let content = self
-                .cur.song_doc.song()
-                .clip_contents
-                .get(&c.content_id)
-                .cloned()
-                .unwrap_or_default();
+            // 写しから content を作る貼り付けは、audio の take を元の編集から始める (`AudioEvent::take_origins`)。
+            let song = self.cur.song_doc.song();
+            let content =
+                song.clip_contents.get(&c.content_id).map(|x| x.copied_from(song.project_id, c.content_id)).unwrap_or_default();
             let name = self.cur.song_doc.song().clip_content_names.get(&c.content_id).cloned();
             clips.push(crate::clipboard::ClipCopy {
                 track_offset: (*ti as i64) - (min_track as i64),
