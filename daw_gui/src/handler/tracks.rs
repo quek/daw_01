@@ -36,9 +36,7 @@ impl AppData {
             self.delete_tracks_inner(&ids);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::DeleteTracks {
-            track_ids: ids,
-        }));
+        self.enqueue_deferred_edit(DeferredEdit::DeleteTracks { track_ids: ids });
     }
 
     /// 複数トラック削除の本体。 呼び出し側で undo snapshot 済み (deferred 経由 or
@@ -85,9 +83,7 @@ impl AppData {
             self.cut_tracks_inner(&track_ids);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::CutTracks {
-            track_ids,
-        }));
+        self.enqueue_deferred_edit(DeferredEdit::CutTracks { track_ids });
     }
 
     /// copy 本体。最新 state 込みの live song から該当トラックを serialize して
@@ -702,10 +698,7 @@ impl AppData {
             self.duplicate_tracks_inner(&track_ids, linked);
             return;
         }
-        self.enqueue_state_request(PendingStateRequest::Deferred(DeferredEdit::DuplicateTracks {
-            track_ids,
-            linked,
-        }));
+        self.enqueue_deferred_edit(DeferredEdit::DuplicateTracks { track_ids, linked });
     }
 
     /// 複製本体。呼び出し側で最新 plugin state 反映済み (deferred 経由 or 即時 fallback)。
@@ -878,6 +871,7 @@ impl AppData {
             .collect();
         let removal_plan =
             Self::plan_track_removal_ipc(self.cur.song_doc.song(), &removal_targets);
+        let live_before = self.live_before();
         for &i in subtree_idxs.iter().rev() {
             self.edit_song(|song| song.tracks.remove(i as usize));
         }
@@ -893,7 +887,7 @@ impl AppData {
         // の clip / セル。残すと歌が無いのに口だけ動き、二度と片付かない)・選択範囲の行・折り畳み・
         // Audio Editor の対象は、トラックを外す 3 経路共通の 1 本が担う (ここで「消した id の集合」から
         // 作り直すと経路ごとに分岐が増え、実際にグループ解除 / 末尾削除で漏れていた)。
-        self.after_tracks_removed(&removal_plan, audio_editor_key);
+        self.after_tracks_removed(&removal_plan, audio_editor_key, &live_before);
 
         // selected_track_ids: subtree に含まれていた id を全て除外。
         // 残りが空なら **削除位置に繰り上がった隣接トラック** を選ぶ

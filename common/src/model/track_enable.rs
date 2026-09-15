@@ -4,6 +4,11 @@
 //! 素材の常駐) ・映像・プラグインの host 常駐・VOICEVOX 合成・書き出しがすべて
 //! [`Song::track_effectively_enabled`] **1 本**を読んで外す。group を無効にすると子も実効的に無効
 //! (子自身の `Track::enabled` は別に保つので、group を戻すと個別に無効だった子は無効のまま)。
+//!
+//! Song が持つのは **ユーザーの意図** (有効 / 無効) だけ。engine のグラフが「いま実行してよいか」は、それに
+//! 「鳴らす plugin が host への読み込み中ではない」を足した [`Song::executable_mask`] で決まる (有効に戻した
+//! トラックは読み込みが確定するまで無効と同じに見える)。読み込み中かは Song に載らない実行時の状態で、
+//! 所有者は daw_gui の `pending_plugin_loads` (engine へは `AudioCommand::SetLoadingDevices` で届く)。
 
 use super::*;
 
@@ -19,12 +24,27 @@ impl Song {
         self.lineage_all(track_id, |t| t.enabled)
     }
 
-    /// song-track index 順の [`Self::track_effectively_enabled`]。compile / 索引のように全トラックを
-    /// 1 回で引く口 (トラックごとに線形探索しない)。同じ id が複数あれば先頭を親として引く
+    /// song-track index 順の [`Self::track_effectively_enabled`]。索引 / 素材の常駐 / ランチャーの行のように
+    /// 全トラックを 1 回で引く口 (トラックごとに線形探索しない)。同じ id が複数あれば先頭を親として引く
     /// (`track_by_id` と同じ答え)。
     #[must_use]
     pub fn effectively_enabled_mask(&self) -> Vec<bool> {
         self.lineage_mask(|t| t.enabled)
+    }
+
+    /// song-track index 順に **engine のグラフがいま実行してよいか**: 自分と祖先 group が全部 `enabled` で、
+    /// どれも **待たせる plugin** (`holds(plugin)`、Parallel の中も含む) を持たない。
+    ///
+    /// `holds` は engine が決める — 「host への読み込み中で、かつその描画で op を出す (bypass 中 / 描かない段の
+    /// device は待たない)」(`daw_audio::graph::executable_tracks`)。有効に戻した / 開いた直後のトラックは、鳴らす
+    /// plugin の読み込みが確定 (成功か失敗) するまで無効と同じに扱われる — engine は plugin 登録の無い device を
+    /// 素通しにするので、読み込み途中の chain を走らせると FX の掛かっていない音が鳴る。group の plugin を待つなら
+    /// 子も待つ (子の合流先がグラフに居ない)。待つのは **音 (グラフ)** だけで、ユーザーの意図を読む口 (ランチャーの
+    /// 行 / 素材の常駐 / solo の表示 / 変調ソース) は [`Self::effectively_enabled_mask`] のまま (待っている間も
+    /// セルの時間は進み、素材は揃う)。
+    #[must_use]
+    pub fn executable_mask(&self, holds: impl Fn(&PluginInstance) -> bool) -> Vec<bool> {
+        self.lineage_mask(|t| t.enabled && !plugins(&t.devices).any(&holds))
     }
 
     /// **実行系に居るべき** plugin = 実効的に有効なトラックと master の全 plugin ([`Self::all_plugins`] と同じ
@@ -140,6 +160,31 @@ mod tests {
         assert!(!s.set_tracks_enabled(&[10, MASTER_TRACK_ID, 999], true));
         assert!(s.track_effectively_enabled(MASTER_TRACK_ID));
         assert!(!s.track_effectively_enabled(999));
+    }
+
+    /// 読み込み中の plugin を持つトラックは、有効でもグラフでは実行しない (group なら子孫も)。意図の判定は変わらない。
+    #[test]
+    fn 読み込み中の_plugin_を持つトラックと_group_の子孫は実行しない() {
+        let plugin = |id: u64| {
+            Device::Plugin(PluginInstance { id, ..PluginInstance::new("p".into(), crate::plugin_format::PluginFormat::Clap) })
+        };
+        let mut s = song();
+        s.tracks[0].devices = vec![plugin(100)];
+        // 12 の plugin は Parallel の中 (信号の中に居る plugin は全部数える)。
+        let mut par = Parallel::new();
+        par.chains[0].devices.push(plugin(120));
+        s.tracks[2].devices = vec![Device::Parallel(par)];
+        s.tracks[3].devices = vec![plugin(130)];
+
+        let loading = |want: u64| move |p: &PluginInstance| p.id == want;
+        assert_eq!(s.executable_mask(|_| false), s.effectively_enabled_mask(), "読み込み中が無ければ意図と同じ");
+        assert_eq!(s.executable_mask(loading(120)), vec![true, true, false, true], "Parallel の中の読み込みも待つ");
+        assert_eq!(s.executable_mask(loading(100)), vec![false, false, false, true], "group の読み込みは子孫も待つ");
+        assert_eq!(s.executable_mask(loading(999)), vec![true; 4], "Song に居ない device は関係ない");
+        // 無効は読み込みと独立に効く。意図の判定 (`track_effectively_enabled`) は読み込みを知らない。
+        s.set_tracks_enabled(&[13], false);
+        assert_eq!(s.executable_mask(loading(120)), vec![true, true, false, false]);
+        assert!(s.track_effectively_enabled(12));
     }
 
     #[test]

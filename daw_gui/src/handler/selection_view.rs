@@ -152,12 +152,11 @@ impl AppData {
         let Some(surface) = self.edit_surface(is_pianoroll_active) else {
             return;
         };
+        // 解決した面の削除は **必ず AppEvent で** 流す (1 操作 = 1 undo step + 操作名、
+        // `AppData::handle_event` の doc)。
         let event = match surface {
-            // section: 選択帯のみ削除 (内容温存)。 専用 handler で AppEvent を持たない。
-            EditSurface::Sections => {
-                self.apply_delete_selected_sections();
-                return;
-            }
+            // section: 選択帯のみ削除 (内容温存)。
+            EditSurface::Sections => AppEvent::Section(crate::event_section::SectionEvent::DeleteSelected),
             // トラック面: 選択中の全トラックを 1 undo step で削除 (Ableton 準拠)。
             // 確認ダイアログは出さない (Ableton / REAPER とも出さず undo で戻す)。
             EditSurface::Tracks => {

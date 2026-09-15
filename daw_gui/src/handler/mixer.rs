@@ -103,7 +103,7 @@ impl AppData {
             self.cur.pipc
                 .pending_added_plugin_finalize
                 .insert(device_id, open_gui);
-            self.send_set_slot_plugin(device_id, &entry_id, None);
+            self.send_set_slot_plugin(device_id, &entry_id, None, LoadPlayback::Pause);
         }
 
         let new_device = common::model::PluginInstance {

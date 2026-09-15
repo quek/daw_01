@@ -25,13 +25,19 @@ mod app_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod event;
+/// 貼り付け / カット / コピーのイベント (`AppEvent::Clipboard` の中身)。
+pub mod event_clipboard;
 /// チェーン上のデバイス操作のイベント (`AppEvent::Device` の中身)。
 pub mod event_device;
 /// r.md #129: 内蔵 device / master Limiter の値編集 (`DeviceEvent::NativeEdit` の中身)。
 pub mod event_native;
 /// r.md #87: クリップランチャーのイベントと値型 (`AppEvent::Launcher` の中身)。
 pub mod event_launcher;
+/// 範囲選択の中身の移動 / 複製 / ミュート (`AppEvent::Range` の中身)。
+pub mod event_range;
 pub mod event_sampler;
+/// Arranger セクション帯の編集 (`AppEvent::Section` の中身)。
+pub mod event_section;
 /// r.md #132: 分割 / 結合キーのイベント (`AppEvent::SplitJoin` の中身)。
 pub mod event_split;
 pub mod event_tabs;

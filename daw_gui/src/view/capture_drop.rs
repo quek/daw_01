@@ -13,6 +13,7 @@ use daw_ui_renderer::Rect;
 use crate::app::{AppData, AppEvent};
 use crate::app_types::{PROJECT_XFER_DRAG_KIND, ProjectTransferPayload};
 use crate::clipboard::{ClipboardPayload, cells_from_clips, clips_from_cells};
+use crate::event_clipboard::{CellPasteDest, ClipPasteDest, ClipboardEvent, PasteContent, PasteOrigin};
 use crate::event_launcher::LauncherRow;
 use crate::state::LauncherFocus;
 use crate::event_sampler::SamplerEvent;
@@ -139,10 +140,8 @@ fn take_project_transfer_drop(
                 return;
             };
             let clips = crate::clipboard::sanitize_clips(clips);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                let n = app.paste_clips_at(clips, src_pid, track_id, at, &media);
-                app.ui_ephemeral.status_message = format!("別のタブからクリップを {n} 個コピーしました");
-            }));
+            let dest = ClipPasteDest::Track(track_id);
+            ui.push_edit(paste_from_tab(PasteContent::Clips { clips, source_project_id: src_pid, media, dest, at }));
         }
         // セルをアレンジのレーンへ: 行 = 相対行、拍 = 落とした拍 + 同じ行のセルを長さぶん右へ。
         ClipboardPayload::LauncherCells(cells) => {
@@ -158,19 +157,14 @@ fn take_project_transfer_drop(
                 return;
             };
             let clips = crate::clipboard::sanitize_clips(clips);
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                let n = app.paste_clips_at(clips, src_pid, track_id, at, &media);
-                app.ui_ephemeral.status_message = format!("別のタブからクリップを {n} 個コピーしました");
-            }));
+            let dest = ClipPasteDest::Track(track_id);
+            ui.push_edit(paste_from_tab(PasteContent::Clips { clips, source_project_id: src_pid, media, dest, at }));
         }
         crate::clipboard::ClipboardPayload::Tracks(payload) => {
             // 落とした行の直上へ。余白なら末尾 (`paste_tracks_at` は未知の id を末尾扱いする)。
             let above = hovered_row.and_then(|i| rows.get(i)).map_or(u32::MAX, |(id, _)| *id);
             let payload = crate::clipboard::sanitize_tracks(payload.clone());
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                let n = app.paste_tracks_at(payload, src_pid, above, &media);
-                app.ui_ephemeral.status_message = format!("別のタブからトラックを {n} 本コピーしました");
-            }));
+            ui.push_edit(paste_from_tab(PasteContent::Tracks { payload, source_project_id: src_pid, media, above }));
         }
         _ => {}
     }
@@ -279,18 +273,21 @@ fn drop_into_new_tracks(
         })
         .collect();
     let clips = crate::clipboard::sanitize_clips(clips);
-    let media = media.clone();
-    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        // トラックを足す編集と貼る編集を **1 undo 手** に束ねる (ユーザーの操作は
-        // 1 回の drop なので、undo も 1 回で元に戻るべき)。
-        let save = app.cur.song_doc.enter_own_gesture();
-        if let Some(anchor) = app.append_empty_tracks(n_tracks) {
-            let n = app.paste_clips_at(clips, src_pid, anchor, at, &media);
-            app.ui_ephemeral.status_message =
-                format!("別のタブからクリップを {n} 個、新しいトラックにコピーしました");
-        }
-        app.cur.song_doc.leave_own_gesture(save);
+    // トラックを足す編集と貼る編集は 1 event = **1 undo 手** (ユーザーの操作は 1 回の drop)。
+    ui.push_edit(paste_from_tab(PasteContent::Clips {
+        clips,
+        source_project_id: src_pid,
+        media: media.clone(),
+        dest: ClipPasteDest::NewTracks(n_tracks),
+        at,
     }));
+}
+
+/// 別のタブから運んだものを貼る `Edit` (`handle_event` を通す = 1 undo step + 操作名)。
+fn paste_from_tab(content: PasteContent) -> Edit<AppData> {
+    Edit::mutate(move |app: &mut AppData| {
+        app.handle_event(AppEvent::Clipboard(ClipboardEvent::Paste { content, origin: PasteOrigin::OtherTab }));
+    })
 }
 
 /// §5.6: ランチャー帯 (セッション) へ落とす。クリップは **その行 × 列のセル** に
@@ -331,10 +328,7 @@ fn take_project_transfer_drop_on_launcher(
                 crate::widgets::arrangement::ArrangementRowKey::Lane(l) => l.track,
             });
             let payload = crate::clipboard::sanitize_tracks(payload.clone());
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                let n = app.paste_tracks_at(payload, src_pid, above, &media);
-                app.ui_ephemeral.status_message = format!("別のタブからトラックを {n} 本コピーしました");
-            }));
+            ui.push_edit(paste_from_tab(PasteContent::Tracks { payload, source_project_id: src_pid, media, above }));
             return;
         }
         _ => return,
@@ -347,29 +341,16 @@ fn take_project_transfer_drop_on_launcher(
         if cells.is_empty() {
             return;
         }
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            // 上と同じ: トラックを足す編集と貼る編集で 1 undo 手。
-            let save = app.cur.song_doc.enter_own_gesture();
-            if let Some(track_id) = app.append_empty_track() {
-                let dest = LauncherFocus {
-                    row: LauncherRow::Track(track_id),
-                    scene_index: scene_index as usize,
-                };
-                let n = app.paste_launcher_cells(cells, src_pid, dest, &media);
-                app.ui_ephemeral.status_message = format!("別のタブからセルを {n} 個コピーしました");
-            }
-            app.cur.song_doc.leave_own_gesture(save);
-        }));
+        // 上と同じ: トラックを足す編集と貼る編集で 1 undo 手。
+        let dest = CellPasteDest::NewTrack { scene_index: scene_index as usize };
+        ui.push_edit(paste_from_tab(PasteContent::LauncherCells { cells, source_project_id: src_pid, media, dest }));
         return;
     };
     let Some((cells, dest_row)) = retarget_cells(app, resp, row, cells) else {
         return;
     };
-    let dest = LauncherFocus { row: dest_row, scene_index: scene_index as usize };
-    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        let n = app.paste_launcher_cells(cells, src_pid, dest, &media);
-        app.ui_ephemeral.status_message = format!("別のタブからセルを {n} 個コピーしました");
-    }));
+    let dest = CellPasteDest::Cell(LauncherFocus { row: dest_row, scene_index: scene_index as usize });
+    ui.push_edit(paste_from_tab(PasteContent::LauncherCells { cells, source_project_id: src_pid, media, dest }));
 }
 
 /// 帯の **表示行**で解いた着地先を、`paste_launcher_cells` が使う

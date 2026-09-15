@@ -169,6 +169,7 @@ impl SlotReconcileAction {
 /// 居るべきでない (`Song::live_plugins`) — 無効化で `RemoveDevice`、有効化で state 付きの `LoadDevice`、
 /// undo / redo も同じ口。`pending_loads` (= load 応答待ち、`AppData::pending_plugin_loads` の鍵) のうち
 /// 居るべきでないものも `RemoveDevice` にする (読み込み中に無効化すると、応答後に載ったまま残らない)。
+/// 送る順 (engine への構造の同期をどこに挟むか) は適用する側 `AppData::apply_slot_reconcile_actions` が持つ。
 pub fn compute_slot_reconcile_actions(
     song: &common::model::Song,
     loaded_devices: &HashMap<u64, LoadedDeviceInfo>,

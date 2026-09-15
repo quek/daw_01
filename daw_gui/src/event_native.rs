@@ -85,7 +85,7 @@ impl NativeEdit {
         let kind = match self {
             Self::Params(params) => match params.first() {
                 Some((p, _)) => p.kind(),
-                None => return "編集",
+                None => return crate::state::song_doc::GENERIC_UNDO_LABEL,
             },
             Self::EqBandOn { .. } | Self::EqBell { .. } => common::model::NativeKind::Eq,
             Self::CompMode(_) => common::model::NativeKind::Comp,

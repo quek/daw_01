@@ -217,18 +217,20 @@ impl AppData {
         // audio editor の対象は song を差し替えると消えている可能性があるので、
         // **前** に key を退避して `after_undo_redo` で引き直す。
         let key = self.audio_editor_target_key();
+        let disabled_before = self.disabled_track_ids();
         if !self.cur.song_doc.undo() {
             return;
         }
-        self.after_undo_redo(key);
+        self.after_undo_redo(key, &disabled_before);
     }
 
     pub(crate) fn redo(&mut self) {
         let key = self.audio_editor_target_key();
+        let disabled_before = self.disabled_track_ids();
         if !self.cur.song_doc.redo() {
             return;
         }
-        self.after_undo_redo(key);
+        self.after_undo_redo(key, &disabled_before);
     }
 
     /// r.md #29: 履歴リストの行 click → `index` 番目の state へ一気に遡る /
@@ -236,10 +238,11 @@ impl AppData {
     /// (`after_undo_redo`) は最終 state に対して 1 度だけ走らせる。
     pub(crate) fn jump_history_to(&mut self, index: usize) {
         let key = self.audio_editor_target_key();
+        let disabled_before = self.disabled_track_ids();
         if !self.cur.song_doc.jump_to(index) {
             return;
         }
-        self.after_undo_redo(key);
+        self.after_undo_redo(key, &disabled_before);
     }
 
     /// プロジェクト非依存の UI 設定 (resource monitor on/off・編集履歴 window の
@@ -268,7 +271,14 @@ impl AppData {
     /// `audio_editor_key` は song を差し替える **前** に退避した安定 `ClipKey`
     /// (`AppData::audio_editor_target_key`)。 audio editor の対象は positional な
     /// `ClipKey` なので、 これで貼り直さないと index が詰まって別クリップを指す。
-    pub(crate) fn after_undo_redo(&mut self, audio_editor_key: Option<common::model::ClipKey>) {
+    ///
+    /// `disabled_before` = 差し替える **前** の Song で実効的に無効だったトラック ([`Self::disabled_track_ids`]、
+    /// r.md #131 — 有効に戻ったトラックの読み込みは再生を止めない)。
+    pub(crate) fn after_undo_redo(
+        &mut self,
+        audio_editor_key: Option<common::model::ClipKey>,
+        disabled_before: &std::collections::HashSet<u32>,
+    ) {
         // (epoch bump / gesture chain 切断は SongDoc::undo/redo が実施済み。)
         // selected_clip が undo 後も存在するなら維持、消えていれば None。
         // (常に None にすると undo のたびにピアノロールがプレースホルダに戻ってしまう)
@@ -342,7 +352,7 @@ impl AppData {
         // RemoveSlot/SetSlot IPC コストを観測したい場合は
         // `daw_gui::app::undo_perf=trace` で見る。
         let reconcile_started = std::time::Instant::now();
-        self.reconcile_plugins_with_song();
+        self.reconcile_plugins_with_song(disabled_before);
         let reconcile_elapsed = reconcile_started.elapsed();
         tracing::trace!(
             target: "daw_gui::app::undo_perf",
@@ -910,13 +920,16 @@ impl AppData {
     /// `initial_state` として渡す。 直前 commit で push_undo_snapshot 前に
     /// `RequestAllStates` で最新 state を Song に書き戻しているので、
     /// 削除直前の knob 値も Undo で復元される。
-    pub(crate) fn reconcile_plugins_with_song(&mut self) {
+    ///
+    /// `disabled_before` = 差し替える **前** の Song で実効的に無効だったトラック (r.md #131)。undo / redo で有効に
+    /// 戻ったトラックの読み込みは再生を止めない ([`LoadPlayback::KeepPlaying`])。
+    pub(crate) fn reconcile_plugins_with_song(&mut self, disabled_before: &std::collections::HashSet<u32>) {
         let actions = compute_slot_reconcile_actions(
             self.cur.song_doc.song(),
             &self.cur.pipc.loaded_devices,
             &self.cur.pipc.pending_plugin_loads,
         );
-        self.apply_slot_reconcile_actions(actions);
+        self.apply_slot_reconcile_actions(actions, disabled_before);
         // 「未ロード」表示は host に居るべき device のものだけ残す (undo で消えた device / r.md #131 で無効にした
         // トラックの device は失敗表示を持ち越さない。有効に戻すと `LoadDevice` が読み込みをやり直す)。
         let live: std::collections::HashSet<u64> = self.cur.song_doc.song().live_plugins().map(|p| p.id).collect();
@@ -924,48 +937,72 @@ impl AppData {
     }
 
     /// [`compute_slot_reconcile_actions`] の action を IPC と帳簿へ適用する (reconcile 全体と、r.md #131 の
-    /// 「居るべきかが変わった device だけ」の追従 `follow_live_devices` が共有する)。
-    pub(crate) fn apply_slot_reconcile_actions(&mut self, actions: Vec<SlotReconcileAction>) {
+    /// 「居るべきかが変わった device だけ」の追従 `follow_live_devices` が共有する)。**engine への構造の同期
+    /// ([`Self::flush_song_sync`]) もここが持つ** — 送る位置が音を決めるので呼び出し側に並べさせない:
+    ///
+    /// 1. 載せる device を応答待ちに積む (まだ host へは送らない)。
+    /// 2. engine へ「読み込み中」→ 新しい構造 (`LoadSong`) の順に届ける。有効に戻したトラックは読み込みが確定するまで
+    ///    グラフに入らない (先に構造が届くと、登録の無い device を素通しにした FX の掛かっていない音が鳴る)。
+    /// 3. 降ろす (`ClosePluginShmem` → `RemoveSlotPlugin`)。無効にしたトラックは 2 でグラフから抜けているので、plugin が
+    ///    消えても素通しで鳴らない。
+    /// 4. 1 の `SetSlotPlugin` を送る (host が受ける順は従来どおり降ろす → 載せる)。
+    ///
+    /// `disabled_before` = 編集の前に実効的に無効だったトラック。そこへ載せる読み込み = 有効に戻したトラックの読み込みは
+    /// 再生を止めない ([`LoadPlayback::KeepPlaying`]、r.md #131)。それ以外 (鳴っていたトラックへ device が戻る / 増える、
+    /// 消したトラックが戻る) は従来どおり止める。
+    pub(crate) fn apply_slot_reconcile_actions(
+        &mut self,
+        actions: Vec<SlotReconcileAction>,
+        disabled_before: &std::collections::HashSet<u32>,
+    ) {
+        let mut removals = Vec::new();
+        let mut loads = Vec::new();
         for action in actions {
             match action {
-                SlotReconcileAction::RemoveDevice { device_id } => {
-                    tracing::info!(device_id, "reconcile: removing extra host device");
-                    // close the editor before removing (see
-                    // remove_devices_inner for the ordering rationale).
-                    self.cleanup_slot_gui(device_id);
-                    // **`ClosePluginShmem` を `RemoveSlotPlugin` より先に送る**
-                    // (順序は死守。 audio worker が unmapped shmem を踏むと
-                    // silent terminate → `all_done` 永久 wait。 理由は
-                    // `handler/grouping.rs` の `plan_track_removal_ipc` doc)。
-                    // 旧 Phase A が track 単位でまとめて送っていた責務を、
-                    // device 単位でここが引き取る。
-                    self.send_audio(AudioCommand::ClosePluginShmem { project: self.pk(), device_id });
-                    self.send_plugin(PluginCommand::RemoveSlotPlugin { device: self.dev(device_id) });
-                    self.cur.pipc.loaded_devices.remove(&device_id);
-                    self.cur.pipc.pending_plugin_loads.remove(&device_id);
-                    // r.md #131: 追加直後の GUI 自動 open 予約も落とす (無効化したトラックの窓が load 応答後に開かない)。
-                    self.cur.pipc.pending_added_plugin_finalize.remove(&device_id);
-                    self.cur.pipc.gui_open_requests.retain(|&id| id != device_id);
-                }
+                SlotReconcileAction::RemoveDevice { device_id } => removals.push(device_id),
                 // plugin DB が未ロードなら SetSlotPlugin を組み立てられない (= db ロード待ち)。降ろす側
                 // (`RemoveDevice`) は db が要らないので、ここで止めずに先に済ませる (無効化が db 待ちで漏れない)。
                 SlotReconcileAction::LoadDevice { device_id, .. } if self.ipc.plugin_db.is_none() => {
                     tracing::warn!(device_id, "reconcile: plugin database not loaded; load skipped");
                 }
-                SlotReconcileAction::LoadDevice {
-                    device_id,
-                    plugin_id_str,
-                    initial_state,
-                } => {
-                    tracing::info!(
-                        device_id,
-                        plugin_id = %plugin_id_str,
-                        "reconcile: loading device from song"
-                    );
-                    self.send_set_slot_plugin(device_id, &plugin_id_str, initial_state);
+                SlotReconcileAction::LoadDevice { device_id, plugin_id_str, initial_state } => {
+                    tracing::info!(device_id, plugin_id = %plugin_id_str, "reconcile: loading device from song");
+                    let resumed = self
+                        .cur
+                        .song_doc
+                        .song()
+                        .device_owner_track(device_id)
+                        .is_some_and(|owner| disabled_before.contains(&owner));
+                    let playback = if resumed { LoadPlayback::KeepPlaying } else { LoadPlayback::Pause };
+                    loads.extend(self.prepare_set_slot_plugin(device_id, &plugin_id_str, initial_state, playback));
                 }
             }
         }
+        self.flush_song_sync();
+        for device_id in removals {
+            tracing::info!(device_id, "reconcile: removing extra host device");
+            // close the editor before removing (see
+            // remove_devices_inner for the ordering rationale).
+            self.cleanup_slot_gui(device_id);
+            // **`ClosePluginShmem` を `RemoveSlotPlugin` より先に送る**
+            // (順序は死守。 audio worker が unmapped shmem を踏むと
+            // silent terminate → `all_done` 永久 wait。 理由は
+            // `handler/grouping.rs` の `plan_track_removal_ipc` doc)。
+            // 旧 Phase A が track 単位でまとめて送っていた責務を、
+            // device 単位でここが引き取る。
+            self.send_audio(AudioCommand::ClosePluginShmem { project: self.pk(), device_id });
+            self.send_plugin(PluginCommand::RemoveSlotPlugin { device: self.dev(device_id) });
+            self.cur.pipc.loaded_devices.remove(&device_id);
+            self.cur.pipc.pending_plugin_loads.remove(&device_id);
+            // r.md #131: 追加直後の GUI 自動 open 予約も落とす (無効化したトラックの窓が load 応答後に開かない)。
+            self.cur.pipc.pending_added_plugin_finalize.remove(&device_id);
+            self.cur.pipc.gui_open_requests.retain(|&id| id != device_id);
+        }
+        for cmd in loads {
+            self.send_plugin(cmd);
+        }
+        // 読み込み中に降ろした device を engine の「読み込み中」から外す (構造は上で届いている)。
+        self.sync_loading_devices(false);
     }
 
     /// PR-V3 後段: 旧 project file を読み込んだとき、 `track.source =
@@ -1068,34 +1105,51 @@ impl AppData {
         device_id: u64,
         plugin_id: &str,
         initial_state: Option<Vec<u8>>,
+        playback: LoadPlayback,
     ) -> bool {
+        let Some(cmd) = self.prepare_set_slot_plugin(device_id, plugin_id, initial_state, playback) else {
+            return false;
+        };
+        self.send_plugin(cmd);
+        true
+    }
+
+    /// [`Self::send_set_slot_plugin`] の前半: 解決して応答待ち (`pending_plugin_loads`) に積み、送る `SetSlotPlugin` を返す
+    /// (まだ送らない)。host へ送る前に engine へ「読み込み中」と構造を届けたい reconcile ([`Self::apply_slot_reconcile_actions`])
+    /// が、送る位置を自分で決めるために分けてある。解決できなければ何も積まず `None`。
+    fn prepare_set_slot_plugin(
+        &mut self,
+        device_id: u64,
+        plugin_id: &str,
+        initial_state: Option<Vec<u8>>,
+        playback: LoadPlayback,
+    ) -> Option<PluginCommand> {
         let Some(db) = self.ipc.plugin_db.clone() else {
             tracing::warn!(%plugin_id, "plugin database not loaded; cannot resolve plugin id");
-            return false;
+            return None;
         };
         let Some(entry) = db.find_by_id(plugin_id) else {
             tracing::error!(id = %plugin_id, device_id, "plugin id not in database");
-            return false;
+            return None;
         };
         // v29: 安定 device id でアドレスする。 0 (未採番) は ensure_ids 前の
         // song が漏れてきた設計バグなので error に出して skip。
         if device_id == 0 {
             tracing::error!(id = %plugin_id, "device id unallocated; skipping SetSlotPlugin");
-            return false;
+            return None;
         }
         let format = entry.format;
         let path = entry.path.clone();
         let resolved_id = entry.id.clone();
-        let generation = self.track_pending_load(device_id);
-        self.send_plugin(PluginCommand::SetSlotPlugin {
+        let generation = self.track_pending_load(device_id, playback);
+        Some(PluginCommand::SetSlotPlugin {
             device: self.dev(device_id),
             format,
             path,
             plugin_id: resolved_id,
             initial_state,
             generation,
-        });
-        true
+        })
     }
 
     /// plugin_host にこの device を実体化させる **唯一の口**。
@@ -1110,6 +1164,7 @@ impl AppData {
             inst.id,
             &inst.plugin_id,
             inst.state.as_deref().map(<[u8]>::to_vec),
+            LoadPlayback::Pause,
         )
     }
 
@@ -1151,13 +1206,6 @@ impl AppData {
         } else {
             self.action_save_as();
         }
-    }
-
-    /// ウィンドウを閉じる要求 (`WindowEvent::CloseRequested` = ✕ / Alt+F4 /
-    /// システムメニュー / タスクバー) のエントリ。 r.md #61 で終了経路が
-    /// 増えたので、実体は [`AppData::request_quit`] (全経路の合流点)。
-    pub fn request_close(&mut self) {
-        self.request_quit(crate::shutdown::QuitRequest::USER);
     }
 
     /// **アクティブなタブ** を破棄する操作 (終了 / タブを閉じる) のエントリ。
@@ -1401,6 +1449,13 @@ impl AppData {
         if was_idle {
             self.dispatch_front_state_request();
         }
+    }
+
+    /// plugin state の往復を待ってから走らせる編集を積む。いま dispatch 中の操作の履歴ラベルを
+    /// 控え、完了時 (`on_all_states_from_child`) にその名前の独立した 1 undo step で適用する。
+    pub(crate) fn enqueue_deferred_edit(&mut self, edit: DeferredEdit) {
+        let label = self.cur.song_doc.event_label();
+        self.enqueue_state_request(PendingStateRequest::Deferred { edit, label });
     }
 
     /// queue 先頭 request の state 収集を開始する (= `RequestAllStates` 送信)。

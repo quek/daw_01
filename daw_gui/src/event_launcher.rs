@@ -385,7 +385,7 @@ impl LauncherEvent {
             E::SetSceneFollow { .. } => "フォローアクション",
             // 非編集 (表示 / 選択 / MIDI learn) は snapshot を積まないので
             // ラベルは記録されない。
-            _ => "編集",
+            _ => crate::state::song_doc::GENERIC_UNDO_LABEL,
         }
     }
 }

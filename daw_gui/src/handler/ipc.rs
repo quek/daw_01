@@ -260,7 +260,7 @@ impl AppData {
                 if let Some(p) = self.cur.pipc.pending_vocal_synth_bounce.take() {
                     let key = ClipKey { track_id: p.track_id, clip_id: p.clip_id };
                     match self.live_clip_key(key) {
-                        Some(target) => self.start_clip_bounce(target, p.mode),
+                        Some(target) => self.start_clip_bounce(target, p.mode, p.label),
                         None => {
                             self.ui_ephemeral.status_message =
                                 "Bounce: 対象クリップが消えたため中止しました".into();
@@ -360,7 +360,8 @@ impl AppData {
                 // 自身の窓の中で触った param** をそのソースの変調先にする。
                 // daw_gui はプラグインの窓の中に overlay を描けないので、 arm +
                 // ドラッグが届かないのはここだけ。 touch 通知がその唯一の到達手段。
-                self.connect_armed_mod_source_to(track, target);
+                // ユーザー操作なので操作名の付く event で繋ぐ (この IPC event の名前で積まない)。
+                self.handle_event(AppEvent::ConnectArmedModSource { track_id: track, target });
             }
             PluginEvent::PluginParamValueChanged {
                 device: DeviceAddr { device_id, .. },

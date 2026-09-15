@@ -54,8 +54,12 @@ impl AppData {
     /// `flush_pending_host_sync` (`pending_host_sync` flag 経路) を吸収一本化した。
     /// `pub`: runner (frame flush) と各 handler (ensure-synced) のほか、 headless
     /// 統合テストが frame 境界を模して呼ぶ (`tests/app_state/*`)。
+    ///
+    /// r.md #131: 読み込み中の device の表 ([`Self::sync_loading_devices`]) もここで揃える — 増える分は `LoadSong` の
+    /// 前、減る分は後。構造が変わらない frame でも表だけは揃える (読み込みの確定は Song を変えない)。
     pub fn flush_song_sync(&mut self) {
         if self.cur.song_doc.sync_epoch() == self.cur.pipc.last_synced_epoch {
+            self.sync_loading_devices(false);
             return;
         }
         // v23 (review fix #4/#5/#6): daw_audio は各 device の役割を `ports` から
@@ -81,7 +85,9 @@ impl AppData {
         // 「Song が差し替わる」全経路 (Open / New / Undo / Redo / 復旧) が通る
         // 唯一の口なので、開いた直後に保存値が効かない取りこぼしが構造的に無い。
         self.send_audio(AudioCommand::SetMasterGain { project: self.pk(), gain: song.master_gain });
+        self.sync_loading_devices(true);
         self.send_audio(AudioCommand::LoadSong { project: self.pk(), song });
+        self.sync_loading_devices(false);
         // PR-V3: vocal track が builtin VOICEVOX を instrument に持つ場合、
         // notes / bpm 変更を plugin に flush して背景 synth を trigger。
         // 既存 vocal block (= track.instrument is None の旧 project) には
@@ -96,6 +102,46 @@ impl AppData {
         // (resolve_default_device_ports の normalize bump も含めて吸収する
         // ため末尾で読む = 次 frame で epoch 一致 → no-op に収束)。
         self.cur.pipc.last_synced_epoch = self.cur.song_doc.sync_epoch();
+    }
+
+    /// r.md #131: engine が compile に使う「読み込み中の device」を `pending_plugin_loads` (所有者) に揃える
+    /// (前に送った集合と違うときだけ `SetLoadingDevices` を送る)。engine はこれを持つトラックをグラフに入れないので、
+    /// 有効に戻した / 開いた直後のトラックは読み込みが確定 (成功 / 失敗) した瞬間から鳴る。
+    ///
+    /// 順序が音を決める — engine は登録の無い device を素通しにするので:
+    /// - **増える分は構造より前** (`grow_only = true`、前に送った集合 ∪ いまの読み込み中): `LoadSong` がトラックを
+    ///   実行に入れる前に「読み込み中」を知っていないと、その間 FX の掛かっていない音が鳴る。
+    /// - **減る分は構造より後** (`grow_only = false`): 消えた device (トラックの削除 / 無効化で読み込みを取り消した) を
+    ///   それがまだ居る古い構造の上で外すと、一瞬素通しで鳴る。engine が今の構造を持っている (`LoadSong` の直後か、
+    ///   送っていない編集が無い) ときだけ呼ぶ。読み込みが確定した 1 台は [`Self::settle_loading_device`]。
+    pub(crate) fn sync_loading_devices(&mut self, grow_only: bool) {
+        let pending = self.cur.pipc.pending_plugin_loads.keys().copied();
+        let next: std::collections::BTreeSet<u64> = if grow_only {
+            pending.chain(self.cur.pipc.last_sent_loading_devices.iter().copied()).collect()
+        } else {
+            pending.collect()
+        };
+        self.send_loading_devices(next);
+    }
+
+    /// r.md #131: 読み込みが確定した (`SlotPluginLoaded` / `SlotPluginLoadFailed`) 1 台だけを engine の「読み込み中」から
+    /// 外す。成功なら `OpenPluginShmem` を送った後に呼ぶ (登録より先に外すと、登録が届くまで素通しで鳴る)。失敗なら
+    /// その device は素通しになる (失敗した device の規則)。ほかの差分 (まだ送っていない編集で消えた device) は
+    /// 構造と一緒に [`Self::flush_song_sync`] が揃える — ここで外すと古い構造の上で素通しになる。
+    pub(crate) fn settle_loading_device(&mut self, device_id: u64) {
+        let mut next = self.cur.pipc.last_sent_loading_devices.clone();
+        if next.remove(&device_id) {
+            self.send_loading_devices(next);
+        }
+    }
+
+    fn send_loading_devices(&mut self, next: std::collections::BTreeSet<u64>) {
+        if next == self.cur.pipc.last_sent_loading_devices {
+            return;
+        }
+        let device_ids = next.iter().copied().collect();
+        self.send_audio(AudioCommand::SetLoadingDevices { project: self.pk(), device_ids });
+        self.cur.pipc.last_sent_loading_devices = next;
     }
 
     /// (r.md #5 ARA2) Expose each ARA-capable device's track audio clips to the

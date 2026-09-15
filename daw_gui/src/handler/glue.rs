@@ -35,6 +35,8 @@ pub struct PendingGlueBake {
     pub jobs: Vec<GlueBakeJob>,
     /// 実行中 job の index。
     pub current: usize,
+    /// `J` の履歴ラベル (完了を運ぶ `BounceClipFxComplete` の名前で積まない)。
+    pub label: &'static str,
 }
 
 /// Glue の対象種別 (= 1 トラック内で 1 つに畳める content variant)。
@@ -269,12 +271,16 @@ impl AppData {
             .map(|(id, _)| *id)
             .collect();
         if audio_tracks.is_empty() {
-            self.apply_glue(&sel, &BTreeMap::new());
+            let label = self.cur.song_doc.event_label();
+            self.apply_glue(&sel, &BTreeMap::new(), label);
             return;
         }
         // r.md #131: audio の結合は offline render で焼く。無効なトラックは実行系に居ないので焼けない。
         if audio_tracks.iter().any(|&id| !self.cur.song_doc.song().track_effectively_enabled(id)) {
             self.ui_ephemeral.status_message = "Glue: 無効なトラックの audio は焼けません (有効にしてから)".into();
+            return;
+        }
+        if self.reject_offline_render_while_loading("Glue") {
             return;
         }
         self.start_glue_bake(sel, &audio_tracks);
@@ -346,7 +352,8 @@ impl AppData {
         }
         self.ui_ephemeral.status_message =
             format!("Glue: {} トラックを焼き込み中...", jobs.len());
-        self.cur.pipc.pending_glue_bake = Some(PendingGlueBake { sel, jobs, current: 0 });
+        let label = self.cur.song_doc.event_label();
+        self.cur.pipc.pending_glue_bake = Some(PendingGlueBake { sel, jobs, current: 0, label });
         if !self.send_glue_bake(0) {
             self.abort_glue_bake("Glue: 焼き込みを開始できませんでした".into());
         }
@@ -440,7 +447,7 @@ impl AppData {
         };
         let baked: BTreeMap<u32, GlueBakeJob> =
             done.jobs.into_iter().map(|j| (j.track_id, j)).collect();
-        self.apply_glue(&done.sel, &baked);
+        self.apply_glue(&done.sel, &baked, done.label);
         // 適用**後**に engine の song を戻す (= 焼き上がった song をそのまま届ける)。
         // 先に戻すと isolated → 旧 song → 次フレームの epoch flush で新 song、と
         // LoadSong が 2 度走り、その間 engine は結合前の song で鳴る。
@@ -465,8 +472,8 @@ impl AppData {
     }
 
     /// 結合を song へ適用する。`baked` に居るトラックは焼いた WAV へ置換、
-    /// それ以外は非破壊 merge。**1 gesture = 1 undo step**。
-    fn apply_glue(&mut self, sel: &TimeSelection, baked: &BTreeMap<u32, GlueBakeJob>) {
+    /// それ以外は非破壊 merge。**1 gesture = 1 undo step** (`label` = `J` の履歴ラベル)。
+    fn apply_glue(&mut self, sel: &TimeSelection, baked: &BTreeMap<u32, GlueBakeJob>, label: &'static str) {
         if !sel.start_beat.is_finite() || !sel.end_beat.is_finite() {
             return;
         }
@@ -488,7 +495,7 @@ impl AppData {
         // トラックごとの結合 (N 回) が別々の step になると、1 回の `J` を戻すのに
         // N+1 回 Undo が要る。**非同期の完了から呼ばれる**ので、進行中のドラッグの
         // bracket は横取りせず退避して戻す。
-        let gesture = self.cur.song_doc.enter_own_gesture();
+        let gesture = self.cur.song_doc.enter_own_gesture(label);
         // **範囲の境界でクリップを割ってから集める。** はみ出した部分は元のクリップと
         // して残り、範囲の中身だけが 1 クリップへ焼き込まれる (Live の `Ctrl+E`
         // "Split Clip at Selection" と同じ切り出し、`docs/plan_range_selection.md` §7.1)。

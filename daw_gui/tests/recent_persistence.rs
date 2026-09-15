@@ -60,7 +60,7 @@ fn save_fresh_project(app: &mut AppData, proj_dir: &std::path::Path) -> std::pat
     let proj_path = proj_dir.join("proj.daw");
     app.cur.song_doc.file_path = Some(proj_path.clone());
     app.cur.song_doc.normalize(|_| {});
-    app.request_close();
+    app.handle_event(AppEvent::Quit(daw_gui::shutdown::QuitRequest::USER));
     app.handle_event(AppEvent::DirtyGuardSave);
     proj_path
 }

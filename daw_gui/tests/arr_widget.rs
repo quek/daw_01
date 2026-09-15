@@ -362,6 +362,8 @@ fn clip_dragged_below_the_last_row_lands_on_a_new_track() {
             song.tracks[1].clips[0].start_beat
         );
     }
+    let doc = &app.cur.song_doc;
+    assert_eq!(doc.history_labels()[doc.history_current()], "クリップ移動", "履歴に操作名が付く");
     // トラックを足した編集と動かした編集で 1 undo 手 (操作は 1 回の drop)。
     app.handle_event(daw_gui::app::AppEvent::Undo);
     let song = app.cur.song_doc.song();

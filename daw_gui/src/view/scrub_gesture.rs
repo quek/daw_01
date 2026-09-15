@@ -112,7 +112,7 @@ pub(crate) fn close(app: &mut AppData) {
             app.handle_event(AppEvent::EndInspectorScrub);
             // 立ち下がり = このツマミへの割り当てが完了した瞬間。routing 自体は
             // drag 中に作られているので、ここは解除と通知だけ (`view::modulation`)。
-            app.connect_armed_mod_source_to(track_id, target);
+            app.handle_event(AppEvent::ConnectArmedModSource { track_id, target });
         }
         ScrubGesture::Inspector(_) | ScrubGesture::LaneDefault(_) | ScrubGesture::MasterGain => {
             app.handle_event(AppEvent::EndInspectorScrub);

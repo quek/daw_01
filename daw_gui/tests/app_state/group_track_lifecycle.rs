@@ -236,8 +236,8 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
         track_ids: vec![group_id],
     });
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
-    // frame flush: ClosePluginShmem は ungroup handler が UAF 防止で直送済。 schedule
-    // 再構築の LoadSong はここで送られ、 close をブラケットする (load_before/after)。
+    // ungroup handler は group を外した構造 (LoadSong) を送ってから ClosePluginShmem を直送する (UAF 防止)。
+    // frame flush は残りの編集 (無ければ no-op)。
     app.flush_song_sync();
 
     let audio_msgs = drain(&mut audio_rx);
@@ -252,17 +252,12 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
                 "ClosePluginShmem(delay) must be sent on audio_tx during ungroup: {audio_msgs:?}"
             )
         });
-    let load_after = audio_msgs.iter().enumerate().any(|(i, m)| {
-        i > close_idx && matches!(m, AudioCommand::LoadSong { project: _, song: _ })
-    });
+    // group を外した構造が plugin を降ろすより先に届く (後だと、まだ group が居る古い構造の上で登録を失った
+    // device が素通しで鳴る)。
     let load_before = audio_msgs.iter().enumerate().any(|(i, m)| {
         i < close_idx && matches!(m, AudioCommand::LoadSong { project: _, song: _ })
     });
-    assert!(
-        load_before || load_after,
-        "LoadSong should bracket the close: {:?}",
-        audio_msgs
-    );
+    assert!(load_before, "LoadSong (group を外した構造) は close より先: {:?}", audio_msgs);
 
     // ----- ungroup IPC: plugin_host 側 -----
     // group が持っていた device (= delay) だけが teardown される。 synth は別

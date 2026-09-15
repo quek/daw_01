@@ -1,5 +1,5 @@
 use super::*;
-use crate::graph::{DeviceLatencies, compile_schedule};
+use crate::graph::{DeviceLatencies, LoadingDevices, compile_schedule};
 use common::model::{
     AudioTap, AuxInputRoute, AuxOutputRoute, FollowerConfig, ModSource, ModSourceKind, NativeDevice, NativeKind,
     PluginInstance, Send, SendMode, TapPoint, TapSource, Track,
@@ -115,7 +115,7 @@ fn reachability(g: &RenderGraph) -> Vec<Vec<bool>> {
 #[test]
 fn 資源が衝突する手の組は直列トレースと同じ順に並ぶ() {
     let (song, lat) = busy_song();
-    let sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).expect("compile");
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).expect("compile");
     let g = &sched.graph;
     let kinds = |pred: fn(&NodeOp) -> bool| sched.nodes.iter().filter(|op| pred(op)).count();
     assert!(kinds(|op| matches!(op, NodeOp::ApplyDelay { .. })) > 0, "前提: PDC");
@@ -162,7 +162,7 @@ fn 資源が衝突する手の組は直列トレースと同じ順に並ぶ() {
 #[test]
 fn 依存の無い_bus_同士は別々の_job_で同時に走れる() {
     let (song, lat) = busy_song();
-    let sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).expect("compile");
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).expect("compile");
     let g = &sched.graph;
     let job_with = |want: Step| (0..g.job_count() as u32).find(|&j| g.steps(j).contains(&want)).expect("job");
     let group_fx = |track_idx: u32| {
@@ -201,7 +201,7 @@ impl Park for NoPark {
 #[test]
 fn master_バスへの合流は_callback_スレッドだけが流す() {
     let (song, lat) = busy_song();
-    let sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).expect("compile");
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).expect("compile");
     let (g, nodes) = (&sched.graph, &sched.nodes);
     let writes_master =
         |j: u32| g.steps(j).iter().any(|s| matches!(s, Step::Node(k) if matches!(nodes[*k as usize], NodeOp::Mix { dst: BufRef::Master, .. })));
@@ -220,7 +220,7 @@ fn master_バスへの合流は_callback_スレッドだけが流す() {
 #[test]
 fn 待ち行列は全_job_を辺の順に_1_回ずつ流す() {
     let (song, lat) = busy_song();
-    let sched = compile_schedule(&song, &lat, 48_000, 256, RenderScope::Mix).expect("compile");
+    let sched = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 256, RenderScope::Mix).expect("compile");
     let g = &sched.graph;
     for _ in 0..3 {
         g.begin();

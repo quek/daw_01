@@ -3,7 +3,7 @@
 //! タブを置き換えない (新しいタブに開く) のでガードを通らない。
 //!
 //! 検証する状態機械 (`AppData`):
-//! - `request_close` / `request_guarded_action`: dirty なら確認モーダルを開く /
+//! - `AppEvent::Quit` / `request_guarded_action`: dirty なら確認モーダルを開く /
 //!   clean なら即操作実行
 //! - `DirtyGuardDiscard`: 保存せず操作実行 (終了 / タブを閉じる)
 //! - `DirtyGuardCancel`: 操作取りやめ (プロジェクト維持)
@@ -36,7 +36,7 @@ fn not_dirty_close_quits_immediately() {
     let (mut app, _rx) = build_app();
     app.cur.song_doc.mark_saved();
 
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
 
     assert!(app.shutdown.is_shutting_down(), "clean project closes immediately");
     assert!(app.ui_ephemeral.dirty_guard.is_none(), "no confirm modal when clean");
@@ -47,7 +47,7 @@ fn dirty_close_opens_confirm_modal() {
     let (mut app, _rx) = build_app();
     app.cur.song_doc.normalize(|_| {});
 
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
 
     assert_eq!(
         app.ui_ephemeral.dirty_guard,
@@ -61,7 +61,7 @@ fn dirty_close_opens_confirm_modal() {
 fn discard_quits_without_saving() {
     let (mut app, _rx) = build_app();
     app.cur.song_doc.normalize(|_| {});
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
 
     app.handle_event(AppEvent::DirtyGuardDiscard);
 
@@ -73,7 +73,7 @@ fn discard_quits_without_saving() {
 fn cancel_keeps_app_running() {
     let (mut app, _rx) = build_app();
     app.cur.song_doc.normalize(|_| {});
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
 
     app.handle_event(AppEvent::DirtyGuardCancel);
 
@@ -90,7 +90,7 @@ fn save_without_plugins_saves_synchronously_then_quits() {
     let (mut app, _rx) = build_app();
     app.cur.song_doc.file_path = Some(path.clone());
     app.cur.song_doc.normalize(|_| {});
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
 
     app.handle_event(AppEvent::DirtyGuardSave);
 
@@ -114,7 +114,7 @@ fn save_with_plugins_waits_for_states_then_quits() {
     );
     app.cur.song_doc.file_path = Some(path.clone());
     app.cur.song_doc.normalize(|_| {});
-    app.request_close();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
 
     // 「保存して終了」: plugin 有りなので save は非同期 (state 取得待ち)。
     app.handle_event(AppEvent::DirtyGuardSave);

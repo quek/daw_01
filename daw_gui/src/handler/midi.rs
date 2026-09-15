@@ -253,6 +253,11 @@ impl AppData {
             })
             .map(|b| b.target)
             .collect();
+        if !targets.is_empty() {
+            // ツマミを回すと CC は数十通続けて届く。1 通 = 1 undo step にすると履歴が溢れて
+            // それ以前の編集が捨てられるので、途切れるまでを 1 step に畳む。
+            self.cur.song_doc.use_stream_scope(crate::state::StreamGesture::MidiCc);
+        }
         for target in targets {
             self.apply_midi_value_to_target(target, value);
         }

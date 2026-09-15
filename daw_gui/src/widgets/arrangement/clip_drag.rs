@@ -45,13 +45,12 @@ pub(super) struct ClipDragSession {
     pub(super) last_alt: bool,
     /// M14 Phase 63e (#019): drag 中の最終 ctrl 状態。 `last_alt` と同じ仕組みで保持する
     /// (winit 0.30 の `ModifiersChanged` が `MouseInput(Released)` より先に届く race を回避)。
-    /// release 時 dispatch で `Move + last_ctrl + !last_shift` → `CloneClipsLinked`、
-    /// `Move + last_ctrl + last_shift` → `CloneClipsIndependent`、 それ以外 (ResizeLeft/Right
-    /// 含む) → 既存 `MoveClips` / `ResizeClips`。 ghost overlay も `last_ctrl` を読んで色 / badge
-    /// glyph を切替えるため、 commit と overlay が必ず同一値で確定する。
+    /// release 時の Move は `RangeEvent::Move` の `mode` をこれで決める (`last_ctrl + !last_shift` →
+    /// `CopyLinked`、 `last_ctrl + last_shift` → `CopyUnique`、 それ以外 → `Move`)。 ghost overlay も
+    /// `last_ctrl` を読んで色 / badge glyph を切替えるため、 commit と overlay が必ず同一値で確定する。
     pub(super) last_ctrl: bool,
     /// M14 Phase 63e (#019): drag 中の最終 shift 状態。 `last_ctrl` と組み合わせて
-    /// `CloneClipsLinked` (ctrl のみ) と `CloneClipsIndependent` (ctrl + shift) を識別する。
+    /// リンクコピー (ctrl のみ) と独立コピー (ctrl + shift) を識別する。
     /// 保持仕組みは `last_alt` / `last_ctrl` と同じ (continuation で update / release で skip)。
     pub(super) last_shift: bool,
     /// Move が動かす**時間範囲** (`docs/plan_range_selection.md` §6)。 press 時に確定する

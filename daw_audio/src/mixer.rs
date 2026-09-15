@@ -186,11 +186,13 @@ pub(crate) fn install_input_delay_lines(
 /// 無音 — メーター / Global Sampler / 並べ替えで同じ行に来た別トラックが前の音を読まない。旧 schedule でも無効だった
 /// 行は既に無音なので触らない (定常の差し込みで全無効行を毎回 fill しない)。
 ///
-/// 発音台帳 (`PerTrackState::active_notes`) と次の buffer 頭の Off も捨てる。無効トラックの plugin は host から降り
-/// (有効に戻すと載せ直す)、行は sequencer に呼ばれないので、残すと有効に戻したとき「まだ鳴っている」ことになり、
-/// 跨いでいる note を追わない (載せ直した plugin には On が届いていない)。
+/// 鳴っている音は止める予約にし、発音台帳 (`PerTrackState::active_notes`) は空にする ([`queue_notes_off`])。
+/// - 読み込み待ちで外れた行 (`Song::executable_mask`) は plugin が載ったまま凍るので、外れている間に来るはずだった
+///   note-off が出ないと、戻った後に鳴りっぱなしになる。予約した Off は戻った最初の buffer 頭で届く。
+/// - 台帳を残すと戻ったとき「まだ鳴っている」ことになり、跨いでいる note を追わない。無効化で host から降りて
+///   載せ直した plugin には On が届いていないので、追い直しが要る (予約した Off は知らない voice への Off で無害)。
 ///
-/// RT 安全: 事前確保済みの buffer への fill と、容量を保つ clear のみ (1 行あたり `MAX_FRAMES` × 6 本)。
+/// RT 安全: 事前確保済みの buffer への fill と、容量内の push / 容量を保つ clear のみ (1 行あたり `MAX_FRAMES` × 6 本)。
 pub(crate) fn silence_disabled_rows(
     scratch: &mut [TrackScratch],
     old_programs: &[crate::graph::ChainProgram],
@@ -206,8 +208,7 @@ pub(crate) fn silence_disabled_rows(
             buf.fill(0.0);
         }
         (s.peak_l, s.peak_r, s.effective_mute) = (0.0, 0.0, false);
-        s.state.active_notes.clear();
-        s.state.pending_offs.clear();
+        queue_notes_off(s);
     }
 }
 
@@ -357,16 +358,27 @@ pub fn pass_strip(scratch: &mut TrackScratch, n: usize) {
 /// `write_end` を越えた瞬間 (= live の Stop に対応する点) で通る。手写しすると
 /// どれかが必ず漏れ、跳び越された Off が二度と emit されず note が鳴り続ける。
 ///
-/// RT-safe: `pending_offs` は `process_track_owned` の冒頭で毎 buffer drain + clear
-/// されるので push 時点では空。`active_notes` (発音台帳) は `note_ledger::MAX_SOUNDING` で
-/// クランプ済みで、`pending_offs` も同じ量を確保しているので push で再確保しない。
+/// RT-safe: 行ごとの [`queue_notes_off`] を参照。
 pub fn queue_all_notes_off(scratch: &mut [TrackScratch]) {
     for s in scratch.iter_mut() {
-        for note in s.state.active_notes.iter() {
-            s.state.pending_offs.push((note.voice_id, note.key));
-        }
-        s.state.active_notes.clear();
+        queue_notes_off(s);
     }
+}
+
+/// 1 行ぶんの [`queue_all_notes_off`]。r.md #131: 実行から外れる行 ([`silence_disabled_rows`]) も通る — 外れている
+/// 行は process されない (= `pending_offs` を drain しない) ので、予約は戻った最初の buffer の frame 0 で出る。
+///
+/// RT-safe: 台帳 (`active_notes`、`note_ledger::MAX_SOUNDING` でクランプ) は process される間にしか増えず、process は
+/// 冒頭で `pending_offs` を drain するので、`pending_offs` + 台帳は `pending_offs` の確保量 (同じ量) を超えない。
+/// それでも push が再確保しないよう容量で打ち切る。
+fn queue_notes_off(s: &mut TrackScratch) {
+    let state = &mut s.state;
+    for note in state.active_notes.iter() {
+        if state.pending_offs.len() < state.pending_offs.capacity() {
+            state.pending_offs.push((note.voice_id, note.key));
+        }
+    }
+    state.active_notes.clear();
 }
 
 #[cfg(test)]
