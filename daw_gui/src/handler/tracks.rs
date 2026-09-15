@@ -871,6 +871,7 @@ impl AppData {
             .collect();
         let removal_plan =
             Self::plan_track_removal_ipc(self.cur.song_doc.song(), &removal_targets);
+        let live_before = self.live_before();
         for &i in subtree_idxs.iter().rev() {
             self.edit_song(|song| song.tracks.remove(i as usize));
         }
@@ -886,7 +887,7 @@ impl AppData {
         // の clip / セル。残すと歌が無いのに口だけ動き、二度と片付かない)・選択範囲の行・折り畳み・
         // Audio Editor の対象は、トラックを外す 3 経路共通の 1 本が担う (ここで「消した id の集合」から
         // 作り直すと経路ごとに分岐が増え、実際にグループ解除 / 末尾削除で漏れていた)。
-        self.after_tracks_removed(&removal_plan, audio_editor_key);
+        self.after_tracks_removed(&removal_plan, audio_editor_key, &live_before);
 
         // selected_track_ids: subtree に含まれていた id を全て除外。
         // 残りが空なら **削除位置に繰り上がった隣接トラック** を選ぶ

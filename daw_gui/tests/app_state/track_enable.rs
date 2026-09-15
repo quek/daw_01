@@ -5,11 +5,44 @@
 //! device は Song の state 付きで載せ直す。ここが崩れると「無効 → 有効でツマミが初期値に戻る」か
 //! 「無効なのに host に残って CPU を使う」になる。
 
-use common::protocol::{PluginCommand, PluginEvent, SlotState};
+use common::protocol::{AudioCommand, PluginCommand, PluginEvent, SlotState};
 
-use daw_gui::app::AppEvent;
+use daw_gui::app::{AppData, AppEvent};
 
-use super::support::{build_app, drain, load_instrument};
+use super::support::{build_app, drain, fake_plugin_loaded, load_instrument, select_track_single};
+
+/// engine へ送った「読み込み中の device」(`SetLoadingDevices`) の位置と中身。
+fn loading_sets(msgs: &[AudioCommand]) -> Vec<(usize, Vec<u64>)> {
+    msgs.iter()
+        .enumerate()
+        .filter_map(|(i, m)| match m {
+            AudioCommand::SetLoadingDevices { device_ids, .. } => Some((i, device_ids.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `track_id` が有効 / 無効で届いた `LoadSong` の位置。
+fn load_song_at(msgs: &[AudioCommand], track_id: u32, enabled: bool) -> Option<usize> {
+    msgs.iter().position(|m| {
+        matches!(m, AudioCommand::LoadSong { song, .. } if song.track_by_id(track_id).is_some_and(|t| t.enabled == enabled))
+    })
+}
+
+fn position(msgs: &[AudioCommand], pred: impl Fn(&AudioCommand) -> bool) -> Option<usize> {
+    msgs.iter().position(pred)
+}
+
+/// 楽器を載せた track 0 を、再生中の状態で無効化まで済ませる (state の往復も)。`(track_id, device_id)`。
+fn disabled_while_playing(app: &mut AppData) -> (u32, u64) {
+    load_instrument(app);
+    let track_id = app.cur.song_doc.song().tracks[0].id;
+    let device_id = app.cur.song_doc.song().tracks[0].plugins().next().expect("synth").id;
+    app.cur.transport.is_playing = true;
+    app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![track_id], enabled: false });
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    (track_id, device_id)
+}
 
 fn set_slot_states(msgs: &[PluginCommand], device_id: u64) -> Vec<Option<Vec<u8>>> {
     msgs.iter()
@@ -142,4 +175,228 @@ fn 無効な_group_へ移すと降り_解くと戻る() {
 
     app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![group], enabled: true });
     assert_eq!(set_slot_states(&drain(&mut plugin_rx), device_id).len(), 1, "group を有効に戻すと子の plugin を載せる");
+}
+
+/// 再生中に有効へ戻す: 再生は止めず、engine には **トラックを実行に入れる構造 (LoadSong) より前に** その plugin が
+/// 読み込み中だと届け (engine は読み込みが確定するまでグラフに入れない = FX の掛かっていない音を出さない)、
+/// 登録 (`OpenPluginShmem`) の後に外す = そこから鳴る。
+#[test]
+fn 再生中に有効へ戻すと再生を止めず_読み込み中を構造より先に届け_登録の後に外す() {
+    let (mut app, mut audio_rx, mut plugin_rx, _d) = build_app();
+    let (track_id, device_id) = disabled_while_playing(&mut app);
+    let msgs = drain(&mut audio_rx);
+    let disabled = load_song_at(&msgs, track_id, false).expect("無効化の構造");
+    let close = position(&msgs, |m| matches!(m, AudioCommand::ClosePluginShmem { device_id: d, .. } if *d == device_id));
+    assert!(close.is_some_and(|c| disabled < c), "無効化は構造を届けてから plugin を降ろす (素通しで鳴らさない): {msgs:?}");
+    drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![track_id], enabled: true });
+    let msgs = drain(&mut audio_rx);
+    let enabled = load_song_at(&msgs, track_id, true).expect("有効化の構造");
+    let declared = loading_sets(&msgs).into_iter().find(|(_, ids)| ids.contains(&device_id));
+    assert!(declared.is_some_and(|(i, _)| i < enabled), "読み込み中は構造より先に届く: {msgs:?}");
+    assert!(position(&msgs, |m| matches!(m, AudioCommand::Stop { .. })).is_none(), "有効に戻しても再生は止めない: {msgs:?}");
+    assert_eq!(app.cur.transport.pending_play, None);
+    assert_eq!(set_slot_states(&drain(&mut plugin_rx), device_id).len(), 1);
+
+    // 対照: 鳴っているトラックへ plugin を足すのは従来どおり止める (有効化の読み込みが応答待ちでも)。
+    app.handle_event(AppEvent::AddInstrumentTrack);
+    let other = app.cur.song_doc.song().tracks.len() - 1;
+    select_track_single(&mut app, other);
+    app.handle_event(AppEvent::SelectPluginFromDb { id: "test.fx".into(), keep_open: false, open_gui: false });
+    assert!(drain(&mut audio_rx).iter().any(|m| matches!(m, AudioCommand::Stop { .. })), "plugin を足すと読み込みの間は止める");
+
+    fake_plugin_loaded(&mut app, track_id, 0, "test.synth");
+    let msgs = drain(&mut audio_rx);
+    let open = position(&msgs, |m| matches!(m, AudioCommand::OpenPluginShmem { device_id: d, .. } if *d == device_id));
+    let settled = loading_sets(&msgs).into_iter().find(|(_, ids)| !ids.contains(&device_id));
+    assert!(open.zip(settled).is_some_and(|(o, (s, _))| o < s), "登録の後に読み込み中から外す: {msgs:?}");
+}
+
+/// 読み込みが失敗で確定しても読み込み中から外す (その device は素通しで鳴る = 失敗した device の規則)。
+#[test]
+fn 有効化の読み込みが失敗で確定すると読み込み中から外す() {
+    let (mut app, mut audio_rx, _plugin_rx, _d) = build_app();
+    let (track_id, device_id) = disabled_while_playing(&mut app);
+    app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![track_id], enabled: true });
+    drain(&mut audio_rx);
+    assert!(app.cur.pipc.last_sent_loading_devices.contains(&device_id), "前提: 読み込み中を届けてある");
+
+    let generation = app.cur.pipc.pending_plugin_loads[&device_id];
+    app.handle_event(AppEvent::Plugin(PluginEvent::SlotPluginLoadFailed {
+        device: app.dev(device_id),
+        plugin_id: "test.synth".into(),
+        reason: "boom".into(),
+        generation,
+    }));
+    let msgs = drain(&mut audio_rx);
+    assert!(loading_sets(&msgs).iter().any(|(_, ids)| !ids.contains(&device_id)), "{msgs:?}");
+    assert!(app.cur.pipc.failed_plugin_loads.contains_key(&device_id));
+}
+
+/// plugin の読み込みが確定するまでは、オフライン描画 (書き出し / 解析) を始めない — 始めると読み込み中の plugin を
+/// 鳴らすトラックは無音で焼かれ、描画中の読み込み応答は捨てられて、終わった後もそのトラックは鳴らず再生も待ち続ける。
+/// 確定すれば始められる。
+#[test]
+fn 読み込み中は書き出しと解析を始めず_確定すれば始める() {
+    use daw_gui::app::FileDialogKind;
+    use daw_gui::state::LoudnessPhase;
+    let (mut app, _audio_rx, mut plugin_rx, _d) = build_app();
+    let (track_id, _device_id) = disabled_while_playing(&mut app);
+    app.cur.transport.is_playing = false;
+    app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![track_id], enabled: true });
+    drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::FileDialogResult {
+        kind: FileDialogKind::ExportWav { range: None },
+        paths: vec![std::path::PathBuf::from("C:/out.wav")],
+    });
+    assert!(app.cur.transport.export_stage.is_none(), "読み込み中に書き出しを始めた");
+    assert!(app.cur.transport.pending_export.is_none());
+    app.handle_event(AppEvent::AnalyzeLoudness);
+    app.handle_event(AppEvent::ConfirmExportRange);
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::Idle, "読み込み中に解析を始めた");
+    assert!(!drain(&mut plugin_rx).iter().any(|m| matches!(m, PluginCommand::ReinitAllPlugins { .. })));
+
+    fake_plugin_loaded(&mut app, track_id, 0, "test.synth");
+    app.handle_event(AppEvent::AnalyzeLoudness);
+    app.handle_event(AppEvent::ConfirmExportRange);
+    assert!(matches!(app.cur.loudness.phase, LoudnessPhase::AwaitingReinit { .. }), "確定すれば解析を始める");
+}
+
+/// undo / redo で有効へ戻る場合も同じ規則 (止めない / 読み込み中が構造より先)。無効へ戻る redo は構造を届けてから降ろす。
+#[test]
+fn undo_redo_で有効へ戻るときも読み込み中を構造より先に届け_無効へ戻るときは構造の後に降ろす() {
+    let (mut app, mut audio_rx, _plugin_rx, _d) = build_app();
+    let (track_id, device_id) = disabled_while_playing(&mut app);
+    drain(&mut audio_rx);
+
+    app.handle_event(AppEvent::Undo);
+    let msgs = drain(&mut audio_rx);
+    assert!(app.cur.song_doc.song().track_effectively_enabled(track_id), "前提: undo で有効へ戻る");
+    let enabled = load_song_at(&msgs, track_id, true).expect("構造");
+    assert!(loading_sets(&msgs).iter().any(|&(i, ref ids)| i < enabled && ids.contains(&device_id)), "{msgs:?}");
+    assert!(position(&msgs, |m| matches!(m, AudioCommand::Stop { .. })).is_none(), "{msgs:?}");
+
+    app.handle_event(AppEvent::Redo);
+    let msgs = drain(&mut audio_rx);
+    let disabled = load_song_at(&msgs, track_id, false).expect("構造");
+    let close = position(&msgs, |m| matches!(m, AudioCommand::ClosePluginShmem { device_id: d, .. } if *d == device_id));
+    assert!(close.is_some_and(|c| disabled < c), "{msgs:?}");
+    assert!(!app.cur.pipc.last_sent_loading_devices.contains(&device_id), "降ろした読み込みは外す");
+}
+
+/// プロジェクトを開いた直後の全読み込みも同じ規則: 開いた曲の plugin は、その曲の構造 (LoadSong) より先に読み込み中と
+/// して届く。無効トラックの plugin は読み込まないので含まない。
+#[test]
+fn プロジェクトを開くと読み込む_plugin_を構造より先に読み込み中として届ける() {
+    use common::model::{Device, PluginInstance, Track};
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("proj.daw");
+    let (mut app, mut audio_rx, _plugin_rx, _d) = build_app();
+    load_instrument(&mut app);
+    let synth = app.cur.song_doc.song().tracks[0].plugins().next().expect("synth").id;
+    let parked = app
+        .edit_song(|song| {
+            let id = song.alloc_device_id();
+            let fx = PluginInstance { id, ..PluginInstance::new("test.fx".into(), common::plugin_format::PluginFormat::Clap) };
+            let track = Track { id: song.alloc_track_id(), enabled: false, devices: vec![Device::Plugin(fx)], ..Track::default() };
+            song.tracks.push(track);
+            id
+        })
+        .expect("edit");
+    common::project::save(&proj, app.cur.song_doc.song()).expect("write project file");
+    app.cur.song_doc.mark_saved();
+    app.flush_song_sync();
+    drain(&mut audio_rx);
+
+    app.handle_event(AppEvent::OpenRecent(proj));
+    app.flush_song_sync();
+    let msgs = drain(&mut audio_rx);
+    let load = position(&msgs, |m| matches!(m, AudioCommand::LoadSong { .. })).expect("開いた曲の構造");
+    let declared: Vec<u64> = loading_sets(&msgs).into_iter().filter(|&(i, _)| i < load).flat_map(|(_, ids)| ids).collect();
+    assert!(declared.contains(&synth), "開いた曲の plugin は構造より先に読み込み中: {msgs:?}");
+    assert!(!declared.contains(&parked), "無効トラックの plugin は読み込まない: {msgs:?}");
+}
+
+/// 楽器を載せた track 0 を group の子にし、その group を無効化まで済ませる (state の往復も)。`(child, device_id, group)`。
+fn child_in_disabled_group(app: &mut AppData) -> (u32, u64, u32) {
+    load_instrument(app);
+    let child = app.cur.song_doc.song().tracks[0].id;
+    let device_id = app.cur.song_doc.song().tracks[0].plugins().next().expect("synth").id;
+    app.handle_event(AppEvent::AddInstrumentTrack);
+    let group = app.cur.song_doc.song().tracks.iter().map(|t| t.id).find(|&id| id != child).expect("group");
+    app.handle_event(AppEvent::SetTrackParent { track_ids: vec![child], parent_id: Some(group), anchor_after: None });
+    app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![group], enabled: false });
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    assert!(!app.cur.song_doc.song().track_effectively_enabled(child), "前提: 無効な group の子");
+    (child, device_id, group)
+}
+
+/// `track_id` を **実効的に有効** (祖先 group も含めて) にした `LoadSong` の位置。
+fn runs_at(msgs: &[AudioCommand], track_id: u32) -> Option<usize> {
+    position(msgs, |m| matches!(m, AudioCommand::LoadSong { song, .. } if song.track_effectively_enabled(track_id)))
+}
+
+/// group を有効に戻すと、子の plugin も読み込み中として構造より先に届く (engine は group の子孫も待たせる)。
+#[test]
+fn group_を有効に戻すと子の読み込み中も構造より先に届く() {
+    let (mut app, mut audio_rx, _plugin_rx, _d) = build_app();
+    let (_child, device_id, group) = child_in_disabled_group(&mut app);
+    app.cur.transport.is_playing = true;
+    drain(&mut audio_rx);
+
+    app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![group], enabled: true });
+    let msgs = drain(&mut audio_rx);
+    let enabled = load_song_at(&msgs, group, true).expect("構造");
+    assert!(loading_sets(&msgs).iter().any(|&(i, ref ids)| i < enabled && ids.contains(&device_id)), "{msgs:?}");
+    assert!(position(&msgs, |m| matches!(m, AudioCommand::Stop { .. })).is_none(), "{msgs:?}");
+}
+
+/// 無効な group を解く (子は実効的に有効へ戻る) のも有効化と同じ規則: 子の plugin は、子を実行に入れる構造 (group を
+/// 外した `LoadSong`) より先に読み込み中として届き、再生は止めない。外した group の plugin は構造の後に降ろす。
+#[test]
+fn 無効な_group_を解くと子の読み込み中を構造より先に届け_再生を止めない() {
+    let (mut app, mut audio_rx, mut plugin_rx, _d) = build_app();
+    let (child, device_id, group) = child_in_disabled_group(&mut app);
+    app.cur.transport.is_playing = true;
+    drain(&mut audio_rx);
+    drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::UngroupTracks { track_ids: vec![group] });
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    assert!(app.cur.song_doc.song().track_by_id(group).is_none(), "前提: group を解いた");
+    let msgs = drain(&mut audio_rx);
+    let runs = runs_at(&msgs, child).expect("子を実行に入れる構造");
+    assert!(loading_sets(&msgs).iter().any(|&(i, ref ids)| i < runs && ids.contains(&device_id)), "{msgs:?}");
+    assert!(position(&msgs, |m| matches!(m, AudioCommand::Stop { .. })).is_none(), "{msgs:?}");
+    assert_eq!(set_slot_states(&drain(&mut plugin_rx), device_id).len(), 1, "有効へ戻った子の plugin を載せる");
+}
+
+/// 無効な group の子を group の外のトラックと一緒にグループ化すると、新しい group は根に置かれて子は実効的に有効へ
+/// 戻る — これも有効化と同じ規則で、子の plugin を載せ、子を実行に入れる構造より先に読み込み中として届ける。
+#[test]
+fn 無効な_group_の子を外のトラックとグループ化すると載せ_読み込み中を構造より先に届ける() {
+    let (mut app, mut audio_rx, mut plugin_rx, _d) = build_app();
+    let (child, device_id, _group) = child_in_disabled_group(&mut app);
+    let outside = app
+        .edit_song(|song| {
+            let id = song.alloc_track_id();
+            song.tracks.push(common::model::Track { id, ..common::model::Track::default() });
+            id
+        })
+        .expect("edit");
+    app.flush_song_sync();
+    app.cur.transport.is_playing = true;
+    drain(&mut audio_rx);
+    drain(&mut plugin_rx);
+
+    app.handle_event(AppEvent::GroupSelectedTracks { track_ids: vec![child, outside] });
+    assert!(app.cur.song_doc.song().track_effectively_enabled(child), "前提: 新しい group は根 = 子は有効");
+    assert_eq!(set_slot_states(&drain(&mut plugin_rx), device_id).len(), 1, "有効へ戻った子の plugin を載せる");
+    app.flush_song_sync();
+    let msgs = drain(&mut audio_rx);
+    let runs = runs_at(&msgs, child).expect("子を実行に入れる構造");
+    assert!(loading_sets(&msgs).iter().any(|&(i, ref ids)| i < runs && ids.contains(&device_id)), "{msgs:?}");
+    assert!(position(&msgs, |m| matches!(m, AudioCommand::Stop { .. })).is_none(), "{msgs:?}");
 }

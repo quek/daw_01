@@ -291,6 +291,11 @@ impl AppData {
                 let song_snapshot = app.cur.song_doc.song().clone();
                 app.restore_plugin_from_song(&song_snapshot);
                 app.cur.pipc.last_synced_epoch = 0;
+                if matches!(kind, ChildKind::Audio) {
+                    // r.md #131: 新しい engine は「読み込み中の device」を知らない。送った記憶を捨て、次の frame flush が
+                    // LoadSong より先に送り直す。
+                    app.cur.pipc.last_sent_loading_devices.clear();
+                }
                 // ループ (ON/OFF + 範囲) は `Song` に載らない session state なので LoadSong
                 // では戻らない。 新しい audio プロセスは既定 (OFF / 範囲未設定) で立ち上がる
                 // ため、 明示的に送り直して GUI 表示と engine の実挙動を揃える。

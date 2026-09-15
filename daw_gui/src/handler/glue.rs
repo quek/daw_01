@@ -280,6 +280,9 @@ impl AppData {
             self.ui_ephemeral.status_message = "Glue: 無効なトラックの audio は焼けません (有効にしてから)".into();
             return;
         }
+        if self.reject_offline_render_while_loading("Glue") {
+            return;
+        }
         self.start_glue_bake(sel, &audio_tracks);
     }
 

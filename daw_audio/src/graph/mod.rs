@@ -28,7 +28,7 @@ pub mod selector_split;
 pub mod step;
 pub mod voices;
 
-pub use compile::{DeviceLatencies, GraphError, compile_schedule};
+pub use compile::{DeviceLatencies, GraphError, LoadingDevices, compile_schedule, executable_tracks};
 #[cfg(test)]
 pub(crate) use compile::compile_schedule_for_test;
 pub use delay_line::DelayLine;

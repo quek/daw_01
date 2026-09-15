@@ -18,6 +18,17 @@ pub enum PlayFrom {
     Continue,
 }
 
+/// plugin の読み込みを頼むとき、再生中なら読み込みが終わるまで再生を止めるか (A7、[`crate::app::AppData::track_pending_load`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadPlayback {
+    /// 止めて、読み込みが全部終わったら止めた位置から続ける。鳴っているトラックに plugin を足す / 差し替える /
+    /// 読み込み直す操作 — 足した音が遅れて鳴り出すより、揃って鳴り出すことを取る (録音中は止めない)。
+    Pause,
+    /// 止めない。有効に戻したトラック (r.md #131: 無効から実行系へ戻る) の読み込み — engine はそのトラックを
+    /// 読み込みが確定するまでグラフに入れず (`AudioCommand::SetLoadingDevices`)、確定した瞬間から鳴らす。
+    KeepPlaying,
+}
+
 /// r.md #129 (§11.1): GR を出す内蔵 device の GR 表示値 (**正の減衰量 dB**)。
 ///
 /// 読み手 (Rack 行 / Par / Mixer 帯 / マスターパネル) は device id で引く。engine の GR 面は
