@@ -204,6 +204,11 @@ impl Song {
     ///   足りない側で音量が落ち込まない。 分割の片同士は同じ素材を同じ位置で鳴らすので、分割前と同じ音になる。
     /// - 端の片が窓の端を跨いでいれば、先に窓の端で切る (切れ目を入れるだけ = 音は変わらない)。
     pub fn crossfade_adjacent(&mut self, prev: ClipKey, next: ClipKey, xfade_beats: f64) -> Crossfade {
+        // 片側でも境界で鳴っていなければ掛けない (切るだけで何も掛けない編集を履歴に残さない)。 両側が鳴っていれば、
+        // 跨ぐ片を切った側には take の続きがあるので、ランプの区間は必ず正の長さになる。
+        if !(self.sounds_at_window_edge(prev, true) && self.sounds_at_window_edge(next, false)) {
+            return Crossfade { applied: false, changed: false };
+        }
         // 先に両側の端で切ってから片を探す (content を共有していると、後から切ると前に探した index がずれる)。
         let cut = self.cut_at_window_edge(prev, true) | self.cut_at_window_edge(next, false);
         let not_applied = Crossfade { applied: false, changed: cut };
@@ -240,6 +245,23 @@ impl Song {
             c.xfade_lead_beats = lead;
         }
         Crossfade { applied: true, changed: true }
+    }
+
+    /// クリップ `key` の窓の端 (`at_end` = 末尾、`false` = 先頭) で audio の片が鳴っているか (窓に見えている片が
+    /// 端に接しているか、端を跨いでいる)。
+    fn sounds_at_window_edge(&self, key: ClipKey, at_end: bool) -> bool {
+        let Some(clip) = self.clip_by_key(key) else {
+            return false;
+        };
+        let window = clip.content_window();
+        let edge = if at_end { window.1 } else { window.0 };
+        let Some(ClipContent::Audio(audio)) = self.clip_contents.get(&clip.content_id) else {
+            return false;
+        };
+        audio.events.iter().filter(|e| shown_in(*e, window)).any(|e| {
+            let (start, end) = (e.start(), e.start() + e.len());
+            if at_end { end >= edge - EPS } else { start <= edge + EPS }
+        })
     }
 
     /// クリップ `key` の窓の端 (`at_end` = 末尾、`false` = 先頭) を跨ぐ audio の片を端で切る。 切ったら `true`。

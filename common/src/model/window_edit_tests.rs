@@ -119,6 +119,34 @@ fn 窓に見えている片だけに効き_反対側の窓の片は変わらな�
     assert_eq!((shown.fade_in_beats, shown.fade_out_beats), (original.fade_in_beats, original.fade_out_beats));
 }
 
+/// Auto-Crossfade は境界の片側でも鳴っていなければ何もしない — 跨ぐ片を切るだけ切って (履歴と dirty に残る
+/// 編集) 何も掛けない、にならない。
+#[test]
+fn 片側が境界で鳴っていなければクロスフェードは切りも掛けもしない() {
+    let mut song = Song::default();
+    song.media.audio_sources.insert(
+        1,
+        AudioSource {
+            path: AudioSourcePath::Absolute("C:/xfade.wav".into()),
+            sample_rate: 48_000,
+            channels: 1,
+            frames: 480_000,
+            original_bpm: None,
+            root_key: None,
+        },
+    );
+    // 前のクリップ [0, 2) の中身は窓の末尾を跨ぐ 4 拍の event、次のクリップ [2, 4) の中身は拍 1 から始まる (窓の頭は無音)。
+    let prev = song.alloc_content(ClipContent::Audio(AudioContent { events: vec![take()], next_event_id: 8 }), String::new());
+    let late = AudioEvent { event_start_in_clip_beats: 1.0, event_length_beats: 1.0, ..take() };
+    let next = song.alloc_content(ClipContent::Audio(AudioContent { events: vec![late], next_event_id: 8 }), String::new());
+    let clip = |id: u32, start: f64, content_id| Clip { id, start_beat: start, length_beats: 2.0, content_id, ..Clip::default() };
+    song.tracks = vec![Track { id: 1, clips: vec![clip(1, 0.0, prev), clip(2, 2.0, next)], next_clip_id: 3, ..Track::default() }];
+    let before = song.clone();
+    let keys = (ClipKey { track_id: 1, clip_id: 1 }, ClipKey { track_id: 1, clip_id: 2 });
+    assert_eq!(song.crossfade_adjacent(keys.0, keys.1, 0.25), Crossfade { applied: false, changed: false });
+    assert_eq!(song, before, "跨ぐ片も切らない");
+}
+
 #[test]
 fn 分割の片は元の_take_を継ぎ_写した片は別の_take_になる() {
     let mut content = AudioContent { events: vec![take()], next_event_id: 8 };
