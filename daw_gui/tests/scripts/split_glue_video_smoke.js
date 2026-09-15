@@ -110,15 +110,17 @@ expectEq(c1.length_beats, 2.0, "back clip length");
 expectEq(c0.content_id, c1.content_id, "split keeps one shared content");
 const splitEvents = s.clip_contents[c0.content_id].events;
 expectEq(splitEvents.length, 2, "split event count");
-// VideoEvent の source_micros が比例分割されたことを確認:
-//   front : source [0, 2_000_000)
-//   back  : source [2_000_000, 4_000_000)
+// v42 (r.md #132 残件): 分割は **take の窓を進めるだけ**で source の範囲を配り直さない
+// (配り直すとテンポ変化・伸縮・移調で写像がずれる)。片はどちらも元の source 範囲を持ち、
+// 後半だけが take の頭から 2 拍後ろを見る。
 const fEv = splitEvents[0];
 const bEv = splitEvents[1];
 expectNear(fEv.source_start_micros, 0, 1, "front source_start");
-expectNear(fEv.source_end_micros, 2000000, 1, "front source_end");
-expectNear(bEv.source_start_micros, 2000000, 1, "back source_start");
+expectNear(fEv.source_end_micros, 4000000, 1, "front source_end");
+expectNear(fEv.take_head_beats || 0, 0.0, 1e-9, "front take_head");
+expectNear(bEv.source_start_micros, 0, 1, "back source_start");
 expectNear(bEv.source_end_micros, 4000000, 1, "back source_end");
+expectNear(bEv.take_head_beats || 0, 2.0, 1e-9, "back take_head");
 
 // ---- 4. 両方選択して glue → 1 つに戻る ---------------------------------
 daw.setSelection(JSON.stringify([
@@ -133,12 +135,11 @@ const merged = s.tracks[0].clips[0];
 expectEq(merged.start_beat, 0.0, "merged start");
 expectEq(merged.length_beats, 4.0, "merged length");
 const mergedEvents = s.clip_contents[merged.content_id].events;
-// Split が events を 2 つに分けたあと Glue で結合 = 2 events に戻る
-// (offset_into_combined で event_start_in_clip_beats を 0 と 2 に
-// 振り直し)。 source_start_micros / source_end_micros は維持されるので、
-// 全体としては元の 1 event をカバーする 2 event。
-expectEq(mergedEvents.length, 2, "merged events count");
+// v42 (r.md #132 残件): 同じ take から切り出した隣り合う片は、Glue で **元の 1 つに戻る**
+// (`common::model::join_pieces` は `event_piece` の逆)。
+expectEq(mergedEvents.length, 1, "merged events count");
 expectNear(mergedEvents[0].event_start_in_clip_beats, 0.0, 1e-9, "ev0 start");
-expectNear(mergedEvents[1].event_start_in_clip_beats, 2.0, 1e-9, "ev1 start");
+expectNear(mergedEvents[0].event_length_beats, 4.0, 1e-9, "ev0 length");
+expectNear(mergedEvents[0].take_head_beats || 0, 0.0, 1e-9, "ev0 take_head");
 expectNear(mergedEvents[0].source_start_micros, 0, 1, "ev0 src_start");
-expectNear(mergedEvents[1].source_end_micros, 4000000, 1, "ev1 src_end");
+expectNear(mergedEvents[0].source_end_micros, 4000000, 1, "ev0 src_end");
