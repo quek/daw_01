@@ -14,7 +14,8 @@
 //!
 //! クリップの分割で content も切るのは、窓 (クリップ) を割っただけでは「跨いだ note の後半」を
 //! 後半の窓が鳴らせないから (再生側は「発音開始が窓内」の note しか鳴らさない)。 共有されて
-//! いる content は先に fork するので linked clip は無傷。
+//! いる MIDI content は先に fork するので linked clip は無傷 (時間軸を持つ event は切っても鳴り方が
+//! 変わらないので fork しない、[`Song::split_content_at_points`])。
 
 use crate::model::{
     AudioContent, AudioEvent, ClipContent, ContentId, MidiContent, Note, Song, TimedEvent, split_pieces,
@@ -102,7 +103,7 @@ impl AudioContent {
     ///
     /// 片は元の event の窓 ([`super::event_piece`]): source の範囲・伸縮・onset・warp marker は全片が
     /// そのまま継ぎ、take の窓 (`take_head_beats` / `take_tail_beats`) と fade のランプだけが片ごとに
-    /// 変わる。 先頭の片が元の `id`、後ろの片は新しい `id`。
+    /// 変わる。 先頭の片が元の `id`、後ろの片は新しい `id` で、全片が元の take (`take_id`) を継ぐ。
     ///
     /// 返り値は割った event の**全片の id** (event ごとに先頭の片から)。
     pub fn split_events(
@@ -118,9 +119,11 @@ impl AudioContent {
                 continue;
             };
             ids.push(head.id);
+            let take = head.take_key();
             self.events[i] = head;
             for mut piece in pieces {
                 piece.id = self.alloc_event_id();
+                piece.take_id = take;
                 ids.push(piece.id);
                 extra.push(piece);
             }
@@ -168,18 +171,22 @@ impl Song {
     /// 窓モデルなので、切った 1 つの content の上に分割後のクリップの窓が並ぶ。 切り口は構造上の
     /// 境界なので短い片も作る (`min_piece = 0`: 窓の境界ちょうどで切れていないと後ろの窓が鳴らせない)。
     ///
-    /// content が複数の clip から共有されていれば**先に 1 回だけ fork する** (copy-on-write)
-    /// ので、linked clip の中身は変わらない。 返り値は「切り終えた content の id」= 分割後の
-    /// 全片が使う id。 跨ぐ要素が無ければ fork もせず `content_id` をそのまま返す。
+    /// **切ると中身の意味が変わる content (MIDI) だけ**、複数の clip から共有されていれば先に 1 回だけ
+    /// fork する (copy-on-write) ので、linked clip の鳴り方は変わらない — ノートを「あ」+「ー」に割ると
+    /// 切り口で発音し直すので、共有したまま切ると linked clip まで変わる。 時間軸を持つ event (audio /
+    /// video / image / text) の切り口は **切れ目を入れるだけ** ([`super::event_piece`]) で、共有している
+    /// clip の再生・描画・読み上げは 1 sample も変わらないので fork しない (リンクを切らない。 audio は
+    /// ARA の編集 = content と take ごとの audio modification も共有したまま続く)。 返り値は「切り終えた
+    /// content の id」= 分割後の全片が使う id。 跨ぐ要素が無ければ `content_id` をそのまま返す。
     pub fn split_content_at_points(&mut self, content_id: ContentId, ats: &[f64]) -> ContentId {
-        let crosses = self
-            .clip_contents
-            .get(&content_id)
-            .is_some_and(|c| ats.iter().any(|&at| Self::content_crosses(c, at)));
-        if !crosses {
+        let Some(content) = self.clip_contents.get(&content_id) else {
+            return content_id;
+        };
+        if !ats.iter().any(|&at| Self::content_crosses(content, at)) {
             return content_id;
         }
-        let target = if self.clip_content_refcount(content_id) > 1 {
+        let cut_changes_meaning = matches!(content, ClipContent::Midi(_));
+        let target = if cut_changes_meaning && self.clip_content_refcount(content_id) > 1 {
             self.fork_content(content_id)
         } else {
             content_id
@@ -191,7 +198,7 @@ impl Song {
     }
 
     /// `at` を厳密に跨ぐ要素があるか (`split_content_at_points` の早期 return 判定)。
-    fn content_crosses(content: &ClipContent, at: f64) -> bool {
+    pub(super) fn content_crosses(content: &ClipContent, at: f64) -> bool {
         fn any_crosses<E: TimedEvent>(events: &[E], at: f64) -> bool {
             events.iter().any(|e| e.start() < at - EPS && e.start() + e.len() > at + EPS)
         }

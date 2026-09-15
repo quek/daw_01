@@ -19,7 +19,7 @@
 //!   解析窓ぶんの欠けが出て、対照の何十倍にもなる。
 
 use super::*;
-use common::model::{AudioContent, AudioEvent, AudioSource, BeatMarker, Track};
+use common::model::{AudioContent, AudioEvent, AudioSource, BeatMarker, ClipKey, Track};
 
 const ENGINE_SR: u32 = 48_000;
 const BPM: f32 = 120.0;
@@ -367,6 +367,52 @@ fn 対照_ストリームを引き継げないと切り口で許容を超える�
             "{label}: 引き継げない片の差 {rel:.3e} が許容 (buffer 長の差 {partition:.3e} の 4 倍) に収まってしまう"
         );
     }
+}
+
+/// Auto-Crossfade (`Song::crossfade_adjacent`) は **窓の端の片の take の続き** を境界の向こうへ鳴らし合う。
+///
+/// 同じ素材の続きを同じ位置で重ねるので、境界の両側が分割の片 (content を共有する 2 クリップ) でも、
+/// 連続した素材を 2 つの content に置いた隣り合うクリップ (event の端に隠れた素材が無い) でも、
+/// クロスフェードした出力は切れ目の無い 1 つの event と同じ音になる。 張り出しの区間で隣の片をもう一度
+/// 鳴らすと (二重) 差は素材の振幅の桁、素材の続きを鳴らさずにランプだけ掛けると (落ち込み) 差は
+/// ランプの深さの桁になる。 残る差はランプ 1 本ぶんの sample の丸め (fade-out が最後の sample で 0 に
+/// 届く定義、`FadeRamps::gain`) だけ。
+#[test]
+fn クロスフェードは隣の片を二度鳴らさず音量も落ち込まない() {
+    let src = source(48_000, 96_000);
+    let whole = Scene::new(event(StretchMode::Raw, 4.0), Arc::clone(&src)).song();
+    let reference = render(&whole, &src, 4.5, 512, 0);
+    // 0.25 拍 = 6,000 sample のランプ。 丸めの差は振幅 (< 0.6) / 6,000 の桁。
+    let tolerance = 2e-4;
+    let keys = [ClipKey { track_id: 1, clip_id: 1 }, ClipKey { track_id: 1, clip_id: 2 }];
+
+    // 分割の片: 2 クリップが同じ content の [0, 2) と [2, 4) を見る。
+    let mut split_pair = whole.clone();
+    split_pair.split_clips_at(2.0);
+    let shared = split_pair.tracks[0].clips.iter().map(|c| c.content_id).collect::<Vec<_>>();
+    assert_eq!(shared[0], shared[1], "前提: 分割の片は content を共有する");
+    assert!(split_pair.crossfade_adjacent(keys[0], keys[1], 0.25).applied, "境界にクロスフェードが掛かる");
+    let clips = &split_pair.tracks[0].clips;
+    assert_eq!((clips[0].xfade_tail_beats, clips[1].xfade_lead_beats), (0.125, 0.125), "両側に半分ずつ張り出す");
+    let (max, _) = difference(&reference, &render(&split_pair, &src, 4.5, 512, 0));
+    assert!(max < tolerance, "分割の片のクロスフェードが分割前と最大 {max:.3e} 違う (隣の片を二度鳴らす / 境界で落ち込む)");
+
+    // 連続した素材を別々の content に置いた 2 クリップ: event の端の外に隠れた素材は無いが、source には続きがある。
+    let mut adjacent = whole.clone();
+    let halves = [(0.0, 0, 48_000), (2.0, 48_000, 96_000)];
+    adjacent.tracks[0].clips.clear();
+    for (i, (start, from, to)) in halves.into_iter().enumerate() {
+        let ev = AudioEvent { id: 1, source_id: 1, source_start_frames: from, source_end_frames: to, ..event(StretchMode::Raw, 2.0) };
+        let content_id = adjacent.alloc_content_id();
+        adjacent.clip_contents.insert(content_id, ClipContent::Audio(AudioContent { events: vec![ev], next_event_id: 2 }));
+        adjacent.tracks[0].clips.push(Clip { id: keys[i].clip_id, start_beat: start, length_beats: 2.0, content_id, ..Clip::default() });
+    }
+    adjacent.tracks[0].next_clip_id = 3;
+    let (butt, _) = difference(&reference, &render(&adjacent, &src, 4.5, 512, 0));
+    assert!(butt == 0.0, "前提: 突き合わせただけなら 1 つの event と同じ音 (最大 {butt:.3e})");
+    assert!(adjacent.crossfade_adjacent(keys[0], keys[1], 0.25).applied);
+    let (max, _) = difference(&reference, &render(&adjacent, &src, 4.5, 512, 0));
+    assert!(max < tolerance, "隣り合う content のクロスフェードで最大 {max:.3e} 違う (境界で音量が落ち込んでいる)");
 }
 
 /// 片のストリームの引き継ぎ (buffer の途中で前の片が鳴り終え、同じエンジンを後ろの片が続ける) と、take の

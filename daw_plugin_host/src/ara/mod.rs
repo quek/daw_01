@@ -15,6 +15,7 @@ pub mod audio_source;
 pub mod clap_ara;
 pub mod document;
 pub mod extension;
+pub mod graph_plan;
 pub mod host_controllers;
 pub mod session;
 pub mod vst3_ara;
@@ -22,6 +23,7 @@ pub mod vst3_ara;
 use anyhow::Result;
 
 use crate::ara::session::AraSession;
+pub use crate::ara::session::SavedArchive;
 
 /// Backend hooks for the shared ARA lifecycle dance ([`run_setup_ara`] /
 /// [`run_clear_ara`]). CLAP / VST3 は「deactivate → set_clips → restore →
@@ -40,14 +42,15 @@ pub trait AraLifecycleHost {
 
 /// Shared `setup_ara`: ARA の `addPlaybackRegion` / region detach は instance
 /// inactive を要求するので、更新の前後で deactivate → reactivate する。bind
-/// 自体は load 時 (`bind_ara_if_capable`) に済んでいる。ARA 非 bind の
-/// instance は `Ok(false)`。
+/// 自体は load 時 (`bind_ara_if_capable`) に済んでいる。グラフの差分編集と、
+/// 新しく作った object へのアーカイブの restore は [`AraSession::set_clips`]。
+/// ARA 非 bind の instance は `Ok(false)`。
 pub fn run_setup_ara(
     host: &mut dyn AraLifecycleHost,
     clips: &[common::protocol::AraClipSpec],
     bpm: f64,
     time_sig: (u16, u16),
-    archive: Option<&[u8]>,
+    archive: Option<SavedArchive<'_>>,
 ) -> Result<bool> {
     if host.ara_session().is_none() {
         return Ok(false);
@@ -58,12 +61,7 @@ pub fn run_setup_ara(
         host.do_deactivate();
     }
     if let Some(session) = host.ara_session_mut().as_mut() {
-        session.set_clips(clips, bpm, time_sig);
-    }
-    if let Some(archive) = archive.filter(|a| !a.is_empty())
-        && let Some(session) = host.ara_session()
-    {
-        session.restore_archive(archive);
+        session.set_clips(clips, bpm, time_sig, archive);
     }
     if was_active
         && let Some((sample_rate, min_frames, max_frames)) = restore

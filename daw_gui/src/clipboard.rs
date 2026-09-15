@@ -182,8 +182,8 @@ pub fn cells_from_clips(clips: &[ClipCopy]) -> Vec<LauncherCellCopy> {
 pub struct DeviceCopy {
     pub order: usize,
     /// コピー元の所属トラック。貼り付け先が同じなら ARA アーカイブを引き継ぐ
-    /// (別トラックなら捨てて解析し直す — `handler/sync.rs` の persistent_id が
-    /// 元トラックのクリップを指すため)。
+    /// (別トラックなら捨てて解析し直す — persistent id (`common::ara_ids`) が
+    /// 元トラックのクリップの content を指すため)。
     pub source_track: u32,
     /// plugin か Parallel (中身ごと)。 r.md #110。
     pub device: common::model::Device,

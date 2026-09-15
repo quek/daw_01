@@ -690,47 +690,32 @@ impl AppData {
     // (`handler/ipc.rs`)。 どちらも `connect_armed_mod_source_to` に集まる。
 
     /// Audio event field の inspector 表示用ライト read snapshot。
-    /// 選択 clip (`selected_clip`) が `ClipContent::Audio` で、 中に少なくとも
-    /// 1 event ある場合に `Some` を返す。 それ以外 (no selection / MIDI clip
-    /// / Vocal clip / 空 events) は `None`。 Phase 1 では 1 clip 1 event 前提
-    /// なので first event の field を「clip 全体の field」 として表示する。
-    /// 編集 AppEvent (`SetClipReversed` / `SetClipMuted` / `SetClipStretchMode`)
-    /// は全 event に同じ値を broadcast するので、 multi-event clip でも
-    /// view は first event を「代表値」 として見せれば編集後に整合が取れる。
+    /// 選択 clip (`selected_clip`) が `ClipContent::Audio` で、 窓に見えている event がある場合に
+    /// `Some` を返す。 それ以外 (no selection / MIDI clip / Vocal clip / 見えている event 無し) は `None`。
+    ///
+    /// 値は **編集が効く片** (`handler::clip_window`) から読む: Audio Editor がこの clip を開いて
+    /// event を選んでいればその event、そうでなければ窓に見えている最初のひと続き。 fade はひと続きの
+    /// 外側の端 (窓の中に見えているランプの長さ)、上限はひと続きの長さ — 編集が効くのと同じ単位。
     pub fn inspector_audio_event_summary(&self) -> Option<InspectorAudioEventSummary> {
         let cref = self.selected_clip_ref()?;
-        let track = self.cur.song_doc.song().track_by_id(cref.track_id)?;
-        let clip = track.clip_by_id(cref.clip_id)?;
-        let common::model::ClipContent::Audio(audio) =
-            self.cur.song_doc.song().clip_contents.get(&clip.content_id)?
-        else {
-            return None;
-        };
-        // PR-D 段階 2: audio_editor が同じ clip を開いていて event を
-        // 選択中なら、 そちらの event を Inspector の target にする。
-        // multi-event clip でも個別 event を編集可能。 audio_editor が
-        // 閉じている / 別 clip を開いている / 選択中 event idx が範囲外
-        // なら first event (= Phase 2 PR1-3 と同じ既存挙動)。
-        let event_idx = if self.cur.peph.audio_editor_clip == Some(cref) {
-            self.audio_editor_anchor_event().unwrap_or(0)
-        } else {
-            0
-        };
-        let event = audio.events.get(event_idx).or(audio.events.first())?;
+        let clip = self.cur.song_doc.song().clip_by_key(cref)?;
+        let anchor = (self.cur.peph.audio_editor_clip == Some(cref)).then(|| self.audio_editor_anchor_event()).flatten();
+        let (event, fade) =
+            self.clip_edit_anchor(self.audio_edit_targets(cref)?, common::model::ClipContent::audio_events, anchor)?;
         Some(InspectorAudioEventSummary {
             target: cref,
             reversed: event.reversed,
             // "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
             muted: clip.muted,
             stretch_mode: event.stretch_mode,
-            fade_in_curve: event.fade_in_curve,
-            fade_out_curve: event.fade_out_curve,
+            fade_in_curve: fade.fade_in_curve,
+            fade_out_curve: fade.fade_out_curve,
             gain_db: event.gain_db,
             pan: event.pan,
             pitch_semitones: event.pitch_semitones,
-            fade_in_beats: event.fade_in_beats,
-            fade_out_beats: event.fade_out_beats,
-            fade_max_beats: event.event_length_beats,
+            fade_in_beats: fade.visible_fade_in_beats(),
+            fade_out_beats: fade.visible_fade_out_beats(),
+            fade_max_beats: fade.len_beats,
         })
     }
 
@@ -778,12 +763,9 @@ impl AppData {
         let cref = self.selected_clip_ref()?;
         let track = self.cur.song_doc.song().track_by_id(cref.track_id)?;
         let clip = track.clip_by_id(cref.clip_id)?;
-        let common::model::ClipContent::Image(image) =
-            self.cur.song_doc.song().clip_contents.get(&clip.content_id)?
-        else {
-            return None;
-        };
-        let event = image.events.first()?;
+        // 値は窓に見えている最初のひと続きから読む (`handler::clip_window`)。
+        let events_of = common::model::ClipContent::image_events;
+        let (event, fade) = self.clip_edit_anchor(self.clip_shown_targets(cref, events_of)?, events_of, None)?;
         let has_lane = |field: common::model::ImageBuiltinParam| {
             track.automation_lanes.iter().any(|l| {
                 matches!(l.target, common::model::AutomationTarget::ImageBuiltin(p) if p == field)
@@ -793,8 +775,8 @@ impl AppData {
             target: cref,
             // "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
             muted: clip.muted,
-            fade_in_curve: event.fade_in_curve,
-            fade_out_curve: event.fade_out_curve,
+            fade_in_curve: fade.fade_in_curve,
+            fade_out_curve: fade.fade_out_curve,
             x_automated: has_lane(common::model::ImageBuiltinParam::X),
             y_automated: has_lane(common::model::ImageBuiltinParam::Y),
             w_automated: has_lane(common::model::ImageBuiltinParam::W),
@@ -807,88 +789,33 @@ impl AppData {
             h: event.h,
             opacity: event.opacity,
             rotation_radians: event.rotation_radians,
-            fade_in_beats: event.fade_in_beats,
-            fade_out_beats: event.fade_out_beats,
+            fade_in_beats: fade.visible_fade_in_beats(),
+            fade_out_beats: fade.visible_fade_out_beats(),
             flip_h: event.flip_h,
             flip_v: event.flip_v,
-            fade_max_beats: event.event_length_beats,
+            fade_max_beats: fade.len_beats,
         })
     }
 
-    /// PR-D 段階 2: set_clip_audio_event_* 系 helper の broadcast 範囲を
-    /// 決める。 audio_editor が `target` clip を開いていて event を
-    /// 選択中なら、 当該 event 1 つだけ更新 (= multi-event clip の個別
-    /// 編集)。 そうでなければ全 event に broadcast (= Phase 2 PR1-3 の
-    /// 既存挙動、 1 clip 1 event 前提なので broadcast = first event 編集)。
-    /// 引数 `n_events` は当該 ClipContent::Audio の events 長 (= 呼び出し
-    /// 前に immutable get で取得)。
-    pub(crate) fn audio_event_target_indices(&self, target: ClipKey, n_events: usize) -> Vec<usize> {
-        if self.cur.peph.audio_editor_clip == Some(target)
-            && !self.selected_audio_event_indices().is_empty()
-        {
-            let mut v: Vec<usize> = self
-                .selected_audio_event_indices()
-                .iter()
-                .copied()
-                .filter(|&i| i < n_events)
-                .collect();
-            v.sort_unstable();
-            v.dedup();
-            // 選択はあるが全て範囲外 (stale) なら全 event に broadcast
-            // (= 旧 `idx < n_events` else 全件 の挙動を踏襲)。
-            if v.is_empty() { (0..n_events).collect() } else { v }
-        } else {
-            (0..n_events).collect()
-        }
-    }
-
-    /// PR-D 段階 2 の集約 helper: `target` clip の `ClipContent::Audio`
-    /// 内、 `audio_event_target_indices` で決まる範囲の event 群に
-    /// closure `f` を適用 + sync。 audio_editor で個別 event 選択中なら
-    /// その 1 つだけ、 そうでなければ全 event を更新する。 戻り値は
-    /// 「実際に何らかの event を更新したか」 (= caller が edit buffer
-    /// resync を呼ぶかの判断に使う)。
-    pub(crate) fn mutate_audio_events_in_clip<F>(&mut self, target: ClipKey, mut f: F) -> bool
+    /// set_clip_audio_event_* 系の集約 helper: `target` clip の編集が効く片
+    /// ([`Self::audio_edit_targets`] = Audio Editor の選択、無ければ窓に見えている片) を、窓の中で
+    /// ひと続きの片ごとに 1 つの event として `f` で編集する (`common::model::edit_runs`)。 戻り値は
+    /// 「実際に何らかの event を更新したか」 (= caller が edit buffer resync を呼ぶかの判断に使う)。
+    pub(crate) fn mutate_audio_events_in_clip<F>(&mut self, target: ClipKey, f: F) -> bool
     where
         F: FnMut(&mut common::model::AudioEvent),
     {
-        let Some(content_id) = self
-            .cur.song_doc.song()
-            .track_by_id(target.track_id)
-            .and_then(|t| t.clip_by_id(target.clip_id))
-            .map(|c| c.content_id)
-        else {
+        let Some(targets) = self.audio_edit_targets(target) else {
             return false;
         };
-        let n_events = match self.cur.song_doc.song().clip_contents.get(&content_id) {
-            Some(common::model::ClipContent::Audio(a)) => a.events.len(),
-            _ => return false,
-        };
-        let indices = self.audio_event_target_indices(target, n_events);
-        if indices.is_empty() {
-            return false;
-        }
-        self.edit_song(|song| {
-            if let Some(common::model::ClipContent::Audio(audio)) =
-                song.clip_contents.get_mut(&content_id)
-            {
-                for &i in &indices {
-                    if let Some(event) = audio.events.get_mut(i) {
-                        f(event);
-                    }
-                }
-                true
-            } else {
-                false
-            }
-        }) == Some(true)
+        self.edit_event_runs(targets, common::model::ClipContent::audio_events_mut, f)
     }
 
     /// **時間写像を変える編集** (移調 / 逆再生 / 伸縮 mode) を [`Self::mutate_audio_events_in_clip`] と
-    /// 同じ対象へ掛ける。 値が変わる event は先に take を見えている窓へ詰め直す
-    /// ([`common::model::AudioEvent::rebase_take`]) — 分割の片の写像の起点は片の外 (分割前の頭) に
-    /// あるので、詰め直さずに変えると片の頭の音が跳ぶ (逆再生なら前の片の音を逆に読む)。 詰め直すと
-    /// 分割していない event に掛けたのと同じく、片自身の頭を起点に効く。
+    /// 同じ対象へ掛ける。 値が変わるひと続きは先に take を見えている窓へ詰め直す
+    /// ([`common::model::AudioEvent::rebase_take`]) — 分割の片の写像の起点は窓の外 (分割前の頭) に
+    /// あるので、詰め直さずに変えると窓の頭の音が跳ぶ (逆再生なら隣の片の音を逆に読む)。 詰め直すと
+    /// 分割していない event に掛けたのと同じく、窓に見えているひと続きの頭を起点に効く。
     pub(crate) fn mutate_audio_event_mapping_in_clip(
         &mut self,
         target: ClipKey,
@@ -946,38 +873,18 @@ impl AppData {
         }) == Some(true)
     }
 
-    /// `target` clip が `ClipContent::Image` の場合、 全 ImageEvent に
-    /// `f` を適用する (= image clip は audio_editor のような per-event
-    /// 選択 UI を持たないので broadcast 固定)。 戻り値は「実際に何らか
-    /// の event を更新したか」 (= caller が edit buffer resync を呼ぶか
-    /// の判断に使う)。
-    pub(crate) fn mutate_image_events_in_clip<F>(&mut self, target: ClipKey, mut f: F) -> bool
+    /// `target` clip が `ClipContent::Image` の場合、 窓に見えている ImageEvent (ひと続きは 1 つとして)
+    /// に `f` を適用する (image clip は audio_editor のような per-event 選択 UI を持たない、
+    /// `handler::clip_window`)。 戻り値は「実際に何らかの event を更新したか」 (= caller が edit buffer
+    /// resync を呼ぶかの判断に使う)。
+    pub(crate) fn mutate_image_events_in_clip<F>(&mut self, target: ClipKey, f: F) -> bool
     where
         F: FnMut(&mut common::model::ImageEvent),
     {
-        let Some(content_id) = self
-            .cur.song_doc.song()
-            .track_by_id(target.track_id)
-            .and_then(|t| t.clip_by_id(target.clip_id))
-            .map(|c| c.content_id)
-        else {
+        let Some(targets) = self.clip_shown_targets(target, common::model::ClipContent::image_events) else {
             return false;
         };
-        self.edit_song(|song| {
-            if let Some(common::model::ClipContent::Image(image)) =
-                song.clip_contents.get_mut(&content_id)
-            {
-                if image.events.is_empty() {
-                    return false;
-                }
-                for event in &mut image.events {
-                    f(event);
-                }
-                true
-            } else {
-                false
-            }
-        }) == Some(true)
+        self.edit_event_runs(targets, common::model::ClipContent::image_events_mut, f)
     }
 
     /// 単一デバイスチェーン (`docs/plan_linear_chain.md` §5): `Track.devices`

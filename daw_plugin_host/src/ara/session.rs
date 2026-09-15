@@ -6,16 +6,23 @@
 //! order from Celemony's `MiniHost.c`:
 //!
 //! 1. create document controller (injecting our host controllers)
-//! 2. `beginEditing` → musical context → region sequence → per clip: audio
-//!    source → audio modification → playback region → `endEditing`
+//! 2. `beginEditing` → musical context → region sequence → audio sources →
+//!    audio modifications → playback regions → `endEditing`
 //! 3. enable sample access for every source
 //! 4. bind the instance with the playback-renderer role
 //! 5. `addPlaybackRegion` for every region
+//!
+//! The graph is then **edited in place** to follow the song ([`AraSession::set_clips`],
+//! diff in [`crate::ara::graph_plan`]): one audio source per source file, one
+//! audio modification per content take (split pieces share it, so the plug-in's
+//! edits continue across a split), one playback region per piece a clip window
+//! shows. Objects whose persistent id survives are never re-created.
 //!
 //! On drop the graph is torn down bottom-up before the document controller is
 //! destroyed and ARA is uninitialised.
 
 use std::ffi::CString;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ara_sys::{
@@ -24,11 +31,13 @@ use ara_sys::{
     ARAPlaybackTransformationFlags, ARAPlugInExtensionInstance, ARARegionSequenceRef,
     kARAPlaybackTransformationTimestretch,
 };
+use common::ara_ids::{AraIdAlias, archived_id};
 use common::protocol::{AraClipSpec, AraRegionUpdate};
 
 use crate::ara::audio_source::AraAudioSourceHost;
 use crate::ara::document::AraDocumentController;
 use crate::ara::extension::AraPlugInExtension;
+use crate::ara::graph_plan::{self, GraphNow};
 use crate::ara::host_controllers::AraMusicalContextHost;
 
 // The clip/source spec is defined once in `common::protocol`
@@ -37,16 +46,36 @@ use crate::ara::host_controllers::AraMusicalContextHost;
 // (`AraClipSpec::source_wav`) — the in-memory `Pcm` variant was removed
 // (`docs/plan_arch_refactor.md` §2).
 
-/// A host model source + its plug-in-side refs, owned for the session's life.
-struct OwnedAraSource {
-    /// Stable id (matches `AraClipSpec::persistent_id`) so `update_regions` can
-    /// find this region when only its placement changed.
+/// The saved ARA archive handed to [`AraSession::set_clips`]: its bytes and the
+/// legacy persistent-id aliases it was written with (empty = current ids).
+#[derive(Clone, Copy)]
+pub struct SavedArchive<'a> {
+    pub bytes: &'a [u8],
+    pub ids: &'a [AraIdAlias],
+}
+
+/// A host model audio source + its plug-in-side ref, owned for the session's life.
+struct OwnedSource {
     persistent_id: String,
+    wav: PathBuf,
     /// Boxed so its address is stable — it backs the `ARAAudioSourceHostRef`
     /// the plug-in hands to our AudioAccess controller in `readAudioSamples`.
     _host: Box<AraAudioSourceHost>,
     source_ref: ARAAudioSourceRef,
+}
+
+/// An audio modification (the plug-in's edit layer) over one source.
+struct OwnedModification {
+    persistent_id: String,
+    source_id: String,
     modification_ref: ARAAudioModificationRef,
+}
+
+/// A playback region on one modification.
+struct OwnedRegion {
+    /// Host key (`AraClipSpec::region_key`) so `update_regions` can find it.
+    key: String,
+    modification_id: String,
     region_ref: ARAPlaybackRegionRef,
 }
 
@@ -59,11 +88,13 @@ pub struct AraSession {
     /// Host-side tempo / bar signature served to the plug-in via the
     /// ContentAccess controller. Boxed so its address (the
     /// `ARAMusicalContextHostRef` the plug-in holds) stays stable; updated in
-    /// place by [`Self::set_musical_context`].
+    /// place by [`Self::set_clips`].
     musical_context_host: Box<AraMusicalContextHost>,
     musical_context: ARAMusicalContextRef,
     region_sequence: ARARegionSequenceRef,
-    sources: Vec<OwnedAraSource>,
+    sources: Vec<OwnedSource>,
+    modifications: Vec<OwnedModification>,
+    regions: Vec<OwnedRegion>,
     extension: AraPlugInExtension,
     controller: AraDocumentController,
     /// Playback transformations the plug-in advertises (`ARAFactory`). We enable
@@ -131,73 +162,67 @@ impl AraSession {
             musical_context,
             region_sequence,
             sources: Vec::new(),
+            modifications: Vec::new(),
+            regions: Vec::new(),
             extension,
             controller,
             supported_transformation_flags,
         })
     }
 
-    /// Replace the document's audio sources / playback regions to match `clips`.
-    /// Best-effort: a clip whose source can't be decoded is skipped (logged) so
-    /// one bad source doesn't drop the rest.
+    /// Edit the document's model graph in place to match `clips`
+    /// ([`graph_plan::plan`]): regions / modifications / sources whose ids are gone
+    /// are removed bottom-up, new ones created top-down, surviving regions get
+    /// their placement updated. Surviving modifications keep the plug-in's live
+    /// edits (a split adds a region on the same modification). `archive` is
+    /// restored **only into the objects created here** (restore filter, legacy
+    /// ids mapped through its aliases), inside the same editing cycle, as ARA's
+    /// unarchiving session prescribes. Best-effort: a clip whose source can't be
+    /// decoded is skipped (logged) so one bad source doesn't drop the rest.
     ///
     /// The caller must ensure the plug-in is **inactive** — ARA's
     /// `addPlaybackRegion` / `removePlaybackRegion` (and detaching regions before
     /// destroying them) require it.
-    pub fn set_clips(&mut self, clips: &[AraClipSpec], bpm: f64, time_sig: (u16, u16)) {
-        // Detach + destroy the current sources / regions, freeing their host data.
-        for owned in &self.sources {
+    pub fn set_clips(&mut self, clips: &[AraClipSpec], bpm: f64, time_sig: (u16, u16), archive: Option<SavedArchive<'_>>) {
+        let plan = graph_plan::plan(&self.graph_now(), clips);
+        let first_build = self.sources.is_empty() && self.modifications.is_empty();
+        for owned in self.regions.iter().filter(|r| plan.remove_regions.contains(&r.key)) {
             self.extension.remove_playback_region(owned.region_ref);
         }
         self.controller.begin_editing();
-        // Update the musical context to the real song tempo / time signature so
-        // the plug-in's editor grid (bars/beats) aligns to the project instead of
-        // the placeholder created at bind time. The content controller reads
-        // these from the boxed host model, so update it then tell the plug-in to
-        // re-read via updateMusicalContextContent.
-        self.musical_context_host.seconds_per_quarter = 60.0 / bpm.max(1.0);
-        self.musical_context_host.bar_numerator = i32::from(time_sig.0.max(1));
-        self.musical_context_host.bar_denominator = i32::from(time_sig.1.max(1));
-        self.controller
-            .update_musical_context_content(self.musical_context);
-        for owned in &self.sources {
-            self.controller.destroy_playback_region(owned.region_ref);
-            self.controller.destroy_audio_modification(owned.modification_ref);
-            self.controller.destroy_audio_source(owned.source_ref);
-        }
-        self.sources = Vec::new();
+        self.update_musical_context(bpm, time_sig);
+        self.destroy_planned(&plan);
 
-        let supports_timestretch = self.supports_timestretch();
-        let mut new_sources = Vec::with_capacity(clips.len());
-        for clip in clips {
-            let time_stretch = clip.placement.time_stretch && supports_timestretch;
-            match unsafe {
-                build_source(&self.controller, self.region_sequence, clip, time_stretch)
-            } {
-                Ok(source) => new_sources.push(source),
-                Err(e) => {
-                    tracing::warn!(
-                        error = ?e,
-                        id = %clip.persistent_id,
-                        "ARA: skipping clip with unreadable source"
-                    );
-                }
+        let created_sources = self.create_sources(clips, &plan.create_sources);
+        let restore_modifications = self.create_modifications(clips, &plan.create_modifications, first_build);
+        let created_regions = self.create_regions(clips, &plan.create_regions);
+        for &i in &plan.update_regions {
+            self.update_region(&clips[i].region_key, &clips[i].placement);
+        }
+        if let Some(saved) = archive.filter(|a| !a.bytes.is_empty())
+            && (!created_sources.is_empty() || !restore_modifications.is_empty())
+        {
+            let sources: Vec<(&str, &str)> =
+                created_sources.iter().map(|id| (archived_id(saved.ids, id), id.as_str())).collect();
+            let modifications: Vec<(&str, &str)> = restore_modifications
+                .iter()
+                .map(|(id, from)| (archived_id(saved.ids, from), id.as_str()))
+                .collect();
+            if !self.controller.restore_objects_from_archive(saved.bytes, first_build, &sources, &modifications) {
+                tracing::warn!(n_sources = sources.len(), n_modifications = modifications.len(), "ARA: restoring the archive failed");
             }
         }
         self.controller.end_editing();
 
-        for owned in &new_sources {
-            self.controller
-                .enable_audio_source_samples_access(owned.source_ref, true);
+        for owned in self.sources.iter().filter(|s| created_sources.contains(&s.persistent_id)) {
+            self.controller.enable_audio_source_samples_access(owned.source_ref, true);
             // Force analysis now; otherwise the plug-in may postpone it forever
             // (no editor / head-less), leaving nothing to render.
-            self.controller
-                .request_audio_source_content_analysis(owned.source_ref);
+            self.controller.request_audio_source_content_analysis(owned.source_ref);
         }
-        for owned in &new_sources {
+        for owned in self.regions.iter().filter(|r| created_regions.contains(&r.key)) {
             self.extension.add_playback_region(owned.region_ref);
         }
-        self.sources = new_sources;
 
         // Note: we deliberately do NOT assign regions/sequences to the *editor*
         // renderer here. That renderer is for transient preview audio and the
@@ -206,6 +231,167 @@ impl AraSession {
         // What populates the editor's timeline is the editor-view *selection*,
         // pushed below and re-pushed when the editor view opens.
         self.notify_editor_selection();
+    }
+
+    /// The ids currently in the graph (input of [`graph_plan::plan`]).
+    fn graph_now(&self) -> GraphNow<'_> {
+        GraphNow {
+            sources: self.sources.iter().map(|s| (s.persistent_id.as_str(), s.wav.as_path())).collect(),
+            modifications: self.modifications.iter().map(|m| (m.persistent_id.as_str(), m.source_id.as_str())).collect(),
+            regions: self.regions.iter().map(|r| (r.key.as_str(), r.modification_id.as_str())).collect(),
+        }
+    }
+
+    /// Update the musical context to the real song tempo / time signature so the
+    /// plug-in's editor grid (bars/beats) aligns to the project instead of the
+    /// placeholder created at bind time. The content controller reads these from
+    /// the boxed host model, so update it then tell the plug-in to re-read via
+    /// updateMusicalContextContent. Inside an editing cycle.
+    fn update_musical_context(&mut self, bpm: f64, time_sig: (u16, u16)) {
+        self.musical_context_host.seconds_per_quarter = 60.0 / bpm.max(1.0);
+        self.musical_context_host.bar_numerator = i32::from(time_sig.0.max(1));
+        self.musical_context_host.bar_denominator = i32::from(time_sig.1.max(1));
+        self.controller.update_musical_context_content(self.musical_context);
+    }
+
+    /// Destroy the planned regions → modifications → sources (dependency order). Inside an editing cycle.
+    fn destroy_planned(&mut self, plan: &graph_plan::GraphPlan) {
+        let controller = &self.controller;
+        self.regions.retain(|r| {
+            let gone = plan.remove_regions.contains(&r.key);
+            if gone {
+                controller.destroy_playback_region(r.region_ref);
+            }
+            !gone
+        });
+        self.modifications.retain(|m| {
+            let gone = plan.destroy_modifications.contains(&m.persistent_id);
+            if gone {
+                controller.destroy_audio_modification(m.modification_ref);
+            }
+            !gone
+        });
+        self.sources.retain(|s| {
+            let gone = plan.destroy_sources.contains(&s.persistent_id);
+            if gone {
+                controller.destroy_audio_source(s.source_ref);
+            }
+            !gone
+        });
+    }
+
+    /// Create the audio sources for `clips[i]` (`indices`); returns the ids created.
+    fn create_sources(&mut self, clips: &[AraClipSpec], indices: &[usize]) -> Vec<String> {
+        let mut created = Vec::new();
+        for clip in indices.iter().map(|&i| &clips[i]) {
+            match unsafe { build_source(&self.controller, clip) } {
+                Ok(source) => {
+                    created.push(source.persistent_id.clone());
+                    self.sources.push(source);
+                }
+                Err(e) => tracing::warn!(error = ?e, id = %clip.source_id, "ARA: skipping unreadable audio source"),
+            }
+        }
+        created
+    }
+
+    /// Create the audio modifications for `clips[i]` on their (existing or just created) sources, and return
+    /// which of them to restore from the archive: `(modification id, id whose archived state to restore)`.
+    /// How each one starts ([`graph_plan::modification_start`]): cloned from its live origin (content un-shared,
+    /// `cloneAudioModification` — not restored), or created empty and restored from the archive.
+    fn create_modifications(
+        &mut self,
+        clips: &[AraClipSpec],
+        indices: &[usize],
+        first_build: bool,
+    ) -> Vec<(String, String)> {
+        use graph_plan::ModificationStart;
+        let mut restore = Vec::new();
+        for clip in indices.iter().map(|&i| &clips[i]) {
+            let Some(source_ref) = self.sources.iter().find(|s| s.persistent_id == clip.source_id).map(|s| s.source_ref)
+            else {
+                continue;
+            };
+            let Ok(id) = CString::new(clip.modification_id.as_str()) else {
+                tracing::warn!(id = %clip.modification_id, "ARA: modification id has interior NUL");
+                continue;
+            };
+            let live = |origin: &str| {
+                self.modifications.iter().find(|m| m.persistent_id == origin && m.source_id == clip.source_id)
+            };
+            let origin_live = clip.modification_origin.as_deref().and_then(live).is_some();
+            let (modification_ref, restore_from) = match graph_plan::modification_start(clip, first_build, origin_live) {
+                ModificationStart::Clone(origin) => {
+                    let original = live(origin).map(|m| m.modification_ref);
+                    (original.and_then(|o| self.controller.clone_audio_modification(o, std::ptr::null_mut(), &id)), None)
+                }
+                ModificationStart::Restore(from) => {
+                    (self.controller.create_audio_modification(source_ref, std::ptr::null_mut(), &id), Some(from.to_owned()))
+                }
+            };
+            let Some(modification_ref) = modification_ref.filter(|r| !r.is_null()) else {
+                tracing::warn!(id = %clip.modification_id, "ARA: plug-in returned null audio modification");
+                continue;
+            };
+            if let Some(from) = restore_from {
+                restore.push((clip.modification_id.clone(), from));
+            }
+            self.modifications.push(OwnedModification {
+                persistent_id: clip.modification_id.clone(),
+                source_id: clip.source_id.clone(),
+                modification_ref,
+            });
+        }
+        restore
+    }
+
+    /// Create the playback regions for `clips[i]` on their modifications; returns the keys created.
+    fn create_regions(&mut self, clips: &[AraClipSpec], indices: &[usize]) -> Vec<String> {
+        let supports_timestretch = self.supports_timestretch();
+        let mut created = Vec::new();
+        for clip in indices.iter().map(|&i| &clips[i]) {
+            let Some(modification) = self.modifications.iter().find(|m| m.persistent_id == clip.modification_id) else {
+                continue;
+            };
+            let p = &clip.placement;
+            let Some(region_ref) = self.controller.create_playback_region(
+                modification.modification_ref,
+                std::ptr::null_mut(),
+                self.region_sequence,
+                p.start_in_modification_seconds,
+                p.duration_in_modification_seconds,
+                p.start_in_playback_seconds,
+                p.duration_in_playback_seconds,
+                p.time_stretch && supports_timestretch,
+            )
+            .filter(|r| !r.is_null()) else {
+                tracing::warn!(key = %clip.region_key, "ARA: plug-in returned null playback region");
+                continue;
+            };
+            created.push(clip.region_key.clone());
+            self.regions.push(OwnedRegion {
+                key: clip.region_key.clone(),
+                modification_id: clip.modification_id.clone(),
+                region_ref,
+            });
+        }
+        created
+    }
+
+    /// Re-state one region's placement (inside an editing cycle). Unknown keys are ignored.
+    fn update_region(&self, key: &str, p: &common::protocol::AraRegionPlacement) {
+        let Some(owned) = self.regions.iter().find(|r| r.key == key) else {
+            return;
+        };
+        self.controller.update_playback_region_properties(
+            owned.region_ref,
+            self.region_sequence,
+            p.start_in_modification_seconds,
+            p.duration_in_modification_seconds,
+            p.start_in_playback_seconds,
+            p.duration_in_playback_seconds,
+            p.time_stretch && self.supports_timestretch(),
+        );
     }
 
     /// Drive the plug-in's deferred model work / analysis. ARA requires the host
@@ -224,13 +410,11 @@ impl AraSession {
     /// this right after creating the editor view — without it Melodyne's timeline
     /// stays empty even though playback renders.
     pub fn notify_editor_selection(&self) {
-        if self.sources.is_empty() {
+        if self.regions.is_empty() {
             return;
         }
-        let region_refs: Vec<ARAPlaybackRegionRef> =
-            self.sources.iter().map(|o| o.region_ref).collect();
-        self.extension
-            .notify_selection(&region_refs, &[self.region_sequence]);
+        let region_refs: Vec<ARAPlaybackRegionRef> = self.regions.iter().map(|o| o.region_ref).collect();
+        self.extension.notify_selection(&region_refs, &[self.region_sequence]);
     }
 
     /// Serialise the plug-in's ARA edit state for project save.
@@ -238,47 +422,20 @@ impl AraSession {
         self.controller.store_objects_to_archive()
     }
 
-    /// Restore ARA edit state (from a prior [`Self::store_archive`]) onto the
-    /// already-built model graph. Bracketed in an editing session, as ARA 2
-    /// requires for `restoreObjectsFromArchive`.
-    pub fn restore_archive(&self, archive: &[u8]) -> bool {
-        self.controller.begin_editing();
-        let ok = self.controller.restore_objects_from_archive(archive);
-        self.controller.end_editing();
-        ok
-    }
-
     /// Update the placement / stretch of already-present regions in place,
-    /// matched by `persistent_id`, without rebuilding the document. Safe while
+    /// matched by `region_key`, without rebuilding the document. Safe while
     /// the plug-in renders: `updatePlaybackRegionProperties` only re-states
     /// region properties (not renderer assignment) and is bracketed in
-    /// begin/endEditing, which the plug-in uses for render-thread sync. Ids not
+    /// begin/endEditing, which the plug-in uses for render-thread sync. Keys not
     /// currently present are ignored (a clip-set change goes through
     /// [`Self::set_clips`] instead).
     pub fn update_regions(&self, updates: &[AraRegionUpdate]) {
         if updates.is_empty() {
             return;
         }
-        let supports_timestretch = self.supports_timestretch();
         self.controller.begin_editing();
         for upd in updates {
-            let Some(owned) = self
-                .sources
-                .iter()
-                .find(|o| o.persistent_id == upd.persistent_id)
-            else {
-                continue;
-            };
-            let p = &upd.placement;
-            self.controller.update_playback_region_properties(
-                owned.region_ref,
-                self.region_sequence,
-                p.start_in_modification_seconds,
-                p.duration_in_modification_seconds,
-                p.start_in_playback_seconds,
-                p.duration_in_playback_seconds,
-                p.time_stretch && supports_timestretch,
-            );
+            self.update_region(&upd.region_key, &upd.placement);
         }
         self.controller.end_editing();
     }
@@ -291,62 +448,24 @@ impl AraSession {
     }
 }
 
-/// Create one source → modification → playback region chain for a clip.
-unsafe fn build_source(
-    controller: &AraDocumentController,
-    region_sequence: ARARegionSequenceRef,
-    clip: &AraClipSpec,
-    time_stretch: bool,
-) -> Result<OwnedAraSource> {
+/// Create the audio source (decoding its WAV) for a clip. Inside an editing cycle.
+unsafe fn build_source(controller: &AraDocumentController, clip: &AraClipSpec) -> Result<OwnedSource> {
     let host = Box::new(AraAudioSourceHost::from_audio_file(&clip.source_wav)?);
 
     // The boxed host's address is the opaque host ref the plug-in passes back.
     let host_ref: ARAAudioSourceHostRef = (std::ptr::from_ref::<AraAudioSourceHost>(&host)) as _;
 
-    let source_id =
-        CString::new(clip.persistent_id.as_str()).context("persistent_id has interior NUL")?;
-    let modification_id = CString::new(format!("{}/mod", clip.persistent_id))
-        .context("modification id has interior NUL")?;
-
+    let source_id = CString::new(clip.source_id.as_str()).context("source id has interior NUL")?;
     let sample_count = i64::try_from(host.frame_count).unwrap_or(i64::MAX);
     let channel_count = i32::try_from(host.channel_count).unwrap_or(0);
     let sample_rate = host.sample_rate;
 
     let source_ref = controller
-        .create_audio_source(
-            host_ref,
-            source_id.as_c_str(),
-            sample_count,
-            sample_rate,
-            channel_count,
-            false,
-        )
+        .create_audio_source(host_ref, source_id.as_c_str(), sample_count, sample_rate, channel_count, false)
+        .filter(|r| !r.is_null())
         .context("plug-in returned null audio source")?;
 
-    let modification_ref = controller
-        .create_audio_modification(source_ref, std::ptr::null_mut(), modification_id.as_c_str())
-        .context("plug-in returned null audio modification")?;
-
-    let region_ref = controller
-        .create_playback_region(
-            modification_ref,
-            std::ptr::null_mut(),
-            region_sequence,
-            clip.placement.start_in_modification_seconds,
-            clip.placement.duration_in_modification_seconds,
-            clip.placement.start_in_playback_seconds,
-            clip.placement.duration_in_playback_seconds,
-            time_stretch,
-        )
-        .context("plug-in returned null playback region")?;
-
-    Ok(OwnedAraSource {
-        persistent_id: clip.persistent_id.clone(),
-        _host: host,
-        source_ref,
-        modification_ref,
-        region_ref,
-    })
+    Ok(OwnedSource { persistent_id: clip.source_id.clone(), wav: clip.source_wav.clone(), _host: host, source_ref })
 }
 
 impl Drop for AraSession {
@@ -354,13 +473,17 @@ impl Drop for AraSession {
         // Detach regions from the renderer before destroying them, then tear the
         // model graph down bottom-up. The controller (and ARA uninitialise) is
         // released afterwards when the `controller` field drops.
-        for owned in &self.sources {
+        for owned in &self.regions {
             self.extension.remove_playback_region(owned.region_ref);
         }
         self.controller.begin_editing();
-        for owned in &self.sources {
+        for owned in &self.regions {
             self.controller.destroy_playback_region(owned.region_ref);
+        }
+        for owned in &self.modifications {
             self.controller.destroy_audio_modification(owned.modification_ref);
+        }
+        for owned in &self.sources {
             self.controller.destroy_audio_source(owned.source_ref);
         }
         self.controller.destroy_region_sequence(self.region_sequence);

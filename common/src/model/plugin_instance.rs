@@ -78,6 +78,12 @@ pub struct PluginInstance {
     /// D2 (r.md #8): `Arc<[u8]>` で保持し undo snapshot 間で共有 (Melodyne 等の
     /// ARA アーカイブは MB 級で undo の編集対象でないため)。
     pub ara_archive: Option<std::sync::Arc<[u8]>>,
+    /// v42 (r.md #132 残件): `ara_archive` が **旧 persistent id** で書かれているときの、旧 id → 今の id の表
+    /// (`crate::ara_ids` の doc、旧ファイルの読み込みで作る)。 document を組むときに `SetupAraDocument.archive_ids`
+    /// で送り、restore の filter で読み替える。 新しいアーカイブは今の id で書かれるので、アーカイブと必ず一緒に
+    /// 置き換える / 捨てる ([`Self::set_ara_archive`] / [`Self::drop_ara_archive`])。 wire (LoadSong) には載せない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ara_archive_ids: Vec<crate::ara_ids::AraIdAlias>,
     /// r.md #36: このプラグインのエディタ窓では **キーを一切横取りしない**
     /// (= REAPER の 「Send all keyboard input to plug-in」)。
     ///
@@ -111,9 +117,22 @@ impl PluginInstance {
             aux_input_count: 0,
             ports: crate::port_config::PortConfig::default(),
             ara_archive: None,
+            ara_archive_ids: Vec::new(),
             send_all_keys_to_plugin: false,
             bypassed: false,
         }
+    }
+
+    /// プラグインが今書いた ARA アーカイブで置き換える (今の persistent id で書かれているので読み替え表は捨てる)。
+    pub fn set_ara_archive(&mut self, archive: std::sync::Arc<[u8]>) {
+        self.ara_archive = Some(archive);
+        self.ara_archive_ids.clear();
+    }
+
+    /// ARA アーカイブを捨てる (読み替え表も一緒に)。 捨てたら `true`。
+    pub fn drop_ara_archive(&mut self) -> bool {
+        self.ara_archive_ids.clear();
+        self.ara_archive.take().is_some()
     }
 
     pub fn with_ports(
@@ -132,6 +151,7 @@ impl PluginInstance {
             aux_input_count: 0,
             ports,
             ara_archive: None,
+            ara_archive_ids: Vec::new(),
             send_all_keys_to_plugin: false,
             bypassed: false,
         }
@@ -140,7 +160,8 @@ impl PluginInstance {
 }
 
 /// wire (bincode / IPC) 表現は手書きで、`state` / `ara_archive` の MB 級 blob を
-/// **構造的に除外**する (`docs/plan_arch_refactor.md` §2)。ドキュメント
+/// **構造的に除外**する (`docs/plan_arch_refactor.md` §2)。 アーカイブの読み替え表 `ara_archive_ids` も
+/// アーカイブと一緒に `SetupAraDocument` が運ぶので載せない。ドキュメント
 /// (serde / JSON 保存) は両フィールドを base64 で保持し、blob が必要な IPC
 /// 操作は専用メッセージ (`SetSlotPlugin.initial_state` /
 /// `SetupAraDocument.archive` / `AllPluginStates`) が個別に運ぶ。これで
@@ -180,6 +201,7 @@ impl<Ctx> bincode::Decode<Ctx> for PluginInstance {
             aux_output_count: bincode::Decode::decode(decoder)?,
             ports: bincode::Decode::decode(decoder)?,
             ara_archive: None,
+            ara_archive_ids: Vec::new(),
             send_all_keys_to_plugin: bincode::Decode::decode(decoder)?,
             bypassed: bincode::Decode::decode(decoder)?,
             aux_input_count: bincode::Decode::decode(decoder)?,

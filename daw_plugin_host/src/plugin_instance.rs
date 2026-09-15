@@ -686,14 +686,14 @@ pub trait LoadedPlugin: Send {
     }
 
     /// Update the bound ARA document to expose `clips` (deactivate →
-    /// set_clips → restore archive → reactivate は
+    /// set_clips (graph diff + restore into the created objects) → reactivate は
     /// [`crate::ara::run_setup_ara`] に一本化)。
     fn setup_ara(
         &mut self,
         _clips: &[common::protocol::AraClipSpec],
         _bpm: f64,
         _time_sig: (u16, u16),
-        _archive: Option<&[u8]>,
+        _archive: Option<crate::ara::SavedArchive<'_>>,
     ) -> Result<bool> {
         Ok(false)
     }

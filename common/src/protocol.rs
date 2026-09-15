@@ -286,9 +286,10 @@ pub struct AraRegionPlacement {
     pub time_stretch: bool,
 }
 
-/// One audio clip exposed to an ARA plug-in: its source WAV plus its placement
-/// on the song timeline. The host (daw_gui) resolves a track's audio clips
-/// into these before sending `SetupAraDocument`.
+/// One playback region exposed to an ARA plug-in: the clip window's piece of one
+/// audio event, with the audio source and audio modification it plays. The host
+/// (daw_gui) resolves a track's audio clips into these before sending
+/// `SetupAraDocument`. 名前はすべて安定 id から作る (`crate::ara_ids`)。
 ///
 /// v29: source は常に絶対 WAV path。旧 `AraSourceSpec::Pcm` (in-memory f32 を
 /// wire に直載せ — 3 分 stereo で ~69MB と 16MB wire 上限を必ず超える) は
@@ -298,20 +299,28 @@ pub struct AraRegionPlacement {
 pub struct AraClipSpec {
     /// Decode this absolute WAV path inside the plugin host (on demand).
     pub source_wav: std::path::PathBuf,
-    /// Unique, save/restore-stable id for the source within the document.
-    pub persistent_id: String,
+    /// ARA audio source の persistent id (素材ごとに 1 つ、`ara_ids::source_id`)。
+    pub source_id: String,
+    /// ARA audio modification の persistent id (content と take ごとに 1 つ、`ara_ids::modification_id`)。
+    /// 同じ id の region は 1 つの modification を共有する (分割の片は Melodyne の編集を共有する)。
+    pub modification_id: String,
+    /// modification を新しく作るとき、編集を写して始める元の modification (`ara_ids::modification_origin`、
+    /// content を複製して共有を解いた場合)。
+    pub modification_origin: Option<String>,
+    /// playback region のキー (`ara_ids::region_key`、永続しない)。
+    pub region_key: String,
     pub placement: AraRegionPlacement,
 }
 
 /// A lightweight update of an existing ARA playback region's placement, matched
-/// to its region by `persistent_id`. Sent via `UpdateAraRegions` when only the
+/// to its region by `region_key`. Sent via `UpdateAraRegions` when only the
 /// timeline placement / stretch of already-present clips changed (manual
 /// edge-drag, tempo change, clip move) so the plug-in can
 /// `updatePlaybackRegionProperties` in place instead of rebuilding the whole
 /// document (which would interrupt playback).
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct AraRegionUpdate {
-    pub persistent_id: String,
+    pub region_key: String,
     pub placement: AraRegionPlacement,
 }
 
@@ -1086,9 +1095,11 @@ pub enum PluginCommand {
     /// Worker pool の plugin_host 側 open (audio 側と対で、同じ [`WorkerPoolSpec`] が送られる)。
     OpenWorkerPool(WorkerPoolSpec),
     CloseWorkerPool,
-    /// (r.md #5 ARA2) Build/replace the ARA document for the ARA-capable
-    /// device: expose `clips` as ARA audio sources + playback regions and
-    /// bind the instance for playback rendering.
+    /// (r.md #5 ARA2) Build/update the ARA document for the ARA-capable
+    /// device so its model graph matches `clips` (audio sources / audio
+    /// modifications / playback regions). The host edits the graph in place:
+    /// objects whose persistent id is still present are kept (their live edits
+    /// continue), missing ones are destroyed, new ones are created.
     SetupAraDocument {
         device: DeviceAddr,
         clips: Vec<AraClipSpec>,
@@ -1096,14 +1107,19 @@ pub enum PluginCommand {
         /// context so the plug-in's editor grid aligns to the song.
         bpm: f64,
         time_sig: (u16, u16),
-        /// Prior ARA edit archive to restore after (re)building the document
-        /// (from `PluginInstance.ara_archive`). `None` for a fresh document.
+        /// Saved ARA edit archive (from `PluginInstance.ara_archive`). Restored
+        /// only into the objects this update **creates** (a restore filter), so
+        /// objects that already live in the document keep their live edits.
+        /// `None` for a fresh document.
         archive: Option<Vec<u8>>,
+        /// `archive` が旧 persistent id で書かれているときの読み替え表
+        /// (`PluginInstance.ara_archive_ids`、空 = 今の id のまま)。
+        archive_ids: Vec<crate::ara_ids::AraIdAlias>,
     },
     /// (r.md #5 ARA2) Tear down the ARA document/session for `device`.
     ClearAraDocument { device: DeviceAddr },
     /// (r.md #7 ARA2) Update only the playback-region placements of an
-    /// existing ARA document (matched by `persistent_id`).
+    /// existing ARA document (matched by `region_key`).
     UpdateAraRegions {
         device: DeviceAddr,
         regions: Vec<AraRegionUpdate>,

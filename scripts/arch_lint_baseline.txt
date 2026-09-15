@@ -222,7 +222,6 @@ FN-NESTING | daw_gui/src/handler/export.rs::AppData::handle_file_dialog_result |
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_midi                     | 9/42 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::begin_rescan                           | 8/15 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_positions                     | 8/14 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::auto_warp_clip                   | 8/13 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/view_model.rs::AppData::arrangement_labels                | 8/12 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_clips_at                    | 8/8  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_points_at                   | 8/7  | edit_song 多重ループ。未起票
@@ -236,15 +235,12 @@ FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_image         
 # 再構築が positional index から安定 device_id 一本になり、 「track ごとに index を
 # 数え直して貼り替える」 二重ループそのものが消えた (不変条件 1)。
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_automation_clips_at         | 7/14 | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/sync.rs::AppData::collect_ara_clips_for_track             | 7/11 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::quantize_selected_automation_points | 7/10 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::ensure_voicevox_engine                 | 7/10 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/project.rs::AppData::action_save_as                       | 7/9  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::copy_automation_clips_clip        | 7/8  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::set_notes_muted                  | 7/8  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/project.rs::AppData::begin_asset_decode                   | 7/8  | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/audio_editor.rs::AppData::auto_fade_selected_clips        | 7/4  | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::detect_onsets_for_clip           | 7/4  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::quantize_selected_notes                | 7/4  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/view_model.rs::AppData::parallel_output_entries           | 7/4  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::delete_automation_points          | 7/3  | edit_song 多重ループ。未起票
@@ -321,4 +317,3 @@ FN-NESTING | ui/crates/ui/src/widgets/goniometer.rs::Ui::goniometer             
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::action_join_selected_notes | 7/28 | Join Notes (ピアノロールの j)。分割は後回し (ユーザー判断)
 FN-NESTING | daw_gui/src/handler/range_ops.rs::AppData::apply_delete_time_selection | 7/11 | 範囲削除のレーン別分岐。分割は後回し (ユーザー判断)
 FN-NESTING | daw_gui/src/handler/range_ops.rs::AppData::apply_mute_time_selection | 7/4 | 同上
-FN-NESTING | daw_gui/src/handler/audio_editor.rs::AppData::auto_crossfade_selected_clips | 7/3 | 隣接ペアのクロスフェード作り直しで +1 段。分割は後回し (ユーザー判断)

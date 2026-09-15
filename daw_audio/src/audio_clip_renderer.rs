@@ -526,28 +526,38 @@ fn push_clip_events(
     // (`start_beat` 起点の source 読み出し / fade) は **一切動かさず**、
     // 出力範囲だけを交差させる (source 窓を切り詰めると warp marker /
     // slice onset / spectral stretch の写像が壊れるため)。
-    let (clip_gate_start, clip_gate_end) = {
-        let (s, e) = clip.song_window();
-        // クリップ同士は重ならないので、境界で音を途切れさせないには **鳴らす範囲だけ**
-        // を隣の側へ伸ばす (`docs/plan_range_selection.md` §6.5)。 伸ばした区間は
-        // event の fade ランプが覆うので、境界を挟んで左が下がり右が上がる。
-        (s - xfade.0, e + xfade.1)
-    };
+    let (window_start, window_end) = clip.song_window();
+    // クリップ同士は重ならないので、境界で音を途切れさせないには **鳴らす範囲だけ**
+    // を隣の側へ伸ばす (`docs/plan_range_selection.md` §6.5)。 伸ばした区間は
+    // event の fade ランプが覆うので、境界を挟んで左が下がり右が上がる。
+    let (clip_gate_start, clip_gate_end) = (window_start - xfade.0, window_end + xfade.1);
     for event in &audio.events {
         let Some(buffer) = sources.get(&event.source_id) else {
             continue;
         };
-        let event_start_beat =
-            clip.content_to_song_beat(event.event_start_in_clip_beats);
-        let event_end_beat = event_start_beat + event.event_length_beats;
+        let visible_start = clip.content_to_song_beat(event.event_start_in_clip_beats);
+        let visible_end = visible_start + event.event_length_beats;
         // 始点が有限で長さが正の event だけ (NaN の始点・長さは比較を素通りして、描画で位置の無い音になっていた)。
-        if !event_start_beat.is_finite() || event_end_beat.partial_cmp(&event_start_beat) != Some(std::cmp::Ordering::Greater) {
+        if !visible_start.is_finite() || visible_end.partial_cmp(&visible_start) != Some(std::cmp::Ordering::Greater) {
             continue;
         }
-        // 窓と交差しない event は schedule に載せない。
-        if event_end_beat <= clip_gate_start || event_start_beat >= clip_gate_end {
+        // **窓に見えている** event だけを載せる。 張り出し (クロスフェード) の区間に居る別の片は鳴らさない —
+        // content を共有する隣のクリップ (分割の片) がその片を鳴らすので、載せると 2 回鳴る。
+        if visible_end <= window_start || visible_start >= window_end {
             continue;
         }
+        // 張り出しで鳴らすのは、窓の端に接する片の **take の続き** (隠れている頭 / 尻)。 窓の端を跨いで
+        // いる片は元から窓の外に続きがあるので、伸ばすのは take の中に限る (`Song::crossfade_adjacent`)。
+        let event_start_beat = if xfade.0 > 0.0 && visible_start <= window_start + 1e-9 {
+            visible_start.min((window_start - xfade.0).max(visible_start - event.take_head_beats.max(0.0)))
+        } else {
+            visible_start
+        };
+        let event_end_beat = if xfade.1 > 0.0 && visible_end >= window_end - 1e-9 {
+            visible_end.max((window_end + xfade.1).min(visible_end + event.take_tail_beats.max(0.0)))
+        } else {
+            visible_end
+        };
         // 時間軸 (SR 比) と ピッチ軸 (semitone) は直交した 2 量として持ち、
         // どちらをどこに掛けるかは render loop が mode ごとに決める
         // (旧 `pitch_ratio_for` は mode 分岐でピッチ比を捨てており、

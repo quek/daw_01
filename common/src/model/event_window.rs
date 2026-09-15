@@ -56,6 +56,9 @@ pub trait TimedEvent: Clone + PartialEq {
     fn take_continues_into(&self, next: &Self) -> bool;
     /// 結合: `next` の take の尻を写す (位置と fade は [`join_pieces`] が持つ)。
     fn absorb_take_tail(&mut self, _next: &Self) {}
+    /// 片を作り直したとき、元の片の **安定 id** (event の id / take の id) を引き継ぐ
+    /// (`window_edit::edit_run`)。 id を持たない event は何もしない。
+    fn keep_identity(&mut self, _orig: &Self) {}
 }
 
 /// 4 種で同じ意味・同じ名前のフィールドの accessor。
@@ -119,6 +122,8 @@ impl TimedEvent for AudioEvent {
 
     fn material(&self) -> Self {
         let mut m = without_window(self);
+        // 片ごとに違う event の id は捨て、同じ take か (take の id) は中身として比べる。
+        m.take_id = self.take_key();
         m.id = 0;
         m.take_head_beats = 0.0;
         m.take_tail_beats = 0.0;
@@ -132,6 +137,11 @@ impl TimedEvent for AudioEvent {
 
     fn absorb_take_tail(&mut self, next: &Self) {
         self.take_tail_beats = next.take_tail_beats;
+    }
+
+    fn keep_identity(&mut self, orig: &Self) {
+        self.id = orig.id;
+        self.take_id = orig.take_id;
     }
 }
 
@@ -247,8 +257,9 @@ pub fn split_pieces<E: TimedEvent>(ev: &E, cuts: impl IntoIterator<Item = f64>, 
     bounds.windows(2).map(|w| event_piece(ev, w[0], w[1])).collect()
 }
 
-/// `next` を `prev` の直後の片として 1 つにつなげるか ([`event_piece`] の逆)。
-fn joinable<E: TimedEvent>(prev: &E, next: &E) -> bool {
+/// `next` を `prev` の直後の片として 1 つにつなげるか ([`event_piece`] の逆) = 同じ event から切り出した
+/// ままの隣り合う片 (「窓の中でひと続きの片」、`window_edit` の run の単位)。
+pub(super) fn joinable<E: TimedEvent>(prev: &E, next: &E) -> bool {
     if (prev.start() + prev.len() - next.start()).abs() > EPS
         || !prev.take_continues_into(next)
         || prev.material() != next.material()
@@ -286,15 +297,21 @@ pub fn join_pieces<E: TimedEvent>(events: &mut Vec<E>) {
             out.push(ev);
             continue;
         };
-        let start = prev.start();
-        let (p, n) = (prev.fade(), ev.fade());
-        let mut joined = p;
-        joined.fade_out_beats = n.fade_out_beats;
-        joined.fade_out_curve = n.fade_out_curve;
-        joined.fade_out_trail_beats = n.fade_out_trail_beats;
-        prev.set_window(start, ev.start() + ev.len() - start);
-        prev.set_fade(&joined);
-        prev.absorb_take_tail(&ev);
+        join_into(prev, &ev);
     }
     *events = out;
+}
+
+/// `prev` の直後の片 `next` を `prev` へつなぐ (呼び側が [`joinable`] を確かめてある前提)。 窓は
+/// `next` の末尾まで伸び、fade-out と take の尻は `next` のものになる。
+pub(super) fn join_into<E: TimedEvent>(prev: &mut E, next: &E) {
+    let start = prev.start();
+    let n = next.fade();
+    let mut joined = prev.fade();
+    joined.fade_out_beats = n.fade_out_beats;
+    joined.fade_out_curve = n.fade_out_curve;
+    joined.fade_out_trail_beats = n.fade_out_trail_beats;
+    prev.set_window(start, next.start() + next.len() - start);
+    prev.set_fade(&joined);
+    prev.absorb_take_tail(next);
 }

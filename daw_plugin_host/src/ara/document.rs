@@ -196,17 +196,82 @@ impl AraDocumentController {
         (ok != 0).then_some(writer.data)
     }
 
-    /// Restore plug-in edit state from an ARA archive. Call inside an editing
-    /// session, after the matching model objects (sources / modifications with
-    /// the archived persistent ids) have been re-created.
-    pub fn restore_objects_from_archive(&self, archive: &[u8]) -> bool {
+    /// Restore plug-in edit state from an ARA archive into **only the listed
+    /// objects** (`ARARestoreObjectsFilter`, partial persistency). Call inside an
+    /// editing session, after those model objects have been created.
+    ///
+    /// `sources` / `modifications` are `(id in the archive, id in the current
+    /// graph)` pairs — the filter maps each archived state onto the current
+    /// object (ARAInterface.h `ARARestoreObjectsFilter`: "The given IDs refer to
+    /// objects in the archive, but can optionally be mapped to those used in the
+    /// current document"). Objects already live in the document are not listed,
+    /// so their edits are not overwritten by the (older) saved archive.
+    /// `document_data` restores the plug-in's private document-level state too
+    /// (only when the whole graph is being rebuilt). An id with an interior NUL
+    /// is skipped (it cannot name an ARA object).
+    pub fn restore_objects_from_archive(
+        &self,
+        archive: &[u8],
+        document_data: bool,
+        sources: &[(&str, &str)],
+        modifications: &[(&str, &str)],
+    ) -> bool {
         let Some(restore) = self.interface.restoreObjectsFromArchive else {
             return false;
         };
+        let sources = IdPairs::new(sources);
+        let modifications = IdPairs::new(modifications);
+        let filter = ara_sys::ARARestoreObjectsFilter {
+            structSize: core::mem::size_of::<ara_sys::ARARestoreObjectsFilter>(),
+            documentData: ARABool::from(document_data),
+            audioSourceIDsCount: sources.len(),
+            audioSourceArchiveIDs: sources.archived_ptr(),
+            audioSourceCurrentIDs: sources.current_ptr(),
+            audioModificationIDsCount: modifications.len(),
+            audioModificationArchiveIDs: modifications.archived_ptr(),
+            audioModificationCurrentIDs: modifications.current_ptr(),
+        };
         let mut reader = host_controllers::AraArchiveReader::new(archive.to_vec());
         let reader_ref = ptr::from_mut(&mut reader) as ara_sys::ARAArchiveReaderHostRef;
-        let ok = unsafe { restore(self.controller_ref, reader_ref, ptr::null()) };
+        // SAFETY: `filter` and the id arrays it points to (owned by `sources` /
+        // `modifications`, alive until the end of this function) outlive the call;
+        // ARA only reads them during the call.
+        let ok = unsafe { restore(self.controller_ref, reader_ref, &filter) };
         ok != 0
+    }
+}
+
+/// `(archive id, current id)` の組を、`ARARestoreObjectsFilter` が指す 2 本の C 配列として持つ。
+/// `CString` の実体と、それを指す配列を同じ寿命で所有する。
+struct IdPairs {
+    _strings: Vec<(std::ffi::CString, std::ffi::CString)>,
+    archived: Vec<ara_sys::ARAPersistentID>,
+    current: Vec<ara_sys::ARAPersistentID>,
+}
+
+impl IdPairs {
+    fn new(pairs: &[(&str, &str)]) -> Self {
+        let strings: Vec<(std::ffi::CString, std::ffi::CString)> = pairs
+            .iter()
+            .filter_map(|&(a, c)| Some((std::ffi::CString::new(a).ok()?, std::ffi::CString::new(c).ok()?)))
+            .collect();
+        // CString の中身はヒープにあり、`strings` を動かしてもポインタは変わらない。
+        let archived = strings.iter().map(|(a, _)| a.as_ptr()).collect();
+        let current = strings.iter().map(|(_, c)| c.as_ptr()).collect();
+        Self { _strings: strings, archived, current }
+    }
+
+    fn len(&self) -> ara_sys::ARASize {
+        self.archived.len()
+    }
+
+    /// 空なら NULL (ARA: "The list may be empty, in which case count should be 0 and the pointer NULL")。
+    fn archived_ptr(&self) -> *const ara_sys::ARAPersistentID {
+        if self.archived.is_empty() { ptr::null() } else { self.archived.as_ptr() }
+    }
+
+    fn current_ptr(&self) -> *const ara_sys::ARAPersistentID {
+        if self.current.is_empty() { ptr::null() } else { self.current.as_ptr() }
     }
 }
 
@@ -442,6 +507,26 @@ impl AraDocumentController {
             persistentID: persistent_id.as_ptr(),
         };
         Some(unsafe { create(self.controller_ref, source, host_ref, &properties) })
+    }
+
+    /// Create a new audio modification that **copies the state** of `original`
+    /// (same audio source): an independent variation of its edits, as opposed to
+    /// an alias made by adding regions to `original` (ARAInterface.h
+    /// `cloneAudioModification`). `persistent_id` must be unique within the document.
+    pub fn clone_audio_modification(
+        &self,
+        original: ARAAudioModificationRef,
+        host_ref: ARAAudioModificationHostRef,
+        persistent_id: &CStr,
+    ) -> Option<ARAAudioModificationRef> {
+        let clone = self.interface.cloneAudioModification?;
+        let properties = ARAAudioModificationProperties {
+            structSize: core::mem::size_of::<ARAAudioModificationProperties>(),
+            name: ptr::null(),
+            persistentID: persistent_id.as_ptr(),
+        };
+        let created = unsafe { clone(self.controller_ref, original, host_ref, &properties) };
+        (!created.is_null()).then_some(created)
     }
 
     pub fn destroy_audio_modification(&self, modification: ARAAudioModificationRef) {

@@ -2007,6 +2007,7 @@ impl AppData {
             AppEvent::SetClipTalkParam { clip, param, value } => {
                 self.set_clip_talk_param(clip, param, value);
             }
+            AppEvent::SetClipTextReads { clip, reads } => self.set_clip_text_reads(clip, reads),
             AppEvent::SetPianoRollSnapEnabled(b) => {
                 self.cur.view.pianoroll_snap_enabled = b;
             }

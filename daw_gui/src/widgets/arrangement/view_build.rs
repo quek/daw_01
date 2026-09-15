@@ -197,10 +197,11 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
                         // 端 drag の preview が「クリップ幅 ÷ クリップ長」 のスケールに頼る
                         // ことになる。 窓の offset は `ClipView::content_offset_beats` が持ち、
                         // 換算は `geometry::content_map` 1 本に集約した。
+                        // r.md #132 残件: 窓に見えている片だけ、ひと続きの片は 1 つとして (掴み所は
+                        // ひと続きの外側の端)。 `event_index` はひと続きの先頭の event。
                         fades: content.map_or_else(Vec::new, |ct| {
-                            ct.event_fades()
+                            ct.window_fades(c.content_window())
                                 .into_iter()
-                                .enumerate()
                                 .map(|(i, fade)| ClipEventFade {
                                     event_index: u32::try_from(i).unwrap_or(u32::MAX),
                                     fade,

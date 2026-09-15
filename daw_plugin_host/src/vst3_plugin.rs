@@ -1222,7 +1222,7 @@ impl LoadedPlugin for Vst3Plugin {
         clips: &[common::protocol::AraClipSpec],
         bpm: f64,
         time_sig: (u16, u16),
-        archive: Option<&[u8]>,
+        archive: Option<crate::ara::SavedArchive<'_>>,
     ) -> Result<bool> {
         crate::ara::run_setup_ara(self, clips, bpm, time_sig, archive)
     }

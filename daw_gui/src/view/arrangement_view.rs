@@ -334,6 +334,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         // そのトラックの全 clip に、口パク再生成中なら口 track の auto_lipsync clip に、
         // 右上角へ回転スピナーを出す (= このクリップはまだ最新を反映していない の合図)。
         draw_clip_synth_spinner(app, ui, *clip_key, *rect);
+        draw_clip_continuation_badge(app, ui, *clip_key, *rect);
 
         // clip rename mode 中はこの clip rect の上端に text_input を重ね描き。
         // track rename と同 idiom (text_input_at_focused が click で focus 取得、
@@ -1243,6 +1244,57 @@ fn draw_clip_synth_spinner(
 }
 
 // ---------------------------------------------------------------------------
+// r.md #132 残件: 読み上げない続きの片 (字幕) の「続き」の印
+// ---------------------------------------------------------------------------
+
+/// 「続き」の印の文字。
+const CONTINUATION_BADGE_TEXT: &str = "続き";
+
+/// 「続き」の印の色 `(チップの塗り, 縁, 文字)`。 チップは **極性固定インクの逆極性の縁取り**: 暗い塗りは
+/// 明るいクリップの上で、明るい縁は暗いクリップの上で輪郭を出し、文字は塗りに対して読める。 載るのは
+/// ユーザー着色クリップ (選択中の黄 / 減光を含む) の上なので、テーマ従属トークンを使わない
+/// (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
+fn continuation_badge_colors(p: &daw_ui_core::theme::Palette) -> (Color, Color, Color) {
+    (p.ink_on_bright, p.ink_on_dark, p.ink_on_dark)
+}
+
+/// VOICEVOX トラックの字幕クリップのうち、**窓の頭が読み上げない続きの片** (分割の後ろの片) の左下に
+/// 「続き」のチップを出す (読み上げは前の片が 1 回だけ、`TextEvent::continuation`)。 Inspector の
+/// 「ここから読む」で普通の読み上げに戻すと消える。 rect が小さい (zoom out) ときは名前に被るので省略する。
+fn draw_clip_continuation_badge(app: &AppData, ui: &mut Ui<'_, AppData>, clip_key: ClipKey, clip_rect: Rect) {
+    const FONT: f32 = 9.0;
+    if clip_rect.w < 36.0 || clip_rect.h < 30.0 {
+        return;
+    }
+    let continues = app.cur.song_doc.song().track_by_id(clip_key.track_id).is_some_and(common::model::Track::is_voicevox_vocal)
+        && app.clip_text_reads(clip_key) == Some(false);
+    if !continues {
+        return;
+    }
+    let text_w = ui.measure_text(CONTINUATION_BADGE_TEXT, FONT);
+    let chip = Rect { x: clip_rect.x + 3.0, y: clip_rect.y + clip_rect.h - FONT * 1.2 - 6.0, w: text_w + 8.0, h: FONT * 1.2 + 4.0 };
+    if chip.x + chip.w > clip_rect.x + clip_rect.w - 3.0 {
+        return;
+    }
+    let (fill, border, ink) = continuation_badge_colors(ui.palette());
+    ui.push_rect(RectCommand {
+        rect: chip,
+        fill,
+        border,
+        border_width: 1.0,
+        radius: [3.0; 4],
+        clip_rect: Some(clip_rect),
+    });
+    ui.label_at_clipped(
+        (b"clip_continuation_badge", clip_key.track_id, clip_key.clip_id),
+        CONTINUATION_BADGE_TEXT,
+        Rect { x: chip.x + 4.0, y: chip.y + 2.0, w: text_w, h: FONT * 1.2 },
+        FONT,
+        ink,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Phase 1 PR4: audio clip 内の波形描画 (`Ui::waveform` を clip rect に重ねる)
 // ---------------------------------------------------------------------------
 
@@ -1371,6 +1423,37 @@ mod tests {
     use super::track_index_at_y;
     use crate::widgets::arrangement::view_build::clip_display_label;
     use daw_ui_renderer::Rect;
+
+    /// 「続き」の印は **どのクリップ色の上でも** 輪郭が出て (塗りか縁のどちらかが背景に 3:1)、文字が塗りに
+    /// 対して読める (4.5:1)。 背景には沈む側 (明るいクリーム / 選択中の黄 / ライトテーマの地 / 暗い青) と
+    /// クリップ色のパレット全色を入れる (memory `feedback_ui_indicator_contrast_on_variable_bg`)。
+    #[test]
+    fn continuation_badge_is_readable_on_every_clip_color() {
+        use daw_ui_core::theme::{Palette, contrast_ratio};
+        use daw_ui_renderer::Color;
+        for p in [Palette::dark(), Palette::light()] {
+            let mut backgrounds: Vec<(String, Color)> = vec![
+                ("明るいクリーム".into(), Color::rgb(0.93, 0.90, 0.72)),
+                ("選択中の黄".into(), p.selection_warm),
+                ("地".into(), p.window_bg),
+                ("暗い青".into(), Color::rgb(0.05, 0.08, 0.16)),
+                ("白".into(), Color::rgb(1.0, 1.0, 1.0)),
+                ("黒".into(), Color::rgb(0.0, 0.0, 0.0)),
+            ];
+            backgrounds.extend(
+                crate::view::track_color::PALETTE
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (format!("palette[{i}]"), Color::rgb(c[0], c[1], c[2]))),
+            );
+            let (fill, border, ink) = super::continuation_badge_colors(&p);
+            assert!(contrast_ratio(ink, fill) >= 4.5, "文字がチップの塗りに対して読めない");
+            for (name, bg) in backgrounds {
+                let outline = contrast_ratio(fill, bg).max(contrast_ratio(border, bg));
+                assert!(outline >= 3.0, "「{name}」の上でチップの輪郭が出ない: {outline:.2}:1");
+            }
+        }
+    }
 
     fn rect_at(y: f32, h: f32) -> Rect {
         Rect { x: 0.0, y, w: 100.0, h }

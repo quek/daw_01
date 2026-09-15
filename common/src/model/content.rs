@@ -459,59 +459,6 @@ impl ClipContent {
         }
     }
 
-    /// r.md #38: clip 内の各 event の fade 情報を **content 種別に依らず** 列挙する。
-    ///
-    /// `AudioEvent` / `VideoEvent` / `ImageEvent` / `TextEvent` は
-    /// `event_start_in_clip_beats` / `event_length_beats` / `fade_in_beats` /
-    /// `fade_out_beats` / `fade_in_curve` / `fade_out_curve` を同じ意味で持ち、
-    /// 適用側も全部 [`crate::audio_render::fade_curve_at`] を通る。 よって
-    /// 「fade をどう描き、 どう掴み、 どう編集するか」 は content に依存しない。
-    /// アレンジ画面の描画 / hit-test / drag はこの 1 本を SSoT にする
-    /// (種別ごとに 4 実装を持たない = DRY)。
-    ///
-    /// `Midi` / `Automation` は fade を持たないので空 Vec。
-    #[must_use]
-    pub fn event_fades(&self) -> Vec<EventFade> {
-        fn collect<E: TimedEvent>(events: &[E]) -> Vec<EventFade> {
-            events.iter().map(TimedEvent::fade).collect()
-        }
-        match self {
-            ClipContent::Audio(c) => collect(&c.events),
-            ClipContent::Video(c) => collect(&c.events),
-            ClipContent::Image(c) => collect(&c.events),
-            ClipContent::Text(c) => collect(&c.events),
-            ClipContent::Midi(_) | ClipContent::Automation(_) => Vec::new(),
-        }
-    }
-
-    /// r.md #38: `index` 番目の event の fade フィールドを content 種別に依らず
-    /// 書き換える。 `f` には現在値を渡し、 戻り値の長さ / curve / ランプの張り出しを
-    /// そのまま書き戻す (clamp は caller の責務 = [`EventFade::len_beats`] を上限にする。
-    /// 端から掛け直す fade は張り出しを 0 にして渡す)。
-    ///
-    /// event が存在しない / fade を持たない content なら `false`。
-    pub fn set_event_fade(
-        &mut self,
-        index: usize,
-        f: impl FnOnce(EventFade) -> EventFade,
-    ) -> bool {
-        fn apply<E: TimedEvent>(events: &mut [E], index: usize, f: impl FnOnce(EventFade) -> EventFade) -> bool {
-            let Some(e) = events.get_mut(index) else {
-                return false;
-            };
-            let next = f(e.fade());
-            e.set_fade(&next);
-            true
-        }
-        match self {
-            ClipContent::Audio(c) => apply(&mut c.events, index, f),
-            ClipContent::Video(c) => apply(&mut c.events, index, f),
-            ClipContent::Image(c) => apply(&mut c.events, index, f),
-            ClipContent::Text(c) => apply(&mut c.events, index, f),
-            ClipContent::Midi(_) | ClipContent::Automation(_) => false,
-        }
-    }
-
     /// Borrow the audio events slice if this is an `Audio` variant.
     pub fn audio_events(&self) -> Option<&[AudioEvent]> {
         match self {
@@ -819,6 +766,13 @@ pub struct AudioEvent {
     pub take_head_beats: f64,
     #[serde(default, skip_serializing_if = "is_zero_beats")]
     pub take_tail_beats: f64,
+    /// v42 (r.md #132 残件): **take の安定 id** (content 内)。 `0` = この event 自身が take
+    /// (= [`Self::id`])、それ以外は分割の片が継いだ元の event の take。 読み出しは
+    /// [`AudioEvent::take_key`] 1 本。 ARA の audio modification (= Melodyne の編集の単位) は
+    /// content と take で 1 つ ([`crate::ara_ids`]) なので、片同士は同じ編集を共有し、分割しても
+    /// 編集が続く。 片の中身の比較 (Glue でつなげるか) にも入る。
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub take_id: u32,
 
     pub gain_db: f32,
     pub pan: f32,
@@ -883,6 +837,7 @@ impl Default for AudioEvent {
             source_end_frames: 0,
             take_head_beats: 0.0,
             take_tail_beats: 0.0,
+            take_id: 0,
             gain_db: 0.0,
             pan: 0.0,
             pitch_semitones: 0.0,

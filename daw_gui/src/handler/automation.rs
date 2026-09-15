@@ -894,18 +894,15 @@ impl AppData {
             else {
                 return None;
             };
-            let mut new_indices = Vec::with_capacity(events.len());
             let mut max_end = 0.0f64;
             for e in &mut events {
                 e.event_start_in_clip_beats += anchor;
-                // clipboard の AudioEvent は元 content の id を持つ。 貼り付け先 content
-                // で per-content 一意 id 不変条件 (invariant #1) を守るため再採番する
-                // (paste_points_at と同 idiom、 M4 sibling)。
-                e.id = audio.alloc_event_id();
                 max_end = max_end.max(e.event_start_in_clip_beats + e.event_length_beats);
-                new_indices.push(audio.events.len());
-                audio.events.push(e.clone());
             }
+            // clipboard の AudioEvent は元 content の id / take を持つ。 貼り付け先 content で
+            // per-content 一意 id 不変条件 (invariant #1) を守るため新しい id と take で足す
+            // (一緒に貼った同じ take の片は同じ take のまま、paste_points_at と同 idiom、 M4 sibling)。
+            let new_indices = audio.adopt_events(events);
             // clip 長が足りなければ拡張 (add_audio_event_from_file と同 idiom)。
             // r.md #44: `max_end` は content-local。 clip の窓の末尾を基準に伸ばす。
             if let Some(track) = song.track_by_id_mut(target.track_id)

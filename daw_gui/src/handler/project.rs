@@ -1432,8 +1432,10 @@ impl AppData {
             // actually produced one; a non-ARA device or a not-yet-bound
             // session reports None, and we must not wipe a previously-saved
             // archive in that case.
-            if s.ara_archive.is_some() {
-                p.ara_archive = s.ara_archive.clone().map(std::sync::Arc::from);
+            // A fresh archive is written with the current persistent ids, so the
+            // legacy-id aliases go with the replaced one (`set_ara_archive`).
+            if let Some(archive) = &s.ara_archive {
+                p.set_ara_archive(std::sync::Arc::from(archive.as_slice()));
             }
         }
     }

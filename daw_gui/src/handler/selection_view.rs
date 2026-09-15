@@ -963,61 +963,70 @@ impl AppData {
         if mixed { None } else { acc }
     }
 
-    /// `target` clip の first `ImageEvent` に `f` を適用 (image clip でなければ `None`)。
-    /// mixed 畳み込み (`inspector_fold`) 用 accessor。
+    /// `target` clip の編集が効く最初の `ImageEvent` に `f` を適用 (image clip でない / 窓に見えている
+    /// event が無ければ `None`、`handler::clip_window`)。 mixed 畳み込み (`inspector_fold`) 用 accessor。
+    /// fade は片ではなくひと続きの値なので [`Self::image_first_fade`] で読む。
     pub fn image_first_event<R>(
         &self,
         target: ClipKey,
         f: impl FnOnce(&common::model::ImageEvent) -> R,
     ) -> Option<R> {
-        let content_id = self
-            .cur.song_doc.song()
-            .track_by_id(target.track_id)?
-            .clip_by_id(target.clip_id)?
-            .content_id;
-        match self.cur.song_doc.song().clip_contents.get(&content_id)? {
-            common::model::ClipContent::Image(img) => img.events.first().map(f),
-            _ => None,
-        }
+        let events_of = common::model::ClipContent::image_events;
+        self.clip_edit_anchor(self.clip_shown_targets(target, events_of)?, events_of, None).map(|(e, _)| f(e))
     }
 
-    /// `target` clip の first `TextEvent` に `f` を適用 (text clip でなければ `None`)。
+    /// `target` clip の編集が効く最初のひと続きの fade (位置・長さ・両端)。
+    pub fn image_first_fade(&self, target: ClipKey) -> Option<common::model::EventFade> {
+        let events_of = common::model::ClipContent::image_events;
+        self.clip_edit_anchor(self.clip_shown_targets(target, events_of)?, events_of, None).map(|(_, fade)| fade)
+    }
+
+    /// `target` clip の編集が効く最初の `TextEvent` に `f` を適用 (text clip でなければ `None`)。
     pub fn text_first_event<R>(
         &self,
         target: ClipKey,
         f: impl FnOnce(&common::model::TextEvent) -> R,
     ) -> Option<R> {
-        let content_id = self
-            .cur.song_doc.song()
-            .track_by_id(target.track_id)?
-            .clip_by_id(target.clip_id)?
-            .content_id;
-        match self.cur.song_doc.song().clip_contents.get(&content_id)? {
-            common::model::ClipContent::Text(text) => text.events.first().map(f),
-            _ => None,
-        }
+        self.text_first_run(target).map(|(e, _)| f(e))
     }
 
-    /// `target` clip の first `AudioEvent` に `f` を適用 (audio clip でなければ `None`)。
+    /// `target` clip の窓に見えている最初の `TextEvent` と、そのひと続きの fade。
+    fn text_first_run(&self, target: ClipKey) -> Option<(&common::model::TextEvent, common::model::EventFade)> {
+        let events_of = common::model::ClipContent::text_events;
+        self.clip_edit_anchor(self.clip_shown_targets(target, events_of)?, events_of, None)
+    }
+
+    /// `target` clip の編集が効く最初の `AudioEvent` に `f` を適用 (audio clip でなければ `None`)。
+    /// Audio Editor がこの clip を開いて event を選んでいれば、その代表 (Inspector の summary と同じ)。
     pub fn audio_first_event<R>(
         &self,
         target: ClipKey,
         f: impl FnOnce(&common::model::AudioEvent) -> R,
     ) -> Option<R> {
-        let content_id = self
-            .cur.song_doc.song()
-            .track_by_id(target.track_id)?
-            .clip_by_id(target.clip_id)?
-            .content_id;
-        match self.cur.song_doc.song().clip_contents.get(&content_id)? {
-            common::model::ClipContent::Audio(audio) => audio.events.first().map(f),
-            _ => None,
-        }
+        self.audio_first_run(target).map(|(e, _)| f(e))
     }
 
-    /// text num field を `inspector_target_refs` 全体で畳む (mixed 検出)。
+    /// `target` clip の編集が効く最初のひと続きの fade (位置・長さ・両端)。
+    pub fn audio_first_fade(&self, target: ClipKey) -> Option<common::model::EventFade> {
+        self.audio_first_run(target).map(|(_, fade)| fade)
+    }
+
+    fn audio_first_run(&self, target: ClipKey) -> Option<(&common::model::AudioEvent, common::model::EventFade)> {
+        let anchor = (self.cur.peph.audio_editor_clip == Some(target)).then(|| self.audio_editor_anchor_event()).flatten();
+        self.clip_edit_anchor(self.audio_edit_targets(target)?, common::model::ClipContent::audio_events, anchor)
+    }
+
+    /// text num field を `inspector_target_refs` 全体で畳む (mixed 検出)。 fade の長さは片ではなく
+    /// ひと続きの窓に見えているランプの長さ (編集が効くのと同じ単位)。
     pub fn inspector_text_num_folded(&self, field: TextNumField) -> Option<f64> {
-        self.inspector_fold(|a, t| a.text_first_event(t, |e| text_event_num_value(e, field)))
+        self.inspector_fold(|a, t| {
+            let (e, fade) = a.text_first_run(t)?;
+            Some(match field {
+                TextNumField::FadeInBeats => fade.visible_fade_in_beats(),
+                TextNumField::FadeOutBeats => fade.visible_fade_out_beats(),
+                _ => text_event_num_value(e, field),
+            })
+        })
     }
 
     /// stable `ClipKey` → `&Clip` (track_by_id + clip_by_id)。

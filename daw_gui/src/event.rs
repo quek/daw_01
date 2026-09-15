@@ -1201,6 +1201,13 @@ pub enum AppEvent {
         param: TalkParamKind,
         value: f32,
     },
+    /// r.md #132 残件: Text clip Inspector の「ここから読む」。 クリップの窓で始まる字幕の片を普通の
+    /// 読み上げ (`reads = true`) / 読み上げない続きの片 (`false`、`TextEvent::continuation`) にする
+    /// (ノートの歌詞を「ー」と書き換えられるのと同じ対称性、`AppData::set_clip_text_reads`)。
+    SetClipTextReads {
+        clip: common::model::ClipKey,
+        reads: bool,
+    },
 
     // -------- WAV export -------------------------------------------------
     /// File → Export WAV...: open the range picker (default窓 = 全曲)。
@@ -1963,6 +1970,8 @@ impl AppEvent {
             E::SetMouthMapSlot { .. } => "口形状設定",
             E::SetClipVoice { .. } => "声変更",
             E::SetClipTalkParam { .. } => "トークパラメータ変更",
+            E::SetClipTextReads { reads: true, .. } => "ここから読む",
+            E::SetClipTextReads { reads: false, .. } => "読み上げを続きにする",
 
             // ---- Audio Editor (波形編集) ----
             E::DuplicateAudioEditorEvent => "オーディオイベント複製",

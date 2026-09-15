@@ -173,6 +173,8 @@ impl AppData {
             // event が 2 つでき (`ensure_element_ids` も既存非 0 id は再採番しないので
             // save/reload で残存)、 id addressing が壊れる。
             new_event.id = audio.alloc_event_id();
+            // 複製は元とは別の take (ARA の編集を共有しない、`AudioContent::adopt_events` と同じ規則)。
+            new_event.take_id = 0;
             let insert_at = idx + 1;
             if insert_at >= audio.events.len() {
                 audio.events.push(new_event);
@@ -465,6 +467,10 @@ impl AppData {
     /// .md` §3.5 Auto-Fade)。 fade 長は 4 ms 相当 (= `0.004 * bpm / 60`
     /// beats)、 既存値は上書き。 audio 以外の clip (MIDI / Vocal) と
     /// `selected_clip` がない場合は no-op。
+    ///
+    /// 掛けるのは **各クリップの窓に見えている片** で、窓の中でひと続きの片はその外側の端にだけ付く
+    /// (`handler::clip_window`) — 分割直後に掛けても、分割前に掛けてから分割したのと同じ。 content を
+    /// 共有する反対側のクリップ (分割の片) には効かない。
     pub(crate) fn auto_fade_selected_clips(&mut self) {
         let bpm = self.cur.song_doc.song().bpm.max(1.0) as f64;
         let auto_fade_beats = 0.004 * bpm / 60.0; // 4 ms 相当
@@ -472,35 +478,20 @@ impl AppData {
         // borrow checker: target list を先に固める。
         let targets: Vec<ClipKey> = self.selected_clip_refs();
         for target in targets {
-            let Some(content_id) = self
-                .cur.song_doc.song()
-                .track_by_id(target.track_id)
-                .and_then(|t| t.clip_by_id(target.clip_id))
-                .map(|c| c.content_id)
-            else {
+            let Some(shown) = self.clip_shown_targets(target, common::model::ClipContent::audio_events) else {
                 continue;
             };
-            let did = self.edit_song_checked(move |song| {
-                if let Some(common::model::ClipContent::Audio(audio)) =
-                    song.clip_contents.get_mut(&content_id)
-                {
-                    for event in &mut audio.events {
-                        // r.md #38: fade の上限は clip 長ではなく **event 長**
-                        // (音は event 長基準で fade を掛ける)。 Auto-Crossfade
-                        // (`auto_crossfade_selected_clips`) と同じ基準。
-                        let fade_beats =
-                            auto_fade_beats.min(event.event_length_beats.max(0.0));
-                        event.set_edge_fade_in(fade_beats);
-                        event.set_edge_fade_out(fade_beats);
-                    }
-                    true
-                } else {
-                    false
-                }
-            });
-            if did {
-                applied += 1;
+            if shown.1.is_empty() {
+                continue;
             }
+            // r.md #38: fade の上限はひと続きの event 長 (音は event 長基準で fade を掛ける)。
+            // 既に同じ fade なら履歴に残さない (`edit_event_runs`) が、掛かっているクリップとして数える。
+            self.edit_event_runs(shown, common::model::ClipContent::audio_events_mut, |event| {
+                let fade_beats = auto_fade_beats.min(event.event_length_beats.max(0.0));
+                event.set_edge_fade_in(fade_beats);
+                event.set_edge_fade_out(fade_beats);
+            });
+            applied += 1;
         }
         if applied > 0 {
             // edit buffer (Inspector) も追従させる。
@@ -516,16 +507,11 @@ impl AppData {
     /// Auto-Crossfade — **隣接する audio クリップの境界**にクロスフェードを掛ける。
     ///
     /// クリップ同士は重ならない (`Track::clips` の不変条件) ので、境界で音を途切れ
-    /// させないには **鳴らす範囲だけ**を境界の向こうへ伸ばす。 1 ペアにつき:
-    ///
-    /// - 前のクリップ: `xfade_tail_beats = N/2` (境界の先まで鳴らす) + 末尾 event の
-    ///   `fade_out_beats = N`
-    /// - 次のクリップ: `xfade_lead_beats = N/2` (境界の手前から鳴らす) + 先頭 event の
-    ///   `fade_in_beats = N`
-    ///
-    /// これで境界を中心に左が下がりながら右が上がる = 真のクロスフェードになる
-    /// (`docs/plan_range_selection.md` §6.5)。 張り出しは再生側が**隣が実在するときだけ**
-    /// 使うので、後でクリップを動かしても音が漏れない。
+    /// させないには **鳴らす範囲だけ**を境界の向こうへ伸ばす。 何を鳴らし合い、ランプを
+    /// どこに置くかは窓の定義から決める (`Song::crossfade_adjacent` の doc が正本): 窓の端に
+    /// 接する片の take の続きを、両側で揃えた 1 本の区間だけ重ねる (`docs/plan_range_selection.md`
+    /// §6.5)。 張り出しは再生側が**隣が実在するときだけ**使うので、後でクリップを動かしても
+    /// 音が漏れない。
     ///
     /// Live の「隣接クリップに自動で 4ms が付く」 (§6.8) は入れていない — フェードは
     /// ユーザーが明示的に掛けたときだけ付く。
@@ -533,88 +519,50 @@ impl AppData {
         // クロスフェード長 (拍)。 4 ms 相当を拍へ換算 (Auto-Fade と同じ尺度)。
         let bpm = f64::from(self.cur.song_doc.song().bpm.max(1.0));
         let xfade_beats = (0.004 * bpm / 60.0).max(1e-4);
-        // (track_id, clip_id, start, end, content_id) を集める。
-        let mut entries: Vec<(u32, u32, f64, f64, common::model::ContentId)> = Vec::new();
-        for target in self.selected_clip_refs() {
-            let Some(clip) = self.cur.song_doc.song().clip_by_key(target) else {
-                continue;
-            };
-            let Some(common::model::ClipContent::Audio(_)) =
-                self.cur.song_doc.song().clip_contents.get(&clip.content_id)
-            else {
-                continue;
-            };
-            entries.push((
-                target.track_id,
-                target.clip_id,
-                clip.start_beat,
-                clip.start_beat + clip.length_beats,
-                clip.content_id,
-            ));
-        }
+        let song = self.cur.song_doc.song();
+        let mut entries: Vec<(ClipKey, f64, f64)> = self
+            .selected_clip_refs()
+            .into_iter()
+            .filter_map(|key| {
+                let clip = song.clip_by_key(key)?;
+                matches!(song.clip_contents.get(&clip.content_id)?, common::model::ClipContent::Audio(_))
+                    .then(|| (key, clip.start_beat, clip.start_beat + clip.length_beats))
+            })
+            .collect();
         if entries.len() < 2 {
             self.ui_ephemeral.status_message =
                 "Auto-Crossfade: 隣接判定には audio clip が 2 つ以上必要です".into();
             return;
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.total_cmp(&b.2)));
-        let mut pairs: Vec<(u32, u32, u32, common::model::ContentId, common::model::ContentId)> =
-            Vec::new();
-        for w in entries.windows(2) {
-            let (prev_track, prev_id, _, prev_end, prev_content) = w[0];
-            let (next_track, next_id, next_start, _, next_content) = w[1];
-            // **隣接** = 端が触れている (重なりは不変条件で存在しない)。
-            if prev_track != next_track || (next_start - prev_end).abs() > 1e-6 {
-                continue;
-            }
-            pairs.push((prev_track, prev_id, next_id, prev_content, next_content));
-        }
+        entries.sort_by(|a, b| a.0.track_id.cmp(&b.0.track_id).then(a.1.total_cmp(&b.1)));
+        // **隣接** = 同じトラックで端が触れている (重なりは不変条件で存在しない)。
+        let pairs: Vec<(ClipKey, ClipKey)> = entries
+            .windows(2)
+            .filter(|w| w[0].0.track_id == w[1].0.track_id && (w[1].1 - w[0].2).abs() <= 1e-6)
+            .map(|w| (w[0].0, w[1].0))
+            .collect();
         if pairs.is_empty() {
             self.ui_ephemeral.status_message =
                 "Auto-Crossfade: 隣接しているペアがありません".into();
             return;
         }
-        let applied = pairs.len();
-        let half = xfade_beats * 0.5;
-        self.edit_song(move |song| {
-            for (track_id, prev_id, next_id, prev_content, next_content) in pairs {
-                if let Some(clip) = song
-                    .track_by_id_mut(track_id)
-                    .and_then(|t| t.clip_by_id_mut(prev_id))
-                {
-                    clip.xfade_tail_beats = half;
-                }
-                if let Some(clip) = song
-                    .track_by_id_mut(track_id)
-                    .and_then(|t| t.clip_by_id_mut(next_id))
-                {
-                    clip.xfade_lead_beats = half;
-                }
-                // ランプは event 側に持たせる (fade の SSoT は event)。 境界を挟んで
-                // 左が下がり右が上がるよう、両側とも長さ N を掛ける。
-                if let Some(common::model::ClipContent::Audio(audio)) =
-                    song.clip_contents.get_mut(&prev_content)
-                    && let Some(last) = audio.events.iter_mut().max_by(|a, b| {
-                        (a.event_start_in_clip_beats + a.event_length_beats)
-                            .total_cmp(&(b.event_start_in_clip_beats + b.event_length_beats))
-                    })
-                {
-                    last.set_edge_fade_out(xfade_beats);
-                }
-                if let Some(common::model::ClipContent::Audio(audio)) =
-                    song.clip_contents.get_mut(&next_content)
-                    && let Some(first) = audio.events.iter_mut().min_by(|a, b| {
-                        a.event_start_in_clip_beats.total_cmp(&b.event_start_in_clip_beats)
-                    })
-                {
-                    first.set_edge_fade_in(xfade_beats);
-                }
+        let mut applied = 0usize;
+        self.edit_song_checked(|song| {
+            let mut changed = false;
+            for (prev, next) in pairs {
+                let done = song.crossfade_adjacent(prev, next, xfade_beats);
+                applied += usize::from(done.applied);
+                changed |= done.changed;
             }
+            changed
         });
         if let Some(target) = self.cur.peph.clip_edit_buffer_target {
             self.resync_clip_audio_event_edit_buffers(target);
         }
-        self.ui_ephemeral.status_message =
-            format!("Auto-Crossfade: {applied} ペアの境界にクロスフェードを掛けました");
+        self.ui_ephemeral.status_message = if applied == 0 {
+            "Auto-Crossfade: 境界で鳴っている片がありません".into()
+        } else {
+            format!("Auto-Crossfade: {applied} ペアの境界にクロスフェードを掛けました")
+        };
     }
 }

@@ -4,9 +4,17 @@
 //! (オーディオエディタの端 trim / 伸縮) を 1 か所に集める — どれも「写像はそのまま、窓だけを動かす」
 //! (窓が take の外へ出るときだけ、take 自体を同じ伸縮率のまま source 側へ伸ばす)。
 
-use super::{AudioEvent, StretchMode};
+use std::collections::HashMap;
+
+use super::{AudioContent, AudioEvent, StretchMode};
 
 impl AudioEvent {
+    /// この event が属する take の id ([`Self::take_id`] の doc)。 分割していない event は自分の `id`。
+    #[must_use]
+    pub fn take_key(&self) -> u32 {
+        if self.take_id == 0 { self.id } else { self.take_id }
+    }
+
     /// take の長さ (拍) = 見えている長さ + 頭と尻の隠れている分。 `source_*_frames` の窓はこの長さへ
     /// 写る (伸縮率 `common::audio_render::stretch_ratio_for` の分母)。
     #[must_use]
@@ -159,6 +167,46 @@ impl AudioEvent {
         self.onsets = kept;
     }
 
+    /// 見えている末尾の **先で鳴らせる素材** の拍: take の隠れている尻と、take を同じ伸縮率のまま source の
+    /// 残り (ファイルの末尾 `file_frames` まで) へ伸ばせる分。 クロスフェードの張り出しの上限。
+    #[must_use]
+    pub fn room_after(&self, fallback_fpb: f64, file_frames: u64) -> f64 {
+        let spare = if self.reversed {
+            self.source_start_frames
+        } else {
+            file_frames.saturating_sub(self.source_end_frames)
+        };
+        self.take_tail_beats.max(0.0) + frames_as_beats(spare, self.take_frames_per_beat(fallback_fpb))
+    }
+
+    /// 見えている先頭の **手前で鳴らせる素材** の拍 ([`Self::room_after`] の対)。
+    #[must_use]
+    pub fn room_before(&self, fallback_fpb: f64, file_frames: u64) -> f64 {
+        let spare = if self.reversed {
+            file_frames.saturating_sub(self.source_end_frames)
+        } else {
+            self.source_start_frames
+        };
+        self.take_head_beats.max(0.0) + frames_as_beats(spare, self.take_frames_per_beat(fallback_fpb))
+    }
+
+    /// take の隠れている尻を少なくとも `beats` 拍にする (足りない分だけ take を source の残りへ伸ばす。
+    /// 見えている音は 1 frame も動かない)。
+    pub fn reserve_take_tail(&mut self, beats: f64, fallback_fpb: f64, file_frames: u64) {
+        let short = beats - self.take_tail_beats;
+        if short > 0.0 {
+            self.extend_take_tail(short, fallback_fpb, file_frames);
+        }
+    }
+
+    /// take の隠れている頭を少なくとも `beats` 拍にする ([`Self::reserve_take_tail`] の対)。
+    pub fn reserve_take_head(&mut self, beats: f64, fallback_fpb: f64, file_frames: u64) {
+        let short = beats - self.take_head_beats;
+        if short > 0.0 {
+            self.extend_take_head(short, fallback_fpb, file_frames);
+        }
+    }
+
     /// 左端 trim: `delta` > 0 で内側へ縮め、< 0 で外へ伸ばす。 **窓を動かすだけ** で、見えている音は
     /// 1 frame も動かない。 take の頭より外へ伸ばすときは take を source の手前へ伸ばす (ファイルの
     /// 先頭 `file_frames` まで)。 長さは `min_len` を、開始拍は clip の頭 (0) を下回らない。
@@ -261,6 +309,35 @@ impl AudioEvent {
         self.take_tail_beats += granted;
         granted
     }
+}
+
+impl AudioContent {
+    /// 別の場所から来た event 群 (貼り付け / 複製) をこの content の **新しい id と新しい take** で足し、
+    /// 足した位置 (index) を返す。
+    ///
+    /// 来た event の中で同じ take だった片同士は、ここでも同じ take にまとめる (片を並べて貼ったら
+    /// Glue で元に戻せる)。 元の take とは別の take になる — ARA の編集 (audio modification) は
+    /// content と take で 1 つなので、写した先は元と編集を共有しない。
+    pub fn adopt_events(&mut self, events: impl IntoIterator<Item = AudioEvent>) -> Vec<usize> {
+        let mut takes: HashMap<u32, u32> = HashMap::new();
+        let mut added = Vec::new();
+        for mut ev in events {
+            let old_take = ev.take_key();
+            ev.id = self.alloc_event_id();
+            let take = *takes.entry(old_take).or_insert(ev.id);
+            ev.take_id = if take == ev.id { 0 } else { take };
+            added.push(self.events.len());
+            self.events.push(ev);
+        }
+        added
+    }
+}
+
+/// `frames` を伸縮率 `rate` (frame / 拍) で拍にする (退化した率は 0 拍)。
+fn frames_as_beats(frames: u64, rate: f64) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let beats = frames as f64 / rate;
+    if rate.is_finite() && rate > 0.0 { beats } else { 0.0 }
 }
 
 /// `beats` 拍を伸縮率 `rate` (frame / 拍) で frame にし、使える `available` frame に収める。

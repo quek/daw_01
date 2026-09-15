@@ -380,8 +380,9 @@ impl AppData {
 /// を通したもの) で割り、片の `ClipKey` を先頭から返す (先頭 = 元のクリップ。 割れなければ空)。
 ///
 /// **content は切り口で 1 回だけ切り、窓を割る** (`docs/plan_range_selection.md` §10)。 跨ぐ
-/// note / event は [`Song::split_content_at_points`] が割る (共有されていれば 1 回だけ fork
-/// するので linked clip は無傷)。 片は**同じ content を別の窓で見る**ので、窓の外に隠れていた
+/// note / event は [`Song::split_content_at_points`] が割る (共有されている MIDI は 1 回だけ fork
+/// するので linked clip は無傷。 時間軸を持つ event は切っても鳴り方が変わらないので共有のまま)。
+/// 片は**同じ content を別の窓で見る**ので、窓の外に隠れていた
 /// 素材は失われない。 後ろの片は口パク自動生成の再生成対象から外す (手で割った片を
 /// 再生成で消さない)。
 ///

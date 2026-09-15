@@ -312,7 +312,7 @@ pub(super) fn draw_audio_event_section(
         app,
         "inspector_audio_fade_in_input",
         Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-        app.inspector_fold(|a, t| a.audio_first_event(t, |e| e.fade_in_beats)),
+        app.inspector_fold(|a, t| a.audio_first_fade(t).map(|f| f.visible_fade_in_beats())),
         0.0,
         ScrubableNumberFormat::Decimal(3),
         &ScrubableNumberStyle {
@@ -354,7 +354,7 @@ pub(super) fn draw_audio_event_section(
         app,
         "inspector_audio_fade_out_input",
         Rect { x: fade_len_x, y, w: fade_len_w, h: input_h },
-        app.inspector_fold(|a, t| a.audio_first_event(t, |e| e.fade_out_beats)),
+        app.inspector_fold(|a, t| a.audio_first_fade(t).map(|f| f.visible_fade_out_beats())),
         0.0,
         ScrubableNumberFormat::Decimal(3),
         &ScrubableNumberStyle {

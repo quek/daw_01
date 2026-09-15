@@ -24,7 +24,7 @@
   (ナッジの前例 `handler/note_nudge.rs:27-33`)。Adaptive は現在のズームの単位。ピアノロールは `piano_roll_snap_config`、
   アレンジ / オーディオエディタは `arrange_snap_config` (それぞれの画面の設定)。
 - **分割後の選択**: 分割片はすべて選択されたまま (E と同じ)。
-- **リンクしたクリップ**: 各画面の E と同じ扱い (ノート編集はその場、クリップ分割は `split_content_at` の fork)。
+- **リンクしたクリップ**: 各画面の E と同じ扱い (ノート編集はその場、クリップ分割は `split_content_at` の fork — MIDI だけ。 下の「残件の続き」)。
 - velocity / muted は全片が継ぐ。重なり解消は不要 (分割は新しい同音程の重なりを作らない、`plan_fixme_83_note_overlap.md:68-70`)。
 - ノート単位の変調 (ADSR / retrigger=Note) は分割点で再トリガされる — 新しい note-on なので正しい挙動。
 
@@ -82,3 +82,17 @@
 - 片の端 trim は窓を動かすだけ (`AudioEvent::trim_left` / `trim_right`)。 take の外まで伸ばすときだけ同じ伸縮率で source を伸ばす。
 - 移調 / 逆再生 / 伸縮 mode を片に掛けるときは先に take を窓へ詰め直す (`AudioEvent::rebase_take`) — 片自身の頭を起点に効く。
 - 検証: `daw_audio` の `split_fidelity_tests` (engine の render で分割前と比較。 tape / slice は 1 sample も違わない、スペクトル経路は buffer 長の違いと同じ桁)、`common::audio_render` の片の波形、`text_compose` / `video_playback` の分割前比較、`app_state::split_fidelity` (読み上げ・歌唱・trim・移調)。
+
+### 残件の続き (2026-09-15 main 決定、ユーザー不在時)
+
+| 決定 | 内容 | 正本 |
+|---|---|---|
+| 続きの片の見え方 = 3 | アレンジに「続き」のチップ (逆極性の縁取り、どのクリップ色でも読める)、Inspector の読み上げ節に「ここから読む」トグル (1 undo step、ひと続きは窓の頭から読む) | `AppData::clip_text_reads` / `set_clip_text_reads`、`view::arrangement_view::draw_clip_continuation_badge` |
+| 編集の効く範囲 = 1 | クリップへの編集 (Inspector の値・fade・写像、Auto-Fade、Auto-Warp / onset、アレンジの fade 角) は **窓に見えている片だけ**。 窓の中でひと続きの片 (同じ take の連続) はつないで編集して切り直す = 分割前に掛けてから割ったのと同じ。 表示もひと続きから読む | `common::model::window_edit`、`handler::clip_window`、`ClipContent::window_fades` |
+| Auto-Crossfade | 窓の端に接する片の take の続きを、両側で揃えた 1 本の区間だけ重ねる (素材の足りない側で落ち込まない)。 再生は窓に見えている片だけを載せ、張り出しは端の片の take を伸ばす (隣の片を 2 回鳴らさない) | `Song::crossfade_adjacent`、`audio_clip_renderer::push_clip_events` |
+| Bounce In Place | 同じ窓を見るクリップだけが焼いた content に置き換わる (別の窓を見る分割の片は元の content) | `Song::replace_window_content` |
+| ARA = 1 | persistent id を安定 id に (素材 / content と take / クリップと event)。 片は modification を共有し、document は差分で編集 (作り直さない)、restore は新しい object にだけ filter で。 共有を解いた content (Make Unique / 共有 content の伸縮) の modification は複製元の編集を写す (`cloneAudioModification`、`Song::content_forked_from`)。 v41 以前のアーカイブは読み替え表 (linked clip は content を分けてクリップごとの編集を保つ) | `common::ara_ids`、`daw_plugin_host::ara::graph_plan` / `session` |
+
+付随して決めたこと:
+- 時間軸を持つ event (audio / video / image / text) の content は、共有されていても分割で fork しない (切れ目を入れるだけで鳴り方が変わらない。 リンクと ARA の編集の共有を保つ)。 MIDI は切り口で発音し直すので従来どおり fork する (`Song::split_content_at_points`)。
+- `AudioEvent::take_id` (片が継ぐ take の安定 id)。 貼り付け / 複製は別の take (ARA の編集を共有しない、`AudioContent::adopt_events`)。

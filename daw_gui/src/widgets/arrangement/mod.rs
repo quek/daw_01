@@ -180,8 +180,9 @@ pub use common::model::ClipKey;
 /// `event_length_beats` / `fade_*_beats` / `fade_*_curve` を同じ意味で持ち、 適用側も
 /// 全部 `common::audio_render::fade_curve_at` を通るため。
 ///
-/// caller は `ClipContent::event_fades()` を **そのまま** 写して渡す。 `event_index` は
-/// clip 内の event 位置で、 drag の commit 先 (`SetClipFadeBeatsBatch` 等) の宛先になる。
+/// caller は `ClipContent::window_fades()` を **そのまま** 写して渡す (窓に見えている片の、ひと続きごとに
+/// 1 つ)。 `event_index` はひと続きの先頭の event 位置で、 drag の commit 先 (`SetClipFadeBeatsBatch` 等)
+/// の宛先になる。
 ///
 /// r.md #68: `fade.start_in_clip_beats` は **content-local 拍** (model の値そのもの)。
 /// r.md #44 で一旦「窓ローカル」 (= `content_offset_beats` を引いた値) に畳んでいたが、
@@ -190,7 +191,7 @@ pub use common::model::ClipKey;
 /// [`geometry::ContentMap`] (content 原点 + ビューのズーム) 1 本に集約した。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipEventFade {
-    /// clip 内の event index。 fade の編集はこの 1 event だけに効く
+    /// clip 内の event index (ひと続きの先頭)。 fade の編集はこの event を含むひと続きの外側の端だけに効く
     /// (r.md #38 以前は clip 内全 event に broadcast されていて、 掴んだ event と
     /// 書き換わる event が一致しなかった)。
     pub event_index: u32,
