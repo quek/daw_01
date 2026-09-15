@@ -200,7 +200,7 @@ impl Song {
     /// `at` を厳密に跨ぐ要素があるか (`split_content_at_points` の早期 return 判定)。
     pub(super) fn content_crosses(content: &ClipContent, at: f64) -> bool {
         fn any_crosses<E: TimedEvent>(events: &[E], at: f64) -> bool {
-            events.iter().any(|e| e.start() < at - EPS && e.start() + e.len() > at + EPS)
+            events.iter().any(|e| e.start() < at - EPS && e.start() + e.len_beats() > at + EPS)
         }
         match content {
             ClipContent::Midi(m) => m

@@ -11,6 +11,9 @@ use daw_gui::event_split::{SplitAt, SplitJoinEvent, SplitSurface};
 
 use super::support;
 
+/// 1 event の観測値: (開始拍, 長さ拍, source 先頭 frame, source 末尾 frame, take 頭, take 尻, fade-in, fade-out)。
+type EventShape = (f64, f64, u64, u64, f64, f64, f64, f64);
+
 /// `support::build_app` の既定トラックの id。
 const TRACK: u32 = 1;
 const A: ClipKey = ClipKey { track_id: TRACK, clip_id: 1 };
@@ -269,7 +272,7 @@ fn オーディオエディタの_shift_e_は_event_をグリッド線で割る(
     let Some(ClipContent::Audio(audio)) = song.clip_contents.get(&clip.content_id) else {
         panic!("audio content");
     };
-    let got: Vec<(f64, f64, u64, u64, f64, f64, f64, f64)> = audio
+    let got: Vec<EventShape> = audio
         .events
         .iter()
         .map(|e| {

@@ -2231,8 +2231,7 @@ mod bundle_install_tests {
     #[test]
     fn 無効にしたトラックの_scratch_は差し込みで無音になる() {
         let (mut local, mut bundle_tx, _recycle_rx) = harness();
-        let mut song = Song::default();
-        song.tracks = vec![track(1), track(2)];
+        let mut song = Song { tracks: vec![track(1), track(2)], ..Song::default() };
         bundle_tx.push(make_bundle(&Arc::new(song.clone()))).unwrap();
         local.refresh_bundle();
         for s in &mut local.scratch {

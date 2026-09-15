@@ -465,6 +465,11 @@ mod tests {
     use super::*;
     use common::model::{ClipContent, MidiContent, Track};
 
+    /// ラベル付きの「Song を変える編集」(テーブル駆動のテスト用)。
+    type LabeledEdit = (&'static str, fn(&mut Song));
+    /// ラベル付きの「Song を拍の位置で変える編集」(分割のテスト用)。
+    type LabeledEditAt = (&'static str, fn(&mut Song, f64));
+
     /// テスト用の薄いラッパ: アレンジ行 (= その track の `clips` 全部) を
     /// buffer 先頭から集める (`clips` = 源、`time_offset` = 0)。
     /// ランチャー行の分割は `crate::launcher::render` 側でテストする。
@@ -1066,7 +1071,7 @@ mod tests {
             let cid = s.tracks[0].clips[0].content_id;
             s.clip_contents.get_mut(&cid).unwrap().notes_mut().expect("Midi")
         }
-        let edits: [(&str, fn(&mut Song)); 7] = [
+        let edits: [LabeledEdit; 7] = [
             ("note をミュート", |s| notes(s)[0].muted = true),
             ("note を削除", |s| notes(s).clear()),
             ("note の終端を再生位置より手前へ短くする", |s| notes(s)[0].duration_beats = 0.5),
@@ -1142,7 +1147,7 @@ mod tests {
                 ..clip
             });
         }
-        let cases: [(&str, fn(&mut Song, f64)); 2] = [("note の分割", split_note), ("clip の分割", split_clip)];
+        let cases: [LabeledEditAt; 2] = [("note の分割", split_note), ("clip の分割", split_clip)];
         let buf = 512u32;
         let step = f64::from(buf) / SPB as f64;
         for (label, split) in cases {

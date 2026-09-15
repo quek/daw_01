@@ -59,13 +59,13 @@ pub(crate) enum GlueKind {
 /// 窓の端を跨ぐ fade のランプ、字幕の読み上げ (窓より前で始まった文は読まない) が、窓の中で
 /// 見えていた姿のまま残る。
 fn crop_event<E: TimedEvent>(ev: &E, win_start: f64, win_end: f64, shift: f64) -> Option<E> {
-    let (e0, e1) = (ev.start(), ev.start() + ev.len());
+    let (e0, e1) = (ev.start(), ev.start() + ev.len_beats());
     let (c0, c1) = (e0.max(win_start), e1.min(win_end));
     if c1 <= c0 {
         return None;
     }
     let mut out = common::model::event_piece(ev, c0, c1);
-    out.set_window(out.start() + shift, out.len());
+    out.set_window(out.start() + shift, out.len_beats());
     Some(out)
 }
 

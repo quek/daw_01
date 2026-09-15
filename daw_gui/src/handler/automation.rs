@@ -18,7 +18,7 @@ impl AppData {
         // insert_at == tracks.len()) ときだけ master 直下 (None)。基準がグループ (子持ち)
         // でも「同じ階層 = 兄弟」になる (parent_group_id 継承がそのまま兄弟化する)。
         let parent_group_id = self.cur.song_doc.song().tracks.get(insert_at).and_then(|t| t.parent_group_id);
-        let Some(id) = self.edit_song(|song| {
+        let id = self.edit_song(|song| {
             let id = song.alloc_track_id();
             let track = track_with(|t| {
                 t.id = id;
@@ -28,9 +28,7 @@ impl AppData {
             });
             song.tracks.insert(insert_at, track);
             id
-        }) else {
-            return None;
-        };
+        })?;
         // 追加直後はこの新 track を唯一の選択 + カーソルにする (次の操作の対象)。
         // 明示的なトラック面操作なので last-wins タグも Tracks に倒す (= 直後の
         // Delete は「今足したトラック」 を消す。 Ableton と同じ)。

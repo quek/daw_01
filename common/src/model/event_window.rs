@@ -23,7 +23,7 @@ pub trait TimedEvent: Clone + PartialEq {
     /// clip 内の開始拍 (content-local)。
     fn start(&self) -> f64;
     /// 長さ (拍)。
-    fn len(&self) -> f64;
+    fn len_beats(&self) -> f64;
     /// 開始拍と長さを置き換える (中身の写像は動かさない)。
     fn set_window(&mut self, start: f64, len: f64);
     /// 位置と fade (長さ / curve / ランプの張り出し)。
@@ -67,7 +67,7 @@ macro_rules! timed_event_common {
         fn start(&self) -> f64 {
             self.event_start_in_clip_beats
         }
-        fn len(&self) -> f64 {
+        fn len_beats(&self) -> f64 {
             self.event_length_beats
         }
         fn set_window(&mut self, start: f64, len: f64) {
@@ -206,7 +206,7 @@ impl TimedEvent for TextEvent {
 /// - 端ちょうど (`EPS` 以内) は元の値のまま使う — 浮動小数の往復で窓やランプの端を 1 ulp もずらさない。
 #[must_use]
 pub fn event_piece<E: TimedEvent>(ev: &E, a: f64, b: f64) -> E {
-    let (start, len) = (ev.start(), ev.len());
+    let (start, len) = (ev.start(), ev.len_beats());
     let end = start + len;
     let head = if (a - start).abs() <= EPS { 0.0 } else { a - start };
     let tail = if (end - b).abs() <= EPS { 0.0 } else { end - b };
@@ -247,7 +247,7 @@ pub fn event_piece<E: TimedEvent>(ev: &E, a: f64, b: f64) -> E {
 /// 割れなければ空。
 #[must_use]
 pub fn split_pieces<E: TimedEvent>(ev: &E, cuts: impl IntoIterator<Item = f64>, min_piece: f64) -> Vec<E> {
-    let (start, len) = (ev.start(), ev.len());
+    let (start, len) = (ev.start(), ev.len_beats());
     let end = start + len;
     let kept = super::split_boundaries(start, end, cuts, min_piece);
     if kept.is_empty() {
@@ -260,7 +260,7 @@ pub fn split_pieces<E: TimedEvent>(ev: &E, cuts: impl IntoIterator<Item = f64>, 
 /// `next` を `prev` の直後の片として 1 つにつなげるか ([`event_piece`] の逆) = 同じ event から切り出した
 /// ままの隣り合う片 (「窓の中でひと続きの片」、`window_edit` の run の単位)。
 pub(super) fn joinable<E: TimedEvent>(prev: &E, next: &E) -> bool {
-    if (prev.start() + prev.len() - next.start()).abs() > EPS
+    if (prev.start() + prev.len_beats() - next.start()).abs() > EPS
         || !prev.take_continues_into(next)
         || prev.material() != next.material()
     {
@@ -311,7 +311,7 @@ pub(super) fn join_into<E: TimedEvent>(prev: &mut E, next: &E) {
     joined.fade_out_beats = n.fade_out_beats;
     joined.fade_out_curve = n.fade_out_curve;
     joined.fade_out_trail_beats = n.fade_out_trail_beats;
-    prev.set_window(start, next.start() + next.len() - start);
+    prev.set_window(start, next.start() + next.len_beats() - start);
     prev.set_fade(&joined);
     prev.absorb_take_tail(next);
 }

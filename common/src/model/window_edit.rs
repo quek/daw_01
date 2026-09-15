@@ -19,7 +19,7 @@ const EPS: f64 = 1e-9;
 /// `ev` が窓 `(lo, hi)` (content-local 拍) に正の長さで見えているか。
 #[must_use]
 pub fn shown_in<E: TimedEvent>(ev: &E, (lo, hi): (f64, f64)) -> bool {
-    ev.start() < hi && ev.start() + ev.len() > lo
+    ev.start() < hi && ev.start() + ev.len_beats() > lo
 }
 
 /// 窓 `window` に見えている event の index (開始拍順)。
@@ -88,7 +88,7 @@ pub fn edit_run<E: TimedEvent>(events: &mut [E], run: &[usize], f: impl FnOnce(&
     }
     for &i in run {
         let orig = &events[i];
-        let (start, len) = (orig.start(), orig.len());
+        let (start, len) = (orig.start(), orig.len_beats());
         let mut piece = event_piece(&joined, start, start + len);
         // 窓は元の値のまま (浮動小数の往復で片の端を 1 ulp も動かさない)。
         piece.set_window(start, len);
@@ -259,7 +259,7 @@ impl Song {
             return false;
         };
         audio.events.iter().filter(|e| shown_in(*e, window)).any(|e| {
-            let (start, end) = (e.start(), e.start() + e.len());
+            let (start, end) = (e.start(), e.start() + e.len_beats());
             if at_end { end >= edge - EPS } else { start <= edge + EPS }
         })
     }
@@ -298,7 +298,7 @@ impl Song {
         let run = runs.into_iter().find(|run| {
             let edge_of = |i: &usize| {
                 let e = &events[*i];
-                if at_end { e.start() + e.len() } else { e.start() }
+                if at_end { e.start() + e.len_beats() } else { e.start() }
             };
             let touching = if at_end { run.last() } else { run.first() };
             touching.is_some_and(|i| (edge_of(i) - edge).abs() <= EPS)
@@ -306,7 +306,7 @@ impl Song {
         let joined = joined_run(events, &run)?;
         let (fpb, frames) = source_reading(&self.media.audio_sources, self.bpm, joined.source_id);
         let room = if at_end { joined.room_after(fpb, frames) } else { joined.room_before(fpb, frames) };
-        Some(XfadeSide { content_id, run, room, len: joined.len() })
+        Some(XfadeSide { content_id, run, room, len: joined.len_beats() })
     }
 }
 
