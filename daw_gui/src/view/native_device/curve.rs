@@ -43,7 +43,9 @@ impl<'a> EqCurveSource<'a> {
         match params {
             NativeParams::Eq(eq) => Some(Self::Channel(eq)),
             NativeParams::ToneEq(eq) => Some(Self::Tone(eq)),
-            NativeParams::Comp(_) | NativeParams::BusComp(_) => None,
+            NativeParams::Comp(_) | NativeParams::BusComp(_) | NativeParams::Reverb(_) | NativeParams::Delay(_) => {
+                None
+            }
         }
     }
 }

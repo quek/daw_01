@@ -102,7 +102,7 @@ fn ctx<'a>(env: &'a Env, song: &'a Song, index: &'a SongIndex, n: usize) -> Prog
 }
 
 fn build(devices: &[Device], track_id: u32) -> ChainProgram {
-    build_program(devices, track_id, None, &DeviceLatencies::new(), &HashSet::new(), common::protocol::RenderScope::Mix)
+    build_program(devices, track_id, None, &DeviceLatencies::new(), &HashSet::new(), common::protocol::RenderScope::Mix, 48_000)
         .program
 }
 
@@ -227,11 +227,11 @@ fn bypass_crossfades_then_settles_bit_exact_and_restarts_from_a_reset_dsp() {
         let (mut l, mut r) = (x.clone(), x.clone());
         run(&mut p, &mut l, &mut r, &ctx(&env, song, index, n));
         if b == 80 {
-            let mut fresh = NativeDsp::new(NativeKind::Comp);
+            let mut fresh = NativeDsp::new(NativeKind::Comp, SR as f32);
             let (mut wl, mut wr) = (x.clone(), x.clone());
             fresh.process(
                 &on_dev.params,
-                NativeBlock { l: &mut wl, r: &mut wr, n, sample_rate: SR as f32, sidechain: None, listen_out: None },
+                NativeBlock { l: &mut wl, r: &mut wr, n, sample_rate: SR as f32, bpm: 120.0, sidechain: None, listen_out: None },
             );
             let to = n as f32 / (NATIVE_BYPASS_FADE_MS * 0.001 * SR as f32);
             for i in 0..n {

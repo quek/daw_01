@@ -330,7 +330,7 @@ pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, ru
 /// `content_forked_from` を複製の event の `take_origins` へ移し、目次の無いアーカイブにはトラックの document の
 /// object から目次を作る (`project::migrate_forked_contents_to_take_origins` / `ara_ids::migrate_archive_contents`)。
 /// 新ファイルを旧ビルドで開くと写した元が消え、目次を旧い読み替え表と取り違えるので、版を上げて gate で弾く。
-pub const CURRENT_VERSION: u32 = 43;
+pub const CURRENT_VERSION: u32 = 44;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.

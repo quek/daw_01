@@ -19,13 +19,17 @@ use super::{AuxInputRoute, AutomationLane, AutomationTarget, ModRouting, NativeP
 mod bus_comp;
 mod chain_rules;
 mod comp;
+mod delay;
 mod eq;
+mod reverb;
 mod tone_eq;
 
 pub use bus_comp::*;
 pub use chain_rules::*;
 pub use comp::*;
+pub use delay::*;
 pub use eq::*;
+pub use reverb::*;
 pub use tone_eq::*;
 
 /// GR メーターの表示レンジ (dB)。Comp / Bus Comp / Limiter 共通。
@@ -40,11 +44,14 @@ pub enum NativeKind {
     Eq,
     BusComp,
     ToneEq,
+    Reverb,
+    Delay,
 }
 
 impl NativeKind {
     /// picker の並び。
-    pub const ALL: [Self; 4] = [Self::Comp, Self::Eq, Self::BusComp, Self::ToneEq];
+    pub const ALL: [Self; 6] =
+        [Self::Comp, Self::Eq, Self::BusComp, Self::ToneEq, Self::Reverb, Self::Delay];
     /// 通常 / group / return トラックの組み込み (チェーン末尾にこの順で補う)。
     pub const BUILTIN_TRACK: [Self; 2] = [Self::Comp, Self::Eq];
     /// master の組み込み (チェーン先頭にこの順で補う)。
@@ -57,6 +64,8 @@ impl NativeKind {
             Self::Eq => "EQ",
             Self::BusComp => "Bus Comp",
             Self::ToneEq => "Tone EQ",
+            Self::Reverb => "Reverb",
+            Self::Delay => "Delay",
         }
     }
 
@@ -68,11 +77,14 @@ impl NativeKind {
             Self::Eq => "EQ 変更",
             Self::BusComp => "バスコンプ変更",
             Self::ToneEq => "トーン EQ 変更",
+            Self::Reverb => "リバーブ変更",
+            Self::Delay => "ディレイ変更",
         }
     }
 
-    /// 4 種とも audio in / out のみ (置換型、MIDI には触れない)。engine の直結規則
-    /// (「audio_in があればバスを置換」) がそのまま効く。
+    /// 全種とも audio in / out のみ (置換型、MIDI には触れない)。engine の直結規則
+    /// (「audio_in があればバスを置換」) がそのまま効く。Reverb / Delay の dry/wet は
+    /// device の中で混ぜるので、外から見れば同じ「置換」。
     #[must_use]
     pub fn ports(self) -> crate::port_config::PortConfig {
         crate::port_config::PortConfig {
@@ -109,6 +121,8 @@ impl NativeKind {
             Self::Eq => db::NATIVE_EQ_PICKER_ID,
             Self::BusComp => db::NATIVE_BUS_COMP_PICKER_ID,
             Self::ToneEq => db::NATIVE_TONE_EQ_PICKER_ID,
+            Self::Reverb => db::NATIVE_REVERB_PICKER_ID,
+            Self::Delay => db::NATIVE_DELAY_PICKER_ID,
         }
     }
 
@@ -126,6 +140,8 @@ pub enum NativeParams {
     Eq(EqSettings),
     BusComp(BusCompSettings),
     ToneEq(ToneEqSettings),
+    Reverb(ReverbSettings),
+    Delay(DelaySettings),
 }
 
 impl NativeParams {
@@ -136,6 +152,8 @@ impl NativeParams {
             Self::Eq(_) => NativeKind::Eq,
             Self::BusComp(_) => NativeKind::BusComp,
             Self::ToneEq(_) => NativeKind::ToneEq,
+            Self::Reverb(_) => NativeKind::Reverb,
+            Self::Delay(_) => NativeKind::Delay,
         }
     }
 
@@ -147,6 +165,8 @@ impl NativeParams {
             NativeKind::Eq => Self::Eq(EqSettings::default()),
             NativeKind::BusComp => Self::BusComp(BusCompSettings::default()),
             NativeKind::ToneEq => Self::ToneEq(ToneEqSettings::default()),
+            NativeKind::Reverb => Self::Reverb(ReverbSettings::default()),
+            NativeKind::Delay => Self::Delay(DelaySettings::default()),
         }
     }
 
@@ -161,6 +181,8 @@ impl NativeParams {
             (Self::Eq(s), NativeParamId::Eq { band, param }) => Some(s.param(band, param)),
             (Self::BusComp(s), NativeParamId::BusComp(q)) => Some(s.param(q)),
             (Self::ToneEq(s), NativeParamId::ToneEq(b)) => Some(s.gain_db(b)),
+            (Self::Reverb(s), NativeParamId::Reverb(q)) => Some(s.param(q)),
+            (Self::Delay(s), NativeParamId::Delay(q)) => Some(s.param(q)),
             _ => None,
         }
     }
@@ -177,6 +199,8 @@ impl NativeParams {
             (Self::Eq(s), NativeParamId::Eq { band, param }) => s.param_mut(band, param),
             (Self::BusComp(s), NativeParamId::BusComp(q)) => return s.write(q, v),
             (Self::ToneEq(s), NativeParamId::ToneEq(b)) => s.gain_mut(b),
+            (Self::Reverb(s), NativeParamId::Reverb(q)) => return s.write(q, v),
+            (Self::Delay(s), NativeParamId::Delay(q)) => return s.write(q, v),
             _ => return false,
         };
         let changed = *slot != v;
@@ -191,6 +215,8 @@ impl NativeParams {
             Self::Eq(s) => s.sanitize(),
             Self::BusComp(s) => s.sanitize(),
             Self::ToneEq(s) => s.sanitize(),
+            Self::Reverb(s) => s.sanitize(),
+            Self::Delay(s) => s.sanitize(),
         }
     }
 }

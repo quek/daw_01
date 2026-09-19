@@ -122,6 +122,8 @@ fn draw_mini(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &RowCtx<'_>, entry: &
             let gr = app.cur.transport.native_gr.get(id);
             draw_gr_horizontal(app, ui, wid(ParamSurface::Rack, key, "mini_gr", ()), rect, gr, active, GR_METER_RANGE_DB, None);
         }
+        // Reverb / Delay は行に小表示を持たない (名前と ON/OFF だけ)。
+        NativeKind::Reverb | NativeKind::Delay => {}
     }
 }
 

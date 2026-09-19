@@ -7,8 +7,8 @@ use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BusCompParam, BusCompSettings, CompParam, CompSettings, EqBand, EqParam, EqSettings,
-    NativeKind, ParamRange, ToneEqBand, ToneEqSettings,
+    BusCompParam, BusCompSettings, CompParam, CompSettings, DelayParam, DelaySettings, EqBand, EqParam, EqSettings,
+    NativeKind, ParamRange, ReverbParam, ReverbSettings, ToneEqBand, ToneEqSettings,
 };
 
 /// 内蔵 device のパラメーター住所。
@@ -21,6 +21,8 @@ pub enum NativeParamId {
     Eq { band: EqBand, param: EqParam },
     BusComp(BusCompParam),
     ToneEq(ToneEqBand),
+    Reverb(ReverbParam),
+    Delay(DelayParam),
 }
 
 use NativeParamId as P;
@@ -64,6 +66,47 @@ const BUS_COMP_ALL: [NativeParamId; 6] = [
     P::BusComp(BusCompParam::Makeup),
 ];
 
+const REVERB_ALL: [NativeParamId; 14] = [
+    P::On(NativeKind::Reverb),
+    P::Reverb(ReverbParam::Predelay),
+    P::Reverb(ReverbParam::Size),
+    P::Reverb(ReverbParam::Decay),
+    P::Reverb(ReverbParam::Damp),
+    P::Reverb(ReverbParam::LfDamp),
+    P::Reverb(ReverbParam::Diffusion),
+    P::Reverb(ReverbParam::LowCut),
+    P::Reverb(ReverbParam::HighCut),
+    P::Reverb(ReverbParam::ModRate),
+    P::Reverb(ReverbParam::ModDepth),
+    P::Reverb(ReverbParam::Width),
+    P::Reverb(ReverbParam::Mix),
+    P::Reverb(ReverbParam::Freeze),
+];
+
+const DELAY_ALL: [NativeParamId; 21] = [
+    P::On(NativeKind::Delay),
+    P::Delay(DelayParam::Sync),
+    P::Delay(DelayParam::DivL),
+    P::Delay(DelayParam::TimeL),
+    P::Delay(DelayParam::OffsetL),
+    P::Delay(DelayParam::DivR),
+    P::Delay(DelayParam::TimeR),
+    P::Delay(DelayParam::OffsetR),
+    P::Delay(DelayParam::Link),
+    P::Delay(DelayParam::Feedback),
+    P::Delay(DelayParam::Cross),
+    P::Delay(DelayParam::Hp),
+    P::Delay(DelayParam::Lp),
+    P::Delay(DelayParam::Pattern),
+    P::Delay(DelayParam::Mode),
+    P::Delay(DelayParam::Drive),
+    P::Delay(DelayParam::ModRate),
+    P::Delay(DelayParam::ModDepth),
+    P::Delay(DelayParam::Width),
+    P::Delay(DelayParam::Mix),
+    P::Delay(DelayParam::Freeze),
+];
+
 const TONE_EQ_ALL: [NativeParamId; 4] = [
     P::On(NativeKind::ToneEq),
     P::ToneEq(ToneEqBand::Low),
@@ -81,6 +124,8 @@ impl NativeParamId {
             P::Eq { .. } => NativeKind::Eq,
             P::BusComp(_) => NativeKind::BusComp,
             P::ToneEq(_) => NativeKind::ToneEq,
+            P::Reverb(_) => NativeKind::Reverb,
+            P::Delay(_) => NativeKind::Delay,
         }
     }
 
@@ -94,7 +139,7 @@ impl NativeParamId {
                 EqParam::Gain => band.has_gain(),
                 EqParam::Q => band.has_q_knob(),
             },
-            P::On(_) | P::Comp(_) | P::BusComp(_) | P::ToneEq(_) => true,
+            P::On(_) | P::Comp(_) | P::BusComp(_) | P::ToneEq(_) | P::Reverb(_) | P::Delay(_) => true,
         }
     }
 
@@ -107,6 +152,8 @@ impl NativeParamId {
             P::Eq { band, param } => param.range(band),
             P::BusComp(p) => p.range(),
             P::ToneEq(b) => b.range(),
+            P::Reverb(p) => p.range(),
+            P::Delay(p) => p.range(),
         }
     }
 
@@ -119,6 +166,8 @@ impl NativeParamId {
             P::Eq { param, .. } => param.label(),
             P::BusComp(p) => p.label(),
             P::ToneEq(b) => b.label(),
+            P::Reverb(p) => p.label(),
+            P::Delay(p) => p.label(),
         }
     }
 
@@ -127,7 +176,7 @@ impl NativeParamId {
     pub fn lane_label(self) -> &'static str {
         match self {
             P::Eq { band, param } => eq_lane_label(band, param),
-            P::On(_) | P::Comp(_) | P::BusComp(_) | P::ToneEq(_) => self.knob_label(),
+            P::On(_) | P::Comp(_) | P::BusComp(_) | P::ToneEq(_) | P::Reverb(_) | P::Delay(_) => self.knob_label(),
         }
     }
 
@@ -139,6 +188,8 @@ impl NativeParamId {
             NativeKind::Eq => &EQ_ALL,
             NativeKind::BusComp => &BUS_COMP_ALL,
             NativeKind::ToneEq => &TONE_EQ_ALL,
+            NativeKind::Reverb => &REVERB_ALL,
+            NativeKind::Delay => &DELAY_ALL,
         }
     }
 
@@ -151,15 +202,18 @@ impl NativeParamId {
             P::Eq { band, param } => Some(EqSettings::default().param(band, param)),
             P::BusComp(p) => Some(BusCompSettings::default().param(p)),
             P::ToneEq(b) => Some(ToneEqSettings::default().gain_db(b)),
+            P::Reverb(p) => Some(ReverbSettings::default().param(p)),
+            P::Delay(p) => Some(DelaySettings::default().param(p)),
         }
     }
 
-    /// 段階式の表示ラベル (Bus Comp の Ratio / Attack / Release だけ `Some`)。
+    /// 段階式の表示ラベル (`Some` = 段階式。Bus Comp の 3 つと Delay の Div / Pattern / Mode / Drive)。
     #[must_use]
     pub fn step_labels(self) -> Option<&'static [&'static str]> {
         match self {
             P::BusComp(p) => p.step_labels(),
-            P::On(_) | P::Comp(_) | P::Eq { .. } | P::ToneEq(_) => None,
+            P::Delay(p) => p.step_labels(),
+            P::On(_) | P::Comp(_) | P::Eq { .. } | P::ToneEq(_) | P::Reverb(_) => None,
         }
     }
 
@@ -168,7 +222,7 @@ impl NativeParamId {
     pub fn eq_band(self) -> Option<EqBand> {
         match self {
             P::Eq { band, .. } => Some(band),
-            P::On(_) | P::Comp(_) | P::BusComp(_) | P::ToneEq(_) => None,
+            P::On(_) | P::Comp(_) | P::BusComp(_) | P::ToneEq(_) | P::Reverb(_) | P::Delay(_) => None,
         }
     }
 }

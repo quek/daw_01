@@ -8,13 +8,19 @@
 //! ここの `process` は常に「効いている」ものとして処理する。
 //!
 //! RT 規約: 確保・ロック・I/O なし。三角関数を呼ぶ係数の組み直しは値が変わった buffer だけ。
-//! 状態は固定長 (`Copy`) なので、再 compile を跨ぐ引き継ぎ ([`NativeDsp::adopt_state_from`]) も
-//! 構造体のコピーだけで済む。
+//! Comp / EQ / Bus Comp / Tone EQ の状態は固定長なので引き継ぎ ([`NativeDsp::adopt_state_from`])
+//! は構造体のコピー、Reverb / Delay は秒オーダーの遅延メモリを持つので **swap で move** する。
+//! どちらも RT 上では確保も解放もしない — 遅延メモリを確保するのは [`NativeDsp::new`]
+//! (compile 時 = off-RT) だけで、[`NativeDsp::reset`] は容量を保ったまま 0 埋めする
+//! (`reset` は bypass の OFF → ON で **RT から** 呼ばれる)。
 
 mod bus_comp;
 mod comp;
+mod delay;
 mod eq;
 mod limiter;
+mod reverb;
+mod ring;
 mod tone_eq;
 #[cfg(test)]
 mod tests;
@@ -31,6 +37,8 @@ pub struct NativeBlock<'a> {
     pub r: &'a mut [f32],
     pub n: usize,
     pub sample_rate: f32,
+    /// この buffer のテンポ (Delay の tempo sync)。block 内は一定。
+    pub bpm: f32,
     /// 外部 (または自トラック Pre-FX) の検出信号。長さが `n` に足りない分は 0 とみなす。
     /// `None` = 自分の入力で検出する。SC を受けない種類は無視する。
     pub sidechain: Option<(&'a [f32], &'a [f32])>,
@@ -41,25 +49,29 @@ pub struct NativeBlock<'a> {
 
 /// 内蔵 device 1 台ぶんの DSP 状態 (種類ごと)。
 ///
-/// variant の大きさは揃っていない (EQ はバイクワッド 6 段ぶん) が、Box にしない: 状態は compile 時に
-/// `ChainProgram::natives` へ並べて確保し、再 compile を跨ぐ引き継ぎは RT 上の固定長コピー (`Copy`) で行う。
+/// variant の大きさは揃っていないが Box にしない: 状態は compile 時に `ChainProgram::natives` へ
+/// 並べて確保する。Reverb / Delay だけが中に `Vec` (遅延リング) を持ち、その確保も compile 時。
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Copy)]
 pub enum NativeDsp {
     Comp(comp::CompState),
     Eq(eq::EqState),
     BusComp(bus_comp::BusCompState),
     ToneEq(tone_eq::ToneEqState),
+    Reverb(reverb::ReverbState),
+    Delay(delay::DelayState),
 }
 
 impl NativeDsp {
+    /// **off-RT 専用** (compile から呼ばれる)。Reverb / Delay はここで遅延メモリを確保する。
     #[must_use]
-    pub fn new(kind: NativeKind) -> Self {
+    pub fn new(kind: NativeKind, sample_rate: f32) -> Self {
         match kind {
             NativeKind::Comp => Self::Comp(comp::CompState::default()),
             NativeKind::Eq => Self::Eq(eq::EqState::default()),
             NativeKind::BusComp => Self::BusComp(bus_comp::BusCompState::default()),
             NativeKind::ToneEq => Self::ToneEq(tone_eq::ToneEqState::default()),
+            NativeKind::Reverb => Self::Reverb(reverb::ReverbState::new(sample_rate)),
+            NativeKind::Delay => Self::Delay(delay::DelayState::new(sample_rate)),
         }
     }
 
@@ -70,13 +82,23 @@ impl NativeDsp {
             Self::Eq(_) => NativeKind::Eq,
             Self::BusComp(_) => NativeKind::BusComp,
             Self::ToneEq(_) => NativeKind::ToneEq,
+            Self::Reverb(_) => NativeKind::Reverb,
+            Self::Delay(_) => NativeKind::Delay,
         }
     }
 
-    /// バイクワッドの遅延・平滑値・係数キャッシュを無音の状態に戻す (確保なし)。
-    /// bypass から戻る瞬間に呼ぶ — 古いフィルタ状態のまま再開すると、止めた時点の残響が鳴る。
+    /// 遅延・平滑値・係数キャッシュを無音の状態に戻す (**確保なし**)。
+    /// bypass から戻る瞬間に **RT 上で** 呼ぶ — 古い状態のまま再開すると、止めた時点の残響が鳴る。
     pub fn reset(&mut self) {
-        *self = Self::new(self.kind());
+        match self {
+            Self::Comp(st) => *st = comp::CompState::default(),
+            Self::Eq(st) => *st = eq::EqState::default(),
+            Self::BusComp(st) => *st = bus_comp::BusCompState::default(),
+            Self::ToneEq(st) => *st = tone_eq::ToneEqState::default(),
+            // 遅延リングは容量を保ったまま 0 埋めする (ここで確保すると RT 違反)。
+            Self::Reverb(st) => st.reset(),
+            Self::Delay(st) => st.reset(),
+        }
     }
 
     /// `params` で 1 buffer を処理し、この buffer の GR (dB、0 以下) を返す。EQ 系は 0。
@@ -88,16 +110,27 @@ impl NativeDsp {
             (Self::Eq(st), NativeParams::Eq(s)) => st.process(s, b),
             (Self::BusComp(st), NativeParams::BusComp(s)) => st.process(s, b),
             (Self::ToneEq(st), NativeParams::ToneEq(s)) => st.process(s, b),
+            (Self::Reverb(st), NativeParams::Reverb(s)) => st.process(s, b),
+            (Self::Delay(st), NativeParams::Delay(s)) => st.process(s, b),
             _ => 0.0,
         }
     }
 
-    /// 再 compile を跨ぐ状態の引き継ぎ。同じ種類のときだけ `old` の状態をコピーして `true`。
-    pub fn adopt_state_from(&mut self, old: &NativeDsp) -> bool {
-        if self.kind() != old.kind() {
-            return false;
+    /// 再 compile を跨ぐ状態の引き継ぎ。同じ種類のときだけ `old` の状態を引き取って `true`。
+    ///
+    /// 固定長の 4 種はコピー、遅延メモリを持つ 2 種は **swap** (RT 上でポインタを入れ替えるだけ。
+    /// 確保も解放もしない — `old` は呼び出し側が持ったまま次の swap で捨てられる)。
+    /// 容量が違う = サンプルレートが変わったときは引き継がない (長さの意味が変わっている)。
+    pub fn adopt_state_from(&mut self, old: &mut NativeDsp) -> bool {
+        match (self, old) {
+            (Self::Comp(a), Self::Comp(b)) => *a = *b,
+            (Self::Eq(a), Self::Eq(b)) => *a = *b,
+            (Self::BusComp(a), Self::BusComp(b)) => *a = *b,
+            (Self::ToneEq(a), Self::ToneEq(b)) => *a = *b,
+            (Self::Reverb(a), Self::Reverb(b)) if a.capacity_key() == b.capacity_key() => std::mem::swap(a, b),
+            (Self::Delay(a), Self::Delay(b)) if a.capacity_key() == b.capacity_key() => std::mem::swap(a, b),
+            _ => return false,
         }
-        *self = *old;
         true
     }
 }

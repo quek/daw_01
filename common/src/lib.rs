@@ -18,6 +18,7 @@ pub mod mod_plane;
 pub mod mod_sidecar;
 pub mod model;
 pub mod modulators;
+pub mod note_value;
 pub mod onset;
 pub mod lipsync;
 pub mod plugin_db;

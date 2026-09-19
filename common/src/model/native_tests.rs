@@ -167,7 +167,9 @@ fn native_params_address_every_field_independently_and_sanitize_per_field() {
         for &p in NativeParamId::all_of(kind).iter().filter(|p| !matches!(p, NativeParamId::On(_))) {
             let mut params = NativeParams::default_of(kind);
             let before: Vec<Option<f32>> = NativeParamId::all_of(kind).iter().map(|q| params.get(*q)).collect();
-            let v = p.range().clamp(p.range().from_norm(0.93) as f32);
+            // 既定と必ず違う値を選ぶ (Toggle / 少ない段では 0.93 が既定と一致しうる)。
+            let probe = |n: f64| p.range().clamp(p.range().from_norm(n) as f32);
+            let v = if params.get(p) == Some(probe(0.93)) { probe(0.07) } else { probe(0.93) };
             assert_ne!(params.get(p), Some(v), "{p:?}: 既定と同じ値では検査にならない");
             assert!(params.set(p, v), "{p:?}");
             assert_eq!(params.get(p), Some(v), "{p:?}");

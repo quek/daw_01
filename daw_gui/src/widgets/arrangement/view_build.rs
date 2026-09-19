@@ -829,12 +829,15 @@ fn intern_send_label(send_id: u32) -> Arc<str> {
     })
 }
 
-/// 内蔵 device のレーン色 (Comp / Bus Comp / Limiter = 橙、EQ / Tone EQ = 青緑)。
+/// 内蔵 device のレーン色 (Comp / Bus Comp / Limiter = 橙、EQ / Tone EQ = 青緑、
+/// Reverb = 藤、Delay = 黄緑)。
 fn native_lane_color(kind: common::model::NativeKind) -> Color {
     use common::model::NativeKind as K;
     match kind {
         K::Comp | K::BusComp => Color::rgb(0.95, 0.65, 0.35),
         K::Eq | K::ToneEq => Color::rgb(0.40, 0.85, 0.80),
+        K::Reverb => Color::rgb(0.70, 0.55, 0.95),
+        K::Delay => Color::rgb(0.70, 0.85, 0.40),
     }
 }
 

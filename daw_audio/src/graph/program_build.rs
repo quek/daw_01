@@ -94,6 +94,7 @@ pub fn build_program(
     latencies: &DeviceLatencies,
     taps: &HashSet<(u64, TapPoint)>,
     scope: RenderScope,
+    sample_rate: u32,
 ) -> BuiltProgram {
     let mut program = ChainProgram::empty(track_id);
     program.fader = scope.fader();
@@ -108,6 +109,7 @@ pub fn build_program(
         chain_latency: &mut chain_latency,
         chain_slots: &mut chain_slots,
         native_slots: &mut native_slots,
+        sample_rate,
     };
     let mut acc = 0u32;
     let mut pass1_end: Option<usize> = None;
@@ -142,6 +144,8 @@ struct Builder<'a> {
     chain_latency: &'a mut HashMap<u64, ChainLatency>,
     chain_slots: &'a mut HashMap<u64, ChainSlot>,
     native_slots: &'a mut HashMap<u64, u32>,
+    /// セッションのサンプルレート (Reverb / Delay の遅延メモリの確保に要る)。
+    sample_rate: u32,
 }
 
 impl Builder<'_> {
@@ -179,7 +183,7 @@ impl Builder<'_> {
                     return 0;
                 }
                 let native_slot = self.program.natives.len() as u32;
-                self.program.natives.push(NativeScratch::new(nd, self.program.track_id));
+                self.program.natives.push(NativeScratch::new(nd, self.program.track_id, self.sample_rate));
                 self.program.ops.push(ChainOp::Native { device_id: nd.id, native_slot });
                 self.native_slots.insert(nd.id, native_slot);
                 0
@@ -330,7 +334,7 @@ mod tests {
             parallel(10, vec![(11, vec![plug(2), parallel(20, vec![(21, vec![plug(3)])])]), (12, vec![])]),
             plug(4),
         ];
-        let b = build_program(&devices, 7, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix);
+        let b = build_program(&devices, 7, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix, 48_000);
         assert_eq!(
             op_kinds(&b.program),
             vec![
@@ -350,7 +354,7 @@ mod tests {
         lat.insert(3, 40);
         lat.insert(1, 5);
         let devices = vec![plug(1), parallel(10, vec![(11, vec![plug(2)]), (12, vec![plug(3)]), (13, vec![])])];
-        let b = build_program(&devices, 7, None, &lat, &HashSet::new(), RenderScope::Mix);
+        let b = build_program(&devices, 7, None, &lat, &HashSet::new(), RenderScope::Mix, 48_000);
         assert_eq!(b.latency, 105, "5 + max(100, 40, 0)");
         assert_eq!(
             op_kinds(&b.program),
@@ -370,14 +374,14 @@ mod tests {
         let mut p = plug(3);
         p.set_bypassed(true);
         let devices = vec![plug(1), r, p];
-        let b = build_program(&devices, 7, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix);
+        let b = build_program(&devices, 7, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix, 48_000);
         assert_eq!(op_kinds(&b.program), vec!["P1"]);
     }
 
     #[test]
     fn paraout_split_lands_after_the_top_level_device() {
         let devices = vec![plug(1), parallel(10, vec![(11, vec![plug(2)])]), plug(3)];
-        let b = build_program(&devices, 7, Some(2), &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix);
+        let b = build_program(&devices, 7, Some(2), &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix, 48_000);
         // P1 RB CB P2 CE RE | P3
         assert_eq!(b.program.pass1_end, 6);
     }
@@ -394,7 +398,7 @@ mod tests {
         // r.md #114: Selector は全 chain が出力 (chain 数に追従)。
         let mut sel = parallel(40, vec![(41, vec![]), (42, vec![]), (43, vec![])]);
         sel.as_parallel_mut().unwrap().split = common::model::Split::DEFAULT_SELECTOR;
-        let b = build_program(&[split, ms, plain, sel], 7, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix);
+        let b = build_program(&[split, ms, plain, sel], 7, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix, 48_000);
         let outputs: Vec<Option<u8>> = b
             .program
             .ops
@@ -441,11 +445,11 @@ mod tests {
         ];
         let lat: DeviceLatencies = [(1, 7), (2, 100), (3, 40), (4, 1000), (5, 500), (6, 0)].into();
 
-        let mix = build_program(&devices, 7, None, &lat, &HashSet::new(), RenderScope::Mix);
+        let mix = build_program(&devices, 7, None, &lat, &HashSet::new(), RenderScope::Mix, 48_000);
         assert_eq!(mix.latency, 7 + 100 + 1040, "前提: Mix は全部数える");
         assert!(mix.program.fader && !mix.program.parallels[0].sources);
 
-        let b = build_program(&devices, 7, None, &lat, &HashSet::new(), RenderScope::Sources);
+        let b = build_program(&devices, 7, None, &lat, &HashSet::new(), RenderScope::Sources, 48_000);
         assert_eq!(
             op_kinds(&b.program),
             vec!["P1", "RB0", "CB0", "P3", "CE0", "CB1", "CE1d40", "CB2", "CE2d40", "RE0", "RB1", "CB3", "P6", "CE3", "CB4", "CE4", "RE1"],
@@ -474,7 +478,7 @@ mod tests {
     fn tap_needs_are_baked_into_chain_end() {
         let devices = vec![parallel(10, vec![(11, vec![]), (12, vec![])])];
         let taps: HashSet<(u64, TapPoint)> = [(11, TapPoint::PostFx), (12, TapPoint::PostFader)].into();
-        let b = build_program(&devices, 7, None, &DeviceLatencies::new(), &taps, RenderScope::Mix);
+        let b = build_program(&devices, 7, None, &DeviceLatencies::new(), &taps, RenderScope::Mix, 48_000);
         let ends: Vec<(bool, bool)> = b
             .program
             .ops

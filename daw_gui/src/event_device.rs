@@ -176,6 +176,8 @@ impl DeviceEvent {
                 NativeKind::Eq => "EQ 追加",
                 NativeKind::BusComp => "Bus Comp 追加",
                 NativeKind::ToneEq => "Tone EQ 追加",
+                NativeKind::Reverb => "Reverb 追加",
+                NativeKind::Delay => "Delay 追加",
             },
             E::NativeEdit { edit, .. } => edit.undo_label(),
             E::MasterLimiterEdit(_) => "マスターリミッター変更",

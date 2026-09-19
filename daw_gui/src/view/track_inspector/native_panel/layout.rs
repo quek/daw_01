@@ -33,6 +33,12 @@ pub const SWITCH_W: f32 = 44.0;
 pub const SWITCH_H: f32 = 16.0;
 /// 列数。
 pub const COLUMNS: usize = 6;
+/// セクションの小見出し (`── TIME ──`) の行高。
+pub const SECTION_H: f32 = 14.0;
+/// 切り替え帯の中で、段階式セレクタの手前に置く小ラベルの幅。
+pub const SELECTOR_LABEL_W: f32 = 30.0;
+/// 段階式セレクタ (`[Stereo]`) のボタン幅。
+pub const SELECTOR_W: f32 = 62.0;
 
 /// 種類ごとの Par の高さ (行の 26px は含まない)。
 #[must_use]
@@ -46,6 +52,12 @@ pub fn panel_height(kind: NativeKind) -> f32 {
         NativeKind::BusComp => PAD + BAR_H + ROW_GAP + HEAD + CELL + PAD,
         // カーブ → 見出し → 3 セル。
         NativeKind::ToneEq => PAD + CURVE_H + ROW_GAP + HEAD + CELL + PAD,
+        // [Frz] → ROOM 6 セル → TONE / MOD / OUT 6 セル。
+        NativeKind::Reverb => PAD + BAR_H + ROW_GAP + 2.0 * (SECTION_H + HEAD + CELL) + ROW_GAP + PAD,
+        // 切り替え帯 2 段 → TIME 6 セル → FEEDBACK / TONE 4 セル → MOD / OUT 4 セル。
+        NativeKind::Delay => {
+            PAD + 2.0 * BAR_H + ROW_GAP + 3.0 * (SECTION_H + HEAD + CELL) + 2.0 * ROW_GAP + PAD
+        }
     }
 }
 

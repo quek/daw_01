@@ -238,7 +238,7 @@ fn display_units(target: &AutomationTarget) -> (&'static str, ScrubableNumberFor
 
 /// 内蔵 device の住所ごとの単位と書式 (§7.4 の表)。
 fn native_unit_format(param: common::model::NativeParamId) -> (&'static str, ScrubableNumberFormat) {
-    use common::model::{BusCompParam, CompParam, EqParam, NativeParamId as P};
+    use common::model::{BusCompParam, CompParam, DelayParam, EqParam, NativeParamId as P, ReverbParam};
     match param {
         P::On(_) => ("", ScrubableNumberFormat::Integer),
         P::Comp(CompParam::Threshold | CompParam::Makeup) => ("dB", ScrubableNumberFormat::Decimal(1)),
@@ -260,6 +260,29 @@ fn native_unit_format(param: common::model::NativeParamId) -> (&'static str, Scr
             param.step_labels().map_or(ScrubableNumberFormat::Integer, |labels| ScrubableNumberFormat::Choices { labels }),
         ),
         P::ToneEq(_) => ("dB", ScrubableNumberFormat::Decimal(1)),
+        P::Reverb(ReverbParam::Decay) => ("s", ScrubableNumberFormat::Decimal(2)),
+        // 0 = OFF の 2 つ (`ParamRange::LogWithOff`) は "0 ms" / "0 Hz" と出さない。
+        P::Reverb(ReverbParam::Predelay) => {
+            ("ms", ScrubableNumberFormat::SignificantZeroLabeled { digits: 3, zero: "OFF" })
+        }
+        P::Reverb(ReverbParam::LowCut) => {
+            ("Hz", ScrubableNumberFormat::SignificantZeroLabeled { digits: 3, zero: "OFF" })
+        }
+        P::Reverb(ReverbParam::HighCut) => ("Hz", ScrubableNumberFormat::Significant { digits: 3 }),
+        P::Reverb(ReverbParam::ModRate) => ("Hz", ScrubableNumberFormat::Decimal(2)),
+        P::Reverb(ReverbParam::Freeze) => ("", ScrubableNumberFormat::Integer),
+        P::Reverb(_) => ("%", ScrubableNumberFormat::Integer),
+        // 段階式 (音符値 / Pattern / Mode / Drive) は段のラベルをそのまま出す。
+        P::Delay(p @ (DelayParam::DivL | DelayParam::DivR | DelayParam::Pattern | DelayParam::Mode | DelayParam::Drive)) => (
+            "",
+            p.step_labels().map_or(ScrubableNumberFormat::Integer, |labels| ScrubableNumberFormat::Choices { labels }),
+        ),
+        P::Delay(DelayParam::TimeL | DelayParam::TimeR) => ("ms", ScrubableNumberFormat::Significant { digits: 3 }),
+        P::Delay(DelayParam::Hp) => ("Hz", ScrubableNumberFormat::SignificantZeroLabeled { digits: 3, zero: "OFF" }),
+        P::Delay(DelayParam::Lp) => ("Hz", ScrubableNumberFormat::Significant { digits: 3 }),
+        P::Delay(DelayParam::ModRate) => ("Hz", ScrubableNumberFormat::Decimal(2)),
+        P::Delay(DelayParam::Sync | DelayParam::Link | DelayParam::Freeze) => ("", ScrubableNumberFormat::Integer),
+        P::Delay(_) => ("%", ScrubableNumberFormat::Integer),
     }
 }
 

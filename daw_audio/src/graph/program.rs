@@ -1020,7 +1020,7 @@ mod tests {
         bus: &mut (Vec<f32>, Vec<f32>),
         midi: &mut Vec<TimedNoteEvent>,
     ) -> ChainProgram {
-        let built = build_program(&song.tracks[0].devices, 1, None, latencies, &HashSet::new(), scope);
+        let built = build_program(&song.tracks[0].devices, 1, None, latencies, &HashSet::new(), scope, 48_000);
         let mut program = built.program;
         let refs: PluginRefs = std::collections::HashMap::new();
         let lanes = HashSet::new();
@@ -1127,7 +1127,7 @@ mod tests {
             let sr = 48_000u32;
             let n = 960usize; // 20 ms: 50 / 700 / 8000 Hz の周期が整数個乗る
             let built =
-                build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix);
+                build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix, 48_000);
             let mut program = built.program;
             let refs: PluginRefs = std::collections::HashMap::new();
             let lanes = HashSet::new();
@@ -1201,7 +1201,7 @@ mod tests {
         song.tracks[0].devices[0].as_parallel_mut().unwrap().split =
             common::model::Split::Selector { active_chain: 11, fade_ms: 8.0 / 48.0 };
         let taps: HashSet<(u64, common::model::TapPoint)> = [(12, common::model::TapPoint::PostFx)].into();
-        let built = build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &taps, RenderScope::Mix);
+        let built = build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &taps, RenderScope::Mix, 48_000);
         let mut program = built.program;
         let refs: PluginRefs = std::collections::HashMap::new();
         let lanes = HashSet::new();
@@ -1274,7 +1274,7 @@ mod tests {
         let mut midi = Vec::with_capacity(MAX_EVENTS);
         // 同じ program を buffer 跨ぎで回すため `run` ではなく手で組む (`run` は毎回 build する)。
         let built =
-            build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix);
+            build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix, 48_000);
         let mut program = built.program;
         let refs: PluginRefs = std::collections::HashMap::new();
         let lanes = HashSet::new();
@@ -1401,7 +1401,7 @@ mod tests {
             ..common::model::PluginInstance::new("latent".into(), common::plugin_format::PluginFormat::Clap)
         });
         let song = song_with(vec![parallel(10, vec![chain(11, vec![latent]), chain(12, vec![])])]);
-        let built = build_program(&song.tracks[0].devices, 1, None, &lat, &HashSet::new(), RenderScope::Mix);
+        let built = build_program(&song.tracks[0].devices, 1, None, &lat, &HashSet::new(), RenderScope::Mix, 48_000);
         let mut program = built.program;
         let refs: PluginRefs = std::collections::HashMap::new();
         let lanes = HashSet::new();

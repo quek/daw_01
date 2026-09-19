@@ -182,7 +182,7 @@ pub fn compile_schedule(
     let enabled = executable_tracks(song, loading_devices, scope);
     // r.md #110: device ツリーを program に展開する (`docs/plan_parallel.md` §4.1)。
     // 並列 chain の PDC と chain tap の snapshot flag はここで焼き込む。
-    let (mut master_built, mut built, chain_map) = build_all_programs(song, &enabled, device_latencies, scope);
+    let (mut master_built, mut built, chain_map) = build_all_programs(song, &enabled, device_latencies, scope, sample_rate);
     let master_latency = |mix_latency: u32| {
         let chain = master_chain(song, scope);
         master_output_latency(chain, device_latencies, mix_latency, sample_rate, master_limiter_latency, scope)
@@ -289,6 +289,7 @@ fn build_all_programs(
     enabled: &[bool],
     device_latencies: &DeviceLatencies,
     scope: RenderScope,
+    sample_rate: u32,
 ) -> (BuiltProgram, Vec<BuiltProgram>, ChainMap) {
     let chain_taps = collect_chain_taps(song, enabled);
     let master_built = build_program(
@@ -298,6 +299,7 @@ fn build_all_programs(
         device_latencies,
         &chain_taps,
         scope,
+        sample_rate,
     );
     let mut built: Vec<_> = song
         .tracks
@@ -305,7 +307,7 @@ fn build_all_programs(
         .zip(enabled)
         .map(|(t, &on)| {
             let (devices, split) = if on { (t.devices.as_slice(), t.paraout_split_device()) } else { (&[][..], None) };
-            build_program(devices, t.id, split, device_latencies, &chain_taps, scope)
+            build_program(devices, t.id, split, device_latencies, &chain_taps, scope, sample_rate)
         })
         .collect();
     let mut chain_map: ChainMap = HashMap::new();

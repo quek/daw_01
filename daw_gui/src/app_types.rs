@@ -187,7 +187,7 @@ pub fn track_with(f: impl FnOnce(&mut Track)) -> Track {
 }
 
 impl PluginPickEntry {
-    /// r.md #110 / #129 (Q8): ピッカーの全項目 = 内蔵 4 種 (`NativeKind::ALL` の固定順で先頭) +
+    /// r.md #110 / #129 (Q8): ピッカーの全項目 = 内蔵の全種 (`NativeKind::ALL` の固定順で先頭) +
     /// 「Parallel」と DB の plugin (名前順)。 起動時と DB 再走査の両方がこれを通る (SSoT)。
     /// DB が無い環境 (`None`) でも内蔵と Parallel は出る (追加は DB を引かない)。
     pub(crate) fn build_all(db: Option<&common::plugin_db::PluginDatabase>) -> Vec<Self> {

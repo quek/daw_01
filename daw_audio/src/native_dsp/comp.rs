@@ -21,7 +21,7 @@ pub struct CompState {
 
 impl CompState {
     pub(super) fn process(&mut self, s: &CompSettings, b: NativeBlock<'_>) -> f32 {
-        let NativeBlock { l, r, n, sample_rate, sidechain, mut listen_out } = b;
+        let NativeBlock { l, r, n, sample_rate, sidechain, mut listen_out, .. } = b;
         let n = block_len(l, r, n);
         if n == 0 || sample_rate <= 0.0 {
             return 0.0;

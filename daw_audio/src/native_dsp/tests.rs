@@ -137,7 +137,7 @@ fn render(s: &Scenario) -> Vec<WindowStats> {
     }
     let index = common::song_index::SongIndex::build(&song);
     let mut program =
-        build_program(&devices, track_id, None, &DeviceLatencies::new(), &HashSet::new(), common::protocol::RenderScope::Mix)
+        build_program(&devices, track_id, None, &DeviceLatencies::new(), &HashSet::new(), common::protocol::RenderScope::Mix, 48_000)
             .program;
     let mut limiter_state = MasterLimiterState::new();
     let refs: PluginRefs = HashMap::new();

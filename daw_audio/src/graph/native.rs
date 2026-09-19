@@ -141,8 +141,9 @@ pub struct NativeScratch {
 
 impl NativeScratch {
     /// `nd` の scratch を作る (off-RT)。`track_id` = この program の持ち主 (自トラック Pre-FX の判定)。
+    /// `sample_rate` = セッションのサンプルレート (Reverb / Delay の遅延メモリはここで確保する)。
     #[must_use]
-    pub fn new(nd: &NativeDevice, track_id: u32) -> Self {
+    pub fn new(nd: &NativeDevice, track_id: u32, sample_rate: u32) -> Self {
         let kind = nd.kind();
         // 自トラックの Pre-FX は同じ pass の snapshot を直接読む (staging も依存辺も要らない)。
         // 処理しうるか (`can_activate`) は見ない — snapshot は bypass と無関係に取られる。
@@ -151,7 +152,7 @@ impl NativeScratch {
             .is_some_and(|r| r.tap.source == TapSource::Track(track_id) && r.tap.tap_point == TapPoint::PreFx);
         Self {
             device_id: nd.id,
-            dsp: NativeDsp::new(kind),
+            dsp: NativeDsp::new(kind, sample_rate.max(1) as f32),
             fade: BypassFade::new(!nd.bypassed),
             sc_mode: if own_prefx { ScMode::OwnPreFx } else { ScMode::None },
             sc: None,
@@ -164,7 +165,7 @@ impl NativeScratch {
     /// 再 compile を跨ぐ引き継ぎ (RT 上 = 固定長のコピーと `Vec` の swap だけ)。同じ種類のときだけ。
     /// SC の受け皿も swap する — leaf の 1 buffer 遅れの staging を編集のたびに失わない。
     pub fn adopt_state_from(&mut self, old: &mut NativeScratch) {
-        if self.dsp.adopt_state_from(&old.dsp) {
+        if self.dsp.adopt_state_from(&mut old.dsp) {
             self.fade = old.fade;
             self.gr_db = old.gr_db;
             if let (Some(a), Some(b)) = (self.sc.as_mut(), old.sc.as_mut()) {
@@ -250,7 +251,10 @@ pub fn run_native(
     if listen_out.is_some() {
         *listen_pending = Some(native_slot);
     }
-    let gr = dsp.process(&v.params, NativeBlock { l: bus_l, r: bus_r, n, sample_rate, sidechain, listen_out });
+    let gr = dsp.process(
+        &v.params,
+        NativeBlock { l: bus_l, r: bus_r, n, sample_rate, bpm: ctx.current_bpm, sidechain, listen_out },
+    );
     if fading {
         #[allow(clippy::cast_precision_loss)]
         let inv = 1.0 / n as f32;

@@ -19,6 +19,7 @@ use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use super::{AutomationClip, Clip, ClipKey, LaneRef, Song, positional_auto_name};
+use crate::note_value::{NoteKind, NoteValue};
 
 /// ランチャーの 1 列。`Song.scenes` に `Vec` 順 = 表示順で保持する
 /// (並べ替えは `Vec` 内の move、 参照は常に `id`)。
@@ -179,23 +180,17 @@ impl LaunchQuantize {
                 if div == 0 {
                     return None;
                 }
-                let base = 4.0 / f64::from(div);
-                Some(if triplet { base * 2.0 / 3.0 } else { base })
+                let kind = if triplet { NoteKind::Triplet } else { NoteKind::Straight };
+                Some(NoteValue::new(u32::from(div), kind).beats())
             }
         }
     }
 }
 
-/// 1 小節の拍数 (`numerator * 4 / denominator`)。4/4 → 4、3/4 → 3、6/8 → 3。
-/// `common::snap` の `Bars` と同じ式 — 片方だけ直すとグリッドがズレるので、
-/// 式を書き足すときは両方を見ること。
+/// 1 小節の拍数。式の持ち主は [`crate::note_value::beats_per_bar`] (snap のグリッドと同じ 1 本)。
 #[must_use]
 pub fn beats_per_bar(time_sig: (u8, u8)) -> f64 {
-    let (num, den) = (f64::from(time_sig.0), f64::from(time_sig.1));
-    if num <= 0.0 || den <= 0.0 {
-        return 4.0;
-    }
-    num * 4.0 / den
+    crate::note_value::beats_per_bar(time_sig)
 }
 
 /// ローンチ量子化のドロップダウンに出す選択肢の **SSoT** (表示順)。

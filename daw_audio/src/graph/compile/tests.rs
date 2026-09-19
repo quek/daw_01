@@ -2561,7 +2561,7 @@ fn a_post_fx_tap_on_a_group_reads_this_buffers_chain_output() {
 fn sched_free_eq_output(song: &Song, x: &[f32]) -> Vec<f32> {
     let devices = &song.tracks[0].devices;
     let mut alone =
-        crate::graph::build_program(devices, 2, None, &DeviceLatencies::new(), &Default::default(), RenderScope::Mix)
+        crate::graph::build_program(devices, 2, None, &DeviceLatencies::new(), &Default::default(), RenderScope::Mix, 48_000)
             .program;
     let (mut l, mut r) = (x.to_vec(), x.to_vec());
     let refs: crate::engine::PluginRefs = std::collections::HashMap::new();

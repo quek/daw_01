@@ -22,9 +22,9 @@ use daw_gui::dispatcher::{
     BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher,
 };
 
-/// plugin DB と無関係に picker に常に並ぶ行: 内蔵 4 種 (Comp / EQ / Bus Comp / Tone EQ、r.md #129 Q8) +
-/// 「Parallel」 (r.md #110)。
-const BUILTIN_ENTRIES: usize = 5;
+/// plugin DB と無関係に picker に常に並ぶ行: 内蔵の全種 (`NativeKind::ALL`、r.md #129 Q8) +
+/// 「Parallel」 (r.md #110)。**種類を足したら自動で追従する** (数を手で書くと静かに古くなる)。
+const BUILTIN_ENTRIES: usize = common::model::NativeKind::ALL.len() + 1;
 
 fn make_plugin_db_with_n_instruments(n: usize) -> Arc<PluginDatabase> {
     let mut entries = Vec::with_capacity(n);
@@ -108,7 +108,8 @@ fn cursor_clamps_at_lower_bound() {
 fn cursor_clamps_at_upper_bound() {
     let (mut app, _, _) = build_app(5);
     app.handle_event(AppEvent::OpenPluginPicker { chain: None });
-    for _ in 0..10 {
+    // 行数より多く押す (固定回数だと種類が増えたときに下端へ届かなくなる)。
+    for _ in 0..BUILTIN_ENTRIES + 5 + 3 {
         app.handle_event(AppEvent::MovePluginPickerCursor(1));
     }
     assert_eq!(app.ui_ephemeral.plugin_picker_cursor, BUILTIN_ENTRIES + 5 - 1); // visible.len() - 1

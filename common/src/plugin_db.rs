@@ -320,13 +320,15 @@ pub const BUILTIN_ID_VOICEVOX: &str = "builtin://daw_01.voicevox";
 /// plugin ではない (host に load しない、 `PluginDatabase` にも載らない) — picker が
 /// この id を選んだら `Device::Parallel` を挿す。
 pub const PARALLEL_PICKER_ID: &str = "builtin://daw_01.parallel";
-/// r.md #129: picker に「内蔵」として並ぶ 4 種の id (`NativeKind::picker_id`)。plugin ではない
+/// r.md #129 / #134 / #135: picker に「内蔵」として並ぶ種類の id (`NativeKind::picker_id`)。plugin ではない
 /// (host に load しない、`PluginDatabase` にも載らない) — picker がこの id を選んだら
 /// `Device::Native` の追加分を挿す。
 pub const NATIVE_COMP_PICKER_ID: &str = "builtin://daw_01.native.comp";
 pub const NATIVE_EQ_PICKER_ID: &str = "builtin://daw_01.native.eq";
 pub const NATIVE_BUS_COMP_PICKER_ID: &str = "builtin://daw_01.native.bus_comp";
 pub const NATIVE_TONE_EQ_PICKER_ID: &str = "builtin://daw_01.native.tone_eq";
+pub const NATIVE_REVERB_PICKER_ID: &str = "builtin://daw_01.native.reverb";
+pub const NATIVE_DELAY_PICKER_ID: &str = "builtin://daw_01.native.delay";
 /// (talk) 字幕(テキスト表示)デバイス。`ClipContent::Text` clip を画面 overlay 化
 /// するかの**表示ゲート marker** (`docs/plan_voicevox_talk.md` §1.2/§2)。shader 効果では
 /// なく、`text_compose` が「このトラックに在るか」で表示を gate するだけ。`builtin.video.*`

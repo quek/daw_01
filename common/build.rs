@@ -36,6 +36,9 @@ const WIRE_SOURCES: &[&str] = &[
     "src/model/native/eq.rs",
     "src/model/native/bus_comp.rs",
     "src/model/native/tone_eq.rs",
+    // r.md #134 / #135: 内蔵 Reverb / Delay の値 (NativeParams の variant として wire を渡る)。
+    "src/model/native/reverb.rs",
+    "src/model/native/delay.rs",
     "src/model/native_param.rs",
     // master のフェーダー後 Limiter (Song.master_limiter / SetMasterLimiter)。
     "src/model/master_limiter.rs",
