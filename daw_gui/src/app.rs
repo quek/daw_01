@@ -1299,6 +1299,9 @@ impl AppData {
             AppEvent::ToggleStripSection(section) => {
                 self.toggle_strip_section(section);
             }
+            AppEvent::ToggleSendsBand => {
+                self.cur.view.sends_band_open = !self.cur.view.sends_band_open;
+            }
             // メーター / 走行状態 / 変調値面はアクティブなタブの slot だけ読む。届いた
             // 時点で切り替わっていたら (1 tick の窓) 捨てる — 別タブの値を混ぜない。
             AppEvent::TrackPeaksTick { project, tracks, native_gr, master_limiter_gr_db } => {

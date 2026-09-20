@@ -41,7 +41,10 @@ const KNOB_SIZE: f32 = 32.0;
 /// docs/plan_channel_strip.md: 内蔵チャンネルストリップの **常設サムネイル帯**
 /// (EQ カーブ + GR) が必ず上端に乗る。EQ / Comp セクションはこのテストでは
 /// 折り畳んだまま (`UiPrefs` の既定) なので、頭は帯 1 本ぶん。
-const STRIP_HEAD_H: f32 = daw_gui::view::strip_sections::THUMB_H;
+/// r.md #137: その下に Sends 帯の固定の頭 (上端余白 + 「▶ ＋ Send」 行) が乗る
+/// (送り行は畳んだまま = `sends_band_open` の既定は開だが送りが 0 本)。
+const STRIP_HEAD_H: f32 =
+    daw_gui::view::strip_sections::THUMB_H + daw_gui::view::mixer_strips::SENDS_BAND_COLLAPSED_H;
 /// strip 上端から pan 数値の **文字の top** までの距離 (px)。
 /// 頭の帯 + `pad 6 + 名前 18 + M/S 22 + 余白 6` で pan 行 (= ノブ 32px) が始まり、
 /// 数値欄 (16px) はノブと縦センタなので `+8`、 その中で 1 行 (font 10 → 12px) が

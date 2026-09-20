@@ -233,6 +233,10 @@ pub struct ProjectView {
     pub strip_comp_open: bool,
     /// Mixer 帯の組み込み EQ のセクションを開いているか (同上)。
     pub strip_eq_open: bool,
+    /// mixer strip 下部の Sends 帯の送り一覧を開いているか (**全 ch 一括**、r.md #137)。
+    /// 既定は開。畳むと帯はヘッダ行 (開閉 ▼ + 「＋ Send」) だけになり、その分
+    /// フェーダー / メーターが伸びる。session-only: 保存 / Undo 対象外 (見方の都合)。
+    pub sends_band_open: bool,
     /// r.md #129 Q11 / Q18: 開いている Rack Par (plugin / 映像 FX / VOICEVOX / 字幕 / Transform /
     /// Native / Limiter)。Par は行ごとに独立して何枚でも開ける。「見方の都合」なので dirty は
     /// 立てないが `ViewState.open_rack_panels` で保存する (存在しない device は保存時に落とす)。
@@ -909,6 +913,7 @@ impl ProjectState {
                 collapsed_groups: std::collections::HashSet::new(),
                 strip_comp_open: false,
                 strip_eq_open: false,
+                sends_band_open: true,
                 open_rack_panels: std::collections::BTreeSet::new(),
                 expanded_automation_tracks: std::collections::HashSet::new(),
                 collapsed_parallel_nodes: std::collections::HashSet::new(),

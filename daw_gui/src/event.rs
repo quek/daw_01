@@ -1029,6 +1029,9 @@ pub enum AppEvent {
     /// 見方の都合なので `ProjectView` (session-only) に持ち、dirty を立てず Undo にも
     /// 積まない (`collapsed_groups` と同じ扱い)。
     ToggleStripSection(StripSection),
+    /// mixer strip 下部の Sends 帯の送り一覧の開閉 (**全 ch 一括**、r.md #137)。
+    /// `ToggleStripSection` と同じく見方の都合なので `ProjectView` (session-only)。
+    ToggleSendsBand,
     /// Phase 7 B4 (2026-05-13): track Record-arm を toggle。 業界標準どおり
     /// caller 側で前状態を反転、 audio engine には `AudioCommand::SetTrackArmed`
     /// で確定値を送る。 session-only / Undo 対象外 (= 業界標準は arm を Undo

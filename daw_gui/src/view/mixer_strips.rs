@@ -161,15 +161,16 @@ fn style_send_prepost(theme: &Theme) -> ToggleButtonStyle {
 /// strip 帯の外側 (mixer ビューの上下左右) に取る余白 (px)。
 const INNER_PAD: f32 = 8.0;
 
-/// EQ / Comp セクションを開いたことで strip が **余分に** 要る高さ (px)。
-/// 全部折り畳んでいれば `0`。
+/// EQ / Comp セクションと Sends の送り行を開いたことで strip が **余分に**
+/// 要る高さ (px)。全部折り畳んでいれば `0`。
 ///
-/// `root` がこの分だけ下ペインを広げるので、**フェーダー / メーター / Sends の
-/// 高さは開閉で一切変わらない** (`docs/plan_channel_strip.md` §4)。strip の
-/// geometry を知っているのはこの module だけなので、算出もここに置く。
+/// `root` がこの分だけ下ペインを広げるので、**フェーダー / メーターの高さと
+/// 位置は開閉で一切変わらない** (`docs/plan_channel_strip.md` §4、r.md #137)。
+/// strip の geometry を知っているのはこの module だけなので、算出もここに置く。
 #[must_use]
 pub fn extra_head_height(app: &AppData) -> f32 {
     (strip_sections::head_height(app) - strip_sections::THUMB_H).max(0.0)
+        + sends_rows_height(sends_rows(app))
 }
 
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
@@ -211,6 +212,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // ので release-frame の modifier race が無い (arrangement の press_modifiers と同狙い)。
     let visible_order: Vec<u32> = strips.iter().map(|e| e.track_id).collect();
     let select_press = std::cell::Cell::new(None::<u32>);
+
+    // r.md #137: Sends band の行数は **全 strip 共通** (曲で一番 send が多い
+    // トラックに合わせる)。 開いた分は `root` が下ペインを広げて吸収するので、
+    // 本数の違いでも開閉でも fader / メーターの高さと位置は変わらない。
+    let sends_rows = sends_rows(app);
     // live 値 (再生中はレーン値) の文脈は **1 フレームに 1 回**だけ組み、全 strip へ借用で配る
     // (strip ごとに組むと行数 × トラック数の O(N²) になる)。
     let scope = app.live_param_scope();
@@ -251,7 +257,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             {
                 select_press.set(Some(entry.track_id));
             }
-            draw_track_strip(app, ui, entry, strip_rect, &scope);
+            draw_track_strip(app, ui, entry, strip_rect, sends_rows, &scope);
         }
     });
 
@@ -287,6 +293,9 @@ fn draw_track_strip(
     ui: &mut Ui<'_, AppData>,
     entry: &crate::app::TrackMixEntry,
     rect: Rect,
+    // Sends band に出す送り行数。 **全 strip 共通**の値を caller (`draw`) が
+    // 1 フレームに 1 回だけ決めて配る (r.md #137)。
+    sends_rows: usize,
     scope: &LiveParamScope,
 ) {
     let display_name = if entry.depth > 0 {
@@ -303,17 +312,6 @@ fn draw_track_strip(
     } else {
         None
     };
-    let n_sends = app.cur.song_doc.song().track_by_id(track_id).map_or(0, |t| t.sends.len());
-    // strip 高さが足りないときは band 側を縮めてフェーダーの最低高を守る
-    // (縮めた分の send 行は band 内の縦スクロールで到達できる)。 旧実装は
-    // band を要求どおり確保して fader_h を `.max(20.0)` で誤魔化していたため、
-    // send 2 本以上でフェーダー / メーターと Sends セクションが重なって描かれ、
-    // 重なり領域では先に描かれるフェーダーが press を consume して × / send knob が
-    // クリック不能になっていた。
-    // 組み込み Comp / EQ の帯 (`strip_sections`) が上端を食うので、
-    // Sends band に残る余地もその分だけ減る。
-    let sends_band_h =
-        sends_band_height_fitted(n_sends, rect.h - strip_sections::head_height(app));
     draw_strip(
         app,
         ui,
@@ -329,11 +327,11 @@ fn draw_track_strip(
         track_color::to_renderer(entry.color),
         track_id,
         group_collapsed,
-        sends_band_h,
+        sends_rows,
         scope,
     );
-    // Sends セクションは draw_strip の fader 下端より下の band に描画する。
-    draw_sends_section(app, ui, track_id, rect, sends_band_h, scope);
+    // Sends 帯は Comp / EQ 帯の下・トラック名の上 (= strip の上部)。
+    draw_sends_section(app, ui, track_id, rect, sends_rows, scope);
     dim_if_disabled(app, ui, track_id, rect);
 }
 
@@ -374,11 +372,10 @@ fn draw_strip(
     // click で `collapsed_groups` を toggle する
     // (arrangement と同じ SSoT)。 非 group は `None`。
     group_collapsed: Option<bool>,
-    // この strip 下部に確保する Sends セクション band の高さ (px)。 caller が
-    // `sends_band_height` で算出する。 fader 下端をこの分だけ持ち上げて領域を
-    // 空ける。 Sends セクション本体の描画は caller (`draw_track_strip`) が
-    // `draw_sends_section` で行う。
-    sends_band_h: f32,
+    // Sends 帯に出す送り行数 (**全 strip 共通**)。 帯は Comp / EQ 帯の下・
+    // トラック名の上に積むので、 名前以下の y 積み上げがこの分だけ下がる。
+    // 帯本体の描画は caller (`draw_track_strip`) が `draw_sends_section` で行う。
+    sends_rows: usize,
     // フレームで 1 回だけ組んだ live 値の文脈 (`draw` が持つ)。
     scope: &LiveParamScope,
 ) {
@@ -427,7 +424,10 @@ fn draw_strip(
     if let Some(owner) = owner {
         strip_sections::draw_head(app, ui, owner, Rect { h: head_h, ..rect }, pad, bg, scope);
     }
-    let mut y = rect.y + head_h + pad;
+    // r.md #137: その下に Sends 帯 ([`draw_sends_section`] が同じ geometry で描く)。
+    // 開いた行の分は `root` が下ペインを広げて吸収するので、 ここから下
+    // (名前 / M·S / pan / fader) は開閉しても画面上で動かない。
+    let mut y = rect.y + head_h + sends_band_height(sends_rows) + pad;
 
     // 名前 (group strip は左に折り畳み disclosure を置く)。 mixer は strip が
     // **横** に並び、 group の子は右に現れるので開示軸は Inline
@@ -614,17 +614,16 @@ fn draw_strip(
     );
     y += KNOB_SIZE + 2.0;
 
-    // 縦 fader + L/R peak meter。 Sends セクションを持つ strip では、 その
-    // band の高さ分だけ fader 下端を持ち上げて領域を空ける (= caller が
-    // `draw_sends_section` で同じ band geometry を使って描く)。
+    // 縦 fader + L/R peak meter。 下端は strip の下端 (Comp / EQ・Sends の
+    // どちらを開いても動かない)。
     let fader_top = y + 4.0;
-    // `sends_band_height_fitted` はこの積み上げを定数化した値で band 高を決める。
-    // 片方だけ変えると band とフェーダーが重なるので、 一致を固定する。
+    // `STRIP_FADER_TOP_OFFSET` はこの積み上げを定数化した値。 片方だけ変えると
+    // 帯とフェーダーが重なるので、 一致を固定する。
     debug_assert!(
-        (fader_top - (rect.y + head_h + STRIP_FADER_TOP_OFFSET)).abs() < 0.01,
+        (fader_top - (rect.y + head_h + sends_band_height(sends_rows) + STRIP_FADER_TOP_OFFSET)).abs() < 0.01,
         "STRIP_FADER_TOP_OFFSET が draw_strip の y 積み上げとずれている"
     );
-    let fader_bottom = rect.y + rect.h - pad - 12.0 - sends_band_h;
+    let fader_bottom = rect.y + rect.h - STRIP_FADER_BOTTOM_PAD;
     let fader_h = (fader_bottom - fader_top).max(20.0);
 
     let group_w = FADER_W + METER_GAP + METER_SCALE_W;
@@ -681,17 +680,41 @@ fn draw_strip(
     push_mod_depth_bracket(ui, app, ParamSurface::MixerStrip, track_idx, &vol_target, resp.mod_dragging);
 }
 
-/// strip 下部に確保する Sends セクション band の高さ (px)。 send 行数 +
-/// 「＋ Send」 ボタン + 区切り余白で決まる。 `draw_strip` (fader 短縮量) と
-/// `draw_sends_section` (実描画) の両方がこれを使って geometry を揃える。
-fn sends_band_height(n_sends: usize) -> f32 {
-    // 上端の区切り線 + 各 send 行 + 「＋ Send」 ボタン + 下端余白。
-    4.0 + (n_sends as f32) * SEND_ROW_H + ADD_SEND_H + 4.0
+/// Sends band の常設ヘッダ行 (= 全 ch 一括の開閉 disclosure + 「＋ Send」) の
+/// 高さ (px)。 **畳んでいてもこの行は残る**ので、 どの strip からも送りを足せる。
+const SENDS_HEADER_H: f32 = ADD_SEND_H;
+/// Sends band の上端余白 (px)。 Comp / EQ の常設サムネイル帯との間隔。
+const SENDS_BAND_GAP: f32 = 4.0;
+
+/// 送り行を畳んでいるときの Sends band の高さ (px) = 上端余白 + 常設ヘッダ行。
+/// Comp / EQ の常設サムネイル帯と同じく、 **どの strip にも必ず乗る**固定の頭。
+pub const SENDS_BAND_COLLAPSED_H: f32 = SENDS_BAND_GAP + SENDS_HEADER_H;
+
+/// Sends band の高さ (px) = 固定の頭 + 開いている行。
+/// `rows` は [`sends_rows`] が決める **全 strip 共通**の行数。
+fn sends_band_height(rows: usize) -> f32 {
+    SENDS_BAND_COLLAPSED_H + sends_rows_height(rows)
 }
 
-/// フェーダー / メーターに残す最小高 (px)。 これを割り込むと掴めなくなるので、
-/// Sends band 側を縮めて (= band 内を縦スクロールさせて) 守る。
-const MIN_FADER_H: f32 = 28.0;
+/// 開いた送り行が要求する高さ (px)。 **`root` がこの分だけ下ペインを広げる**
+/// ので、 開閉でフェーダー / メーターは 1px も動かない ([`extra_head_height`])。
+fn sends_rows_height(rows: usize) -> f32 {
+    (rows as f32) * SEND_ROW_H
+}
+
+/// Sends band に出す送り行数 (**全 strip 共通**)。 畳んでいるときは 0、
+/// 開いているときは曲の中で一番 send が多いトラックの本数。
+///
+/// 全 strip で同じ行数を確保するので、 送りの本数が違ってもフェーダーと
+/// メーターの高さ・位置は一致する (r.md #137)。 上限を置かない = 一番多い
+/// トラックでも帯の中をスクロールせずに全部見える。
+#[must_use]
+pub fn sends_rows(app: &AppData) -> usize {
+    if !app.cur.view.sends_band_open {
+        return 0;
+    }
+    app.cur.song_doc.song().tracks.iter().map(|t| t.sends.len()).max().unwrap_or(0)
+}
 
 /// strip 上部 (pad + 名前 + M/S + pan 行 + fader 上マージン) が固定で食う高さ。
 /// `draw_strip` の y 積み上げと一致させること (`debug_assert` で固定)。
@@ -707,14 +730,6 @@ const STRIP_FADER_TOP_OFFSET: f32 = STRIP_PAD
 /// fader 下端から strip 下端までの固定余白 (`draw_strip` の `pad + 12.0`)。
 const STRIP_FADER_BOTTOM_PAD: f32 = STRIP_PAD + 12.0;
 
-/// `sends_band_height` を strip の実高さに収まるよう clamp した値。
-/// 収まらないぶんは `draw_sends_section` 内の縦スクロールで到達する。
-fn sends_band_height_fitted(n_sends: usize, strip_h: f32) -> f32 {
-    let want = sends_band_height(n_sends);
-    let room = (strip_h - STRIP_FADER_TOP_OFFSET - MIN_FADER_H - STRIP_FADER_BOTTOM_PAD).max(0.0);
-    want.min(room)
-}
-
 /// controls 行で Pre/Post トグルに割り当てる幅。 knob 右の小ボタン帯から per-send mute
 /// (M) を固定幅で引いた残り全部を Pre/Post に与え、 "Post" (最長ラベル) が省略
 /// (P…) されないようにする。 `inner_w` は strip の内側幅 (= `rect.w - SEND_PAD*2`)。
@@ -729,26 +744,27 @@ fn send_prepost_width(inner_w: f32) -> f32 {
 ///   controls 行: [ミニ level knob | Pre/Post | M(per-send mute)]
 /// 80px ストリップ幅に 4 要素を 1 行で詰めると Pre/Post が ~13px しか取れず "Post"/"Pre"
 /// が "P…" に省略される (daw_01 UI/UX 修正)。 × を header 右上に逃がし、 controls 行の
-/// 残り幅を Pre/Post に寄せて省略を無くす。 末尾に「＋ Send」 ボタン (= track picker を
-/// 開く)。 `band_h` は `sends_band_height` と一致する (= caller が両方に同値を渡す)。
+/// 残り幅を Pre/Post に寄せて省略を無くす。
+///
+/// 帯の構造 (r.md #137)。 **Comp / EQ 帯の下・トラック名の上**に積む:
+/// ```text
+/// [▼][＋ Send]      ヘッダ行 (常設。 ▼ は全 ch 一括の開閉)
+/// [send 行…]        rows 行。 曲で一番 send が多いトラックに合わせるので
+///                   どの strip もスクロール無しで全部見える
+/// ```
+/// `rows` は `sends_rows` が決めた **全 strip 共通**の値 (= caller が全 strip へ
+/// 同値を配る)。 開いた行の分は `root` が下ペインを広げて吸収する
+/// ([`extra_head_height`]) ので、 フェーダーは開閉で動かない。
 fn draw_sends_section(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
     track_id: u32,
     rect: Rect,
-    band_h: f32,
+    rows: usize,
     scope: &LiveParamScope,
 ) {
-    let pad = SEND_PAD;
-    let band_top = rect.y + rect.h - pad - band_h;
-    // 上端に区切り線。 strip の面の上に引くクロームなので本文色 (`text`) で、
-    // fader/メーター帯と Sends 帯の境目をはっきり分ける。
-    ui.panel(
-        ("mixer_sends_div", track_id as usize),
-        Rect { x: rect.x + pad, y: band_top, w: rect.w - pad * 2.0, h: 1.0 },
-        app.theme.core.text,
-        0.0,
-    );
+    let header_y = rect.y + strip_sections::head_height(app) + SENDS_BAND_GAP;
+    draw_sends_header(app, ui, track_id, rect, header_y);
 
     // 各 send の宛先名は派生 (= track_by_id で都度解決)。 send 本体は
     // `app.cur.song_doc.song().track_by_id(track_id).sends` を読む。 track が無ければ
@@ -756,35 +772,42 @@ fn draw_sends_section(
     let Some(src_track) = app.cur.song_doc.song().track_by_id(track_id) else {
         return;
     };
-    // band が必要高より低い (= strip が短い) ときは band 内を縦スクロールさせる。
-    // scrollbar が出る分だけ行の内側幅を詰めて × / M ボタンと重ならないようにする。
-    let content_h = sends_band_height(src_track.sends.len());
-    let band_rect = Rect { x: rect.x, y: band_top, w: rect.w, h: band_h };
-    let scrolling = content_h > band_h + 0.5;
-    let scrollbar_w = if scrolling { 10.0 } else { 0.0 };
-    ui.scroll_area(
-        ("mixer_sends_scroll", track_id as usize),
-        band_rect,
-        (band_rect.w, content_h),
-        |ui, scroll_off| {
-            draw_sends_rows(
-                app,
-                ui,
-                track_id,
-                src_track,
-                rect,
-                band_top - scroll_off.1,
-                scrollbar_w,
-                scope,
-            );
+    if rows == 0 || src_track.sends.is_empty() {
+        return;
+    }
+    draw_sends_rows(app, ui, track_id, src_track, rect, header_y + SENDS_HEADER_H, scope);
+}
+
+/// Sends band のヘッダ行 = [開閉 disclosure][「＋ Send」]。 **畳んでいても常設**
+/// なので、 どの strip からも送りを足せる。 disclosure は全 ch 一括
+/// (`ProjectView::sends_band_open`) で、 開くと中身が **下** に現れるので開示軸は
+/// Block (r.md #74: 展開中 ▼ / 折り畳み中 ▶)。
+fn draw_sends_header(app: &AppData, ui: &mut Ui<'_, AppData>, track_id: u32, rect: Rect, y: f32) {
+    let inner_x = rect.x + SEND_PAD;
+    let inner_w = rect.w - SEND_PAD * 2.0;
+    let collapsed = !app.cur.view.sends_band_open;
+    ui.button_at(
+        ("mixer_sends_disclosure", track_id as usize),
+        disclosure_glyph(collapsed, RevealAxis::Block),
+        Rect { x: inner_x, y, w: DISCLOSURE_W, h: ADD_SEND_H },
+        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleSendsBand)),
+    );
+    // 「＋ Send」 ボタン: track picker を開いて宛先を選ぶ。
+    let add_x = inner_x + DISCLOSURE_W + DISCLOSURE_GAP;
+    ui.button_at(
+        ("mixer_add_send", track_id as usize),
+        "+ Send",
+        Rect { x: add_x, y, w: (inner_x + inner_w - add_x).max(1.0), h: ADD_SEND_H },
+        move || {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::OpenSendPicker { src_track_id: track_id })
+            })
         },
     );
 }
 
-/// Sends band の中身 (send 行 + 「＋ Send」)。 `top` は band 上端 (スクロール
-/// オフセット適用済み)、 `scrollbar_w` は band にスクロールバーが出ているときの
-/// 予約幅。 `draw_sends_section` の scroll_area 内からのみ呼ぶ。
-#[allow(clippy::too_many_arguments)]
+/// Sends band の send 行。 `top` はヘッダ行の直下。
+/// `draw_sends_section` からのみ呼ぶ。
 fn draw_sends_rows(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -792,15 +815,14 @@ fn draw_sends_rows(
     src_track: &common::model::Track,
     rect: Rect,
     top: f32,
-    scrollbar_w: f32,
     scope: &LiveParamScope,
 ) {
     let pad = SEND_PAD;
     // send のミニ knob が可動範囲外をくり抜く面 = strip 本体と同じ (`draw_strip` の bg)。
     let bg = app.theme.core.panel;
-    let mut y = top + 4.0;
+    let mut y = top;
     let inner_x = rect.x + pad;
-    let inner_w = rect.w - pad * 2.0 - scrollbar_w;
+    let inner_w = rect.w - pad * 2.0;
 
     for (send_idx, send) in src_track.sends.iter().enumerate() {
         let dest_name = format!("\u{2192}{}", app.cur.song_doc.song().track_display_name(send.dest_track_id));
@@ -933,20 +955,6 @@ fn draw_sends_rows(
 
         y += SEND_ROW_H;
     }
-
-    // 「＋ Send」 ボタン: track picker を開いて宛先を選ぶ。
-    ui.button_at(
-        ("mixer_add_send", track_id as usize),
-        "+ Send",
-        Rect { x: inner_x, y, w: inner_w, h: ADD_SEND_H },
-        move || {
-            Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::OpenSendPicker {
-                    src_track_id: track_id,
-                })
-            })
-        },
-    );
 }
 
 // ジェスチャーの申告は共通 helper `view::param_gesture::push_param_gesture` (面つき所有者、
