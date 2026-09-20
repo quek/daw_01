@@ -67,22 +67,22 @@ fn 新しいトラックは未命名で上からの番号を表示し並べ替�
 }
 
 #[test]
-fn グループ化とリターン追加も未命名で作りグループもリターンも子も通し番号で数える() {
+fn グループ化と送り先追加も未命名で作りグループも送り先も子も通し番号で数える() {
     let (mut app, _a, _p, _d) = support::build_app();
     app.handle_event(AppEvent::AddInstrumentTrack);
     let children = track_ids(&app);
     app.handle_event(AppEvent::GroupSelectedTracks { track_ids: children.clone() });
     select_track_single(&mut app, 1);
-    app.handle_event(AppEvent::AddReturnTrack);
+    app.handle_event(AppEvent::AddSendToNewTrack { src_track_id: children[0] });
 
     let song = app.cur.song_doc.song();
-    assert_eq!(song.tracks.len(), 4, "グループ + 子 2 本 + リターン");
-    assert_eq!(track_names(&app), ["", "", "", ""], "グループもリターンも名前を焼き込まない");
+    assert_eq!(song.tracks.len(), 4, "グループ + 子 2 本 + 送り先");
+    assert_eq!(track_names(&app), ["", "", "", ""], "グループも送り先も名前を焼き込まない");
     let mix = app.track_mix();
-    let rows: Vec<(&str, bool, bool)> = mix.iter().map(|e| (e.name.as_str(), e.is_group, e.is_return)).collect();
+    let rows: Vec<(&str, bool)> = mix.iter().map(|e| (e.name.as_str(), e.is_group)).collect();
     assert_eq!(
         rows,
-        [("1", true, false), ("2", false, false), ("3", false, false), ("4", false, true)],
+        [("1", true), ("2", false), ("3", false), ("4", false)],
         "上からの通し番号 (グループの子も続きの番号)"
     );
     select_track_single(&mut app, 2);

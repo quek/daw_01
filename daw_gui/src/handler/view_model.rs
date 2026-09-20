@@ -209,19 +209,12 @@ impl AppData {
         let n_tracks = self.cur.song_doc.song().tracks.len();
         let mut is_group_set: std::collections::HashSet<u32> =
             std::collections::HashSet::with_capacity(n_tracks);
-        // リターン判定も同 pass で batch 集計 (= is_group と同 idiom)。
-        // ある track に向けて 1 本でも send があれば、 その宛先はリターン。
-        let mut is_return_set: std::collections::HashSet<u32> =
-            std::collections::HashSet::with_capacity(n_tracks);
         let mut id_to_parent: std::collections::HashMap<u32, Option<u32>> =
             std::collections::HashMap::with_capacity(n_tracks);
         for t in &self.cur.song_doc.song().tracks {
             id_to_parent.insert(t.id, t.parent_group_id);
             if let Some(pid) = t.parent_group_id {
                 is_group_set.insert(pid);
-            }
-            for s in &t.sends {
-                is_return_set.insert(s.dest_track_id);
             }
         }
         // depth は parent chain を walk するが、 lookup を `id_to_parent`
@@ -268,7 +261,6 @@ impl AppData {
                     peak_l_raw: l,
                     peak_r_raw: r,
                     is_group: is_group_set.contains(&t.id),
-                    is_return: is_return_set.contains(&t.id),
                     depth: compute_depth(t.id),
                     color: crate::view::track_color::effective_track_color(t),
                 }

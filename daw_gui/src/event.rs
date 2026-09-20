@@ -1103,13 +1103,14 @@ pub enum AppEvent {
     /// Esc / ショートカット)。
     ToggleResourcePanel,
 
-    // -------- Aux send / return ------------------------------------------
-    /// master 直下 (`parent_group_id = None`) の通常 track を 1 本、 未命名で作る
-    /// (表示は並び順の番号、 r.md #133)。 track が選択中なら
-    /// その track に `Send { dest = 新リターン, gain 1.0, PostFader, enabled }`
-    /// を 1 本足して即座に効果が聞こえるようにする (Ableton "Add Return")。
+    // -------- Aux send ----------------------------------------------------
+    /// master 直下 (`parent_group_id = None`) の通常 track を 1 本、 未命名で作り
+    /// (表示は並び順の番号、 r.md #133)、 `src_track_id` からその新 track へ
+    /// `Send { gain 1.0, PostFader, enabled }` を 1 本張る。 送り先ピッカーの
+    /// 先頭項目 (「＋ 新規トラックに送る」) が発行する唯一の口。 r.md #136:
+    /// 「リターン」 という別枠は UI から廃したので、 出来上がるのはただの track。
     /// 構造変化なので full-song resend を trigger する。
-    AddReturnTrack,
+    AddSendToNewTrack { src_track_id: u32 },
     /// `src_track_id` の `sends` に `dest_track_id` 宛ての send を 1 本追加。
     /// gain 1.0 / PostFader / enabled。 構造変化 → full-song resend。
     AddSend { src_track_id: u32, dest_track_id: u32 },
@@ -1855,7 +1856,7 @@ impl AppEvent {
 
             // ---- トラック ----
             E::AddInstrumentTrack => "トラック追加",
-            E::AddReturnTrack => "リターントラック追加",
+            E::AddSendToNewTrack { .. } => "新規トラックへ送る",
             E::GroupSelectedTracks { .. } => "トラックをグループ化",
             E::UngroupTracks { .. } => "グループ解除",
             E::SetTrackParent { .. } => "トラック親変更",

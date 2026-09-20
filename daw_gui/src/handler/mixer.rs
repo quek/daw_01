@@ -387,46 +387,42 @@ impl AppData {
         }
     }
 
-    // -------- Aux send / return -------------------------------------------
+    // -------- Aux send -----------------------------------------------------
 
-    /// Ableton "Add Return" 相当。 master 直下の通常 track を 1 本 (未命名 = 並び順の番号で表示、
-    /// r.md #133) 作り、 track が選択中ならその track に新リターン宛て
-    /// の send を 1 本足して即座に効果が聞こえるようにする。 構造変化なので
-    /// `flush_song_sync` で full-song resend (= schedule 再 compile)。
+    /// 送り先ピッカーの「＋ 新規トラックに送る」。 master 直下の通常 track を
+    /// 1 本 (未命名 = 並び順の番号で表示、 r.md #133) 作り、 `src_track_id` から
+    /// その track へ send を 1 本張って即座に効果が聞こえるようにする。
+    /// 構造変化なので `flush_song_sync` で full-song resend (= schedule 再 compile)。
     /// `action_add_instrument_track` を mirror した構成。
-    pub(crate) fn action_add_return_track(&mut self) {
+    ///
+    /// r.md #136: 出来上がるのは「リターン」 という別種ではなくただの track
+    /// (REAPER と同じ統一 bus モデル)。 新 track は送り先として真っさらなので
+    /// 閉路は構造上あり得ず、 `can_add_send` の判定は要らない。
+    pub(crate) fn action_add_send_to_new_track(&mut self, src_track_id: u32) {
         let Some(id) = self.edit_song(|song| song.alloc_track_id()) else {
             return;
         };
         let track = track_with(|t| {
             t.id = id;
-            // リターンは master 直下に流す。
+            // 送り先は master 直下に流す。
             t.parent_group_id = None;
         });
         self.edit_song(move |song| song.tracks.push(track));
-        // 選択中 track があれば、 そこから新リターンへ即座に send を 1 本張る
-        // (Ableton "Add Return" の即時性)。 選択が無ければ wiring だけ作って
-        // ユーザーが後で「＋ Send」 で繋ぐ。 自分自身宛て (= 新リターンが
-        // 選択されていた可能性) は意味が無いので除外。
-        if let Some(sel_id) = self.cursor_track_id()
-            && sel_id != id
-        {
-            self.edit_song(move |song| {
-                if let Some(src) = song.tracks.iter_mut().find(|t| t.id == sel_id) {
-                    // v29: 新規 send は必ず per-track allocator で安定 id を採番する。
-                    let send_id = src.alloc_send_id();
-                    src.sends.push(common::model::Send {
-                        id: send_id,
-                        dest_track_id: id,
-                        gain: 1.0,
-                        mode: SendMode::PostFader,
-                        enabled: true,
-                    });
-                }
-            });
-        }
+        self.edit_song(move |song| {
+            if let Some(src) = song.tracks.iter_mut().find(|t| t.id == src_track_id) {
+                // v29: 新規 send は必ず per-track allocator で安定 id を採番する。
+                let send_id = src.alloc_send_id();
+                src.sends.push(common::model::Send {
+                    id: send_id,
+                    dest_track_id: id,
+                    gain: 1.0,
+                    mode: SendMode::PostFader,
+                    enabled: true,
+                });
+            }
+        });
         self.resize_track_peak_display();
-        tracing::info!(return_id = id, "added return track");
+        tracing::info!(src_track_id, dest_track_id = id, "added send to new track");
     }
 
     /// `src_track_id` に `dest_track_id` 宛ての send を 1 本追加。 構造変化

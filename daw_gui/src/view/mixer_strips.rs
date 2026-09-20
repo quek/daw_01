@@ -107,13 +107,9 @@ const SEND_CLOSE_BTN_W: f32 = 14.0;
 const SEND_PREPOST_FONT: f32 = 10.0;
 /// 「＋ Send」 ボタンの高さ。
 const ADD_SEND_H: f32 = 16.0;
-/// returns 帯と通常 strip 帯を分ける divider の幅。
-const RETURN_DIVIDER_W: f32 = 2.0;
 /// track 色ストライプの幅 (px)。 strip 左端に縦に描く。 arrangement header の
 /// `ArrangementStyle.track_color_strip_w` (gui_01 default 4.0) と揃える。
 const COLOR_STRIP_W: f32 = 4.0;
-/// 「＋ Return」 ボタンの高さ (returns 帯の上端に置く)。
-const ADD_RETURN_H: f32 = 22.0;
 
 /// mixer のトグル (M / S / send の Pre-Post / per-send mute) の共通ベース。
 /// ui-core 既定 (`ToggleButtonStyle::from_palette`) から、 mixer の詰まった
@@ -196,64 +192,41 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let strip_h = area.h - inner_pad * 2.0;
     let pitch = STRIP_WIDTH + STRIP_GAP;
 
-    // 派生集合に基づいて mix を「通常 track」 と「リターン (= 他 track の
-    // send 宛先)」 に分割する。 リターンは右側に固めて divider + 緑 tint で
-    // 別物として見せる (Ableton の return track 列メタファ)。 normal / return
-    // 両方とも `track_mix` から来た `is_return` フラグで判定 (派生値、 SSOT)。
+    // r.md #136: 「リターン」 (= 他 track の send 宛先) は派生的な役割でしかなく、
+    // トラックとしては通常 track と同じもの。 REAPER と同じく専用の帯 / tint /
+    // 並び順を与えず、 `song.tracks` の順で 1 列に並べる。
     let mix = app.track_mix();
-    // A track can be both a group (has children) and a return (has incoming
-    // sends) — the unified model allows it and the audio graph handles it.
-    // When it is both, keep it in the *normal* band so it renders with its
-    // children (group hierarchy intact); only a **pure** return (no
-    // children) goes to the returns band. Otherwise the parent strip would
-    // be yanked right while its children stayed left, severing the tree.
-    let (returns, normals): (Vec<_>, Vec<_>) =
-        mix.iter().partition(|e| e.is_return && !e.is_group);
-
     // 折り畳まれた group の配下 strip は隠す (arrangement と同じ
     // `collapsed_groups` を参照 = SSoT 共有)。x レイアウト / content_w が
     // filter 後の index に揃うよう、 並べる前に除外する。group strip 自身は
     // (自分の祖先に collapsed が無い限り) 残り、 disclosure (r.md #74: 展開中 ▶ /
     // 折り畳み中 ▼) を出す。
-    let normals: Vec<_> = normals
-        .into_iter()
-        .filter(|e| !app.is_hidden_under_collapsed_group(e.track_id))
-        .collect();
+    let strips: Vec<_> =
+        mix.iter().filter(|e| !app.is_hidden_under_collapsed_group(e.track_id)).collect();
 
     // r.md #13: strip の名前バンドを押すとトラックを選択する。 arrangement と同じ
     // `selection.selected_track_ids` (SSoT) を読み書きするので、 mixer ↔ arrangement
     // の選択は自動で双方向連動する。 range-select (Shift) の並びは mixer の可視 strip
-    // 順 (normals 左→右 → returns 左→右、 master は除く)。 press 時に modifier を読む
+    // 順 (左→右、 master は除く)。 press 時に modifier を読む
     // ので release-frame の modifier race が無い (arrangement の press_modifiers と同狙い)。
-    let visible_order: Vec<u32> = normals.iter().chain(returns.iter()).map(|e| e.track_id).collect();
+    let visible_order: Vec<u32> = strips.iter().map(|e| e.track_id).collect();
     let select_press = std::cell::Cell::new(None::<u32>);
     // live 値 (再生中はレーン値) の文脈は **1 フレームに 1 回**だけ組み、全 strip へ借用で配る
     // (strip ごとに組むと行数 × トラック数の O(N²) になる)。
     let scope = app.live_param_scope();
 
-    // ----- 右端から固定配置: returns 帯 → 「＋ Return」 -----
     // r.md #50: MASTER ストリップは画面右端の常駐マスターパネル
     // (`view::master_panel`) へ移設したので、ここには居ない。同じフェーダーを
     // 2 か所で編集できる状態を作らないため、Mixer 側からは完全に消す。
-    let returns_right = area.x + area.w - inner_pad;
-
-    // returns 帯: 右端に returns.len() 本 + その左に「＋ Return」 ボタン。
-    // returns 0 本でも「＋ Return」 ボタンは出す。
-    let returns_w = (returns.len() as f32) * pitch;
-    // 「＋ Return」 ボタン用に固定列を 1 本分確保する。
-    let add_return_col_w = STRIP_WIDTH;
-    let returns_band_x = returns_right - returns_w;
-    let add_return_x = returns_band_x - STRIP_GAP - add_return_col_w;
-
-    // 通常 track strips: 左端 inner_pad から returns 帯 / Add Return 列の手前まで
-    // scroll_area で横スクロール。
+    //
+    // track strips: 左端 inner_pad から右端 inner_pad まで scroll_area で横スクロール。
     let scroll_x = area.x + inner_pad;
-    let scroll_right = add_return_x - inner_pad;
+    let scroll_right = area.x + area.w - inner_pad;
     let scroll_w = (scroll_right - scroll_x).max(0.0);
     let scroll_rect = Rect { x: scroll_x, y: strip_y, w: scroll_w, h: strip_h };
-    let content_w = (normals.len() as f32) * pitch;
+    let content_w = (strips.len() as f32) * pitch;
     ui.scroll_area("mixer_strips", scroll_rect, (content_w, strip_h), |ui, offset| {
-        for (i, entry) in normals.iter().enumerate() {
+        for (i, entry) in strips.iter().enumerate() {
             let x = scroll_x - offset.0 + (i as f32) * pitch;
             if x + STRIP_WIDTH < scroll_x || x > scroll_x + scroll_w {
                 continue;
@@ -282,52 +255,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         }
     });
 
-    // ----- 「＋ Return」 ボタン (Add Return 列) -----
-    ui.button_at(
-        "mixer_add_return",
-        "+ Return",
-        Rect { x: add_return_x, y: strip_y, w: add_return_col_w, h: ADD_RETURN_H },
-        || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::AddReturnTrack)),
-    );
-
-    // ----- returns 帯の divider + return strips -----
-    if !returns.is_empty() {
-        // 帯の左端に縦 divider を引いて「ここから右はリターン」 を示す。
-        ui.panel(
-            "mixer_return_divider",
-            Rect {
-                x: returns_band_x - STRIP_GAP - RETURN_DIVIDER_W,
-                y: strip_y,
-                w: RETURN_DIVIDER_W,
-                h: strip_h,
-            },
-            app.theme.daw.strip_return_divider,
-            0.0,
-        );
-        for (i, entry) in returns.iter().enumerate() {
-            let x = returns_band_x + (i as f32) * pitch;
-            // リターンは通常の fader / pan / mute / solo を持つ。 send 元には
-            // ならない想定だが、 リターンから別リターンへ送るのも閉路防止
-            // 込みで許容されている (本タスクでは Sends セクションはリターン
-            // strip には出さない = 簡潔さ優先、 normal strip 経由で繋ぐ)。
-            let strip_rect = Rect { x, y: strip_y, w: STRIP_WIDTH, h: strip_h };
-            if let Some((px, py)) = ptr
-                && strip_rect.contains(px, py)
-            {
-                hovered_strip = Some(entry.track_id);
-            }
-            // 名前バンド上の press でトラック選択 (r.md #13、 returns も実トラック)。
-            let name_band = Rect { x, y: strip_y, w: STRIP_WIDTH, h: NAME_BAND_H };
-            if pointer.primary_just_pressed
-                && let Some((px, py)) = ptr
-                && name_band.contains(px, py)
-            {
-                select_press.set(Some(entry.track_id));
-            }
-            draw_return_strip(app, ui, entry, strip_rect, &scope);
-        }
-    }
-
     // press したトラックがあれば modifier-aware に選択を更新する (r.md #13)。
     // arrangement のヘッダ選択と同じ意味論: Single / Ctrl=Toggle / Shift=Range。
     // r.md #43: 解決ロジックは `AppData::apply_select_tracks` の 1 実装に集約した
@@ -353,8 +280,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     }
 }
 
-/// 通常 (= 非リターン) track strip。 fader / pan / mute / solo + Sends
-/// セクションを描画する。
+/// track strip。 fader / pan / mute / solo + Sends セクションを描画する。
+/// r.md #136: send 宛先になっている track も含め、 全トラックがこれ 1 本。
 fn draw_track_strip(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -362,10 +289,6 @@ fn draw_track_strip(
     rect: Rect,
     scope: &LiveParamScope,
 ) {
-    // グループ強調の色ハイライト (旧 COLOR_GROUP_BG 青 tint) は撤去。
-    // グループ識別は構造手掛かり ("↳" depth prefix + 折り畳み) だけで担い、
-    // 背景は通常 strip と同じ neutral (elevation-1 = strip 本体) に統一する。
-    let bg = app.theme.core.panel;
     let display_name = if entry.depth > 0 {
         let arrows = "↳".repeat(entry.depth.min(4) as usize);
         format!("{arrows} {}", entry.name)
@@ -403,7 +326,6 @@ fn draw_track_strip(
         entry.peak_l_raw,
         entry.peak_r_raw,
         rect,
-        bg,
         track_color::to_renderer(entry.color),
         track_id,
         group_collapsed,
@@ -411,7 +333,7 @@ fn draw_track_strip(
         scope,
     );
     // Sends セクションは draw_strip の fader 下端より下の band に描画する。
-    draw_sends_section(app, ui, track_id, rect, bg, sends_band_h, scope);
+    draw_sends_section(app, ui, track_id, rect, sends_band_h, scope);
     dim_if_disabled(app, ui, track_id, rect);
 }
 
@@ -431,39 +353,6 @@ fn dim_if_disabled(app: &AppData, ui: &mut Ui<'_, AppData>, track_id: u32, rect:
     });
 }
 
-/// リターン strip。 通常の fader / pan / mute / solo を持つが、 緑 tint
-/// (`daw.strip_return_bg`) で別物として見せ、 Sends セクションは描画しない
-/// (= 簡潔さ優先)。
-fn draw_return_strip(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    entry: &crate::app::TrackMixEntry,
-    rect: Rect,
-    scope: &LiveParamScope,
-) {
-    let track_id = entry.track_id;
-    draw_strip(
-        app,
-        ui,
-        track_id as usize,
-        &entry.name,
-        entry.volume,
-        entry.pan,
-        entry.muted,
-        entry.solo,
-        entry.peak_l_raw,
-        entry.peak_r_raw,
-        rect,
-        app.theme.daw.strip_return_bg,
-        track_color::to_renderer(entry.color),
-        track_id,
-        None, // group_collapsed: return strip は disclosure 無し
-        0.0, // sends_band_h = 0 (リターンは send 元 UI を出さない)
-        scope,
-    );
-    dim_if_disabled(app, ui, track_id, rect);
-}
-
 #[allow(clippy::too_many_arguments)]
 fn draw_strip(
     app: &AppData,
@@ -477,29 +366,31 @@ fn draw_strip(
     peak_l_raw: f32,
     peak_r_raw: f32,
     rect: Rect,
-    bg: Color,
     // track の effective 色。 strip 左端に縦カラーストライプを描く (arrangement header と同 idiom)。
     color: Color,
     track_idx: u32,
     // group strip のとき `Some(collapsed)` を渡すと、 名前左に折り畳み
     // disclosure (r.md #74: 展開中 ▶ / 折り畳み中 ▼、 開示軸 Inline) を描き、
     // click で `collapsed_groups` を toggle する
-    // (arrangement と同じ SSoT)。 非 group (通常 track / return) は `None`。
+    // (arrangement と同じ SSoT)。 非 group は `None`。
     group_collapsed: Option<bool>,
-    // この strip 下部に確保する Sends セクション band の高さ (px)。 通常
-    // track は caller が `sends_band_height` で算出した値、 リターン
-    // は 0。 fader 下端をこの分だけ持ち上げて領域を空ける。 Sends セクション
-    // 本体の描画は caller (`draw_track_strip`) が `draw_sends_section` で行う。
+    // この strip 下部に確保する Sends セクション band の高さ (px)。 caller が
+    // `sends_band_height` で算出する。 fader 下端をこの分だけ持ち上げて領域を
+    // 空ける。 Sends セクション本体の描画は caller (`draw_track_strip`) が
+    // `draw_sends_section` で行う。
     sends_band_h: f32,
     // フレームで 1 回だけ組んだ live 値の文脈 (`draw` が持つ)。
     scope: &LiveParamScope,
 ) {
     let p = &app.theme.core;
+    // strip 本体の面 (elevation-1)。 r.md #136: group / リターンで tint を変えず、
+    // 全 strip がこの 1 色。 knob の `surface` もここを見る。
+    let bg = p.panel;
     ui.panel(("mixer_strip_bg", layout_idx), rect, bg, 4.0);
 
     // track 色ストライプ: strip 左端に縦 COLOR_STRIP_W px。 panel と同じ角丸
     // (radius 4) に揃えるため左 2 隅 (tl, bl) のみ丸める。 bg の上に重ねるので
-    // group (青) / return (緑) tint と色衝突せず常にトラック色が視認できる。
+    // 常にトラック色が視認できる。
     ui.push_rect(RectCommand {
         rect: Rect { x: rect.x, y: rect.y, w: COLOR_STRIP_W, h: rect.h },
         fill: color,
@@ -571,8 +462,8 @@ fn draw_strip(
         },
         11.0,
         // 全トラック名を本文色で描画。 旧 dim はクローム面 (strip 本体) に対し
-        // コントラスト不足で読みにくかった。 乗る背景は strip の面 (panel /
-        // return tint) というパレット自身のクロームなので、 極性固定
+        // コントラスト不足で読みにくかった。 乗る背景は strip の面 (`panel`)
+        // というパレット自身のクロームなので、 極性固定
         // インクではなくテーマ従属の `text` でよい。
         p.text,
     );
@@ -633,10 +524,8 @@ fn draw_strip(
         // Pan は bipolar param: 見かけの零点はセンタ (12 時)。 弧はセンタから
         // L/R 方向へ伸び、 センタでは塗りが消えてセンタ notch だけが残る (r.md #47)。
         //
-        // `surface` には **この strip の実際の背景** を渡す。 通常 / group strip は
-        // `panel` だが return strip は緑 tint (`daw.strip_return_bg`) なので、 palette の
-        // 既定 (`panel`) 任せにすると return strip だけ可動範囲外の切り欠きが
-        // 「暗い帯」 として浮く。 caller は bg を持っているので迷わず渡せる。
+        // `surface` には **この strip の実際の背景** を渡す (可動範囲外の切り欠きが
+        // 「暗い帯」 として浮かないように)。
         &KnobStyle { surface: Some(bg), ..KnobStyle::BIPOLAR },
         {
             let target_for_change = pan_target.clone();
@@ -847,9 +736,6 @@ fn draw_sends_section(
     ui: &mut Ui<'_, AppData>,
     track_id: u32,
     rect: Rect,
-    // この strip の背景色。 send のミニ knob が可動範囲外をくり抜くのに使う
-    // (`KnobStyle::surface`)。 strip 本体と同じ面の上に描かれるので同値。
-    bg: Color,
     band_h: f32,
     scope: &LiveParamScope,
 ) {
@@ -887,7 +773,6 @@ fn draw_sends_section(
                 track_id,
                 src_track,
                 rect,
-                bg,
                 band_top - scroll_off.1,
                 scrollbar_w,
                 scope,
@@ -906,12 +791,13 @@ fn draw_sends_rows(
     track_id: u32,
     src_track: &common::model::Track,
     rect: Rect,
-    bg: Color,
     top: f32,
     scrollbar_w: f32,
     scope: &LiveParamScope,
 ) {
     let pad = SEND_PAD;
+    // send のミニ knob が可動範囲外をくり抜く面 = strip 本体と同じ (`draw_strip` の bg)。
+    let bg = app.theme.core.panel;
     let mut y = top + 4.0;
     let inner_x = rect.x + pad;
     let inner_w = rect.w - pad * 2.0 - scrollbar_w;

@@ -94,10 +94,6 @@ palette! {
 
         // ===== ミキサー =====
 
-        /// Return strip 本体 — 緑寄りの tint で通常 track / group bus と区別する。
-        strip_return_bg: Color::rgb(0.18, 0.28, 0.22), srgb(0.863, 0.922, 0.878);
-        /// returns 帯と通常帯を分ける縦 divider。
-        strip_return_divider: Color::rgb(0.30, 0.40, 0.32), srgb(0.561, 0.690, 0.604);
         /// 内蔵チャンネルストリップの EQ カーブ線 (docs/plan_channel_strip.md §3)。
         /// automation (藤) / fx タグ (青) と衝突しない teal に置く。
         strip_eq_curve: Color::rgb(0.40, 0.85, 0.80), srgb(0.043, 0.451, 0.420);

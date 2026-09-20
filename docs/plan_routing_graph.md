@@ -50,8 +50,11 @@ PR4 の **send/return 部分**を実装。group / sidechain / PDC は既存基�
 - IPC: realtime `SetSendGain` / `SetSendEnabled` (構造変更は LoadSong 再コンパ
   イル)。
 - GUI: mixer strip の Sends セクション (level knob + pre/post + mute + remove)、
-  リターンを右帯に表示、Add Return、`track_picker`、SendGain 自動化ジェスチャ。
-  group 兼 return は通常帯に残す (階層保持)。
+  `track_picker`、SendGain 自動化ジェスチャ。r.md #136 (2026-09-20): リターンを
+  右帯 + 緑 tint で別枠にしていた表示と「＋ Return」列は撤去し、送り先になった
+  track も通常 track と同じ 1 列に `song.tracks` 順で並べる (REAPER と同じ統一
+  bus モデル = model が最初から持っていた派生扱いに UI を揃えた)。送り先を新しく
+  作る口は `track_picker` 先頭の「＋ 新規トラックに送る」 1 つ。
 
 ### ソロ × センドの規範挙動 (実機検証で確定)
 

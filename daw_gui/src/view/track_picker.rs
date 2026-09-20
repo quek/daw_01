@@ -5,14 +5,23 @@
 //! 開き、ESC / outside click / Close ボタンで閉じる。宛先 track を選ぶと
 //! `AppEvent::AddSend { src_track_id, dest_track_id }` を発行して閉じる。
 //!
-//! 候補は `AppData::send_destination_candidates` が生成する (= 自分自身と
-//! ルーティング閉路を作る track を除外済み)。
+//! 既存 track の候補は `AppData::send_destination_candidates` が生成する
+//! (= 自分自身とルーティング閉路を作る track を除外済み)。 その先頭に
+//! 「＋ 新規トラックに送る」 (`AppEvent::AddSendToNewTrack`) を置く — r.md #136 で
+//! ミキサーの「＋ Return」 列を廃したので、 **送り先を新しく作る口はここ 1 つ**。
 
 use daw_ui_core::{Edit, ListViewStyle, ModalStyle, Ui};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
+
+/// 一覧 1 行が指す送り先。 既存 track か、 「これから作る 1 本」 か。
+#[derive(Clone, Copy)]
+enum Dest {
+    NewTrack,
+    Existing(u32),
+}
 
 const PANEL_W: f32 = 420.0;
 const PANEL_H: f32 = 420.0;
@@ -29,8 +38,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     }
 
     // 候補は毎フレーム派生 (= AppData は plain struct、 Memo 不使用)。 候補数は
-    // track 数オーダーなので per-frame 再計算で十分。
-    let candidates = app.send_destination_candidates(src_track_id);
+    // track 数オーダーなので per-frame 再計算で十分。 先頭行は「新規トラックを
+    // 作ってそこへ送る」 (= 既存 track が 1 本も無くても必ず選べる)。
+    let rows: Vec<(Dest, String)> = std::iter::once((
+        Dest::NewTrack,
+        "\u{ff0b} \u{65b0}\u{898f}\u{30c8}\u{30e9}\u{30c3}\u{30af}\u{306b}\u{9001}\u{308b}".to_string(),
+    ))
+    .chain(
+        app.send_destination_candidates(src_track_id)
+            .into_iter()
+            .map(|(id, name)| (Dest::Existing(id), name)),
+    )
+    .collect();
 
     // スタイルは const にできない (runtime テーマを読めない、 r.md #48)。 パレット既定を
     // ベースに、 このピッカー固有の寸法だけ差分で上書きする。
@@ -77,22 +96,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 h: panel.y + panel.h - pad - list_y,
             };
 
-            if candidates.is_empty() {
-                ui.label_at(
-                    "sp_empty",
-                    "(\u{9001}\u{308c}\u{308b}\u{30c8}\u{30e9}\u{30c3}\u{30af}\u{306a}\u{3057})",
-                    list_rect.x,
-                    list_rect.y + 8.0,
-                    12.0,
-                    p.text,
-                );
-                return;
-            }
-
             let resp = ui.list_view(
                 "sp_list",
                 list_rect,
-                &candidates,
+                &rows,
                 None,
                 &list_style,
                 |ui, entry, i, row_rect, is_selected| {
@@ -110,11 +117,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
                 },
             );
             if let Some(idx) = resp.clicked
-                && let Some(entry) = candidates.get(idx)
+                && let Some(&(dest, _)) = rows.get(idx)
             {
-                let dest_track_id = entry.0;
+                // 送り先が既存か新規かで発行するイベントだけ変える (閉じる手順は同じ)。
+                let add = match dest {
+                    Dest::NewTrack => AppEvent::AddSendToNewTrack { src_track_id },
+                    Dest::Existing(dest_track_id) => {
+                        AppEvent::AddSend { src_track_id, dest_track_id }
+                    }
+                };
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.handle_event(AppEvent::AddSend { src_track_id, dest_track_id });
+                    app.handle_event(add);
                     app.handle_event(AppEvent::CloseSendPicker);
                 }));
                 ui.close_modal("send_picker");

@@ -1358,8 +1358,8 @@ impl AppData {
                     self.cur.transport.track_voices = voices;
                 }
             }
-            AppEvent::AddReturnTrack => {
-                self.action_add_return_track();
+            AppEvent::AddSendToNewTrack { src_track_id } => {
+                self.action_add_send_to_new_track(src_track_id);
             }
             AppEvent::AddSend { src_track_id, dest_track_id } => {
                 self.add_send(src_track_id, dest_track_id);

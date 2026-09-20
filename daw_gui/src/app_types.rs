@@ -57,10 +57,6 @@ pub struct TrackMixEntry {
     /// `kind == Group` のとき mixer strip / arrangement で別色表示し、
     /// 子トラックを束ねる sub-mix bus として識別する。
     pub is_group: bool,
-    /// このトラックが「リターン」 (= 他トラックの send 宛先) かどうか。
-    /// `is_group` と同じく派生値で、`Track::kind` のような field は無い。
-    /// mixer がリターンストリップを通常 strip と分けて描画するために使う。
-    pub is_return: bool,
     /// このトラックの depth (parent_group_id を辿った段数)。 0 = master 直下、
     /// 1 = 1 段ネスト、… mixer strip / arrangement view が階層インデント描画に使う。
     pub depth: u8,
@@ -84,7 +80,6 @@ impl Default for TrackMixEntry {
             peak_l_raw: 0.0,
             peak_r_raw: 0.0,
             is_group: false,
-            is_return: false,
             depth: 0,
             color: [0.5, 0.5, 0.5],
         }
