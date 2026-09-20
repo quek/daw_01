@@ -65,6 +65,7 @@ pub use widgets::loudness_meter::{LoudnessMeterStyle, loudness_meter_label_w};
 pub use widgets::needle_meter::{NeedleMeterStyle, NeedleScale};
 pub use widgets::oscilloscope::{OscilloscopeStyle, ScopeColumn};
 pub use widgets::spectrum::SpectrumStyle;
+pub use widgets::scroll_area::SCROLLBAR_W;
 pub use widgets::split_view::Orientation;
 pub use widgets::tab_view::TAB_BAR_H;
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};

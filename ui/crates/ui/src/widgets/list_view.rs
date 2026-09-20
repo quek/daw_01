@@ -18,9 +18,7 @@ use crate::id::WidgetId;
 use crate::theme::Palette;
 use crate::ui::Ui;
 
-/// `scroll_area` 内部の scrollbar 幅 (`scroll_area::SCROLLBAR_W` のミラー、
-/// row 幅から差し引くために再宣言)。
-const SCROLLBAR_W: f32 = 10.0;
+use crate::widgets::scroll_area::SCROLLBAR_W;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ListViewStyle {

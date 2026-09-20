@@ -149,8 +149,7 @@ fn internal_drop_indicator_top(
     Some((target_visual as f32) * row_total_h)
 }
 
-/// `scroll_area` 内部の scrollbar 幅 (`scroll_area::SCROLLBAR_W` のミラー、row 幅から差し引くため)。
-const SCROLLBAR_W: f32 = 10.0;
+use crate::widgets::scroll_area::SCROLLBAR_W;
 
 /// drag commit 判定の最小移動量 (px)。これ未満では click 扱いに格下げ。
 /// arrangement の `TrackReorderSession` (Phase 46) と同値。

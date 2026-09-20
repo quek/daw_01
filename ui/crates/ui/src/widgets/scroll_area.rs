@@ -25,7 +25,11 @@ use crate::id::WidgetId;
 use crate::ui::Ui;
 
 /// scrollbar の幅 (px)。track と thumb 共通。
-pub(crate) const SCROLLBAR_W: f32 = 10.0;
+///
+/// **`scroll_area` の外に置くものが scrollbar と重ならないよう自分の高さ / 幅を
+/// 詰めるとき**も、 リテラルを書き写さずこの値を引く (daw_01 の mixer は横
+/// scrollbar のぶん strip を短くする — 詰めないとメーターの下端が隠れる)。
+pub const SCROLLBAR_W: f32 = 10.0;
 /// thumb の最低長さ (px)。content_size が極端に大きいときも掴める大きさを保つ。
 const THUMB_MIN_LEN: f32 = 24.0;
 

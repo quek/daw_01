@@ -9,8 +9,8 @@
 
 use common::model::{AutomationTarget, SendMode, TrackBuiltinParam};
 use daw_ui_core::{
-    Edit, KnobStyle, LevelMeterStyle, MeterBallistic, MeterScale, ScrubableNumberStyle,
-    ToggleButtonStyle, Ui,
+    Edit, KnobStyle, LevelMeterStyle, MeterBallistic, MeterScale, SCROLLBAR_W,
+    ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
 
 use common::automation::{norm_to_plain, plain_to_norm};
@@ -158,9 +158,6 @@ fn style_send_prepost(theme: &Theme) -> ToggleButtonStyle {
     }
 }
 
-/// strip 帯の外側 (mixer ビューの上下左右) に取る余白 (px)。
-const INNER_PAD: f32 = 8.0;
-
 /// EQ / Comp セクションと Sends の送り行を開いたことで strip が **余分に**
 /// 要る高さ (px)。全部折り畳んでいれば `0`。
 ///
@@ -188,9 +185,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let ptr = ui.hover_pos();
     let mut hovered_strip: Option<u32> = None;
 
-    let inner_pad = INNER_PAD;
-    let strip_y = area.y + inner_pad;
-    let strip_h = area.h - inner_pad * 2.0;
+    let strip_y = area.y;
     let pitch = STRIP_WIDTH + STRIP_GAP;
 
     // r.md #136: 「リターン」 (= 他 track の send 宛先) は派生的な役割でしかなく、
@@ -225,13 +220,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (`view::master_panel`) へ移設したので、ここには居ない。同じフェーダーを
     // 2 か所で編集できる状態を作らないため、Mixer 側からは完全に消す。
     //
-    // track strips: 左端 inner_pad から右端 inner_pad まで scroll_area で横スクロール。
-    let scroll_x = area.x + inner_pad;
-    let scroll_right = area.x + area.w - inner_pad;
-    let scroll_w = (scroll_right - scroll_x).max(0.0);
-    let scroll_rect = Rect { x: scroll_x, y: strip_y, w: scroll_w, h: strip_h };
+    // track strips: mixer ビューの全面を使って横スクロール (余白は取らない —
+    // 縦は 1px でもフェーダー / メーターの長さに直結する)。
+    let scroll_x = area.x;
+    let scroll_w = area.w;
     let content_w = (strips.len() as f32) * pitch;
-    ui.scroll_area("mixer_strips", scroll_rect, (content_w, strip_h), |ui, offset| {
+    // 横 scrollbar は scroll_area が **rect の下端**に重ねて描くので、 その分
+    // strip を短くしておく (詰めないとメーターの下端が隠れる)。 出る条件は
+    // scroll_area の `need_h` と同じ。
+    let strip_h = area.h - if content_w > area.w { SCROLLBAR_W } else { 0.0 };
+    let scroll_rect = Rect { x: scroll_x, y: strip_y, w: scroll_w, h: area.h };
+    ui.scroll_area("mixer_strips", scroll_rect, (content_w, area.h), |ui, offset| {
         for (i, entry) in strips.iter().enumerate() {
             let x = scroll_x - offset.0 + (i as f32) * pitch;
             if x + STRIP_WIDTH < scroll_x || x > scroll_x + scroll_w {
@@ -727,8 +726,11 @@ const STRIP_FADER_TOP_OFFSET: f32 = STRIP_PAD
     + KNOB_SIZE
     + 2.0
     + 4.0;
-/// fader 下端から strip 下端までの固定余白 (`draw_strip` の `pad + 12.0`)。
-const STRIP_FADER_BOTTOM_PAD: f32 = STRIP_PAD + 12.0;
+/// fader 下端から strip 下端までの固定余白 = 上端 pad と同じ [`STRIP_PAD`]。
+/// r.md #137 以前はここに `+ 12.0` が乗っていたが、 それは **下端にあった
+/// Sends 帯の区切り線との間隔**で、 帯を strip 上部へ移したあとは死に余白
+/// だった (フェーダーの下に 12px の空きが残る)。
+const STRIP_FADER_BOTTOM_PAD: f32 = STRIP_PAD;
 
 /// controls 行で Pre/Post トグルに割り当てる幅。 knob 右の小ボタン帯から per-send mute
 /// (M) を固定幅で引いた残り全部を Pre/Post に与え、 "Post" (最長ラベル) が省略
