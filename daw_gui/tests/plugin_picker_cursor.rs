@@ -45,6 +45,7 @@ fn make_plugin_db_with_n_instruments(n: usize) -> Arc<PluginDatabase> {
             has_audio_input: false,
             has_video_input: false,
             has_video_output: false,
+            has_embedded_gui: true,
         });
     }
     Arc::new(PluginDatabase::new(entries, None, 0))

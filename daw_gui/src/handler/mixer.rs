@@ -263,8 +263,9 @@ impl AppData {
                         let e = &db.entries()[i];
                         (e.format, e.path.clone(), e.id.clone())
                     };
-                    if let Some(cfg) = crate::subprocess::probe_plugin_ports(format, &path, &id) {
-                        db.update_entry(i, |e| apply_probed_ports(e, &cfg));
+                    if let Some(probe) = crate::subprocess::probe_plugin_ports(format, &path, &id)
+                    {
+                        db.update_entry(i, |e| apply_probe(e, &probe));
                     }
                 }
                 if total > 0 {
@@ -752,11 +753,17 @@ impl AppData {
 /// 戻りの文字列は前後空白を除いてある (呼び側の `trim()` をここに吸収)。
 /// rescan の probe が読んだ port 構成 (note in/out・audio in/out) を DB の entry に書く。映像 port は内蔵映像効果
 /// だけが持つので probe の対象外 (書かない)。
-fn apply_probed_ports(entry: &mut common::plugin_db::PluginEntry, cfg: &common::port_config::PortConfig) {
-    entry.has_note_input = cfg.has_note_input;
-    entry.has_note_output = cfg.has_note_output;
-    entry.has_audio_output = cfg.has_audio_output;
-    entry.has_audio_input = cfg.has_audio_input;
+/// probe subprocess が持ち帰った capability を DB entry へ写す。
+/// video 系は外部 plugin では常に false なので probe 結果で上書きしない (builtin 専用)。
+fn apply_probe(
+    entry: &mut common::plugin_db::PluginEntry,
+    probe: &common::port_config::PluginProbe,
+) {
+    entry.has_note_input = probe.ports.has_note_input;
+    entry.has_note_output = probe.ports.has_note_output;
+    entry.has_audio_output = probe.ports.has_audio_output;
+    entry.has_audio_input = probe.ports.has_audio_input;
+    entry.has_embedded_gui = probe.has_embedded_gui;
 }
 
 pub(crate) fn split_picker_query(query: &str) -> (Option<PluginCategory>, &str) {

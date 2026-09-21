@@ -24,9 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use anyhow::{Context, Result};
 use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
-use crate::vst3_scan::resolve_vst3_dll;
+use crate::module_cache::{ModuleCache, Vst3Module};
 use crate::vst3_scan::{c_array_to_string, tuid_to_hex};
-use libloading::{Library, Symbol};
 use vst3::{
     ComPtr, ComRef, ComWrapper, Interface,
     Steinberg::{
@@ -491,39 +490,25 @@ pub struct Vst3Plugin {
     /// so a stale registry snapshot outliving this struct is benign.
     audio_half: Arc<AudioHalf>,
 
-    /// DLL handle. Declared LAST so it drops LAST.
-    _library: Library,
+    /// 共有モジュール (`LoadLibrary` + `InitDll` + factory)。**最後に宣言** して最後に
+    /// drop する — 最後のインスタンスが消えた時点で `ExitDll` + `FreeLibrary` が走る。
+    _module: Arc<Vst3Module>,
 }
 
 unsafe impl Send for Vst3Plugin {}
 
 impl Vst3Plugin {
-    pub fn load(path: &Path, target_id: &str, callbacks: HostCallbacks) -> Result<Self> {
-        let dll_path = resolve_vst3_dll(path)
-            .with_context(|| format!("resolving VST3 at {}", path.display()))?;
-        let library = unsafe { Library::new(&dll_path) }
-            .with_context(|| format!("LoadLibrary {}", dll_path.display()))?;
-
-        // Call InitDll() if the module exports it (VST3 3.6.x requirement on
-        // Windows). Absent = fine.
-        unsafe {
-            if let Ok(init_dll) = library.get::<Symbol<extern "system" fn() -> bool>>(b"InitDll\0")
-                && !init_dll()
-            {
-                anyhow::bail!("InitDll returned false for {}", dll_path.display());
-            }
-        }
-
-        // Resolve the factory entry.
-        let factory_raw: *mut IPluginFactory = unsafe {
-            let sym: Symbol<extern "system" fn() -> *mut IPluginFactory> = library
-                .get(b"GetPluginFactory\0")
-                .context("missing GetPluginFactory export")?;
-            sym()
-        };
-        anyhow::ensure!(!factory_raw.is_null(), "GetPluginFactory returned null");
-        let factory = unsafe { ComPtr::<IPluginFactory>::from_raw(factory_raw) }
-            .context("factory came back null via from_raw")?;
+    /// `module` は [`ModuleCache`](crate::module_cache::ModuleCache) が持つ **パス単位で
+    /// 共有された** モジュール。`LoadLibrary` / `InitDll` / `GetPluginFactory` はそこで
+    /// 1 回だけ済んでいるので、ここは factory からインスタンスを作るところから始まる。
+    pub fn load(
+        module: Arc<Vst3Module>,
+        path: &Path,
+        target_id: &str,
+        callbacks: HostCallbacks,
+    ) -> Result<Self> {
+        let dll_path = module.path().to_path_buf();
+        let factory = module.factory();
 
         // Scan class infos for Audio Module Class entries. `target_id` is
         // matched as a 32-hex-digit UUID against the class CID; anything
@@ -571,7 +556,7 @@ impl Vst3Plugin {
         };
 
         // Create the component.
-        let component = create_instance::<IComponent>(&factory, &class_cid)
+        let component = create_instance::<IComponent>(factory, &class_cid)
             .context("factory.createInstance for IComponent failed")?;
 
         // Build the host objects.
@@ -606,7 +591,7 @@ impl Vst3Plugin {
         let mut ctrl_cid: TUID = [0; 16];
         let ctrl_res = unsafe { component.getControllerClassId(&mut ctrl_cid as *mut TUID) };
         let (controller, controller_separate) = if ctrl_res == kResultOk && ctrl_cid != class_cid {
-            let c = create_instance::<IEditController>(&factory, &ctrl_cid)
+            let c = create_instance::<IEditController>(factory, &ctrl_cid)
                 .context("failed to create IEditController")?;
             let host_app_ptr2: *mut FUnknown = host_app
                 .to_com_ptr::<FUnknown>()
@@ -738,7 +723,7 @@ impl Vst3Plugin {
             view_alive: Arc::new(AtomicBool::new(false)),
             editor_hwnd: Arc::clone(&callbacks.editor_hwnd),
             audio_half,
-            _library: library,
+            _module: module,
         })
     }
 
@@ -1042,29 +1027,18 @@ fn enumerate_vst3_params(
     out
 }
 
-/// VST3 のクラスを一時 instantiate して bus 構成から port 構成を読む
-/// (`--probe-vst3` one-shot モード)。
-pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::PortConfig> {
-    let dll_path = resolve_vst3_dll(path)
-        .with_context(|| format!("resolving VST3 at {}", path.display()))?;
-    let library = unsafe { Library::new(&dll_path) }
-        .with_context(|| format!("LoadLibrary {}", dll_path.display()))?;
-    unsafe {
-        if let Ok(init_dll) = library.get::<Symbol<extern "system" fn() -> bool>>(b"InitDll\0")
-            && !init_dll()
-        {
-            anyhow::bail!("InitDll returned false");
-        }
-    }
-    let factory_raw: *mut IPluginFactory = unsafe {
-        let sym: Symbol<extern "system" fn() -> *mut IPluginFactory> = library
-            .get(b"GetPluginFactory\0")
-            .context("missing GetPluginFactory export")?;
-        sym()
-    };
-    anyhow::ensure!(!factory_raw.is_null(), "GetPluginFactory returned null");
-    let factory = unsafe { ComPtr::<IPluginFactory>::from_raw(factory_raw) }
-        .context("factory came back null")?;
+/// VST3 のクラスを一時 instantiate して、bus 構成から port 構成を、`createView` から
+/// 埋め込みエディタの有無を読む (`--probe-vst3` one-shot モード)。
+///
+/// **`createView` はここでしか呼ばない。** これがプラグインのクラス単位の性質で、
+/// instance ごとに呼ぶと 1 本あたり +130 MiB / +860 ms 払う
+/// (`common::port_config::PluginProbe::has_embedded_gui` の doc に実測)。
+pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::PluginProbe> {
+    // 使い捨てプロセスなので cache はここだけの寿命。DLL の読み方 (`LoadLibrary` →
+    // `InitDll` → `GetPluginFactory`、畳むときは逆順) の SSoT を `ModuleCache` に寄せる。
+    let mut modules = ModuleCache::default();
+    let module = modules.vst3(path)?;
+    let factory = module.factory();
 
     let count = unsafe { factory.countClasses() };
     let is_uuid =
@@ -1086,7 +1060,7 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
     }
     let class_cid = class_cid.context("no matching Audio Module Class")?;
 
-    let component = create_instance::<IComponent>(&factory, &class_cid)
+    let component = create_instance::<IComponent>(factory, &class_cid)
         .context("createInstance(IComponent) failed")?;
     let host_app = ComWrapper::new(Vst3HostApp::new());
     let host_app_ptr: *mut FUnknown = host_app
@@ -1101,17 +1075,41 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
     let ev_out = unsafe { component.getBusCount(MediaTypes_::kEvent, BusDirections_::kOutput) };
     let au_in = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kInput) };
     let au_out = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput) };
+
+    // 埋め込みエディタの有無。controller が取れなければ「無し」。
+    let has_embedded_gui = component
+        .cast::<IEditController>()
+        .is_some_and(|controller| view_supports_hwnd(&controller));
     let _ = unsafe { component.terminate() };
 
-    Ok(common::port_config::PortConfig {
-        has_note_input: ev_in > 0,
-        has_note_output: ev_out > 0,
-        has_audio_output: au_out > 0,
-        has_audio_input: au_in > 0,
-        // VST3 は映像 port を持たない。
-        has_video_input: false,
-        has_video_output: false,
+    Ok(common::port_config::PluginProbe {
+        ports: common::port_config::PortConfig {
+            has_note_input: ev_in > 0,
+            has_note_output: ev_out > 0,
+            has_audio_output: au_out > 0,
+            has_audio_input: au_in > 0,
+            // VST3 は映像 port を持たない。
+            has_video_input: false,
+            has_video_output: false,
+        },
+        has_embedded_gui,
     })
+}
+
+/// `IEditController::createView("editor")` して HWND を受けられるか聞き、view を捨てる。
+///
+/// **呼ぶのは probe subprocess と、ユーザーが実際にエディタを開く経路だけ。** 呼んだ時点で
+/// プラグインはエディタ実体 (スキン画像など) を作るので、instance の load 時に呼んではいけない。
+fn view_supports_hwnd(controller: &ComPtr<IEditController>) -> bool {
+    let view_raw = unsafe { controller.createView(c"editor".as_ptr()) };
+    if view_raw.is_null() {
+        return false;
+    }
+    let Some(view) = (unsafe { ComPtr::<IPlugView>::from_raw(view_raw) }) else {
+        return false;
+    };
+    let res = unsafe { view.isPlatformTypeSupported(kPlatformTypeHWND) };
+    res == kResultTrue || res == kResultOk
 }
 
 impl Drop for Vst3Plugin {
@@ -1466,31 +1464,12 @@ impl LoadedPlugin for Vst3Plugin {
         self.aux_input_port_count
     }
 
+    /// **load 経路からは呼ばない** (`createView` = エディタ実体の生成)。plugin DB の
+    /// `has_embedded_gui` が SSoT で、これはユーザーがエディタを開く直前の最終確認用。
     fn gui_is_embed_supported(&self) -> bool {
-        // Create view to probe platform support, then release.
-        let view_raw = unsafe { self.controller.createView(c"editor".as_ptr()) };
-        if view_raw.is_null() {
-            tracing::warn!(
-                plugin = %self.name,
-                "VST3 createView returned null — plugin reports no editor"
-            );
-            return false;
-        }
-        let Some(view) = (unsafe { ComPtr::<IPlugView>::from_raw(view_raw) }) else {
-            tracing::warn!(
-                plugin = %self.name,
-                "VST3 createView returned a non-null pointer that ComPtr rejected"
-            );
-            return false;
-        };
-        let res = unsafe { view.isPlatformTypeSupported(kPlatformTypeHWND) };
-        let supported = res == kResultTrue || res == kResultOk;
+        let supported = view_supports_hwnd(&self.controller);
         if !supported {
-            tracing::warn!(
-                plugin = %self.name,
-                "isPlatformTypeSupported(HWND) returned {:#x}",
-                res
-            );
+            tracing::warn!(plugin = %self.name, "VST3 plugin reports no HWND editor");
         }
         supported
     }

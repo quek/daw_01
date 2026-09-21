@@ -58,12 +58,6 @@ pub struct ProjectIpc {
     /// 使う。 session-only (save 対象外、 plugin reload で再取得)。
     /// 変わるたびに世代が進む (レーン名の世代キャッシュが読む、[`PluginParamTable`])。
     pub plugin_params: PluginParamTable,
-    /// device ごとに plugin が埋め込み GUI (editor window)
-    /// を持つか (`PluginParamList` で host が `gui_is_embed_supported` を通知)。
-    /// チェーン行のボタン分岐に使う: GUI あり = 「GUI」 で window を開く、 なし =
-    /// 「⚙」 でインライン param パネルをトグル。 plugin_params と同じ寿命・同じ箇所
-    /// (insert / remove / clear) で維持する。
-    pub slot_has_gui: std::collections::HashMap<u64, bool>,
     /// `device_id` → 現在 plugin_host に load されている plugin の情報。
     /// Undo/Redo の reconcile (`reconcile_plugins_with_song`) で「Song の各
     /// device の plugin が host 側と一致しているか」 を device 粒度で diff する
@@ -884,7 +878,6 @@ impl ProjectState {
                 ara_pcm_materialized: std::collections::HashMap::new(),
                 plugin_param_values: std::collections::HashMap::new(),
                 plugin_params: PluginParamTable::default(),
-                slot_has_gui: std::collections::HashMap::new(),
                 loaded_devices: std::collections::HashMap::new(),
                 pending_clip_fx_bounce: None,
                 pending_glue_bake: None,

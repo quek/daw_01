@@ -353,6 +353,7 @@ fn ara_トラックの片は_modification_を共有し_region_は分割前の位
             has_audio_input: true,
             has_video_input: false,
             has_video_output: false,
+            has_embedded_gui: true,
         }],
         None,
         0,

@@ -51,12 +51,11 @@ use clap_sys::host::clap_host;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 use clap_sys::process::clap_process;
 use clap_sys::stream::{clap_istream, clap_ostream};
-use clap_sys::version::clap_version_is_compatible;
 use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
-use libloading::{Library, Symbol};
 
 use crate::clap_host::Host;
+use crate::module_cache::{ClapModule, ModuleCache};
 use crate::plugin_instance::{
     AudioHalf, AudioProcessorHalf, EditorSizer, HostCallbacks, LoadedPlugin, NoteTransition,
     ResizableProbe, TimedNoteEvent,
@@ -481,11 +480,14 @@ impl AudioProcessorHalf for ClapAudioHalf {
 
 /// Loaded CLAP plugin instance (main half). Holds every resource alive
 /// until dropped. Drop sequence:
-///   1. `impl Drop` body — explicit `gui.destroy` → `plugin.destroy` →
-///      `entry.deinit` (all DLL calls).
-///   2. fields in declaration order; `_library` is declared LAST so
-///      `FreeLibrary` runs after every other field's Drop.
+///   1. `impl Drop` body — explicit `gui.destroy` → `plugin.destroy`
+///      (このインスタンスだけの DLL 呼び出し)。
+///   2. fields in declaration order; `_module` is declared LAST so
+///      `entry.deinit` + `FreeLibrary` は **最後のインスタンスが消えた時だけ**
+///      走る ([`ClapModule`] が所有)。
 pub struct ClapPlugin {
+    /// DSO の静的 entry (`_module` が生きている間だけ有効)。ARA factory の問い合わせに使う。
+    /// **`deinit` はここから呼ばない** — 対の呼び出しは [`ClapModule`] が持つ。
     entry: *const clap_plugin_entry,
     plugin: *const clap_plugin,
     /// CLAP host 実装。`host_data` としてプラグインが握る生ポインタの寿命を持つ。
@@ -519,9 +521,9 @@ pub struct ClapPlugin {
     params_ext: Option<*const clap_plugin_params>,
     /// Audio half (shared with the worker registry via `audio_half()`).
     audio: Arc<AudioHalf>,
-    /// DLL handle. Declared LAST so `FreeLibrary` runs after every other
-    /// field's Drop.
-    _library: Library,
+    /// 共有モジュール (`entry.init` + factory)。**最後に宣言** して最後に drop する —
+    /// 最後のインスタンスが消えた時点で `entry.deinit` + `FreeLibrary` が走る。
+    _module: Arc<ClapModule>,
 }
 
 // The plugin holds raw pointers but ownership is exclusive within the struct.
@@ -532,7 +534,11 @@ impl ClapPlugin {
     /// and instantiates the first one matching `target_id` when provided, or
     /// otherwise the first one for which `matches(features)` returns true.
     /// Returns `Ok(None)` if no descriptor matches.
+    /// `module` は [`ModuleCache`](crate::module_cache::ModuleCache) が持つ **パス単位で
+    /// 共有された** モジュール。`LoadLibrary` / `entry.init` / `get_factory` はそこで 1 回
+    /// だけ済んでいるので、ここは factory からインスタンスを作るところから始まる。
     pub fn load_matching<F>(
+        module: Arc<ClapModule>,
         path: &Path,
         target_id: Option<&str>,
         matches: F,
@@ -541,42 +547,8 @@ impl ClapPlugin {
     where
         F: Fn(&[String]) -> bool,
     {
-        let library = unsafe { Library::new(path) }
-            .with_context(|| format!("failed to load CLAP library at {}", path.display()))?;
-
-        let entry_ptr: *const clap_plugin_entry = unsafe {
-            let sym: Symbol<*const clap_plugin_entry> = library
-                .get(b"clap_entry\0")
-                .context("CLAP library does not export clap_entry symbol")?;
-            *sym
-        };
-        anyhow::ensure!(!entry_ptr.is_null(), "clap_entry symbol is null");
-        let entry = unsafe { &*entry_ptr };
-
-        anyhow::ensure!(
-            clap_version_is_compatible(entry.clap_version),
-            "CLAP version {}.{}.{} is incompatible with host",
-            entry.clap_version.major,
-            entry.clap_version.minor,
-            entry.clap_version.revision
-        );
-
-        let path_str = path.to_string_lossy();
-        let c_path = CString::new(path_str.as_bytes())
-            .context("plugin path contains interior nul byte")?;
-        let init_fn = entry.init.context("clap_plugin_entry::init is null")?;
-        anyhow::ensure!(
-            unsafe { init_fn(c_path.as_ptr()) },
-            "clap_entry.init returned false for {}",
-            path.display()
-        );
-
-        let get_factory = entry
-            .get_factory
-            .context("clap_plugin_entry::get_factory is null")?;
-        let factory_ptr = unsafe { get_factory(CLAP_PLUGIN_FACTORY_ID.as_ptr()) }
-            as *const clap_plugin_factory;
-        anyhow::ensure!(!factory_ptr.is_null(), "clap_plugin_factory is null");
+        let entry_ptr = module.entry();
+        let factory_ptr = module.factory();
         let factory = unsafe { &*factory_ptr };
 
         let get_count = factory
@@ -618,11 +590,9 @@ impl ClapPlugin {
         }
 
         let Some(index) = selected else {
-            // No descriptor matched — unload cleanly and report no match.
-            if let Some(deinit) = entry.deinit {
-                unsafe { deinit() };
-            }
-            drop(library);
+            // 該当 descriptor なし。モジュールは共有なので、ここで落とすのは自分の参照だけ
+            // (`entry.deinit` は最後の保持者が消えたとき `ClapModule::drop` が 1 回だけ呼ぶ)。
+            drop(module);
             return Ok(None);
         };
 
@@ -780,19 +750,24 @@ impl ClapPlugin {
             latency_ext,
             params_ext,
             audio,
-            _library: library,
+            _module: module,
         }))
     }
 
     /// Loads a plugin in the file. If `target_id` is non-empty, selects that
     /// specific descriptor; otherwise loads the first descriptor in the file.
-    pub fn load(path: &Path, target_id: &str, callbacks: HostCallbacks) -> Result<Self> {
+    pub fn load(
+        module: Arc<ClapModule>,
+        path: &Path,
+        target_id: &str,
+        callbacks: HostCallbacks,
+    ) -> Result<Self> {
         let opt_id = if target_id.is_empty() {
             None
         } else {
             Some(target_id)
         };
-        Self::load_matching(path, opt_id, |_| true, callbacks)?.ok_or_else(|| {
+        Self::load_matching(module, path, opt_id, |_| true, callbacks)?.ok_or_else(|| {
             if target_id.is_empty() {
                 anyhow::anyhow!("no plugins in {}", path.display())
             } else {
@@ -1317,10 +1292,10 @@ impl Drop for ClapPlugin {
             if let Some(destroy) = (*self.plugin).destroy {
                 destroy(self.plugin);
             }
-            if let Some(deinit) = (*self.entry).deinit {
-                deinit();
-            }
         }
+        // `entry.deinit` はここでは呼ばない。CLAP 1.2.0 `entry.h` は init/deinit を
+        // 「1 回ずつ、対で」と定めていて、対の相手は `ClapModule::drop` (最後の
+        // インスタンスが消えたとき 1 回) が持つ。
         tracing::info!(name = %self.name, path = %self.path.display(), "plugin destroyed");
     }
 }
@@ -1957,43 +1932,19 @@ fn log_note_ports(plugin: *const clap_plugin, get_ext: GetExtFn) {
 
 /// CLAP プラグインを一時 instantiate して note-ports / audio-ports
 /// extension から port 構成を読む (`--probe-clap` one-shot モード)。
-pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::PortConfig> {
-    let library = unsafe { Library::new(path) }
-        .with_context(|| format!("loading CLAP at {}", path.display()))?;
-    let entry_ptr: *const clap_plugin_entry = unsafe {
-        let sym: Symbol<*const clap_plugin_entry> = library
-            .get(b"clap_entry\0")
-            .context("missing clap_entry symbol")?;
-        *sym
-    };
-    anyhow::ensure!(!entry_ptr.is_null(), "clap_entry is null");
-    let entry = unsafe { &*entry_ptr };
-    anyhow::ensure!(
-        clap_version_is_compatible(entry.clap_version),
-        "incompatible CLAP version"
-    );
-    let c_path =
-        CString::new(path.to_string_lossy().as_bytes()).context("path has interior nul")?;
-    let init_fn = entry.init.context("clap_plugin_entry::init is null")?;
-    anyhow::ensure!(
-        unsafe { init_fn(c_path.as_ptr()) },
-        "clap_entry.init returned false"
-    );
-
-    // entry.init 成功後はどの経路でも deinit + library drop して資源を返す。
-    let probe = probe_ports_after_entry_init(entry, target_id);
-
-    if let Some(deinit) = entry.deinit {
-        unsafe { deinit() };
-    }
-    drop(library);
-    probe
+pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::PluginProbe> {
+    // 使い捨てプロセスなので cache はここだけの寿命。DSO の読み方 (`LoadLibrary` →
+    // `entry.init` → `get_factory`、畳むときは `deinit` → `FreeLibrary`) の SSoT を
+    // `ModuleCache` に寄せる — probe が成功しても失敗しても `module` の drop が対を閉じる。
+    let mut modules = ModuleCache::default();
+    let module = modules.clap(path)?;
+    probe_ports_after_entry_init(unsafe { &*module.entry() }, target_id)
 }
 
 fn probe_ports_after_entry_init(
     entry: &clap_plugin_entry,
     target_id: &str,
-) -> Result<common::port_config::PortConfig> {
+) -> Result<common::port_config::PluginProbe> {
     let get_factory = entry.get_factory.context("get_factory is null")?;
     let factory_ptr = unsafe { get_factory(CLAP_PLUGIN_FACTORY_ID.as_ptr()) }
         as *const clap_plugin_factory;
@@ -2041,7 +1992,7 @@ fn probe_ports_after_entry_init(
 
 fn clap_plugin_port_config(
     plugin_ptr: *const clap_plugin,
-) -> Result<common::port_config::PortConfig> {
+) -> Result<common::port_config::PluginProbe> {
     let plugin_init = unsafe { (*plugin_ptr).init }.context("plugin.init is null")?;
     anyhow::ensure!(
         unsafe { plugin_init(plugin_ptr) },
@@ -2070,14 +2021,26 @@ fn clap_plugin_port_config(
             _ => (0, 0),
         }
     };
-    Ok(common::port_config::PortConfig {
-        has_note_input: note_in > 0,
-        has_note_output: note_out > 0,
-        has_audio_output: audio_out > 0,
-        has_audio_input: audio_in > 0,
-        // CLAP は映像 port を持たない。
-        has_video_input: false,
-        has_video_output: false,
+    // CLAP は `is_api_supported` で聞けるので、VST3 と違って GUI を作らずに分かる。
+    // それでも答えの置き場は plugin DB (クラス単位) で揃える — device 行のボタンが
+    // 「窓を開く」か「param パネル」かは、instance ごとに聞き直す性質ではない。
+    let has_embedded_gui = {
+        let ext = unsafe { get_ext(plugin_ptr, CLAP_EXT_GUI.as_ptr()) } as *const clap_plugin_gui;
+        unsafe { ext.as_ref() }
+            .and_then(|e| e.is_api_supported)
+            .is_some_and(|f| unsafe { f(plugin_ptr, CLAP_WINDOW_API_WIN32.as_ptr(), false) })
+    };
+    Ok(common::port_config::PluginProbe {
+        ports: common::port_config::PortConfig {
+            has_note_input: note_in > 0,
+            has_note_output: note_out > 0,
+            has_audio_output: audio_out > 0,
+            has_audio_input: audio_in > 0,
+            // CLAP は映像 port を持たない。
+            has_video_input: false,
+            has_video_output: false,
+        },
+        has_embedded_gui,
     })
 }
 

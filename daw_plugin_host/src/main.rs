@@ -22,6 +22,8 @@ mod vst3_scan;
 mod clap_host;
 mod clap_plugin;
 mod editor_keys;
+mod load_bench;
+mod module_cache;
 mod editor_window;
 mod plugin_instance;
 mod process_scaffold;
@@ -280,6 +282,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // one-shot 読み込みベンチ。引数の解釈から出力まで `load_bench` が持つ
+    // (使い方と flag は同モジュールの doc が正本)。
+    if std::env::args().nth(1).as_deref() == Some("--load-bench") {
+        return load_bench::run_from_args();
+    }
+
     let pipe_name = std::env::args()
         .nth(1)
         .context("expected pipe name as first argument")?;
@@ -325,7 +333,8 @@ fn editor_selftest(path: &std::path::Path, target_id: &str, seconds: u64) -> Res
         "loading {} as {format:?} (target_id={target_id:?})",
         path.display()
     ));
-    let mut plugin = load_plugin(format, path, target_id, HostCallbacks::noop())
+    let mut modules = module_cache::ModuleCache::default();
+    let mut plugin = load_plugin(&mut modules, format, path, target_id, HostCallbacks::noop())
         .context("load_plugin failed")?;
     anyhow::ensure!(
         plugin.gui_is_embed_supported(),
@@ -423,7 +432,8 @@ fn ara_selftest(path: &std::path::Path, target_id: &str, wav: Option<&str>) -> R
         PluginFormat::Vst3
     };
     step(&format!("loading {} as {format:?} (target_id={target_id:?})", path.display()));
-    let mut plugin = load_plugin(format, path, target_id, HostCallbacks::noop())
+    let mut modules = module_cache::ModuleCache::default();
+    let mut plugin = load_plugin(&mut modules, format, path, target_id, HostCallbacks::noop())
         .context("load_plugin failed")?;
     step("loaded ok; calling bind_ara_if_capable");
     let bound = plugin
@@ -691,6 +701,9 @@ struct PluginHost {
     next_shmem_incarnation: u64,
     /// **唯一の bookkeeping** (v29): 安定 device → record。
     instances: HashMap<DeviceAddr, InstanceRecord>,
+    /// 読み込み済みモジュール (パス単位で 1 つ)。同じプラグインを N 本立てても DSO を
+    /// 読み直さない。`crate::module_cache` の module doc に一次情報と実測。
+    modules: module_cache::ModuleCache,
     /// worker pool が dispatch 中に読む registry の正本 (worker へは snapshot の受け渡しで届く)。
     registry: PluginRegistry,
     worker_pool: Option<process_server::WorkerPool>,
@@ -717,6 +730,7 @@ impl PluginHost {
             pid: std::process::id(),
             next_shmem_incarnation: 0,
             instances: HashMap::new(),
+            modules: module_cache::ModuleCache::default(),
             registry: PluginRegistry::default(),
             worker_pool: None,
             wedged: Vec::new(),
@@ -858,12 +872,7 @@ impl PluginHost {
         if !params.is_empty() {
             tracing::info!(?device, count = params.len(), "plugin enumerated params");
         }
-        let has_embedded_gui = rec.plugin.gui_is_embed_supported();
-        self.emit(PluginEvent::PluginParamList {
-            device,
-            params,
-            has_embedded_gui,
-        });
+        self.emit(PluginEvent::PluginParamList { device, params });
     }
 
     // ----------------------------------------------------------------
@@ -953,6 +962,8 @@ impl PluginHost {
                 }
                 self.ara_states.close_project(project);
                 self.projects.remove(&project);
+                // まとめて消えた直後 = 死んだ Weak が一番たまる位置。
+                self.modules.prune();
             }
             PluginCommand::RequestSlotState { device } => {
                 let data = match self.instances.get_mut(&device) {
@@ -1123,8 +1134,11 @@ impl PluginHost {
 
         // (1) 新 plugin の instantiate。失敗 ⇒ 旧 plugin は touch せず早期
         //     return (旧 plugin が居れば継続再生)。
+        // 読み込みが遅いときに「どこで」を後から言えるように、フェーズごとの所要を測る。
+        // ログ 1 行 = 1 device (`plugin load timing`)。推測でなく数字で切り分けるための器。
+        let t_load = Instant::now();
         let callbacks = self.make_callbacks(device);
-        let mut plugin = match load_plugin(format, path, plugin_id, callbacks) {
+        let mut plugin = match load_plugin(&mut self.modules, format, path, plugin_id, callbacks) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(error = ?e, ?format, path = %path.display(), "load failed");
@@ -1137,13 +1151,17 @@ impl PluginHost {
                 return;
             }
         };
+        let load_ms = t_load.elapsed().as_millis();
         // (r.md #5 ARA2) Bind ARA before the first state load / activate /
         // GUI creation, as the ARA spec requires.
+        let t_ara = Instant::now();
         if let Err(e) = plugin.bind_ara_if_capable() {
             tracing::error!(error = ?e, ?device, "ARA bind at load failed");
         }
         // state_load 失敗は握りつぶさず `state_load_error` で daw_gui へ
         // (silent corruption fix)。plugin 自体は default 状態で進む。
+        let ara_ms = t_ara.elapsed().as_millis();
+        let t_state = Instant::now();
         let state_load_error: Option<String> = if let Some(bytes) = initial_state {
             match plugin.state_load(&bytes) {
                 Ok(()) => None,
@@ -1168,8 +1186,11 @@ impl PluginHost {
         //     `SlotPluginShmemReleased` は teardown_device が必ず送るので、
         //     daw_audio は下の (4) で作る新 mapping を開く前に旧 mapping を
         //     落とす (= 旧へ書いて新を読む窓が閉じる)。 差し替える ARA document の状態は取っておく。
+        let state_ms = t_state.elapsed().as_millis();
+        let t_teardown = Instant::now();
         self.keep_ara_document(device);
         self.teardown_device(device, false);
+        let teardown_ms = t_teardown.elapsed().as_millis();
 
         // (3) activate + start_processing。v29: 失敗した plugin は registry
         //     に **publish しない** (旧実装は無条件 publish でゾンビ化 →
@@ -1177,6 +1198,7 @@ impl PluginHost {
         //     `SlotPluginLoadFailed` で GUI へ可視化する。
         let sr = f64::from(self.session.sample_rate);
         let mf = self.session.max_frames;
+        let t_activate = Instant::now();
         if let Err(e) = plugin
             .activate(sr, 64, mf)
             .and_then(|()| plugin.start_processing())
@@ -1199,6 +1221,8 @@ impl PluginHost {
         //     `common::plugin_ref` の命名契約を参照。世代を含めれば前世代が
         //     生き残っていても create は必ず成功し、旧 mapping は保持者が
         //     居なくなった時点で静かに消える。
+        let activate_ms = t_activate.elapsed().as_millis();
+        let t_shmem = Instant::now();
         self.next_shmem_incarnation += 1;
         let token = InstanceToken(self.next_shmem_incarnation);
         let shmem_id = process_data_shmem_id(self.pid, device.device_id, token.0);
@@ -1227,19 +1251,24 @@ impl PluginHost {
 
         // (5) record 化 + registry publish + 通知。latency / params query は
         //     publish **前** (= plugin-main が排他アクセスを持つ間) に行う。
+        let shmem_ms = t_shmem.elapsed().as_millis();
+        let t_query = Instant::now();
         let loaded_id = plugin.id().to_string();
         let loaded_name = plugin.name().to_string();
         let aux_output_count = plugin.aux_output_port_count().min(u8::MAX as usize) as u8;
         let aux_input_count = plugin.aux_input_port_count().min(u8::MAX as usize) as u8;
         let latency_samples = plugin.query_latency();
         let params = plugin.enumerate_params();
-        let has_embedded_gui = plugin.gui_is_embed_supported();
+        // 埋め込み GUI の有無はここで聞かない (VST3 では `createView` = エディタ実体の
+        // 生成で、1 本あたり +130 MiB / +860 ms)。plugin DB が SSoT。
         let audio = plugin.audio_half();
         let pd_ptr = shmem.ptr();
         // r.md #87: ARA を bind した instance は musical timeline を song に
         // 固定する (`PluginEntry::transport_pinned_to_song`)。判定は
         // `self.instances` へ move する前に取る。
         let transport_pinned_to_song = plugin.has_ara_session();
+        let query_ms = t_query.elapsed().as_millis();
+        let t_publish = Instant::now();
 
         self.instances.insert(
             device,
@@ -1281,6 +1310,20 @@ impl PluginHost {
             aux_input_count,
             generation,
         });
+        tracing::info!(
+            ?device,
+            load_ms,
+            ara_ms,
+            state_ms,
+            teardown_ms,
+            activate_ms,
+            shmem_ms,
+            query_ms,
+            publish_ms = t_publish.elapsed().as_millis(),
+            total_ms = t_load.elapsed().as_millis(),
+            n_params = params.len(),
+            "plugin load timing"
+        );
         tracing::info!(?device, samples = latency_samples, "plugin reported latency");
         self.emit(PluginEvent::PluginLatencyChanged {
             device,
@@ -1289,11 +1332,7 @@ impl PluginHost {
         if !params.is_empty() {
             tracing::info!(?device, count = params.len(), "plugin enumerated params");
         }
-        self.emit(PluginEvent::PluginParamList {
-            device,
-            params,
-            has_embedded_gui,
-        });
+        self.emit(PluginEvent::PluginParamList { device, params });
     }
 
     /// device の instance を完全 teardown する。`emit_unloaded` は
@@ -2192,7 +2231,7 @@ fn plugin_main_loop(
 /// CLAP / VST3 spec の teardown 順 (stop_processing → deactivate →
 /// gui_destroy → drop) を実行する。呼び出し側は事前に registry detach +
 /// `WorkerPool::quiesce` を済ませて、worker からの参照が無いことを保証する。
-fn teardown_plugin(mut plugin: Box<dyn LoadedPlugin>) {
+pub(crate) fn teardown_plugin(mut plugin: Box<dyn LoadedPlugin>) {
     plugin.stop_processing();
     plugin.deactivate();
     plugin.gui_destroy();

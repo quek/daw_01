@@ -327,10 +327,8 @@ impl AppData {
             PluginEvent::PluginParamList {
                 device: DeviceAddr { device_id, .. },
                 params,
-                has_embedded_gui,
             } => {
                 self.cur.pipc.plugin_params.insert(device_id, params);
-                self.cur.pipc.slot_has_gui.insert(device_id, has_embedded_gui);
             }
             PluginEvent::PluginParamTouched {
                 device: DeviceAddr { device_id, .. },

@@ -31,6 +31,9 @@ fn entry(id: &str, name: &str, instrument: bool, path: &str) -> PluginEntry {
         has_audio_input: !instrument,
         has_video_input: false,
         has_video_output: false,
+        // 外部 CLAP/VST3 の既定は「エディタ窓を持つ」。チェーン行のボタンが
+        // 窓を開く経路 (`ToggleSlotGui`) を通るのはこの値が true のときだけ。
+        has_embedded_gui: true,
     }
 }
 

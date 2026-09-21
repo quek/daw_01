@@ -55,6 +55,7 @@ fn ara_db() -> Arc<PluginDatabase> {
         has_audio_input: true,
         has_video_input: false,
         has_video_output: false,
+        has_embedded_gui: true,
     };
     Arc::new(PluginDatabase::new(vec![entry], None, 0))
 }

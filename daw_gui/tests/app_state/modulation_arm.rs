@@ -80,7 +80,6 @@ fn build_app_with_two_fx_tracks() -> (AppData, u32) {
                 default_value: 0.5,
                 flags: 0,
             }],
-            has_embedded_gui: true,
         }));
     }
     let source_id = app.cur.song_doc.song().mod_sources[0].id;

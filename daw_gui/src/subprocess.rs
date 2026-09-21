@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use common::plugin_format::PluginFormat;
-use common::port_config::PortConfig;
+use common::port_config::PluginProbe;
 use tokio::process::{Child, Command};
 
 /// Windows: 子プロセスのコンソール窓を抑制する creation flag。 release では
@@ -83,7 +83,7 @@ pub fn probe_plugin_ports(
     format: PluginFormat,
     path: &Path,
     target_id: &str,
-) -> Option<PortConfig> {
+) -> Option<PluginProbe> {
     const TIMEOUT: Duration = Duration::from_secs(8);
     let flag = match format {
         PluginFormat::Vst3 => "--probe-vst3",
@@ -95,7 +95,7 @@ pub fn probe_plugin_ports(
     cmd.args([flag, &path.display().to_string(), target_id]);
     // stdout を並行 drain して読む (pipe-buffer deadlock 回避、 scan と共通経路)。
     let out = run_capture_stdout(cmd, TIMEOUT, "plugin port probe")?;
-    out.lines().find_map(PortConfig::parse_line)
+    out.lines().find_map(PluginProbe::parse_line)
 }
 
 /// daw_plugin_host を `--scan-plugins` 使い捨てプロセスとして起動し、システムのプラグイン DB

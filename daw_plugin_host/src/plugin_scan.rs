@@ -73,6 +73,10 @@ pub fn scan_system() -> Result<PluginDatabase> {
                     // 外部 VST3 は映像 device ではない。
                     has_video_input: false,
                     has_video_output: false,
+                    // probe 前の暫定値は **true** (楽観)。外れたときの見え方が
+                    // 「窓が開かない」ではなく「param パネルが出る」側に倒れるので、
+                    // 持っている物を持っていない扱いにするより害が小さい。probe が上書きする。
+                    has_embedded_gui: true,
                 });
             }
         }
@@ -196,6 +200,8 @@ fn scan_one_file(path: &Path) -> Result<Vec<PluginEntry>> {
             // 外部 CLAP は映像 device ではない。
             has_video_input: false,
             has_video_output: false,
+            // VST3 と同じく probe 前は楽観的に true。
+            has_embedded_gui: true,
         });
     }
 

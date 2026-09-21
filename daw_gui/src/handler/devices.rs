@@ -457,7 +457,6 @@ impl AppData {
     pub(crate) fn forget_device_caches(&mut self, device_id: u64) {
         self.cur.pipc.loaded_devices.remove(&device_id);
         self.cur.pipc.plugin_params.remove(&device_id);
-        self.cur.pipc.slot_has_gui.remove(&device_id);
         self.cur.pipc
             .plugin_param_values
             .retain(|k, _| k.device_id != device_id);
@@ -508,18 +507,11 @@ impl AppData {
             self.toggle_rack_panel(common::model::RackPanelKey::Device(device_id));
             return; // 映像 device は plugin window を持たない。
         }
-        // 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し
-        // CLAP・VST3) は editor window を開けない。 代わりにインスペクタ内の汎用
-        // param パネル (Par) をトグルする。 builtin は format から
-        // 即断 (PluginParamList 到着前でも正しく分岐)、 外部 plugin は host の
-        // `PluginParamList`(has_embedded_gui=false) 通知に従う。
-        let is_builtin = device.is_some_and(|d| d.format == PluginFormat::Builtin);
-        let has_embedded_gui = !is_builtin
-            && self
-                .cur.pipc.slot_has_gui
-                .get(&device_id)
-                .copied()
-                .unwrap_or(true);
+        // 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し CLAP・VST3) は
+        // editor window を開けない。 代わりにインスペクタ内の汎用 param パネル (Par) を
+        // トグルする。判定は `has_embedded_gui` (plugin DB が SSoT) の 1 箇所。
+        let has_embedded_gui =
+            device.is_some_and(|d| self.has_embedded_gui(d.format, &d.plugin_id));
         if !has_embedded_gui {
             self.toggle_rack_panel(common::model::RackPanelKey::Device(device_id));
             return;

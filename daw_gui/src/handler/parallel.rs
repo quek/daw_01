@@ -514,15 +514,36 @@ impl AppData {
         });
     }
 
+    /// この plugin が埋め込みエディタ窓を持つか。**判定はここ 1 箇所**
+    /// (チェーン行のボタンが「窓を開く」か「param パネルを出す」かを決める)。
+    ///
+    /// SSoT は plugin DB の `PluginEntry::has_embedded_gui` で、scan 時の probe が
+    /// 埋める。instance ごとに plugin へ聞き直さない — VST3 ではそれが `createView`
+    /// = エディタ実体の生成で、1 本あたり +130 MiB / +860 ms になる
+    /// (`common::port_config::PluginProbe::has_embedded_gui` に実測)。
+    ///
+    /// - builtin (VOICEVOX / Silence / 映像効果) は規定で持たない (設定はホスト側 UI)。
+    /// - DB に無い (未 scan / アンインストール済み) ときは楽観的に true — 外したときの
+    ///   見え方が「窓が開かない」ではなく「param パネルが出る」側に倒れる。
+    pub fn has_embedded_gui(
+        &self,
+        format: common::plugin_format::PluginFormat,
+        plugin_id: &str,
+    ) -> bool {
+        use common::plugin_format::PluginFormat;
+        format != PluginFormat::Builtin
+            && self
+                .ipc
+                .plugin_db
+                .as_ref()
+                .and_then(|db| db.find_by_id(plugin_id))
+                .is_none_or(|e| e.has_embedded_gui)
+    }
+
     /// `ChainEntry` (plugin 行の表示情報)。 `inspector_chain` と同じ規則。
     pub fn chain_entry_for(&self, p: &common::model::PluginInstance) -> ChainEntry {
         use common::plugin_format::PluginFormat;
-        // 埋め込み GUI の有無。 builtin (VOICEVOX / Silence) は規定で持たないので
-        // format から即断 (= PluginParamList 到着前でも正しく「Par」routing)。 外部
-        // CLAP・VST3 は host の通知 (`slot_has_gui`)、 未受信 (load 直後) は楽観的に
-        // true で「GUI」のまま。
-        let has_embedded_gui = p.format != PluginFormat::Builtin
-            && self.cur.pipc.slot_has_gui.get(&p.id).copied().unwrap_or(true);
+        let has_embedded_gui = self.has_embedded_gui(p.format, &p.plugin_id);
         let has_params = self
             .cur.pipc
             .plugin_params

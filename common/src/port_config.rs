@@ -83,27 +83,51 @@ impl PortConfig {
     }
 }
 
-impl PortConfig {
-    /// probe subprocess の stdout 1 行へ整形。 [`PortConfig::parse_line`] と対。
+/// probe subprocess (`daw_plugin_host --probe-vst3` / `--probe-clap`) が 1 回の
+/// instantiate で調べた、**プラグインのクラス単位の capability**。
+///
+/// probe は stdout に [`PluginProbe::to_line`] で 1 行出し、rescan 側 (`daw_gui`) が
+/// [`PluginProbe::parse_line`] で復元して [`crate::plugin_db::PluginEntry`] に格納する。
+/// VST3 / CLAP どちらの probe も同じ型・同じ行形式を使う。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PluginProbe {
+    pub ports: PortConfig,
+    /// 埋め込みエディタ窓 (Win32 HWND) を持つか。
+    ///
+    /// **instance ごとに調べてはいけない。** VST3 で答えを得る唯一の手段は
+    /// `IEditController::createView("editor")` = **エディタ実体の生成** で、実測
+    /// (Analog Lab V、2026-09-21、`daw_plugin_host --load-bench ... gui` の有無で A/B):
+    /// **1 本あたり +130 MiB / +860 ms**。40 本の曲なら 5.2 GB と 34 秒を、エディタ窓を
+    /// 一度も開かなくても払うことになる。
+    ///
+    /// これはプラグインの**クラス**の性質なので、scan 時に 1 回だけ調べて plugin DB に
+    /// 持つ (Reaper が `reaper-vstplugins64.ini` でやっているのと同じ)。load 経路
+    /// (`set_slot_plugin`) からは問い合わせない。
+    pub has_embedded_gui: bool,
+}
+
+impl PluginProbe {
+    /// probe subprocess の stdout 1 行へ整形。 [`PluginProbe::parse_line`] と対。
     #[must_use]
     pub fn to_line(&self) -> String {
         format!(
-            "note_in={} note_out={} audio_out={} audio_in={} video_in={} video_out={}",
-            self.has_note_input,
-            self.has_note_output,
-            self.has_audio_output,
-            self.has_audio_input,
-            self.has_video_input,
-            self.has_video_output
+            "note_in={} note_out={} audio_out={} audio_in={} video_in={} video_out={} embed_gui={}",
+            self.ports.has_note_input,
+            self.ports.has_note_output,
+            self.ports.has_audio_output,
+            self.ports.has_audio_input,
+            self.ports.has_video_input,
+            self.ports.has_video_output,
+            self.has_embedded_gui
         )
     }
 
-    /// probe subprocess の stdout から復元。 6 キーが揃わない / 値が `true`/`false`
-    /// でない行は `None`（呼び元は scan-time の暫定値を残す fallback）。旧 4-キー
-    /// 行は `None` を返すので `PORT_PROBE_VERSION` bump で再 probe される。
+    /// probe subprocess の stdout から復元。 7 キーが揃わない / 値が `true`/`false`
+    /// でない行は `None`（呼び元は scan-time の暫定値を残す fallback）。旧 4-キー /
+    /// 6-キー行は `None` を返すので `PORT_PROBE_VERSION` bump で再 probe される。
     #[must_use]
-    pub fn parse_line(s: &str) -> Option<PortConfig> {
-        let mut cfg = PortConfig::default();
+    pub fn parse_line(s: &str) -> Option<PluginProbe> {
+        let mut probe = PluginProbe::default();
         let mut seen = 0u8;
         for tok in s.split_whitespace() {
             let (k, v) = tok.split_once('=')?;
@@ -114,115 +138,129 @@ impl PortConfig {
             };
             match k {
                 "note_in" => {
-                    cfg.has_note_input = b;
+                    probe.ports.has_note_input = b;
                     seen |= 1;
                 }
                 "note_out" => {
-                    cfg.has_note_output = b;
+                    probe.ports.has_note_output = b;
                     seen |= 2;
                 }
                 "audio_out" => {
-                    cfg.has_audio_output = b;
+                    probe.ports.has_audio_output = b;
                     seen |= 4;
                 }
                 "audio_in" => {
-                    cfg.has_audio_input = b;
+                    probe.ports.has_audio_input = b;
                     seen |= 8;
                 }
                 "video_in" => {
-                    cfg.has_video_input = b;
+                    probe.ports.has_video_input = b;
                     seen |= 16;
                 }
                 "video_out" => {
-                    cfg.has_video_output = b;
+                    probe.ports.has_video_output = b;
                     seen |= 32;
+                }
+                "embed_gui" => {
+                    probe.has_embedded_gui = b;
+                    seen |= 64;
                 }
                 _ => {}
             }
         }
-        (seen == 0b111111).then_some(cfg)
+        (seen == 0b111_1111).then_some(probe)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PortConfig;
+    use super::{PluginProbe, PortConfig};
+
+    fn probe(ports: PortConfig, has_embedded_gui: bool) -> PluginProbe {
+        PluginProbe { ports, has_embedded_gui }
+    }
 
     #[test]
     fn round_trip() {
-        for cfg in [
-            PortConfig {
-                has_note_input: true,
-                has_note_output: true,
-                has_audio_output: true,
-                has_audio_input: true,
-                has_video_input: false,
-                has_video_output: false,
-            },
-            PortConfig {
-                has_note_input: true,
-                has_note_output: false,
-                has_audio_output: true,
-                has_audio_input: false,
-                has_video_input: false,
-                has_video_output: false,
-            },
-            PortConfig {
-                has_note_input: true,
-                has_note_output: true,
-                has_audio_output: false,
-                has_audio_input: true,
-                has_video_input: false,
-                has_video_output: false,
-            },
+        for p in [
+            probe(
+                PortConfig {
+                    has_note_input: true,
+                    has_note_output: true,
+                    has_audio_output: true,
+                    has_audio_input: true,
+                    has_video_input: false,
+                    has_video_output: false,
+                },
+                true,
+            ),
+            probe(
+                PortConfig {
+                    has_note_input: true,
+                    has_note_output: false,
+                    has_audio_output: true,
+                    has_audio_input: false,
+                    has_video_input: false,
+                    has_video_output: false,
+                },
+                false,
+            ),
             // 純映像 device (note/audio 全 false、video in/out)。
-            PortConfig {
-                has_note_input: false,
-                has_note_output: false,
-                has_audio_output: false,
-                has_audio_input: false,
-                has_video_input: true,
-                has_video_output: true,
-            },
-            PortConfig::default(),
+            probe(
+                PortConfig {
+                    has_note_input: false,
+                    has_note_output: false,
+                    has_audio_output: false,
+                    has_audio_input: false,
+                    has_video_input: true,
+                    has_video_output: true,
+                },
+                false,
+            ),
+            PluginProbe::default(),
         ] {
-            assert_eq!(PortConfig::parse_line(&cfg.to_line()), Some(cfg));
+            assert_eq!(PluginProbe::parse_line(&p.to_line()), Some(p));
         }
     }
 
     #[test]
-    fn parse_tolerates_surrounding_log_noise_only_on_the_line() {
-        // 1 行に 6 キー揃っていれば順不同で復元できる。
-        let cfg = PortConfig::parse_line(
-            "video_out=true audio_in=true audio_out=false note_out=true note_in=true video_in=false",
+    fn parse_is_order_independent() {
+        // 1 行に 7 キー揃っていれば順不同で復元できる。
+        let p = PluginProbe::parse_line(
+            "embed_gui=true video_out=true audio_in=true audio_out=false note_out=true note_in=true video_in=false",
         )
         .unwrap();
         assert_eq!(
-            cfg,
-            PortConfig {
-                has_note_input: true,
-                has_note_output: true,
-                has_audio_output: false,
-                has_audio_input: true,
-                has_video_input: false,
-                has_video_output: true,
-            }
+            p,
+            probe(
+                PortConfig {
+                    has_note_input: true,
+                    has_note_output: true,
+                    has_audio_output: false,
+                    has_audio_input: true,
+                    has_video_input: false,
+                    has_video_output: true,
+                },
+                true,
+            )
         );
     }
 
     #[test]
     fn parse_rejects_incomplete_or_malformed() {
-        assert_eq!(PortConfig::parse_line("note_in=true note_out=true"), None); // audio/video 欠落
-        // 旧 4-キー行 (video 無し) は None。 PORT_PROBE_VERSION bump で再 probe される。
+        assert_eq!(PluginProbe::parse_line("note_in=true note_out=true"), None); // audio/video 欠落
+        // 旧 6-キー行 (embed_gui 無し) は None。 PORT_PROBE_VERSION bump で再 probe される。
         assert_eq!(
-            PortConfig::parse_line("note_in=true note_out=true audio_out=true audio_in=false"),
+            PluginProbe::parse_line(
+                "note_in=true note_out=true audio_out=true audio_in=false video_in=false video_out=false"
+            ),
             None
         );
         assert_eq!(
-            PortConfig::parse_line("note_in=yes note_out=true audio_out=true"),
+            PluginProbe::parse_line("note_in=yes note_out=true audio_out=true"),
             None
         ); // 値不正
-        assert_eq!(PortConfig::parse_line(""), None);
-        assert_eq!(PortConfig::parse_line("garbage"), None);
+        assert_eq!(PluginProbe::parse_line(""), None);
+        assert_eq!(PluginProbe::parse_line("garbage"), None);
     }
 }

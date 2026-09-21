@@ -1054,7 +1054,6 @@ impl AppData {
         self.cur.pipc.loaded_devices.clear();
         self.cur.pipc.open_plugin_guis.clear();
         self.cur.pipc.plugin_params.clear();
-        self.cur.pipc.slot_has_gui.clear();
         self.cur.pipc.plugin_param_values.clear();
         self.cur.pipc.pending_plugin_loads.clear();
         self.cur.pipc.pending_added_plugin_finalize.clear();

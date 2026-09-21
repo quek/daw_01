@@ -49,6 +49,7 @@ use common::protocol::{DeviceAddr, PluginParamInfo, RenderMode};
 
 use crate::builtin;
 use crate::clap_plugin::ClapPlugin;
+use crate::module_cache::ModuleCache;
 use crate::vst3_plugin::Vst3Plugin;
 
 /// One MIDI-style transition pushed into the next `process()` call.
@@ -744,7 +745,12 @@ pub trait LoadedPlugin: Send {
 /// Loads a plugin at `path` using the backend selected by `format`.
 /// `plugin_id` narrows to a specific descriptor inside a multi-plugin
 /// library; empty means "pick the first descriptor".
+///
+/// `modules` は **パス単位で 1 つ** のモジュール (`LoadLibrary` + entry + factory) を
+/// 持つ cache。同じプラグインを N 本立てても DSO を読み直さない
+/// ([`crate::module_cache`] の module doc に一次情報と理由)。
 pub fn load_plugin(
+    modules: &mut ModuleCache,
     format: PluginFormat,
     path: &Path,
     plugin_id: &str,
@@ -752,11 +758,13 @@ pub fn load_plugin(
 ) -> Result<Box<dyn LoadedPlugin>> {
     match format {
         PluginFormat::Clap => {
-            let plugin = ClapPlugin::load(path, plugin_id, callbacks)?;
+            let module = modules.clap(path)?;
+            let plugin = ClapPlugin::load(module, path, plugin_id, callbacks)?;
             Ok(Box::new(plugin) as Box<dyn LoadedPlugin>)
         }
         PluginFormat::Vst3 => {
-            let plugin = Vst3Plugin::load(path, plugin_id, callbacks)?;
+            let module = modules.vst3(path)?;
+            let plugin = Vst3Plugin::load(module, path, plugin_id, callbacks)?;
             Ok(Box::new(plugin) as Box<dyn LoadedPlugin>)
         }
         PluginFormat::Builtin => {

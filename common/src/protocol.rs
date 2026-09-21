@@ -1295,11 +1295,13 @@ pub enum PluginEvent {
     PluginLatencyChanged { device: DeviceAddr, samples: u32 },
     /// Plugin の parameter 一覧。 activate 完了直後に 1 度、 rescan 要求で
     /// 再送。
+    /// **埋め込み GUI の有無はここに載せない。** それは plugin の**クラス**の性質で、
+    /// SSoT は plugin DB の `PluginEntry::has_embedded_gui` (scan 時に probe が 1 回埋める)。
+    /// instance ごとに聞くと VST3 では `createView` = エディタ実体の生成になり、
+    /// 1 本あたり +130 MiB / +860 ms 払う (`port_config::PluginProbe` の doc)。
     PluginParamList {
         device: DeviceAddr,
         params: Vec<PluginParamInfo>,
-        /// この plugin が埋め込み GUI を持つか。
-        has_embedded_gui: bool,
     },
     /// Plugin GUI で knob を **touch** した通知。
     PluginParamTouched {
@@ -1683,7 +1685,6 @@ mod tests {
                 default_value: 0.5,
                 flags: plugin_param_flags::AUTOMATABLE,
             }],
-            has_embedded_gui: true,
         };
         assert_eq!(roundtrip(&msg), msg);
     }

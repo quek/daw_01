@@ -67,6 +67,19 @@ pub struct PluginEntry {
     /// 映像 (RGBA テクスチャ) 出力ポートを持つ。
     #[serde(default)]
     pub has_video_output: bool,
+    /// 埋め込みエディタ窓 (Win32 HWND) を持つ。probe で確定し、**ここが SSoT**。
+    ///
+    /// load 経路 (`set_slot_plugin`) はこれを問い合わせない。VST3 で答えを得る唯一の
+    /// 手段が `createView("editor")` = エディタ実体の生成で、instance ごとにやると
+    /// 実測 **+130 MiB / +860 ms** かかるため (`PluginProbe::has_embedded_gui` の
+    /// doc に一次データ)。builtin は全て false (設定はホストの native UI 側)。
+    ///
+    /// **旧 cache (このフィールドが無い) は `true` に load する。** 未 probe で
+    /// 「GUI 無し」と決めつけると、GUI を持つ plugin の行ボタンが param パネルに
+    /// 化けてエディタを開けなくなる。外した側の害が小さい向き (= 楽観) に倒す。
+    /// `PORT_PROBE_VERSION` bump により次の起動で自動 rescan が正しい値を入れる。
+    #[serde(default = "default_true")]
+    pub has_embedded_gui: bool,
 }
 
 /// CLAP ARA companion-API の feature タグ (ARACLAP.h の
@@ -103,7 +116,12 @@ impl PluginEntry {
 /// Factory Class` ペアリング) を追加したので 3 → 4 (= 旧 cache を再スキャンさせ、
 /// 既存プラグインに `ara:supported` を付与する。これが無いと `is_ara()` が false の
 /// ままで `sync_ara_documents` が `SetupAraDocument` を送らず ARA が無音になる)。
-pub const PORT_PROBE_VERSION: u32 = 4;
+/// [`PluginEntry::has_embedded_gui`] の serde 既定 (= 未 probe は楽観的に「GUI あり」)。
+fn default_true() -> bool {
+    true
+}
+
+pub const PORT_PROBE_VERSION: u32 = 5;
 
 /// plugin の一覧 (cache / scan の結果) と、id で引く索引。
 ///
@@ -367,6 +385,7 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             has_audio_input: false,
             has_video_input: false,
             has_video_output: false,
+            has_embedded_gui: false,
         },
         PluginEntry {
             id: BUILTIN_ID_VOICEVOX.to_string(),
@@ -389,6 +408,7 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             has_audio_input: false,
             has_video_input: false,
             has_video_output: false,
+            has_embedded_gui: false,
         },
         // (talk) 字幕(テキスト表示)デバイス。video overlay marker。挿さっている
         // トラックの `ClipContent::Text` だけが画面に出る (`text_compose` が gate)。
@@ -411,6 +431,7 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             has_audio_input: false,
             has_video_input: true,
             has_video_output: true,
+            has_embedded_gui: false,
         },
     ];
     // docs/plan_video_fx.md §9: 内蔵映像効果 (`builtin.video.*`) を
@@ -437,6 +458,7 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
             has_audio_input: false,
             has_video_input: true,
             has_video_output: true,
+            has_embedded_gui: false,
         });
     }
     entries
@@ -445,6 +467,27 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧 cache (`has_embedded_gui` フィールドが無い) は **true** に load される。
+    ///
+    /// serde の既定 `false` のままだと、次の rescan が終わるまで **全 plugin の
+    /// チェーン行ボタンが param パネルに化けてエディタ窓を開けなくなる**。ここを
+    /// 取り違えても型は通り、テストが無ければ実機で初めて気付く。
+    #[test]
+    fn missing_has_embedded_gui_loads_as_true() {
+        let json = r#"{
+            "id": "com.example.synth",
+            "format": "Vst3",
+            "name": "Synth",
+            "path": "synth.vst3",
+            "descriptor_index": 0,
+            "has_note_input": true,
+            "has_audio_output": true
+        }"#;
+        let entry: PluginEntry = serde_json::from_str(json).expect("v4 cache entry");
+        assert!(entry.has_embedded_gui, "未 probe の entry は楽観的に GUI あり扱い");
+        assert!(!entry.has_audio_input, "他の bool は従来どおり false 既定");
+    }
 
     #[test]
     fn find_by_id_hit() {
@@ -465,6 +508,7 @@ mod tests {
                 has_audio_input: false,
                 has_video_input: false,
                 has_video_output: false,
+                has_embedded_gui: false,
             }],
             Some(42),
             0,
@@ -500,6 +544,7 @@ mod tests {
             has_audio_input: false,
             has_video_input: false,
             has_video_output: false,
+            has_embedded_gui: false,
         };
         let json = serde_json::to_string(&PluginDatabase::new(vec![entry("a", "A1"), entry("b", "B"), entry("a", "A2")], None, 3))
             .expect("serialize");
@@ -535,6 +580,7 @@ mod tests {
                 has_audio_input: true,
                 has_video_input: false,
                 has_video_output: false,
+                has_embedded_gui: false,
             }],
             Some(100),
             0,
@@ -605,6 +651,7 @@ mod tests {
                 has_audio_input: true,
                 has_video_input: false,
                 has_video_output: false,
+                has_embedded_gui: false,
             }],
             Some(1),
             0,

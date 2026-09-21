@@ -307,7 +307,6 @@ fn app_with_plugin() -> (AppData, u32, u64) {
             default_value: 0.5,
             flags: 0,
         }],
-        has_embedded_gui: true,
     }));
     let visible: Vec<u32> = app.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
     app.apply_select_tracks(t0, daw_gui::widgets::select_modifier::SelectModifier::Single, &visible);
