@@ -662,6 +662,8 @@ impl AppData {
             // 前面化は runner の user_event が window へ直接行うため、
             // ここには届かない。 match 網羅のための no-op。
             AppEvent::RaiseMainWindow => {}
+            // runner が拾う (`RunnerScript::run_steps`)。ここへは来ない。
+            AppEvent::ScriptStep => {}
             AppEvent::GroupSelectedTracks { track_ids } => {
                 self.action_group_selected_tracks(&track_ids);
             }

@@ -1089,6 +1089,7 @@ fn build_stream(
                 let load =
                     common::metrics_bridge::dsp_load(elapsed, frames as u32, session_sample_rate);
                 metrics.observe_dsp_load_peak(load);
+                metrics.observe_load_hist(load);
                 publish_graph_profile(local.worker.as_deref(), &metrics);
                 dsp_load_ema = common::metrics_bridge::ema(dsp_load_ema, load, 0.1);
                 metrics.set_dsp_load_avg(dsp_load_ema);

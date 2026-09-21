@@ -43,6 +43,22 @@ pub struct RunnerInit {
     /// AppData をビルドする closure。引数:
     ///   - `EventLoopProxy<AppEvent>` を受けて AppData の内部に保持してもらう
     pub build_app: Box<dyn FnOnce(EventLoopProxy<AppEvent>) -> AppData + Send>,
+    /// `--script <js> --gui`: JS ドライバの受け口 ([`RunnerScript`])。`None` = 人が操作する通常起動。
+    pub script: Option<Box<dyn RunnerScript>>,
+}
+
+/// GUI モードで走る JS ドライバが runner に差し込む口 (実体は `crate::script::ScriptAttach`)。
+///
+/// script は別スレッドで boa を回し、`AppData` に触る手だけをここ経由で **event loop
+/// スレッドに** 実行させる (= 人の操作と同じスレッド・同じ順)。runner は
+/// (1) 届いた `AppEvent` を [`observe`](Self::observe) に見せ (子プロセスからの event の写しを
+/// script が読めるように)、(2) `AppEvent::ScriptStep` が来たら [`run_steps`](Self::run_steps) で
+/// 溜まった手を全部実行する。trait にしてあるのは runner を `script` feature から独立させるため。
+pub trait RunnerScript: Send {
+    /// runner が dispatch する直前の event を見せる (写しを取るだけ。消費はしない)。
+    fn observe(&mut self, event: &AppEvent);
+    /// 溜まった手を全部 `app` に対して実行する。1 手でも実行したら `true`。
+    fn run_steps(&mut self, app: &mut AppData) -> bool;
 }
 
 /// r.md #61: 終了シーケンス中の再評価間隔。子プロセスの exit はイベントを
@@ -84,6 +100,7 @@ pub fn run(init: RunnerInit) -> Result<RunnerOutcome, winit::error::EventLoopErr
     let mut runner = Runner {
         attrs: Some(init.window_attrs),
         build_app: Some(init.build_app),
+        script: init.script,
         proxy,
         display_changed,
         state: None,
@@ -120,6 +137,8 @@ pub struct RunnerOutcome {
 }
 
 struct RunnerState {
+    /// `--script --gui` の JS ドライバ ([`RunnerScript`])。
+    script: Option<Box<dyn RunnerScript>>,
     window: Arc<WinitWindow>,
     renderer: Renderer<WinitWindow>,
     ui: UiHost<AppData>,
@@ -727,6 +746,8 @@ fn preview_drag_target_kind(app: &AppData, target: ClipKey) -> PreviewDragTarget
 struct Runner {
     attrs: Option<WindowAttributes>,
     build_app: Option<Box<dyn FnOnce(EventLoopProxy<AppEvent>) -> AppData + Send>>,
+    /// `RunnerInit::script`。`resumed` で state へ移す。
+    script: Option<Box<dyn RunnerScript>>,
     proxy: EventLoopProxy<AppEvent>,
     /// r.md #106: `WM_DISPLAYCHANGE` を message hook が受けたら立つ。`new_events` が
     /// 降ろして `ensure_main_window_on_screen` を走らせる。
@@ -872,6 +893,7 @@ impl ApplicationHandler<AppEvent> for Runner {
             .and_then(|d| crate::window_state::load(d.window_state()))
             .and_then(|s| s.preview);
         self.state = Some(RunnerState {
+            script: self.script.take(),
             window: dwin,
             renderer,
             ui,
@@ -1079,6 +1101,18 @@ impl ApplicationHandler<AppEvent> for Runner {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         let Some(state) = self.state.as_mut() else { return };
+        // `--script --gui`: 写しを見せてから、手の合図なら手を実行して終わる (app へは渡さない)。
+        if let Some(script) = state.script.as_mut() {
+            script.observe(&event);
+            if matches!(event, AppEvent::ScriptStep) {
+                if script.run_steps(&mut state.app) {
+                    // `daw.*` 1 呼び出し = 1 frame の契約 (headless の `flush_after_call` と同じ)。
+                    state.app.flush_all_song_sync();
+                    state.window.request_redraw();
+                }
+                return;
+            }
+        }
         // 別インスタンスが起動を試み、 既存 (= この) ウィンドウへ
         // 前面化を要求してきた。 window 操作なので AppData ではなく runner が
         // 直接処理する: 最小化なら復元してフォアグラウンドへ。

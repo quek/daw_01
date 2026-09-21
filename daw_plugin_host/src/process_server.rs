@@ -896,6 +896,15 @@ fn run_worker(
     if _mmcss.is_none() {
         tracing::warn!(worker_idx = idx, "plugin worker MMCSS join failed");
     }
+    // **各物理コアの 1 本目の論理 CPU の集合** に制限する (`common::cpu_topology` の module doc に
+    // 実測)。worker 同士が SMT sibling に乗り合わせると同じ `process()` が伸びて「CPU 50% で xrun」に
+    // なる。1 本ずつ特定の CPU に固定はしない — worker がコアより多いと、空いたコアに移れない。
+    // `DAW_PIN_WORKERS=0` で制限を外せる (A/B と、制限が合わない環境の逃げ道)。
+    if std::env::var("DAW_PIN_WORKERS").as_deref() != Ok("0") {
+        let mask = common::cpu_topology::one_logical_per_core_mask();
+        let ok = common::cpu_topology::restrict_current_thread_to(mask);
+        tracing::info!(worker_idx = idx, mask = format!("{mask:#x}"), ok, "plugin worker restricted to one logical CPU per core");
+    }
     // CLAP `thread_check`: this thread counts as an audio thread.
     crate::clap_host::mark_audio_thread();
     tracing::info!(worker_idx = idx, "plugin worker started");

@@ -19,8 +19,10 @@
 //!   `process()` を回し、1 呼び出しの所要を出す。**これが「他のスレッドと取り合っていない
 //!   ときの 1 本のコスト」** で、実機の per-plugin 計測 (取り合っている値) と比べるための
 //!   対照。差が出たら原因はプラグインではなくスケジューリング側にある。
-//! - `notes` — `run` のとき各 instance にノートを 1 つ与えてから回す (無音の
-//!   instance は voice を走らせないので、鳴っている状態のコストが測れない)。
+//! - `notes` — `run` のとき **performance.daw と同じ演奏** (128 BPM の 4 分音符 60, 59, 60, 62 の
+//!   単音の繰り返し) を与えながら回す。ブロック長を変えても 1 サンプルあたりの音楽的内容が
+//!   同じなので、ブロック長どうしを比べられる。無音の instance は voice を走らせず軽いので、
+//!   鳴っていない計測は結論を誤らせる — 各行に出力ピークを出す (`peak_db`)。
 //! - `par=<k>` — `run` を **k スレッド同時** で回す (1 スレッド = 1 instance、毎回
 //!   barrier で揃える)。IPC も worker pool も engine も通らない純粋な並列で、
 //!   「同時に走らせると 1 本あたりが何倍になるか」がプラグイン / マシン側の性質なのか、
@@ -69,7 +71,7 @@ struct BenchOpts {
     probe_gui: bool,
     /// `process()` を回す buffer 長 (`run=<frames>`)。
     run_frames: Option<u32>,
-    /// `run` のとき各 instance にノートを 1 つ与える (`notes`)。
+    /// `run` のとき performance.daw と同じ演奏を与える (`notes`、[`song_events`])。
     notes: bool,
     /// `run` を k スレッド同時で回す (`par=<k>`)。
     par: Option<usize>,
@@ -188,7 +190,10 @@ fn load_bench(
         let state_ms = ts.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = Instant::now();
-        plugin.activate(48_000.0, 64, 1024)?;
+        // `run=<frames>` がエンジンの上限 (1024) より大きいブロックを測るときは、その長さで
+        // activate する (プラグインは max_frames ぶんの内部バッファを activate で確保する)。
+        let max_frames = run_frames.unwrap_or(0).max(1024);
+        plugin.activate(48_000.0, 64, max_frames)?;
         plugin.start_processing()?;
         let activate_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
@@ -245,48 +250,52 @@ fn load_bench(
 /// コア・SMT・スケジューラの取り合いが入る。ここは 1 本しか走らせないので、その取り合いが
 /// 無いときの素のコストが出る。**2 つの差が「並列化で払っている税」** になる。
 fn run_process_bench(plugins: &mut [Box<dyn LoadedPlugin>], frames: u32, notes: bool) {
-    const WARMUP: usize = 20;
-    const MEASURED: usize = 200;
+    let (warmup, measured) = bench_calls(frames);
     let n = frames as usize;
     let silence = vec![0.0_f32; n];
     let input: Vec<&[f32]> = vec![&silence, &silence];
     let transport = bench_transport();
-    let note_on = [TimedNoteEvent {
-        time: 0,
-        event: NoteTransition::On { note_id: 1, key: 60, velocity: 0.8 },
-    }];
 
     let budget_us = f64::from(frames) / 48_000.0 * 1e6;
     println!(
-        "process bench: frames={frames} (budget {:.2}ms) warmup={WARMUP} measured={MEASURED} notes={notes}",
+        "process bench: frames={frames} (budget {:.2}ms) warmup={warmup} measured={measured} calls notes={notes}",
         budget_us / 1000.0
     );
-    println!("inst  median_us  p95_us  max_us  load_pct");
+    println!("inst  median_us  p95_us  max_us  load_pct  us_per_480f  peak_db");
     let mut medians: Vec<f64> = Vec::with_capacity(plugins.len());
     for (i, plugin) in plugins.iter_mut().enumerate() {
         // SAFETY: worker pool を開いていないので audio half を触るのはこのスレッドだけ
         // (`AudioHalf::get` の quiesced-window 契約を、そもそも並行が無いことで満たす)。
         let audio = plugin.audio_half();
         let half = unsafe { audio.get() };
-        let mut us: Vec<u128> = Vec::with_capacity(MEASURED);
-        for iter in 0..(WARMUP + MEASURED) {
-            let ev: &[TimedNoteEvent] = if notes && iter == 0 { &note_on } else { &[] };
-            let t = Instant::now();
-            let _ = half.process(frames, ev, &[], &input, &[], &transport);
-            if iter >= WARMUP {
-                us.push(t.elapsed().as_micros());
+        let mut us: Vec<u128> = Vec::with_capacity(measured);
+        let mut ev: Vec<TimedNoteEvent> = Vec::with_capacity(8);
+        let mut peak = 0.0_f32;
+        let mut pos: u64 = 0;
+        for iter in 0..(warmup + measured) {
+            if notes {
+                song_events(pos, frames, &mut ev);
             }
+            let t = Instant::now();
+            let _ = half.process(frames, &ev, &[], &input, &[], &transport);
+            if iter >= warmup {
+                us.push(t.elapsed().as_micros());
+                peak = peak.max(output_peak(half, n));
+            }
+            pos += u64::from(frames);
         }
         us.sort_unstable();
         #[allow(clippy::cast_precision_loss)]
         let med = us[us.len() / 2] as f64;
         medians.push(med);
         println!(
-            "{:4}  {med:9.0}  {:6}  {:6}  {:7.1}",
+            "{:4}  {med:9.0}  {:6}  {:6}  {:7.1}  {:11.0}  {:7.1}",
             i + 1,
             us[us.len() * 95 / 100],
             us[us.len() - 1],
             100.0 * med / budget_us,
+            med * 480.0 / f64::from(frames),
+            peak_db(peak),
         );
     }
     let sum: f64 = medians.iter().sum();
@@ -373,9 +382,7 @@ fn parallel_worker(
     barrier: &std::sync::Barrier,
     flags: &ShadowFlags,
 ) -> (u128, u128) {
-    const WARMUP: usize = 20;
-    const MEASURED: usize = 200;
-
+    let (warmup, measured) = bench_calls(frames);
     if rt {
         // 実機の worker と同じ条件に置く。
         unsafe {
@@ -391,26 +398,27 @@ fn parallel_worker(
     let silence = vec![0.0_f32; n];
     let input: Vec<&[f32]> = vec![&silence, &silence];
     let transport = bench_transport();
-    let note_on = [TimedNoteEvent {
-        time: 0,
-        event: NoteTransition::On { note_id: 1, key: 60, velocity: 0.8 },
-    }];
     // SAFETY: この instance の audio half を触るのはこのスレッドだけ
     // (1 スレッド 1 instance、worker pool は開いていない)。
     let plugin = unsafe { half.get() };
-    let mut us: Vec<u128> = Vec::with_capacity(MEASURED);
-    for iter in 0..(WARMUP + MEASURED) {
-        let ev: &[TimedNoteEvent] = if notes && iter == 0 { &note_on } else { &[] };
+    let mut us: Vec<u128> = Vec::with_capacity(measured);
+    let mut ev: Vec<TimedNoteEvent> = Vec::with_capacity(8);
+    let mut pos: u64 = 0;
+    for iter in 0..(warmup + measured) {
+        if notes {
+            song_events(pos, frames, &mut ev);
+        }
         barrier.wait();
         let t = Instant::now();
         // 相方が「依頼が出ている」と見る窓 = 実機の dispatch 窓。
         flags.busy.store(true, Ordering::Release);
-        let _ = plugin.process(frames, ev, &[], &input, &[], &transport);
+        let _ = plugin.process(frames, &ev, &[], &input, &[], &transport);
         flags.busy.store(false, Ordering::Release);
         let e = t.elapsed().as_micros();
-        if iter >= WARMUP {
+        if iter >= warmup {
             us.push(e);
         }
+        pos += u64::from(frames);
     }
     us.sort_unstable();
     (us[us.len() / 2], us[us.len() - 1])
@@ -457,6 +465,51 @@ fn shadow_runner(frames: u32, rt: bool, flags: &ShadowFlags) {
             std::thread::sleep(std::time::Duration::from_micros(100));
         }
     }
+}
+
+/// performance.daw の 1 拍 (128 BPM) の長さ [samples]。
+const BEAT: u64 = 48_000 * 60 / 128; // 22,500
+
+/// (warm-up, 計測) の `process()` 呼び出し回数。回数ではなく **サンプル数** で揃える
+/// (ブロック長ごとに鳴る音の数が変わらないように): warm-up 2 拍 + 計測 8 拍。
+fn bench_calls(frames: u32) -> (usize, usize) {
+    let calls = |beats: u64| usize::try_from((beats * BEAT).div_ceil(u64::from(frames.max(1)))).unwrap_or(usize::MAX);
+    (calls(2), calls(8))
+}
+
+/// performance.daw の演奏 (128 BPM・4 分音符・60, 59, 60, 62 の繰り返し) のうち、
+/// サンプル位置 `pos` から `frames` ぶんに入るノートの切り替えを `out` に書く。
+/// 各拍の頭で前の音を止めて次の音を鳴らす (単音、note id = 拍番号)。
+fn song_events(pos: u64, frames: u32, out: &mut Vec<TimedNoteEvent>) {
+    const PITCHES: [u8; 4] = [60, 59, 60, 62];
+    let pitch = |beat: u64| PITCHES[(beat % 4) as usize];
+    let id = |beat: u64| u32::try_from(beat).unwrap_or(u32::MAX);
+    out.clear();
+    let end = pos + u64::from(frames);
+    let mut beat = pos.div_ceil(BEAT);
+    while beat * BEAT < end {
+        let time = u32::try_from(beat * BEAT - pos).unwrap_or(0);
+        if let Some(prev) = beat.checked_sub(1) {
+            out.push(TimedNoteEvent { time, event: NoteTransition::Off { note_id: id(prev), key: pitch(prev) } });
+        }
+        out.push(TimedNoteEvent {
+            time,
+            event: NoteTransition::On { note_id: id(beat), key: pitch(beat), velocity: 100.0 / 127.0 },
+        });
+        beat += 1;
+    }
+}
+
+/// 出力 (L/R) の最大振幅。
+fn output_peak(half: &dyn crate::plugin_instance::AudioProcessorHalf, n: usize) -> f32 {
+    (0..2)
+        .filter_map(|ch| half.output_buffer(ch))
+        .flat_map(|buf| buf.iter().take(n))
+        .fold(0.0_f32, |p, s| p.max(s.abs()))
+}
+
+fn peak_db(peak: f32) -> f64 {
+    if peak > 0.0 { 20.0 * f64::from(peak).log10() } else { f64::NEG_INFINITY }
 }
 
 /// ベンチ共通の transport (120 BPM / 4-4 / 再生中 / 曲頭)。

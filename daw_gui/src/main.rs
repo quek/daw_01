@@ -20,7 +20,7 @@ use daw_gui::bootstrap::{Bootstrap, bootstrap_subprocess};
 use daw_gui::dispatcher::{Win32JobDispatcher, WinitDispatcher};
 #[cfg(feature = "script")]
 use daw_gui::script::run_scripted;
-use daw_gui::view::runner::{RunnerInit, run as run_runner};
+use daw_gui::view::runner::{RunnerInit, RunnerScript, run as run_runner};
 
 /// CLI 引数。 GUI mode の場合は `script` / `output` / `smoke_test` ともに `None`。
 struct CliArgs {
@@ -41,6 +41,10 @@ struct CliArgs {
     /// histogram で assertion → process::exit(0/1)。 gui_01 Phase 78 runtime 検証用。
     /// 他の smoke / script 系と相互排他。
     smoke_test_text: bool,
+    /// `--gui`: `--script` を **窓・wgpu・poller が生きている本物の GUI** に対して走らせる
+    /// (script は別スレッド、app に触る手は event loop へ送る = `crate::script` module doc)。
+    /// 無ければ従来どおり headless (winit 無し)。
+    gui: bool,
 }
 
 fn parse_args() -> Result<CliArgs> {
@@ -50,6 +54,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut extra: Vec<(String, String)> = Vec::new();
     let mut smoke_test: Option<PathBuf> = None;
     let mut smoke_test_text = false;
+    let mut gui = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -87,10 +92,13 @@ fn parse_args() -> Result<CliArgs> {
             "--smoke-test-text" => {
                 smoke_test_text = true;
             }
+            "--gui" => {
+                gui = true;
+            }
             "--help" | "-h" => {
                 println!(
                     "daw_gui [--script <path.js>] [--output <path.wav>] [--arg KEY=VALUE]... \
-                     [--smoke-test <fixture.mp4>] [--smoke-test-text]"
+                     [--smoke-test <fixture.mp4>] [--smoke-test-text] [--gui]"
                 );
                 std::process::exit(0);
             }
@@ -103,6 +111,9 @@ fn parse_args() -> Result<CliArgs> {
     if script.is_some() && (smoke_test.is_some() || smoke_test_text) {
         anyhow::bail!("--script and --smoke-test[-text] are mutually exclusive");
     }
+    if gui && script.is_none() {
+        anyhow::bail!("--gui は --script と一緒に使う (通常起動はもともと GUI)");
+    }
     if smoke_test.is_some() && smoke_test_text {
         anyhow::bail!("--smoke-test and --smoke-test-text are mutually exclusive");
     }
@@ -112,6 +123,7 @@ fn parse_args() -> Result<CliArgs> {
         extra,
         smoke_test,
         smoke_test_text,
+        gui,
     })
 }
 
@@ -184,7 +196,7 @@ fn main() -> Result<std::process::ExitCode> {
 
     let bootstrap = bootstrap_subprocess()?;
 
-    if let Some(script_path) = cli.script.as_ref() {
+    if let (Some(script_path), false) = (cli.script.as_ref(), cli.gui) {
         tracing::info!(script = %script_path.display(), "headless script mode");
         #[cfg(feature = "script")]
         return run_scripted(bootstrap, script_path, cli.output.as_deref(), &cli.extra, app_dirs)
@@ -205,10 +217,29 @@ fn main() -> Result<std::process::ExitCode> {
     }
 
     // `_singleton` は run_gui (= event loop) が返るまで保持し、 mutex を握り続ける。
-    let code =
-        run_gui(bootstrap, cli.smoke_test, cli.smoke_test_text, singleton_primary, app_dirs)?;
+    let code = run_gui(
+        bootstrap,
+        cli.smoke_test,
+        cli.smoke_test_text,
+        singleton_primary,
+        app_dirs,
+        cli.script.map(|path| GuiScript { path, output: cli.output, extra: cli.extra }),
+    )?;
     Ok(std::process::ExitCode::from(code))
 }
+
+/// `--script <js> --gui` の指定 (script の path と、headless と同じ `--output` / `--arg`)。
+/// `script` feature 無しのビルドでは中身を読まず「エラーにする」だけなので dead_code を許す。
+#[cfg_attr(not(feature = "script"), allow(dead_code))]
+struct GuiScript {
+    path: PathBuf,
+    output: Option<PathBuf>,
+    extra: Vec<(String, String)>,
+}
+
+/// proxy が出来てから script スレッドを起こす closure。型の正本は `daw_gui::script::ScriptStarter`
+/// だが、`script` feature 無しのビルドでも `run_gui` の signature を保つためここで同じ形を持つ。
+type ScriptStarter = Box<dyn FnOnce(EventLoopProxy<AppEvent>) + Send>;
 
 /// `app_dirs` は per-user データディレクトリの SSoT (window_state load / AppData の recent /
 /// recovery / 取り込みキャッシュが全てここから解決される)。smoke test では隔離 root。
@@ -218,6 +249,7 @@ fn run_gui(
     #[cfg_attr(not(windows), allow(unused_variables))] smoke_test_text: bool,
     singleton_primary: bool,
     app_dirs: Option<common::app_dirs::AppDirs>,
+    gui_script: Option<GuiScript>,
 ) -> Result<u8> {
     tracing::info!("opening main window");
 
@@ -258,8 +290,30 @@ fn run_gui(
     if init_state.maximized {
         window_attrs = window_attrs.with_maximized(true);
     }
+    // `--script --gui`: runner に渡す受け口と、proxy が出来てから script スレッドを起こす starter。
+    // `script` feature 無しのビルドで `--gui` を渡されたら、黙って通常起動にせずエラーにする。
+    #[cfg(feature = "script")]
+    let (script_attach, script_start): (Option<Box<dyn RunnerScript>>, Option<ScriptStarter>) =
+        match gui_script {
+            Some(GuiScript { path, output, extra }) => {
+                let io = daw_gui::script::ScriptIo::from_bootstrap(&bootstrap);
+                let (attach, start) = daw_gui::script::prepare_gui(path, output, extra, io);
+                (Some(Box::new(attach)), Some(start))
+            }
+            None => (None, None),
+        };
+    #[cfg(not(feature = "script"))]
+    let (script_attach, script_start): (Option<Box<dyn RunnerScript>>, Option<ScriptStarter>) = {
+        anyhow::ensure!(
+            gui_script.is_none(),
+            "--script requires building daw_gui with `--features script`"
+        );
+        (None, None)
+    };
+
     let init = RunnerInit {
         window_attrs,
+        script: script_attach,
         build_app: Box::new(move |proxy: EventLoopProxy<AppEvent>| {
             let event_dispatcher: Arc<dyn daw_gui::dispatcher::BackgroundDispatcher> =
                 Arc::new(WinitDispatcher::new(proxy.clone()));
@@ -344,6 +398,12 @@ fn run_gui(
                 daw_gui::smoke_test::spawn_text_overlay_orchestrator(proxy.clone());
             }
 
+            // `--script <js> --gui`: proxy が手に入った今、script スレッドを起こす
+            // (受け口は `RunnerInit::script` で runner へ渡してある)。
+            if let Some(start) = script_start {
+                start(proxy.clone());
+            }
+
             app
         }),
     };
@@ -392,7 +452,36 @@ fn spawn_incoming_bridge(
 fn spawn_midi_input(proxy: EventLoopProxy<AppEvent>) {
     let proxy_for_midi = proxy.clone();
     std::thread::spawn(move || {
-        match daw_gui::midi::open_default_input(proxy_for_midi) {
+        // winmm の MIDI 入力 open は **プロセスの優先度クラスを HIGH に上げる** (実測 2026-09-21:
+        // 起動時 NORMAL → `opened MIDI input` の直後に 0x80。headless は MIDI を開かないので
+        // NORMAL のまま)。GUI プロセスの ~70 スレッドが base 13 になり、オーディオ側の通常
+        // 優先度スレッド (plugin-main / recv loop / プラグイン内部) より上に来てしまう。
+        // GUI は 3 プロセスでいちばん低くてよいので、open の前後で変わっていたら戻す。
+        // 人が意図して上げた値 (IFEO 等) は open 前から HIGH なので触らない。
+        #[cfg(windows)]
+        let class_before = unsafe {
+            windows::Win32::System::Threading::GetPriorityClass(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+            )
+        };
+        let opened = daw_gui::midi::open_default_input(proxy_for_midi);
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::System::Threading::{
+                GetCurrentProcess, GetPriorityClass, PROCESS_CREATION_FLAGS, SetPriorityClass,
+            };
+            let class_after = GetPriorityClass(GetCurrentProcess());
+            if class_after != class_before {
+                let restored = SetPriorityClass(GetCurrentProcess(), PROCESS_CREATION_FLAGS(class_before));
+                tracing::info!(
+                    before = format!("{class_before:#x}"),
+                    after = format!("{class_after:#x}"),
+                    restored = restored.is_ok(),
+                    "MIDI input open changed the process priority class; restored"
+                );
+            }
+        }
+        match opened {
             Ok(Some(handle)) => {
                 let name = handle.port_name.clone();
                 Box::leak(Box::new(handle));

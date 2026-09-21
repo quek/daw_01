@@ -65,6 +65,25 @@ pub struct MetricsBridge {
     pub graph_steps: AtomicU64,
     /// 上が何 buffer ぶんか (0 = この窓では 1 buffer も流れていない)。
     pub graph_buffers: AtomicU64,
+
+    /// buffer ごとの DSP load の **分布** (累積 count、`swap` しない — 読み手は差分を取る)。
+    /// bucket `i` = load が `[i×5%, (i+1)×5%)`、最後の bucket = 200% 以上。
+    ///
+    /// DSP load の平均と xrun 数だけでは「毎 buffer が締め切り近くまで重い (仕事量の合計の問題)」と
+    /// 「普段は軽いが、たまに遅い buffer が来る (ばらつきの問題)」を区別できない。直す場所が違う。
+    pub load_hist: [AtomicU64; LOAD_HIST_BUCKETS],
+}
+
+/// [`MetricsBridge::load_hist`] の bucket 数 (5% 刻みで 0〜200%、最後は 200% 以上)。
+pub const LOAD_HIST_BUCKETS: usize = 41;
+
+/// DSP load (1.0 = 締め切りぴったり) → [`MetricsBridge::load_hist`] の bucket 番号。
+#[must_use]
+pub fn load_hist_bucket(load: f32) -> usize {
+    if !load.is_finite() || load <= 0.0 {
+        return 0;
+    }
+    ((load * 20.0) as usize).min(LOAD_HIST_BUCKETS - 1)
 }
 
 /// [`MetricsBridgeHandle::take_graph`] が返す 1 窓ぶんのグラフ内訳。
@@ -201,6 +220,19 @@ impl MetricsBridgeHandle {
             steps: b.graph_steps.swap(0, Ordering::AcqRel),
             buffers: b.graph_buffers.swap(0, Ordering::AcqRel),
         }
+    }
+
+    /// daw_audio: 1 buffer の DSP load を分布へ足す (RT、atomic の加算 1 回)。
+    pub fn observe_load_hist(&self, load: f32) {
+        if let Some(b) = self.bridge().load_hist.get(load_hist_bucket(load)) {
+            b.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// DSP load の分布 (累積)。読み手は 2 回読んで差分を取る。
+    pub fn load_hist(&self) -> [u64; LOAD_HIST_BUCKETS] {
+        let b = self.bridge();
+        std::array::from_fn(|i| b.load_hist[i].load(Ordering::Relaxed))
     }
 
     pub fn xrun_count(&self) -> u64 {

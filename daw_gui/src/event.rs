@@ -1098,6 +1098,10 @@ pub enum AppEvent {
         graph: common::metrics_bridge::GraphBreakdown,
         plugin_us: Vec<(common::protocol::InstanceToken, u32)>,
     },
+    /// `--script <js> --gui`: script スレッドが event loop へ「手を積んだ」合図。中身は
+    /// runner が `RunnerScript::run_steps` で取り出す (closure は AppEvent に載せない —
+    /// derive(Clone / PartialEq) を保つため)。runner が拾って `AppData` へは渡さない。
+    ScriptStep,
     /// resource monitor (r.md #3): sysinfo スレッドが ~1Hz で読む system 指標
     /// (daw_01 3 プロセス合計の CPU% と常駐メモリ MB)。
     SystemMetricsTick { cpu: f32, mem_mb: f32 },

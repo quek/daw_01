@@ -102,10 +102,7 @@ fn pdc_real_mcenter_aligns_master_output() {
     };
     assert!(samples.len() >= 4, "WAV too short");
 
-    let (l, r): (Vec<f32>, Vec<f32>) = samples
-        .chunks_exact(2)
-        .map(|c| (c[0], c[1]))
-        .unzip();
+    let (l, r): (Vec<f32>, Vec<f32>) = samples.as_chunks::<2>().0.iter().map(|&[l, r]| (l, r)).unzip();
 
     // 5. 仕組み (MCenter デフォルト latency = 4096 sample):
     //    - Track A: declared latency 0、 vocal impulse @0、 plugin 無し

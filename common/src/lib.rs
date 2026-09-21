@@ -5,6 +5,7 @@ pub mod audio_bridge;
 pub mod audio_decode;
 pub mod audio_render;
 pub mod automation;
+pub mod cpu_topology;
 pub mod device_scope_bridge;
 pub mod dsp;
 pub mod launcher_sidecar;

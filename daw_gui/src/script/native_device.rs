@@ -13,7 +13,7 @@ use boa_engine::{Context, JsArgs, JsResult, JsString, JsValue};
 use common::model::{CompMode, EqBand, NativeParamId, for_each_native};
 use serde_json::Value;
 
-use super::{arg_to_string, js_native, with_host};
+use super::{arg_to_string, js_native, with_app, with_host};
 use crate::app::AppEvent;
 use crate::event_device::DeviceEvent;
 use crate::event_native::NativeEdit;
@@ -25,8 +25,8 @@ use crate::event_native::NativeEdit;
 /// Parallel の位置)。`kind` は `"Comp" | "Eq" | "BusComp" | "ToneEq"`。
 pub(super) fn daw_native_devices(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let track_id = u32::try_from_js(args.get_or_undefined(0), ctx)?;
-    let json = with_host(|h| {
-        let devices = h.app.cur.song_doc.song().fx_chain_by_track_id(track_id).unwrap_or(&[]);
+    let json = with_app(move |app, _side, _io| {
+        let devices = app.cur.song_doc.song().fx_chain_by_track_id(track_id).unwrap_or(&[]);
         let mut rows: Vec<Value> = Vec::new();
         for (index, top) in devices.iter().enumerate() {
             for_each_native(std::slice::from_ref(top), &mut |n| {
@@ -59,8 +59,8 @@ pub(super) fn daw_native_edit(_this: &JsValue, args: &[JsValue], ctx: &mut Conte
     let json = arg_to_string(args, 1, ctx)?;
     let value: Value = serde_json::from_str(&json).map_err(|e| js_native(format!("nativeEdit: parse: {e}")))?;
     let edit = parse_native_edit(&value).map_err(|e| js_native(format!("nativeEdit: {e}")))?;
-    with_host(|h| {
-        h.app.handle_event(AppEvent::Device(DeviceEvent::NativeEdit { device_id, edit }));
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::Device(DeviceEvent::NativeEdit { device_id, edit }));
     });
     Ok(JsValue::undefined())
 }
@@ -88,9 +88,9 @@ fn decode<T: serde::de::DeserializeOwned>(tag: &str, v: Value) -> Result<T, Stri
 /// 面に居ない (処理されていない / まだ publish されていない) device は 0。
 pub(super) fn daw_native_gain_reduction(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let device_id = u64::try_from_js(args.get_or_undefined(0), ctx)?;
-    let amount = with_host(|h| {
-        let bridge = &h.bootstrap.bridge;
-        let Some(slot) = bridge.find_project(h.app.pk()) else {
+    let amount = with_app(move |app, _side, io| {
+        let bridge = &io.bridge;
+        let Some(slot) = bridge.find_project(app.pk()) else {
             return 0.0;
         };
         // GR は伸びる telemetry 面にある (`docs/plan_unbounded_tracks.md` §3)。今の面を開いて読む。
@@ -112,8 +112,8 @@ pub(super) fn daw_master_limiter_gain_reduction(
     _args: &[JsValue],
     _ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    let amount = with_host(|h| {
-        h.bootstrap.bridge.find_project(h.app.pk()).map_or(0.0, |slot| (-slot.master_limiter_gr_db()).max(0.0))
+    let amount = with_app(move |app, _side, io| {
+        io.bridge.find_project(app.pk()).map_or(0.0, |slot| (-slot.master_limiter_gr_db()).max(0.0))
     });
     Ok(JsValue::from(f64::from(amount)))
 }
@@ -124,8 +124,8 @@ pub(super) fn daw_set_devices_bypassed(_this: &JsValue, args: &[JsValue], ctx: &
     let device_ids: Vec<u64> =
         serde_json::from_str(&ids_json).map_err(|e| js_native(format!("setDevicesBypassed: parse ids: {e}")))?;
     let bypassed = args.get_or_undefined(1).to_boolean();
-    with_host(|h| {
-        h.app.handle_event(AppEvent::Device(DeviceEvent::SetDevicesBypassed { device_ids, bypassed }));
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::Device(DeviceEvent::SetDevicesBypassed { device_ids, bypassed }));
     });
     Ok(JsValue::undefined())
 }
@@ -135,8 +135,8 @@ pub(super) fn daw_set_devices_bypassed(_this: &JsValue, args: &[JsValue], ctx: &
 pub(super) fn daw_set_sc_listen(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let arg = args.get_or_undefined(0);
     let device_id = if arg.is_null() || arg.is_undefined() { None } else { Some(u64::try_from_js(arg, ctx)?) };
-    with_host(|h| {
-        h.app.handle_event(AppEvent::Device(DeviceEvent::SetScListen { device_id }));
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::Device(DeviceEvent::SetScListen { device_id }));
     });
     Ok(JsValue::undefined())
 }
@@ -147,7 +147,7 @@ pub(super) fn daw_set_sc_listen(_this: &JsValue, args: &[JsValue], ctx: &mut Con
 pub(super) fn daw_master_peak_dbfs(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let ms = u64::try_from_js(args.get_or_undefined(0), ctx).unwrap_or(500);
     let peak = with_host(|h| {
-        let scope = std::sync::Arc::clone(&h.bootstrap.scope);
+        let scope = std::sync::Arc::clone(&h.io.scope);
         let mut reader = scope.reader();
         let mut frames: Vec<[f32; 2]> = Vec::new();
         let mut peak = 0.0_f32;

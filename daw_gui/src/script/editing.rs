@@ -6,7 +6,7 @@
 
 use boa_engine::{Context, JsArgs, JsNativeError, JsResult, JsValue};
 
-use super::with_host;
+use super::with_app;
 use crate::app::{AppEvent, ClipKey};
 
 fn scale_from_name(name: &str) -> Option<common::scale::Scale> {
@@ -52,8 +52,8 @@ pub(super) fn daw_set_scale_at_playhead(
     let scale = scale_from_name(&scale_name).ok_or_else(|| {
         JsNativeError::typ().with_message(format!("unknown scale name: {scale_name}"))
     })?;
-    with_host(|host| {
-        host.app
+    with_app(move |app, _side, _io| {
+        app
             .handle_event(AppEvent::SetScaleAtPlayhead { root, scale });
     });
     Ok(JsValue::undefined())
@@ -64,8 +64,8 @@ pub(super) fn daw_clear_scale_changes(
     _args: &[JsValue],
     _ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    with_host(|host| {
-        host.app.handle_event(AppEvent::ClearScaleChanges);
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::ClearScaleChanges);
     });
     Ok(JsValue::undefined())
 }
@@ -75,8 +75,8 @@ pub(super) fn daw_toggle_snap_on_draw(
     _args: &[JsValue],
     _ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    with_host(|host| {
-        host.app.handle_event(AppEvent::ToggleSnapOnDraw);
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::ToggleSnapOnDraw);
     });
     Ok(JsValue::undefined())
 }
@@ -86,8 +86,8 @@ pub(super) fn daw_toggle_snap_live_input(
     _args: &[JsValue],
     _ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    with_host(|host| {
-        host.app.handle_event(AppEvent::ToggleSnapLiveInput);
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::ToggleSnapLiveInput);
     });
     Ok(JsValue::undefined())
 }
@@ -98,8 +98,8 @@ pub(super) fn daw_toggle_virtual_keyboard(
     _args: &[JsValue],
     _ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    with_host(|host| {
-        host.app.handle_event(AppEvent::VirtualKeyboard(
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::VirtualKeyboard(
             crate::event_virtual_keyboard::VirtualKeyboardEvent::Toggle,
         ));
     });
@@ -133,8 +133,8 @@ pub(super) fn daw_virtual_keyboard_key(
                 .into());
         }
     };
-    with_host(|host| {
-        host.app.handle_event(AppEvent::VirtualKeyboard(
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::VirtualKeyboard(
             crate::event_virtual_keyboard::VirtualKeyboardEvent::Key(daw_ui_core::GrabbedKey {
                 key: physical,
                 pressed,
@@ -151,8 +151,8 @@ pub(super) fn daw_toggle_fold_to_scale(
     _args: &[JsValue],
     _ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    with_host(|host| {
-        host.app.handle_event(AppEvent::ToggleFoldToScale);
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::ToggleFoldToScale);
     });
     Ok(JsValue::undefined())
 }
@@ -177,8 +177,8 @@ pub(super) fn daw_quantize_pitches_to_scale(
                 .into());
         }
     };
-    with_host(|host| {
-        host.app
+    with_app(move |app, _side, _io| {
+        app
             .handle_event(AppEvent::QuantizePitchesToScale(target));
     });
     Ok(JsValue::undefined())
@@ -191,8 +191,8 @@ pub(super) fn daw_add_note(_this: &JsValue, args: &[JsValue], ctx: &mut Context)
     let start_beat = args.get_or_undefined(2).to_number(ctx)?;
     let duration = args.get_or_undefined(3).to_number(ctx)?;
     let pitch = args.get_or_undefined(4).to_number(ctx)? as u8;
-    with_host(|host| {
-        host.app.handle_event(AppEvent::AddNote {
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::AddNote {
             key: ClipKey { track_id, clip_id },
             start_beat,
             duration,
@@ -215,8 +215,8 @@ pub(super) fn daw_set_note_positions_json(
     let entries: Vec<(u32, f64, u8)> = serde_json::from_str(&json).map_err(|e| {
         JsNativeError::typ().with_message(format!("entries JSON decode: {e}"))
     })?;
-    with_host(|host| {
-        host.app.handle_event(AppEvent::SetNotePositions(entries));
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::SetNotePositions(entries));
     });
     Ok(JsValue::undefined())
 }
