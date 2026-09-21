@@ -27,6 +27,18 @@
 //!   こちらの dispatch の性質なのかを分ける。`run=` の逐次値との比が答え。
 //! - `rt` — `par` のスレッドを実機と同じ条件 (TIME_CRITICAL + MMCSS "Pro Audio") に置く。
 //!   付けない場合は通常優先度。優先度設計そのものの寄与はこの 2 回の差で測る。
+//! - `shadow` — `par` の各スレッドに **相方スレッド** を 1 本足す。out-of-process
+//!   ホスティングでは 1 プラグインの同時実行に 2 スレッド要る (依頼して完了を待つ
+//!   audio runner + `process()` を回す plugin-host worker)。相方は依頼が出ている間
+//!   `spin_budget` ぶん回り、間に合わなければ寝る。`shadow` あり / なしの差が
+//!   **「完了を待つだけのスレッドがいくら取るか」** の下限になる。
+//!
+//!   **限界: 実機の runner より大人しい。** 実機の runner は待つだけでなくグラフの手
+//!   (sequencer / mixer / 合流) も実行し、仕事を探して queue を見に行く。なのでこの値は
+//!   相方のコストを**過小**に出す。実測 (2026-09-21): ここでは 24 並列で +9% だったが、
+//!   同じ条件で pair を 32 / 42 に増やした実エンジンは DSP 39.9% → 54.2% / 50.4% と
+//!   悪化した (ベンチの外挿では良くなるはずだった)。**方針を決める数字は必ず実エンジン
+//!   (`DAW_AUDIO_WORKERS` + `daw_audio::graph::profile`) で取ること。**
 //!
 //! 実測 (Analog Lab V、2026-09-21、n=8、state 付き):
 //!
@@ -35,6 +47,7 @@
 //! gui あり  1350 ms/本   274 MiB/本
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -62,6 +75,8 @@ struct BenchOpts {
     par: Option<usize>,
     /// `par` のスレッドを TIME_CRITICAL + MMCSS に置く (`rt`)。
     rt: bool,
+    /// `par` の各スレッドに相方スレッドを足す (`shadow`)。
+    shadow: bool,
 }
 
 /// `--load-bench` の argv を解釈して回す。plugin の load は専用スレッドで行う
@@ -80,6 +95,7 @@ pub(crate) fn run_from_args() -> Result<()> {
         notes: has("notes"),
         par: val("par=").and_then(|v| v.parse().ok()),
         rt: has("rt"),
+        shadow: has("shadow"),
     };
     let state = match val("state=") {
         Some(f) => Some(std::fs::read(f).with_context(|| format!("reading {f}"))?),
@@ -134,7 +150,7 @@ fn load_bench(
     state: Option<&[u8]>,
     opts: BenchOpts,
 ) -> Result<()> {
-    let BenchOpts { share, probe_gui, run_frames, notes, par, rt } = opts;
+    let BenchOpts { share, probe_gui, run_frames, notes, par, rt, shadow } = opts;
     let format = if path.extension().and_then(|e| e.to_str()) == Some("clap") {
         PluginFormat::Clap
     } else {
@@ -210,7 +226,7 @@ fn load_bench(
         match par {
             Some(k) => {
                 let k = k.min(kept.len());
-                run_parallel_bench(&mut kept, frames, notes, k, rt);
+                run_parallel_bench(&mut kept, frames, notes, k, rt, shadow);
             }
             None => run_process_bench(&mut kept, frames, notes),
         }
@@ -296,27 +312,37 @@ fn run_parallel_bench(
     notes: bool,
     k: usize,
     rt: bool,
+    shadow: bool,
 ) {
     use std::sync::Barrier;
 
     let budget_us = f64::from(frames) / 48_000.0 * 1e6;
     println!(
-        "parallel bench: threads={k} frames={frames} (budget {:.2}ms) rt={rt} notes={notes}",
+        "parallel bench: threads={k} frames={frames} (budget {:.2}ms) rt={rt} notes={notes} shadow={shadow}",
         budget_us / 1000.0
     );
 
     let halves: Vec<_> = plugins.iter().take(k).map(|p| p.audio_half()).collect();
     let barrier = Barrier::new(k);
     let results = std::sync::Mutex::new(Vec::<(usize, u128, u128)>::new());
+    // worker ごとの札。`busy` = いま `process()` の中 (= 相方が完了を待っている)、
+    // `done` = この worker は全計測を終えた (= 相方も抜けてよい)。
+    let pairs: Vec<ShadowFlags> = (0..k).map(|_| ShadowFlags::default()).collect();
 
     std::thread::scope(|scope| {
         for (i, half) in halves.iter().enumerate() {
             let barrier = &barrier;
             let results = &results;
+            let flags = &pairs[i];
             scope.spawn(move || {
-                let us = parallel_worker(half, frames, notes, rt, barrier);
+                let us = parallel_worker(half, frames, notes, rt, barrier, flags);
+                flags.done.store(true, Ordering::Release);
                 results.lock().unwrap().push((i, us.0, us.1));
             });
+            if shadow {
+                let flags = &pairs[i];
+                scope.spawn(move || shadow_runner(frames, rt, flags));
+            }
         }
     });
 
@@ -345,6 +371,7 @@ fn parallel_worker(
     notes: bool,
     rt: bool,
     barrier: &std::sync::Barrier,
+    flags: &ShadowFlags,
 ) -> (u128, u128) {
     const WARMUP: usize = 20;
     const MEASURED: usize = 200;
@@ -376,7 +403,10 @@ fn parallel_worker(
         let ev: &[TimedNoteEvent] = if notes && iter == 0 { &note_on } else { &[] };
         barrier.wait();
         let t = Instant::now();
+        // 相方が「依頼が出ている」と見る窓 = 実機の dispatch 窓。
+        flags.busy.store(true, Ordering::Release);
         let _ = plugin.process(frames, ev, &[], &input, &[], &transport);
+        flags.busy.store(false, Ordering::Release);
         let e = t.elapsed().as_micros();
         if iter >= WARMUP {
             us.push(e);
@@ -384,6 +414,49 @@ fn parallel_worker(
     }
     us.sort_unstable();
     (us[us.len() / 2], us[us.len() - 1])
+}
+
+/// worker と相方の間の札。
+#[derive(Default)]
+struct ShadowFlags {
+    /// worker が `process()` の中にいる (= 相方は完了を待っている)。
+    busy: AtomicBool,
+    /// worker が全計測を終えた (= 相方も抜けてよい)。
+    done: AtomicBool,
+}
+
+/// 実機の audio runner と同じ待ち方をする相方スレッド。
+///
+/// 依頼 (`busy`) が出たら [`common::worker_bridge::spin_budget`] ぶん回り、間に合わ
+/// なければ寝る。**待つだけで 1 コアを占有はしない**が、スレッドは実在してスケジューラの
+/// 取り合いには入る — その寄与を測るためだけに居る。
+fn shadow_runner(frames: u32, rt: bool, flags: &ShadowFlags) {
+    if rt {
+        unsafe {
+            use windows::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+            };
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        }
+    }
+    let _mmcss = if rt { common::mmcss::join_pro_audio() } else { None };
+    let spin = common::worker_bridge::spin_budget(frames, 48_000);
+    while !flags.done.load(Ordering::Acquire) {
+        if !flags.busy.load(Ordering::Acquire) {
+            // 次の依頼を待つ (実機の runner も次の job まで寝ている)。
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            continue;
+        }
+        // 依頼が出ている間: まず回って待つ。
+        let until = Instant::now() + spin;
+        while flags.busy.load(Ordering::Acquire) && Instant::now() < until {
+            std::hint::spin_loop();
+        }
+        // 間に合わなければ寝て待つ (実機は event、ここは同じ「寝る」効果の sleep)。
+        while flags.busy.load(Ordering::Acquire) && !flags.done.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
 }
 
 /// ベンチ共通の transport (120 BPM / 4-4 / 再生中 / 曲頭)。
