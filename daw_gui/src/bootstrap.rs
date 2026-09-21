@@ -753,13 +753,38 @@ impl Bootstrap {
 
 /// audio 側で plugin を依頼する runner (callback スレッド + audio worker) の数。pair は予備
 /// (`common::worker_bridge::SPARE_PAIRS`) を足した数なので、合計が `MAX_WORKERS` に収まるようにする。
+/// audio 側 runner (= 同時に走らせるプラグインの本数) をいくつにするか。
+///
+/// **out-of-process ホスティングでは、1 プラグインを同時に処理するのに 2 スレッド要る**
+/// — 依頼して完了を待つ audio runner と、`process()` を回す plugin_host worker。
+/// なので「論理コア数」をそのまま runner 数にすると、実際に立つスレッドはその 2 倍になる。
+/// 旧実装は `論理コア - 1` で、32 論理 (物理 16) のマシンで 60 スレッドが高優先度で並んでいた。
+///
+/// 実測 (2026-09-21、Ryzen 9 5950X = 物理 16 / 論理 32、Analog Lab V 40 本、480 frame。
+/// 内訳は `daw_audio::graph::profile`、A/B は `DAW_AUDIO_WORKERS` を振って計測):
+///
+/// ```text
+/// runners  DSP avg  1 buffer の wall  plugin_host 側の process()
+///      12    51.7%           4.054ms                     1258us
+///      16    44.4%           3.351ms                     1369us
+///      20    40.5%           3.246ms                     1614us
+///      24    38.0%           3.180ms                     1395us   <- 最良
+///      30    46.5%           3.685ms                     2293us   <- 旧既定
+/// ```
+///
+/// 16〜24 は平らで、30 で崖が来る (スレッドが論理コアの 2 倍近くなり、`process()` 自体が
+/// 1.7 倍に伸びる)。そこで **論理コアの 3/4** を既定にする — 相方のスレッドぶんの席を
+/// 空けたうえで、runner が待っている間は寝る (= 丸ごと 1 コアは要らない) ぶんを見込む。
+///
+/// **この数字は 1 台・1 プラグイン・1 曲での実測**なので、環境で最適は動く。
+/// `DAW_AUDIO_WORKERS` で上書きできる (そのための逃げ道を残してある)。
 fn pick_worker_count() -> u32 {
     let n = std::env::var("DAW_AUDIO_WORKERS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(1).max(1) as u32)
+                .map(|n| (n.get() as u32 * 3 / 4).max(1))
                 .unwrap_or(2)
         });
     n.clamp(1, common::worker_bridge::MAX_WORKERS as u32 - common::worker_bridge::SPARE_PAIRS)

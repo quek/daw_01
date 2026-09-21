@@ -53,10 +53,23 @@ pub(super) fn pair_usable(slot: &SyncSlot, entry: &PluginEntry) -> bool {
 /// 通知は RT からは行わない — flag を notify スレッド (`main.rs`) が poll して
 /// `AudioEvent::PluginUnresponsive` を 1 回だけ送る。 RT-safe: atomic store のみ。
 /// `frames` / `sample_rate` は完了を回って待つ時間 (buffer 周期に比例) を決める。
+///
+/// **待った時間は `lease` 経由で内訳へ記録する** (`crate::graph::profile`)。
+/// ここが「グラフ自身の仕事」と「他プロセスの完了待ち」の境目そのものなので、
+/// 計測点を別の場所に置くと 2 つが混ざって切り分けられなくなる。
 #[inline]
-pub(super) fn dispatch_bounded(slot: &SyncSlot, entry: &PluginEntry, frames: u32, sample_rate: u32) -> bool {
+pub(super) fn dispatch_bounded(
+    lease: PairLease<'_>,
+    slot: &SyncSlot,
+    entry: &PluginEntry,
+    frames: u32,
+    sample_rate: u32,
+) -> bool {
     let spin = common::worker_bridge::spin_budget(frames, sample_rate);
-    match slot.sync.dispatch(entry.plugin_ref.token, spin, DISPATCH_TIMEOUT_MS) {
+    let started = std::time::Instant::now();
+    let outcome = slot.sync.dispatch(entry.plugin_ref.token, spin, DISPATCH_TIMEOUT_MS);
+    lease.record_dispatch_wait(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+    match outcome {
         DispatchOutcome::Done => true,
         DispatchOutcome::TimedOut | DispatchOutcome::WaitFailed => {
             slot.poisoned.store(true, Ordering::Release);
@@ -811,6 +824,9 @@ pub fn render_master_buffer(
     if let Some(rig) = worker {
         rig.heal();
     }
+    // グラフの壁時計は **並列 / 直列の両経路を覆う 1 箇所**で測る (`crate::graph::profile`)。
+    // 経路ごとに測ると、片方だけ計測が抜けたまま「内訳が合わない」ことになる。
+    let graph_started = std::time::Instant::now();
     let ran = {
         let ctx = RenderCtx::new(
             song,
@@ -827,13 +843,22 @@ pub fn render_master_buffer(
         match pool {
             Some(pool) => pool.run(&ctx),
             None => {
+                let profile = ctx.rig.map(|rig| &rig.profile);
                 for &step in &ctx.graph.trace {
+                    let started = std::time::Instant::now();
                     run_step(&ctx, step, 0);
+                    if let Some(pf) = profile {
+                        pf.add_step(0, started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+                    }
                 }
                 true
             }
         }
     };
+    if let Some(rig) = worker {
+        rig.profile
+            .add_buffer(graph_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+    }
     // stall した pool はこの buffer を描き切っていない (plan §4: stalled = 無音)。途中までの track 出力 / 合流を
     // master の段へ流すと耳障りな stuck tone になるので、scratch と master を明示的に 0 にする
     // (RT-safe: 事前確保済みの buffer への fill のみ)。

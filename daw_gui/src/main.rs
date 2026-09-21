@@ -682,6 +682,9 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
                     xrun_count: metrics.xrun_count(),
                     buffer_frames,
                     sample_rate,
+                    // グラフ内訳は **ここが唯一の読み手**。swap で 0 に戻すので、
+                    // 値は「直近の UI 窓の合計」になる (dsp_load_peak と同じ作法)。
+                    graph: metrics.take_graph(),
                     plugin_us,
                 })
                 .is_err()

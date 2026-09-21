@@ -20,6 +20,7 @@ pub mod follower;
 mod mix;
 pub mod native;
 mod port_buffer;
+pub mod profile;
 pub mod program;
 mod program_build;
 pub mod render_graph;
@@ -38,6 +39,7 @@ pub use execute::{process_master_fx_chain, process_track_owned, render_master_bu
 pub use follower::FollowerSlot;
 pub use native::{DeviceScopeTap, NativeIo};
 pub use port_buffer::{PortBuffer, PortBufferPool};
+pub use profile::GraphProfile;
 pub use program::{ChainOp, ChainProgram, ProgramCtx, run_chain_program};
 pub use program_build::{build_program, program_latency};
 pub use schedule::{BufRef, DelayKey, NodeOp, Schedule};

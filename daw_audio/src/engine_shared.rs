@@ -253,6 +253,12 @@ impl<'a> PairLease<'a> {
         let lease = self.rig.leases.get(self.runner)?;
         self.rig.slots.get(lease.load(Ordering::Relaxed) as usize)
     }
+
+    /// この runner が plugin の完了を `ns` 待った、と内訳へ記録する。
+    #[inline]
+    pub fn record_dispatch_wait(&self, ns: u64) {
+        self.rig.profile.add_dispatch(self.runner, ns);
+    }
 }
 
 /// worker pool 一式 (plugin_host との handshake 面 + audio 側 worker threads)。
@@ -279,6 +285,9 @@ pub struct WorkerRig {
     pub bridge: WorkerBridgeHandle,
     /// `AudioEvent::WorkerPoolStalled` を送ったか (notify thread の dedup)。
     pub stall_notified: AtomicBool,
+    /// 1 buffer のグラフの内訳 (`crate::graph::profile` の module doc に目的と測り方)。
+    /// runner の数が決まるのはここなので、器もここが持つ。
+    pub profile: crate::graph::GraphProfile,
 }
 
 impl WorkerRig {
@@ -295,6 +304,7 @@ impl WorkerRig {
             degraded: AtomicBool::new(false),
             bridge,
             stall_notified: AtomicBool::new(false),
+            profile: crate::graph::GraphProfile::new(runners),
         }
     }
 

@@ -919,6 +919,24 @@ fn start_output_stream(
     stream.play().context("failed to start stream")?;
     Ok(stream)
 }
+/// グラフの内訳 (自分の仕事 / plugin 待ち / 実効並列度) を metrics 面へ publish する。
+///
+/// callback の末尾で 1 回だけ呼ぶ。このとき runner は全員グラフを抜けている
+/// (`AudioWorkerPool::run` が `inside` 0 を待って戻る) ので `take` は安全。
+/// 1 buffer も流れていない窓 (song 未ロード / 停止直後) は何も足さない。
+/// RT-safe: atomic の読み書きだけ。
+#[inline]
+fn publish_graph_profile(
+    worker: Option<&crate::engine_shared::WorkerRig>,
+    metrics: &common::metrics_bridge::MetricsBridgeHandle,
+) {
+    let Some(rig) = worker else { return };
+    let g = rig.profile.take();
+    if g.buffers != 0 {
+        metrics.add_graph(&g);
+    }
+}
+
 
 #[allow(clippy::too_many_arguments)]
 fn build_stream(
@@ -1071,6 +1089,7 @@ fn build_stream(
                 let load =
                     common::metrics_bridge::dsp_load(elapsed, frames as u32, session_sample_rate);
                 metrics.observe_dsp_load_peak(load);
+                publish_graph_profile(local.worker.as_deref(), &metrics);
                 dsp_load_ema = common::metrics_bridge::ema(dsp_load_ema, load, 0.1);
                 metrics.set_dsp_load_avg(dsp_load_ema);
                 metrics.set_buffer_info(frames as u32, session_sample_rate);

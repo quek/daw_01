@@ -241,6 +241,28 @@ fn draw_contents(app: &AppData, ui: &mut Ui<'_, AppData>, panel: Rect) {
             p.text_dim
         },
     );
+    y += ROW_H;
+    // グラフの内訳 (`daw_audio::graph::profile`)。DSP load が高いときに、それが
+    // **グラフ自身の仕事**なのか **plugin_host の完了待ち**なのかはここでしか分からない
+    // (直す場所が違う)。`x` は実効並列度 = busy / wall。
+    let g = &m.graph;
+    let per_buffer_ms = |ns: u64| {
+        if g.buffers == 0 { 0.0 } else { ns as f64 / g.buffers as f64 / 1e6 }
+    };
+    ui.label_at(
+        "resmon_o_graph",
+        &format!(
+            "graph {:.2} ms   自分 {:.2}   plugin 待ち {:.1}   並列 {:.1}x",
+            per_buffer_ms(g.wall_ns),
+            per_buffer_ms(g.engine_ns()),
+            per_buffer_ms(g.dispatch_ns),
+            g.concurrency(),
+        ),
+        px + 12.0,
+        y + 3.0,
+        11.0,
+        p.text_dim,
+    );
     y += ROW_H + 8.0;
 
     ui.panel(

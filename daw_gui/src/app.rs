@@ -1326,6 +1326,7 @@ impl AppData {
                 xrun_count,
                 buffer_frames,
                 sample_rate,
+                graph,
                 plugin_us,
             } => {
                 self.ipc.metrics.dsp_load_peak = dsp_load_peak;
@@ -1333,6 +1334,11 @@ impl AppData {
                 self.ipc.metrics.xrun_count = xrun_count;
                 self.ipc.metrics.buffer_frames = buffer_frames;
                 self.ipc.metrics.sample_rate = sample_rate;
+                // 1 buffer も流れていない窓 (停止中) は前回の値を残す — 0 で上書きすると
+                // 停止した瞬間に表示が消えて、直前に何が重かったのかが読めなくなる。
+                if graph.buffers != 0 {
+                    self.ipc.metrics.graph = graph;
+                }
                 self.ipc.plugin_us.clear();
                 self.ipc.plugin_us.extend(plugin_us);
             }

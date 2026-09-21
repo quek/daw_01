@@ -48,6 +48,60 @@ pub struct MetricsBridge {
     /// (`pid << 32 | 世代`、`0` = 面なし)。書き手 daw_plugin_host が作り直すたびに差し替え、読み手は
     /// 変わったら開き直す (`docs/plan_unbounded_tracks.md` §4)。
     pub plugin_plane_id: AtomicU64,
+
+    // --- グラフの内訳 (`daw_audio::graph::profile`) -------------------------
+    // DSP load は合計しか言わないので、「グラフ自身の仕事」と「plugin_host の
+    // 完了待ち」を分けて持つ。daw_audio が buffer ごとに足し込み、daw_gui が
+    // poll で `swap(0)` して「直近の窓の合計」として読む (dsp_load_peak と同じ作法)。
+    /// グラフを流し終えるまでの壁時計の合計 (ns)。
+    pub graph_wall_ns: AtomicU64,
+    /// 全 runner が 1 手の中にいた時間の合計 (ns)。`/ wall` が実効並列度。
+    pub graph_busy_ns: AtomicU64,
+    /// そのうち plugin の完了待ちの合計 (ns)。`busy - dispatch` がグラフ自身の仕事。
+    pub graph_dispatch_ns: AtomicU64,
+    /// 完了待ちの回数。
+    pub graph_dispatches: AtomicU64,
+    /// 実行した手の数。
+    pub graph_steps: AtomicU64,
+    /// 上が何 buffer ぶんか (0 = この窓では 1 buffer も流れていない)。
+    pub graph_buffers: AtomicU64,
+}
+
+/// [`MetricsBridgeHandle::take_graph`] が返す 1 窓ぶんのグラフ内訳。
+/// 生成元は `daw_audio::graph::GraphSample` で、こちらは **プロセス境界を渡る形**。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraphBreakdown {
+    pub wall_ns: u64,
+    pub busy_ns: u64,
+    pub dispatch_ns: u64,
+    pub dispatches: u64,
+    pub steps: u64,
+    pub buffers: u64,
+}
+
+impl GraphBreakdown {
+    /// グラフ自身の仕事に使った時間 (ns) = `busy - dispatch`。
+    #[must_use]
+    pub fn engine_ns(&self) -> u64 {
+        self.busy_ns.saturating_sub(self.dispatch_ns)
+    }
+
+    /// 実効並列度 (= `busy / wall`)。1 buffer も流れていなければ 0。
+    #[must_use]
+    pub fn concurrency(&self) -> f32 {
+        if self.wall_ns == 0 {
+            return 0.0;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let v = self.busy_ns as f32 / self.wall_ns as f32;
+        v
+    }
+
+    /// 1 buffer あたりの壁時計 (ns)。
+    #[must_use]
+    pub fn wall_per_buffer_ns(&self) -> u64 {
+        self.wall_ns.checked_div(self.buffers).unwrap_or(0)
+    }
 }
 
 impl MetricsBridge {
@@ -123,6 +177,30 @@ impl MetricsBridgeHandle {
     /// クリア後に daw_audio が新たな dropout を検出すれば再び増える。
     pub fn reset_xrun(&self) {
         self.bridge().xrun_count.store(0, Ordering::Release);
+    }
+
+    /// daw_audio: 1 buffer ぶんのグラフ内訳を足し込む (RT、atomic の加算のみ)。
+    pub fn add_graph(&self, s: &GraphBreakdown) {
+        let b = self.bridge();
+        b.graph_wall_ns.fetch_add(s.wall_ns, Ordering::Relaxed);
+        b.graph_busy_ns.fetch_add(s.busy_ns, Ordering::Relaxed);
+        b.graph_dispatch_ns.fetch_add(s.dispatch_ns, Ordering::Relaxed);
+        b.graph_dispatches.fetch_add(s.dispatches, Ordering::Relaxed);
+        b.graph_steps.fetch_add(s.steps, Ordering::Relaxed);
+        b.graph_buffers.fetch_add(s.buffers, Ordering::Relaxed);
+    }
+
+    /// daw_gui: 溜まったグラフ内訳を取り出して 0 に戻す (= 直近の UI 窓の合計)。
+    pub fn take_graph(&self) -> GraphBreakdown {
+        let b = self.bridge();
+        GraphBreakdown {
+            wall_ns: b.graph_wall_ns.swap(0, Ordering::AcqRel),
+            busy_ns: b.graph_busy_ns.swap(0, Ordering::AcqRel),
+            dispatch_ns: b.graph_dispatch_ns.swap(0, Ordering::AcqRel),
+            dispatches: b.graph_dispatches.swap(0, Ordering::AcqRel),
+            steps: b.graph_steps.swap(0, Ordering::AcqRel),
+            buffers: b.graph_buffers.swap(0, Ordering::AcqRel),
+        }
     }
 
     pub fn xrun_count(&self) -> u64 {
@@ -221,6 +299,9 @@ pub struct ResourceMetrics {
     pub memory_mb: f32,
     /// GUI のフレームレート (fps)。
     pub fps: f32,
+    /// 直近の窓のグラフ内訳 ([`GraphBreakdown`])。DSP load は合計しか言わないので、
+    /// 「グラフ自身の仕事」と「plugin_host の完了待ち」を分けて持つ。
+    pub graph: GraphBreakdown,
 }
 
 #[cfg(test)]

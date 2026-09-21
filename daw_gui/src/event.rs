@@ -1086,7 +1086,8 @@ pub enum AppEvent {
         voices: Vec<(u32, common::audio_bridge::VoiceSnapshot)>,
     },
     /// resource monitor (r.md #3): poller が ~30Hz で読む全体メトリクス
-    /// (DSP load peak/avg、 xrun 累積、 buffer 長 / sample rate) と、per-plugin の直近 `process()` 時間
+    /// (DSP load peak/avg、 xrun 累積、 buffer 長 / sample rate)、グラフの内訳
+    /// (`graph`: 自分の仕事 / plugin 待ち / 実効並列度) と、per-plugin の直近 `process()` 時間
     /// (`(instance token, μs)`、plugin host の計測面から読んだもの)。
     MetricsTick {
         dsp_load_peak: f32,
@@ -1094,6 +1095,7 @@ pub enum AppEvent {
         xrun_count: u64,
         buffer_frames: u32,
         sample_rate: u32,
+        graph: common::metrics_bridge::GraphBreakdown,
         plugin_us: Vec<(common::protocol::InstanceToken, u32)>,
     },
     /// resource monitor (r.md #3): sysinfo スレッドが ~1Hz で読む system 指標

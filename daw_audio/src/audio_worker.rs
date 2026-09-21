@@ -301,8 +301,15 @@ impl Drop for AudioWorkerPool {
 /// 進みを数える (stall の判定、[`MasterPark::stuck`])。
 fn run_job(shared: &DispatchShared, ctx: &RenderCtx<'_>, graph: &RenderGraph, job: u32, slot: usize) {
     let progress = shared.progress.get(slot).map(|c| &c.0);
+    // 1 手ごとの所要を内訳へ (`crate::graph::profile`)。`dispatch_bounded` が中で
+    // 「待ち」を別に数えるので、差が「グラフ自身の仕事」になる。
+    let profile = ctx.rig.map(|rig| &rig.profile);
     for &step in graph.steps(job) {
+        let started = std::time::Instant::now();
         run_step(ctx, step, slot);
+        if let Some(pf) = profile {
+            pf.add_step(slot, started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        }
         if let Some(p) = progress {
             p.store(p.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
         }

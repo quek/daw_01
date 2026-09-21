@@ -826,7 +826,10 @@ fn run_plugin(
     let Some(entry) = ctx.plugin_refs.get(&device_id) else {
         return false;
     };
-    let Some(ws) = ctx.worker_sync.and_then(|lease| lease.slot()) else {
+    let Some(lease) = ctx.worker_sync else {
+        return false;
+    };
+    let Some(ws) = lease.slot() else {
         return false;
     };
     // quarantine / poison gate — 通らない device は pd にも触らない
@@ -911,7 +914,7 @@ fn run_plugin(
             pd.aux_in_active[port] = 1;
         }
     }
-    if !super::execute::dispatch_bounded(ws, entry, ctx.frames, ctx.sample_rate) {
+    if !super::execute::dispatch_bounded(lease, ws, entry, ctx.frames, ctx.sample_rate) {
         return false;
     }
     // ---- outputs ----
