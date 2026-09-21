@@ -103,6 +103,8 @@ fn now_secs() -> u64 {
 /// Loads a `.clap` just long enough to query its descriptors, then unloads it cleanly.
 /// Does NOT instantiate any plugin (no `create_plugin` call).
 fn scan_one_file(path: &Path) -> Result<Vec<PluginEntry>> {
+    // プラグインには普通の形のパスを渡す (`plugin_paths::plain_path`)。
+    let path = &crate::plugin_paths::plain_path(path);
     let library = unsafe { Library::new(path) }
         .with_context(|| format!("failed to load {}", path.display()))?;
 

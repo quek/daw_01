@@ -116,12 +116,15 @@ impl PluginEntry {
 /// Factory Class` ペアリング) を追加したので 3 → 4 (= 旧 cache を再スキャンさせ、
 /// 既存プラグインに `ara:supported` を付与する。これが無いと `is_ara()` が false の
 /// ままで `sync_ara_documents` が `SetupAraDocument` を送らず ARA が無音になる)。
+/// 5 → 6: 走査のパスを `\\?\` (verbatim) から普通の形にした (`daw_plugin_host::plugin_paths::plain_path`)。
+/// verbatim のパスでは Melodyne が読み込みを拒んで DB から落ち、Renoise Redux は自分のリソースの
+/// パスを組み立てられなかったので、走査し直して DB のパスを普通の形に戻す。
+pub const PORT_PROBE_VERSION: u32 = 6;
+
 /// [`PluginEntry::has_embedded_gui`] の serde 既定 (= 未 probe は楽観的に「GUI あり」)。
 fn default_true() -> bool {
     true
 }
-
-pub const PORT_PROBE_VERSION: u32 = 5;
 
 /// plugin の一覧 (cache / scan の結果) と、id で引く索引。
 ///

@@ -242,6 +242,8 @@ pub fn scan_vst3_classes() -> Result<Vec<Vst3ClassEntry>> {
 }
 
 fn scan_one_vst3_file(bundle_path: &Path, dll_path: &Path) -> Result<Vec<Vst3ClassEntry>> {
+    // プラグインには普通の形のパスを渡す (`plugin_paths::plain_path`)。
+    let dll_path = &crate::plugin_paths::plain_path(dll_path);
     let library = unsafe { Library::new(dll_path) }
         .with_context(|| format!("LoadLibrary {}", dll_path.display()))?;
 

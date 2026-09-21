@@ -63,7 +63,7 @@
 //! 「ルートが 1 つも無い」と「ルートはあったが .clap が 0 個」を区別できるよう、
 //! 返すのは常に「実在するルートの列」であって Result ではない。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// CLAP 仕様が定める検索ルート (実在するものだけ)。
 ///
@@ -189,8 +189,9 @@ fn existing_unique(roots: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen = Vec::new();
     for root in roots {
         // canonicalize は存在確認も兼ねる。 失敗 (= 存在しない / 権限が無い)
-        // したルートは静かに落とさず、 単に候補から外す。
-        let Ok(real) = root.canonicalize() else {
+        // したルートは静かに落とさず、 単に候補から外す。 Windows の canonicalize は
+        // `\\?\C:\...` (verbatim) を返すので、 普通の形に戻してから使う ([`plain_path`])。
+        let Ok(real) = root.canonicalize().map(|p| plain_path(&p)) else {
             continue;
         };
         if !real.is_dir() || seen.contains(&real) {
@@ -201,9 +202,78 @@ fn existing_unique(roots: Vec<PathBuf>) -> Vec<PathBuf> {
     seen
 }
 
+/// Windows の verbatim パス (`\\?\C:\...` / `\\?\UNC\server\share\...`) を普通の形
+/// (`C:\...` / `\\server\share\...`) に戻す。普通の形では意味が変わるパス (長さが MAX_PATH 以上、
+/// 末尾が `.` や空白の要素、予約名の要素) と、verbatim でないパスはそのまま返す。
+///
+/// **プラグインには普通の形のパスを渡す。** Melodyne 5.4.2 は `\\?\` のパスで読み込まれると
+/// 自分のインストール先を見失い、「Installation Error (-103/123/0)」を出して `GetPluginFactory` が
+/// null を返す (2026-09-21 に実測。同じ DLL を普通の形のパスで読むと成功する)。`canonicalize` の
+/// 結果をそのまま走査に使っていたので、d2ac7c49 以降のスキャンで Melodyne が一覧から落ちていた。
+/// REAPER などのホストも普通の形で渡している。
+pub fn plain_path(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut comps = path.components();
+    let Some(Component::Prefix(prefix)) = comps.next() else {
+        return path.to_path_buf();
+    };
+    let head = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => format!("{}:", char::from(drive)),
+        Prefix::VerbatimUNC(server, share) => {
+            format!(r"\\{}\{}", server.to_string_lossy(), share.to_string_lossy())
+        }
+        _ => return path.to_path_buf(),
+    };
+    let rest = comps.as_path();
+    let safe = rest.components().all(|c| match c {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy();
+            !name.ends_with('.') && !name.ends_with(' ') && !is_reserved_name(&name)
+        }
+        Component::RootDir => true,
+        _ => false,
+    });
+    let mut out = PathBuf::from(head);
+    out.push(rest);
+    // MAX_PATH (260) は終端の NUL を含む。
+    if !safe || out.as_os_str().len() >= 260 {
+        return path.to_path_buf();
+    }
+    out
+}
+
+/// Win32 の予約デバイス名 (拡張子が付いていても予約)。
+fn is_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn plain_path_drops_the_verbatim_prefix_only_when_the_meaning_is_kept() {
+        let p = |s: &str| plain_path(Path::new(s));
+        assert_eq!(
+            p(r"\\?\C:\Program Files\Common Files\VST3\Celemony\Melodyne\Melodyne.vst3"),
+            PathBuf::from(r"C:\Program Files\Common Files\VST3\Celemony\Melodyne\Melodyne.vst3")
+        );
+        assert_eq!(p(r"\\?\UNC\srv\share\VST3\a.vst3"), PathBuf::from(r"\\srv\share\VST3\a.vst3"));
+        // 普通の形で意味が変わるものは verbatim のまま。
+        assert_eq!(p(r"\\?\C:\VST3\trailing."), PathBuf::from(r"\\?\C:\VST3\trailing."));
+        assert_eq!(p(r"\\?\C:\VST3\con.vst3"), PathBuf::from(r"\\?\C:\VST3\con.vst3"));
+        let long = format!(r"\\?\C:\{}", "a".repeat(300));
+        assert_eq!(p(&long), PathBuf::from(&long));
+        // verbatim でないものは触らない。
+        assert_eq!(p(r"C:\VST3\x.vst3"), PathBuf::from(r"C:\VST3\x.vst3"));
+        assert_eq!(p(r"relative\x.vst3"), PathBuf::from(r"relative\x.vst3"));
+    }
 
     #[test]
     fn env_path_list_splits_on_the_os_separator() {

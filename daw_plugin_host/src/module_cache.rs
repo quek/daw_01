@@ -228,6 +228,9 @@ impl ModuleCache {
     /// `path` (bundle でも DLL でも可) の VST3 モジュールを返す。既に読み込み済みなら
     /// **同じ** モジュール (= 同じ factory) を返す。
     pub fn vst3(&mut self, path: &Path) -> Result<Arc<Vst3Module>> {
+        // 旧 DB / 保存済みプロジェクトに残った `\\?\` のパスもここで普通の形にする
+        // (プラグインには普通の形で渡す。`plugin_paths::plain_path`)。
+        let path = &crate::plugin_paths::plain_path(path);
         let dll_path = resolve_vst3_dll(path)
             .with_context(|| format!("resolving VST3 at {}", path.display()))?;
         if let Some(hit) = self.vst3.get(&dll_path).and_then(Weak::upgrade) {
@@ -240,7 +243,8 @@ impl ModuleCache {
 
     /// `path` の CLAP モジュールを返す (VST3 版と対称)。
     pub fn clap(&mut self, path: &Path) -> Result<Arc<ClapModule>> {
-        let key = path.to_path_buf();
+        let key = crate::plugin_paths::plain_path(path);
+        let path = key.as_path();
         if let Some(hit) = self.clap.get(&key).and_then(Weak::upgrade) {
             return Ok(hit);
         }
