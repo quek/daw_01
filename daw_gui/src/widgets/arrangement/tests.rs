@@ -1102,6 +1102,23 @@
         }
     }
 
+    /// 行を下限まで低くしても、名前帯と M/S/R の枠はトラック名の文字 + 上下 1px を収める。
+    /// 縦の余白を固定 4px にしていた頃は 16px 行で枠が 8px になり、文字がはみ出していた。
+    #[test]
+    fn header_row_layout_keeps_text_inside_frames_at_min_row_h() {
+        let text = test_style().track_text_size;
+        for h in [crate::app_types::MIN_ARRANGE_ROW_H, 18.0, 20.0, 24.0] {
+            let row = Rect { x: 0.0, y: 0.0, w: 200.0, h };
+            let layout = header_row_layout(row, 4.0);
+            let mut frames = vec![layout.name_rect];
+            frames.extend(layout.buttons);
+            for f in frames {
+                assert!(f.h >= text + 2.0, "row_h={h}: 枠 {} px に {text} px の文字が収まらない", f.h);
+                assert!(f.y >= row.y && f.y + f.h <= row.y + row.h, "row_h={h}: {f:?} が行からはみ出す");
+            }
+        }
+    }
+
     // -------- M13 Phase 55: ruler / time_sig 対応 grid の確認 --------
 
 

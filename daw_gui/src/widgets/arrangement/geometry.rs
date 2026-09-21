@@ -976,12 +976,17 @@ pub(super) const HEADER_METER_W: f32 = 7.0;
 
 #[allow(clippy::similar_names)]
 pub(super) fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayout {
-    let pad = 4.0_f32;
+    // 横の余白は固定。縦の余白は行が低いときだけ詰める (最小 1px)。固定 4px のままだと
+    // 行高の下限 (`MIN_ARRANGE_ROW_H` = 16px) で名前帯も M/S/R も 8px になり、文字が
+    // 枠からはみ出していた。button が上限の高さを保てる行高 (28px 以上) では従来どおり 4px。
+    const PAD_X: f32 = 4.0;
+    const BTN_MAX_H: f32 = 20.0;
+    let pad_y = ((row.h - BTN_MAX_H) * 0.5).clamp(1.0, 4.0);
     let outer = Rect {
-        x: row.x + pad,
-        y: row.y + pad,
-        w: (row.w - pad * 2.0).max(2.0),
-        h: (row.h - pad * 2.0).max(2.0),
+        x: row.x + PAD_X,
+        y: row.y + pad_y,
+        w: (row.w - PAD_X * 2.0).max(2.0),
+        h: (row.h - pad_y * 2.0).max(2.0),
     };
     // 右端のメーターを先に切り出し、 残りを従来の inner として配る。 メーターは
     // progressive disclosure の対象外 (行を潰してもレベルは見えるべき情報)。
@@ -990,7 +995,7 @@ pub(super) fn header_row_layout(row: Rect, volume_band_h: f32) -> HeaderRowLayou
     let meter_rect = Rect { x: outer.x + outer.w - meter_w, y: outer.y, w: meter_w, h: outer.h };
     let inner = Rect { w: (outer.w - meter_w - meter_gap).max(2.0), ..outer };
     // buttons は常に 20px max (band の有無で縮めない)。band は inner.h に余裕があるときだけ表示する。
-    let btn_h = inner.h.min(20.0);
+    let btn_h = inner.h.min(BTN_MAX_H);
     let small = 22.0_f32;
     let gap = 2.0_f32;
     // Phase 68 (#040): M + S + R の 3 button (← Phase 47c の M + S 2 button 構成から R = Record-arm を追加)。
