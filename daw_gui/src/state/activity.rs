@@ -6,12 +6,13 @@
 //! - 動画プレビュー窓 … 同上 (別 `WindowId`)
 //! - プラグインエディタ窓 … **別プロセス (daw_plugin_host) からの IPC**
 //!
-//! 3 つ目が IPC なのは妥協ではなく必然で、エディタ窓は daw_plugin_host が所有する
-//! owner 無し top-level でなければならない (daw_gui を owner にすると
-//! `GetAncestor(GA_ROOTOWNER)` が daw_gui に解決し、JUCE の cascade サブメニューが
-//! `isForegroundProcess()` 判定で即 dismiss される)。つまりプラグイン GUI 操作中の
-//! daw_gui は非フォーカスどころか foreground プロセスですらなく、**自分の中の情報
-//! だけでは原理的に「アプリはアクティブ」と判定できない**。
+//! 3 つ目が IPC なのは妥協ではなく必然で、エディタ窓は daw_plugin_host が作る
+//! top-level でなければならない (daw_gui が作って窓が daw_gui のプロセスに属すると、
+//! JUCE の cascade サブメニューが `isForegroundProcess()` = 前面窓のプロセス ID 比較で
+//! 即 dismiss される)。owner は daw_gui の本体窓だが (r.md #65)、owner を付けても窓の
+//! 所属プロセスは変わらない。つまりプラグイン GUI 操作中の daw_gui は非フォーカス
+//! どころか foreground プロセスですらなく、**自分の中の情報だけでは原理的に
+//! 「アプリはアクティブ」と判定できない**。
 
 /// アクティブ状態の生の材料と、daw_audio へ最後に送った値。session-only
 /// (保存しない / undo しない / dirty にしない)。

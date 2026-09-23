@@ -952,7 +952,8 @@ impl AudioEvent {
 ///
 /// r.md #65: エディタコンテナ窓の **owner** を「窓の作成時に」決めるために渡す。
 /// 「HWND は IPC を渡らない」という旧不変条件は 2026-08-22 に撤回された
-/// (撤回理由は CLAUDE.md「プラグインエディタ窓と Win32」節。要約すると、旧不変条件は
+/// (撤回理由は `docs/plan_plugin_editor_topwindow.md`「注意 (FFI / window)」の 2026-08-22
+///  撤回の項。要約すると、旧不変条件は
 ///  「daw_gui を owner にしてはいけない」から導出されていたが、その禁止自体が
 ///  JUCE のソース読み違いに基づく誤りだった)。
 ///
@@ -1069,10 +1070,12 @@ pub enum PluginCommand {
     ///
     /// r.md #65: `geometry` は前回このプロジェクトで閉じたときの窓の位置 /
     /// client サイズ (`ViewState.plugin_editor_windows` 由来、`None` = 初回)。
-    /// 位置は常に復元し、**サイズはプラグインが `canResize` / `can_resize` で
-    /// リサイズ可と答えたときだけ**復元する (固定サイズ GUI に前回のサイズを
-    /// 押し付けない)。CLAP の GUI 手順 9 「resizable かつ前回セッションのサイズが
-    /// 分かっているときだけ `set_size`」と同じ規約。
+    /// 位置は常に復元し、**サイズは plugin_host が窓に枠を出したときだけ**復元する
+    /// (`plugin_instance::should_offer_resize_frame`。固定サイズ GUI に前回のサイズを
+    /// 押し付けない)。CLAP は `can_resize` の申告どおりで、GUI 手順 9 「resizable かつ
+    /// 前回セッションのサイズが分かっているときだけ `set_size`」と同じ規約。VST3 は
+    /// `canResize` が false でも枠を出すので、`checkSizeConstraint` で丸めてから復元する
+    /// (2026-08-22 の 694e4d2a)。
     ///
     /// r.md #65: `owner_main_window` は **daw_gui の本体窓** (preview 窓ではない)。
     /// plugin_host はこれをエディタコンテナ窓の **owner** にする (REAPER の FX 窓と
@@ -1203,12 +1206,13 @@ pub enum PluginEvent {
     /// r.md #49: このプロセスが所有する窓 (= プラグインエディタ) がアクティブになった /
     /// 非アクティブになった。`WM_ACTIVATEAPP` 由来。
     ///
-    /// エディタ窓は **daw_plugin_host が所有する owner 無し top-level** で、daw_gui を
-    /// owner にすることは設計上禁止されている (`GetAncestor(GA_ROOTOWNER)` が daw_gui に
-    /// 解決すると JUCE の cascade サブメニューが `isForegroundProcess()` 判定で即 dismiss
-    /// される — `daw_plugin_host::editor_window` の冒頭コメント)。よって「プラグイン GUI を
-    /// 触っている間もアプリはアクティブ」を daw_gui 内の情報だけで判定することは**原理的に
-    /// できず**、このプロセスが自分で報告するしかない。
+    /// エディタ窓は **daw_plugin_host が作る top-level** で、owner は daw_gui の本体窓
+    /// (r.md #65)。窓を daw_gui が作ることは設計上禁止されている (窓が daw_gui のプロセスに
+    /// 属すると、JUCE の cascade サブメニューが `isForegroundProcess()` = 前面窓のプロセス ID
+    /// 比較で即 dismiss される — `daw_plugin_host::editor_window` の冒頭コメント)。owner を
+    /// 付けても窓の所属プロセスは変わらないので、エディタを触っている間の前面窓は
+    /// daw_plugin_host の窓になる。よって「プラグイン GUI を触っている間もアプリはアクティブ」を
+    /// daw_gui 内の情報だけで判定することは**原理的にできず**、このプロセスが自分で報告するしかない。
     HostWindowsActive(bool),
     /// Reply to `PluginCommand::ReinitAllPlugins` (`project` は要求の echo)。
     PluginsReinitDone { project: Option<ProjectKey> },
@@ -1252,9 +1256,10 @@ pub enum PluginEvent {
     },
     /// Reply to `RequestAllStates { project }`: one entry per loaded device of that project.
     AllPluginStates { project: ProjectKey, entries: Vec<SlotState> },
-    /// r.md #65: エディタ窓のジオメトリが確定した。open 直後と、以後
-    /// **ユーザーのドラッグが終わった / プラグイン起点のリサイズが済んだ**
-    /// たびに送る (ドラッグ中は送らない — `WM_EXITSIZEMOVE` で 1 回)。
+    /// r.md #65: エディタ窓のジオメトリ。open 直後 / **rect が変わったとき** /
+    /// close 直前に送る。rect の変化は `WM_MOVE` / `WM_SIZE` だけが拾う
+    /// (`EditorWindow::take_geometry_change` の不変条件。ドラッグ中は modal ループで
+    /// poll が回らないので、確定後に 1 回届く)。
     ///
     /// 窓を所有するのは plugin_host なので、位置 / サイズの一次情報はここにしか
     /// 無い。daw_gui はこれを `plugin_editor_windows` に貯め、保存時に

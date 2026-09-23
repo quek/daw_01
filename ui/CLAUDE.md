@@ -26,15 +26,16 @@ crates/examples/  (mixer / waveform_validation 等) -- 動作確認サンプル
 ```bash
 make build                            # ルート Makefile が SSoT (実行 3 exe)
 make test-nolaunch                    # テスト (素の make test は daw_gui を起動する。root 参照)
-cargo clippy --workspace --tests -- -D warnings
+make clippy                           # -D warnings (--all-targets。root 参照)
 cargo run --bin mixer                 # mixer 動作確認
 cargo run --bin waveform_validation   # 波形 UI 動作確認
 cargo bench -p daw-ui-core            # criterion ベンチ
 cargo test -p daw-ui-core --test no_clone_required   # trybuild (no-Clone 制約)
 ```
 
-example を実機検証する前に必ず `cargo run --bin <name>` または `cargo build` を明示する
-(root CLAUDE.md「ビルドと検証の区別」の ui 版)。
+example を実機検証する前に必ず `cargo run --bin <name>` または `cargo build -p daw-ui-example-<name>` を明示する
+(`<name>` は bin 名の `_` を `-` にしたもの。例: `waveform_validation` → `daw-ui-example-waveform-validation`。
+素の `cargo build` は workspace 全体をビルドする。root CLAUDE.md「ビルドと検証の区別」の ui 版)。
 
 ## 設計上の不変条件 (load-bearing)
 
@@ -42,12 +43,12 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 
 - ユーザ Model 型に `Clone` / `PartialEq` / `Hash` / `Default` を要求しない
 - メッセージ型を導入しない。`Edit<M>` は `Box<dyn FnOnce(&mut M)>` で、`Application::Message: Clone` 伝染を構造的に防ぐ
-- `derive` マクロ (Lens 等) 禁止
+- `derive` マクロ (Lens 等) 禁止: ライブラリは Lens のような derive マクロを提供せず、利用者に derive を書かせる API も作らない (公開 API は即時モード)。ライブラリ自身が定義する型 (公開の Style 型を含む) に `#[derive(Debug, Clone)]` 等の標準 derive を付けるのはこの対象外
 - 差分検出は widget ID + プリミティブ末端値の hash のみ。ユーザ Model の構造体全体は触らない
 - `Ui<'a>` の `'a` で借用ライフタイムを統一、GAT は使わない (stable Rust)
 - ライブラリは audio / IPC / プロセス間通信に一切関知しない。`Edit` を返したところで責務を切る
 
-これらは `crates/ui/tests/no_clone_required.rs` (trybuild) で CI 固定済み。
+このうち「Model に `Clone` / `PartialEq` / `Hash` / `Default` を要求しない」と「利用者に derive を書かせない」(`Application::Message: Clone` の伝染を含む) は `crates/ui/tests/no_clone_required.rs` (trybuild。derive を一切付けない Model で公開 API がコンパイルできることを確かめる。`make test` / `make test-nolaunch` が回す) で固定している。
 
 ## daw_01 側からの使い方
 
@@ -57,19 +58,27 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 - **イベント dispatch**: view から `Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::X))`、
   background thread から `EventLoopProxy<AppEvent>::send_event`。`impl Model` 的な trait 接続は不要。
 - **immediate-mode + `heavy()` escape hatch**: 大量描画 (ピアノロール / アレンジ) は
-  `ui.heavy(id, |hctx| hctx.cached(viewport_key, |hctx| { ... }))` の中で `push_rect` / `push_text` /
-  `push_lines` / `push_edit` を呼ぶ。`Ui::push_edit` は `pub(crate)` なので、view から Edit を
-  流すのは heavy ブロック内から。
+  `ui.heavy(id, |hctx| { ... })` の中で `hctx.push_rect` / `push_text` / `push_lines` を呼び、変わらない
+  背景レイヤだけを `hctx.cached(viewport_key, |hctx| { ... })` で包む。cached の中身は viewport_key が
+  前フレームと同じなら実行されない (前フレームの描画を再生するだけ) ので、ヒットテスト・`push_edit`・
+  動的 overlay (カーソル線 / 選択範囲) は cached の外に置く。Edit は heavy の外なら `ui.push_edit`、
+  中なら `hctx.push_edit` で積む。
 - **背景スレッド** (autosave / playhead poll / MIDI / IPC bridge / VOICEVOX synth / plugin DB
   rescan) は `std::thread` + `EventLoopProxy`。**`tokio::time::sleep` は使えない**。
-- **ダブルクリック検出は built-in が無い**。`AppData::last_click: Option<(Instant, x, y)>` に
-  最終クリックを記録し、各 view の入力ハンドラで 400ms + 5px 以内なら double 判定。
+  `AppData` の handler から起こす thread (VOICEVOX synth / plugin DB rescan / 書き出し等) は
+  `self.ipc.event_proxy` (`Arc<dyn BackgroundDispatcher>`、`daw_gui/src/dispatcher.rs`) の `send` で送る
+  (中身は `EventLoopProxy` の wrapper。test では送った event を記録する実装に差し替わる)。
+- **ダブルクリック**は `Ui::take_double_click_in_rect(rect)` (2 回目の release で成立) /
+  `Ui::take_double_click_press_in_rect(rect)` (2 回目の press で成立。放さず drag する起点) を使う。
+  閾値は `UiHost::set_double_click_threshold` (既定 400ms / 5px)。
 - **UI のキーバインド・イベントは可視フィードバックが無いと動いたか判別不能**。迷ったら
   `AppData::handle_event` 冒頭に `tracing::info!(?event, "received")` を入れてログで確認し、
-  確認後は削除するか debug feature で囲う (`/debug-gui` / `/debug-ui` skill)。
-- イベントループ (`daw_gui/src/view/runner.rs::Runner`)、ショートカット
-  (`Runner::dispatch_shortcut`)、`WindowBackend` の配線 (上流の正準実装
-  `daw_ui_platform::WinitWindow` を直接使う) は該当ファイルを読む。
+  確認後は削除する。残すなら `tracing::debug!` に落とす (既定の filter は `info` なので
+  `RUST_LOG=info,daw_gui=debug` のときだけ出る。`debug-gui` のような cargo feature は無い) (`/debug-gui` / `/debug-ui` skill)。
+- イベントループ (`daw_gui/src/view/runner.rs::Runner`)、ショートカット (定義は
+  `daw_gui/src/view/shortcuts.rs` の `SHORTCUTS`、消費は `daw_gui/src/view/root.rs::dispatch_shortcuts` の
+  `ui.take_shortcut`)、`WindowBackend` の配線 (上流の正準実装 `daw_ui_platform::WinitWindow` を
+  直接使う) は該当ファイルを読む。
 
 ## Coding Principles (daw-ui 固有の上乗せ)
 
@@ -92,6 +101,8 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 - 既存の挙動を勝手に変えない
 - バグ修正ついでのリファクタリングは別コミット
 - 仕様外のデフォルト値・初期状態・キーバインドを勝手に入れない
+- ただし作業中に見つけた問題 (バグ・古いコメント等) は、タスク外でもその場で直す
+  (memory `feedback_fix_found_problems_no_scars`)
 
 ### 新しく入れた抽象は次の機会に使う
 - 新しい API / 抽象 (型/トレイト/モジュール) を入れた直後のタスクでは、その抽象を実用するのが既定
@@ -103,7 +114,7 @@ example を実機検証する前に必ず `cargo run --bin <name>` または `ca
 - 改善のためなら **破壊的 API 変更を恐れない**。単一 workspace + Edition 2024 の利点を活かし、breaking change を入れたら全 example / test / docs を **1 commit で一括更新** する
 - 「audio thread に Edit を送るかも」のような **曖昧な future-proof のために現実の全ユーザに boilerplate を強要しない**。必要になってから別 method (`frame_to_edits` 等) を追加すれば十分
 
-### デバッグの層 (root「Debugging Methodology」の上乗せ)
+### デバッグの層 (root「デバッグ」の上乗せ)
 - **上流→下流**: OS イベント → winit AppEvent → InputAccumulator → `Ui::frame` → widget → Edit
   → Model → render。`Ui::frame` → render → 表示 のサイクル全体で見る
 - クリック・キーバインドは「動いた / 動いてない」が見えないので `tracing::info!` を該当層に
@@ -116,7 +127,7 @@ sub-pixel quad / TSF / wgpu 29.x の offscreen・uniform / text_input のタイ�
 [docs/known_traps.md](docs/known_traps.md) にある。**
 
 ### winit 0.30
-- **Alt-Tab 復帰直後のクリック** で OS が `WM_MOUSEMOVE` を送らず、winit の `cur_pos` が更新されないまま `MouseInput` が来る。`crates/platform/src/winit_backend.rs` で OS にカーソル位置を問い合わせて synthetic な `PointerMoved` を先に流す対処を入れてある。Alt-Tab 後の最初のクリックの hit-test で空振りする症状を見たら、まずこの workaround を疑う。
+- **Alt-Tab 復帰直後のクリック** で OS が `WM_MOUSEMOVE` を送らず、winit の `cur_pos` が更新されないまま `MouseInput` が来る。`crates/platform/src/winit_backend.rs` で OS にカーソル位置を問い合わせて synthetic な `PointerMoved` を先に流す対処を入れてある (daw_gui は自前の `Runner` で winit のイベントを受けるので、同じ対処は `daw_gui/src/view/runner.rs` の `Runner::sync_pointer_from_os`)。Alt-Tab 後の最初のクリックの hit-test で空振りする症状を見たら、まずこの workaround を疑う。
 - **修飾キー**: `WindowEvent::ModifiersChanged(Modifiers)` は `mods.state()` で `ModifiersState` を取り、`control_key()` / `shift_key()` / `alt_key()` / `super_key()` の **新スタイル名** を使う。0.29 以前の `ctrl()` 等は使えない。
 - **Modifiers** は MouseInput より先に届く前提で `InputAccumulator` 単独で track してよい。`MouseInput` に modifier を載せるパスは作らない (二重管理を避ける)。
 - **drag 系 widget での Alt 真値**: 上の「Modifiers が先に届く」 性質の裏返しとして、 ユーザが Alt + マウスを **同時に** 離した release frame では `pointer.modifiers.alt` が **既に false** になっていることがある (ModifiersChanged が MouseInput(Released) より先に dispatch されるため)。 drag 中は Alt が押されていたのに release で「カクッ」と grid に飛ぶ symptom の正体。 **対処**: drag session 構造体側で `last_alt: bool` を持ち、 continuation frame (`!primary_just_released`) で毎フレーム update、 release frame では update を skip して直前値を保持する。 **drag overlay (描画 preview) と release commit (Edit 発行) の両方が `nd.last_alt` を読む**。 `pointer.modifiers.alt` を直接見ると overlay と commit が異なる alt 値で snap 計算を走らせて乖離する。 過去 (M9 Phase 60) に sticky alt (`any_alt: 一度でも true なら以後永続 true`) で誤魔化した実装は「Alt を一瞬触っただけで以後永続 raw」 という UX 不自然性も持っていたため、 Phase 60 visual verify follow-up で `last_alt` 単一真値に統一して廃止。
@@ -133,12 +144,12 @@ sub-pixel quad / TSF / wgpu 29.x の offscreen・uniform / text_input のタイ�
 - **`FlexDirection` / `NodeId` は `taffy::prelude` 経由でしか pub されていない**。`pub use taffy::{...}` ではなく `pub use taffy::prelude::{FlexDirection, NodeId}`。
 
 ### glyphon (cosmic-text)
-- `Buffer::layout_runs()` で実 measure を取りたい場合、ui crate 側に `FontSystem` への参照経路 (Arc 共有 / measure trait 公開 / 別 FontSystem) が必要。現状 renderer に閉じている。proportional フォントの cursor / preedit pixel-perfect 化は M3 残作業。
-- 全テキスト (prefix + preedit + suffix) を **1 つの `GlyphArea`** で描画する方が並びの計算が安定する (HackGen Console NF などの固定幅前提なら ASCII=7 / CJK=14 で近似可能)。
+- テキスト幅は `Ui::measure_text` (`crates/ui/src/text_metrics.rs`、cosmic-text で glyphon と同じ shape) で測る。`UiHost::frame` は measure 用の `FontSystem` を自前で持ち、daw_gui は renderer 所有のものを `UiHost::frame_with_fonts` で注入する (measure と raster で同じ font DB を使うため)。
+- 全テキスト (prefix + preedit + suffix) を **1 つの `GlyphArea`** で描画する方が並びの計算が安定する (glyphon が実 advance で並べる。caret / 選択の x は `Ui::measure_text` で測り、ASCII 7px / CJK 14px のような固定幅の概算は使わない)。
 
 ### immediate-mode + Edit queue (M6 で UiHost が自動対処、利用者の boilerplate 不要)
-- 旧設計 (M5 まで): `edits` が出たフレームの scene は **古い model 値** で積まれている (描画クロージャ後に apply されるため)。利用者は `for e in edits { e.apply(&mut model) }` + `had_edits` 判定 + `window.request_redraw()` の boilerplate を全 example で書く必要があった (sample_edit_ops で漏れて発覚)。
-- M6 commit 以降: `UiHost::with_window(Arc<W>)` で構築 + `ui.frame(&mut model, ...)` で **apply 内蔵 + 自動 `request_redraw`**。利用者の boilerplate は **完全排除**。
+- build closure は **古い model 値** で 1 度だけ走り、そのフレームの Edit は closure の後に apply される。だから Edit が出たフレームの scene は 1 つ古い値を描いている。
+- `UiHost::with_window(Arc<W>)` で構築して `ui.frame(&mut model, ...)` を呼ぶと、frame が Edit の apply と、Edit / focus 変化があったときの `request_redraw` を内部で行い、apply 後の値は次のフレームで描かれる。利用者は apply ループも redraw 判定も書かない (全 example に同じ boilerplate を書かせたら sample_edit_ops で漏れた —「使う側に boilerplate を強要しない」)。
 - audio thread 連携等の advanced 用途では `frame_to_edits(&model, ...) -> Vec<Edit<M>>` を使う (利用者が apply タイミングと request_redraw 制御)。
 - offscreen / headless test では `UiHost::no_redraw()` を使う。
 

@@ -224,7 +224,7 @@ pub(super) fn commit_releases(
         //     pressed point の anchor 位置を round して算出した adjusted_dt を適用)
         //   - 含まれない → 単独 move (旧挙動互換、 selection は変化しない)
         //
-        // **absolute 位置 snap** (CLAUDE.md「drag 系 widget の snap」 と同 idiom): anchor の絶対 beat
+        // **absolute 位置 snap** (ui/CLAUDE.md「drag 系 widget の snap」 と同 idiom): anchor の絶対 beat
         // (`clip_start + anchor_time` ) に raw_dt を足して `snap_beat` で round、 差分 `adjusted_dt`
         // を全 anchor に適用。 これで (a) 単一 / 多重で grid 吸着挙動が一致、 (b) anchor が grid 外でも
         // 最終位置 grid に着地。 alt は session の `last_alt` を真値 (race 回避)。

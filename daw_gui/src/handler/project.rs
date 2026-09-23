@@ -1032,9 +1032,9 @@ impl AppData {
         }
     }
 
-    /// 現在 host に load されている全 plugin を破棄する (project 切替時)。
-    /// audio へ `ClosePluginShmem` を先送りしてから plugin_host へ
-    /// `UnloadAllPlugins` を送る (use-after-free deadlock 防止の順序)。
+    /// この project (`self.pk()`) の plugin を host から全部破棄する (同じタブで別の project に
+    /// 差し替えるとき / タブを閉じるとき)。audio へ `ClosePluginShmem` を先送りしてから plugin_host へ
+    /// `UnloadProject { project }` を送る (use-after-free deadlock 防止の順序)。
     /// 最後に GUI 側 cache を全消去。
     pub(crate) fn teardown_all_loaded_plugins(&mut self) {
         // 列挙元は **在庫 (`loaded_devices`) と Song の和集合**。 片方だけだと
@@ -1049,7 +1049,8 @@ impl AppData {
         // project 切替。`device_id` は Song スコープの名前なので、 前 project の
         // instance を「列挙して消す」ことが原理的にできない (新 Song は旧 id を
         // 知らず、旧 Song はもう無い)。 帳簿にも Song にも依存しない
-        // 「全部捨てろ」でしか塞げない (protocol.rs の UnloadAllPlugins doc 参照)。
+        // 「この project の分を全部捨てろ」(`UnloadProject`) でしか塞げない (protocol.rs の
+        // `UnloadProject` doc 参照)。
         self.send_plugin(PluginCommand::UnloadProject { project: self.pk() });
         self.cur.pipc.loaded_devices.clear();
         self.cur.pipc.open_plugin_guis.clear();

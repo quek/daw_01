@@ -29,7 +29,7 @@ fi
 # **見つからなければ落とす** — 検査だけ黙って消えるのは、このファイルが一番警戒している
 # false green (「緑だが検査が効いていない」) そのもの。
 # なお strip_comments も loc_budget.py に依存するので、python が無い / 壊れていると
-# **checks 1-12 が全部止まる**。これは意図的 (cargo-deny と同じ扱い)。
+# **checks 1-15 が全部止まる**。これは意図的 (cargo-deny と同じ扱い)。
 PY="${PYTHON:-}"
 [ -n "$PY" ] || PY="$(command -v python 2>/dev/null || true)"
 [ -n "$PY" ] || PY="$(command -v python3 2>/dev/null || true)"
@@ -48,7 +48,8 @@ fi
 #
 # **fail-open にしない。** 呼び出し側は `hits=$(grep … | strip_comments || true)` の形で
 # パイプの終了コードを潰すので、python が落ちたときに黙って空を返すと
-# **check 1/2/3/5/12 が「違反ゼロ」になって exit 0** になる。代わりに番兵行を stdout へ流し、
+# **check 1/2/3/5/12/15 が「違反ゼロ」になって exit 0** になる (check 14 は走査が空なら自前で
+# SELF-BROKEN にする)。代わりに番兵行を stdout へ流し、
 # record() がそれを見つけたら SELF-BROKEN で落とす (record は main shell で動くので exit が効く)。
 FILTER_BROKEN='LOC-FILTER-BROKEN'
 strip_comments() {
@@ -72,7 +73,7 @@ rs_dirs="common/src daw_gui/src daw_audio/src daw_plugin_host/src ui/crates"
 #     素のシェル : argv[2]=[HashMap<\(u32,\s*u32\)]
 #     make 経由  : argv[2]=[HashMap<(u32,s*u32)]
 # 結果 `\( \s \b \[` を含むパターンが全部別物になり、当時 8 チェック中 6 つが無言で
-# 無効化され (現在は 12 チェック)、違反 7 行を抱えたまま「OK (違反なし)」を出していた。
+# 無効化され (現在は 15 チェック)、違反 7 行を抱えたまま「OK (違反なし)」を出していた。
 # **シェル経由でも壊れない表記**
 # (POSIX ブラケット式 `[(]` `[)]` `[[]` `[]]` `[[:space:]]`、単語境界は grep -w) だけを使い、
 # 下の canary で毎回「検査器が実際に効いているか」を確かめる。
@@ -205,7 +206,7 @@ fi
 
 # (4) strip_comments が **落ちたときに黙って空を返さない**ことの canary。
 #     呼び出し側の `|| true` がパイプの終了コードを潰すので、ここが fail-open だと
-#     python が壊れた瞬間に check 1/2/3/5/12 が「違反ゼロ」になって exit 0 する。
+#     python が壊れた瞬間に check 1/2/3/5/12/15 が「違反ゼロ」になって exit 0 する。
 _pysave="$PY"
 PY="/nonexistent/python-for-arch-lint-canary"
 _fb="$(printf 'x.rs:1:y\n' | strip_comments 2>/dev/null)"

@@ -800,6 +800,8 @@ SetGeneratedAudio { id: u64, samples: Vec<Vec<f32>>, sample_rate: u32, channels:
   - **`E` (Split) / `J` (Glue)** shortcut wire (text input フォーカス時除外)
   - `Ctrl+B` (Bounce In Place) / `Ctrl+R` (Reverse) wire
   - clip ダブルクリック検出 (gui_01 #018 で AppData.last_click を活用、 既存パターン)
+    (※ `AppData.last_click` はこの計画を書く前の `da0bdf58` (2026-05-04) で撤去済み。clip のダブルクリックは
+    arrangement widget が `Ui::take_double_click_in_rect` で取る — `daw_gui/src/widgets/arrangement/release.rs`)
 - [daw_gui/src/view/root.rs](../daw_gui/src/view/root.rs)
   - File menu に "Import Audio..."
   - Audio Editor open 時の panel 切替 logic

@@ -71,8 +71,8 @@ fn reloaded_instance(
 impl AppData {
     // -------- Plugin GUI bridge --------------------------------------------
 
-    /// r.md #65: エディタ窓のジオメトリが確定した (open 直後 / ユーザーのドラッグ
-    /// 終了 / プラグイン起点リサイズ完了 / close 直前)。
+    /// r.md #65: エディタ窓のジオメトリが届いた (open 直後 / rect が変わったとき
+    /// (`WM_MOVE` / `WM_SIZE`。ドラッグ中は確定後に 1 回) / close 直前)。
     ///
     /// 窓を所有するのは plugin-host なので daw_gui は **記録するだけ**。値は
     /// `snapshot_view_state` でプロジェクトへ書き出され、次の `OpenSlotGuiEmbedded`
@@ -565,11 +565,15 @@ impl AppData {
             // We are the foreground process at this moment (the user just
             // clicked in our UI), so grant the plugin-host process the right
             // to foreground its editor window. Without this, Windows' focus-
-            // steal protection refuses the plugin-host's SetForegroundWindow
-            // and the editor opens hidden behind the main DAW window — and a
-            // plugin that reports its size only post-attach (e.g. Analog Lab)
-            // looks like it "won't open". The grant is consumed by the
-            // plugin-host's next SetForegroundWindow.
+            // steal protection refuses the plugin-host's SetForegroundWindow.
+            // An ownerless editor (main window not ready, see below) then opens
+            // hidden behind the main DAW window — and a plugin that reports its
+            // size only post-attach (e.g. Analog Lab) looks like it "won't
+            // open". Since r.md #65 the editor is normally owned by the main
+            // window ("an owned window is always above its owner in the
+            // z-order"), so it is no longer buried there; the grant is what
+            // lets it take the foreground (activation). The grant is consumed
+            // by the plugin-host's next SetForegroundWindow.
             unsafe {
                 use windows::Win32::UI::WindowsAndMessaging::{
                     ASFW_ANY, AllowSetForegroundWindow,
@@ -597,7 +601,8 @@ impl AppData {
                 device: self.dev(device_id),
                 title,
                 // r.md #65: 前回このプロジェクトで閉じたときの窓の位置 / サイズ。
-                // 位置は常に、サイズは plugin が resizable のときだけ plugin-host が使う。
+                // 位置は常に、サイズは plugin-host が枠を出したとき (`should_offer_resize_frame`)
+                // だけ使う (VST3 は `canResize` が false でも枠を出す)。
                 geometry: self.cur.view.plugin_editor_windows.get(&device_id).copied(),
                 owner_main_window,
             });

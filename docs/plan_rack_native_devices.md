@@ -1,7 +1,7 @@
 # r.md #129 Rack 内蔵デバイス設計（組み込み Comp / EQ をチェーン上の正式なデバイスにする）
 
 > **この文書の位置付け**
-> - 状態: 設計確定、実装前。前提 HEAD は `76837672`（clean）。本文の file:line はすべてこの HEAD の行。
+> - 状態: 設計確定、実装前。前提 HEAD は `76837672`（clean）。本文の file:line はすべてこの HEAD の行。※ 実装はその後 `949f4303`（2026-09-13）で main に統合済み。
 > - **r.md の番号は再利用されている。** コミット `76837672` と `scripts/arch_lint_baseline.txt:114` にある「r.md #129」は旧項目（プロジェクトタブ、`docs/plan_project_tabs.md`）を指し、本書の #129 とは別物。
 > - 本書は `docs/plan_rack_native_devices.md` の正本。置き換える既存の決定は §16 に列挙する。
 > - 「（未実行）」はコードを読んで導いた結論で、実行による確認はしていない。
@@ -2408,7 +2408,7 @@ state/project.rs:462, :595, :630, :634, :960, :984, :991, :992 / handler/devices
 ### 15.8 統合
 
 1. `make clippy` → `make arch-lint` → `make test-nolaunch` → `make build`
-2. 許可を得てから: `DAW01_ALLOW_LAUNCH=1 cargo test -p daw_gui --features daw_gui/script --test glue_bake_parity --test native_chain_smoke --test loudness_analysis_smoke --test device_chain_smoke --test track_duplicate_smoke --test project_tabs_smoke`
+2. `cargo test -p daw_gui --features daw_gui/script --test glue_bake_parity --test native_chain_smoke --test loudness_analysis_smoke --test device_chain_smoke --test track_duplicate_smoke --test project_tabs_smoke`（6 本とも daw_gui を起動する。起動に許可は要らない。守るのは、ユーザーが起動している daw_gui を kill しないこと。当初は「許可を得てから」頭に `DAW01_ALLOW_LAUNCH=1` を付けて回す手順だったが、この変数を読む hook 層は `21d48aa7`（2026-08-29）で撤去済みで、何も効いていなかった）
 3. 実機 sign-off（§20）
 
 video preview / texture には触れないので smoke-test は対象外。

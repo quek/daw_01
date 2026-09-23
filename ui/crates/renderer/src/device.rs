@@ -611,8 +611,8 @@ impl<W: WindowBackend + Send + Sync + 'static> Renderer<W> {
     /// # submit 順序の契約
     /// 効果 pass を **自前 encoder に積んで `queue.submit` してから** [`Self::render`] を呼ぶこと。 GPU は submit
     /// 順に実行するので、 同一 frame 内の「create → 効果 pass 描画 (submit A) → 最終 handle を push して render
-    /// (submit B)」 は安全 ([`Self::composite_scene_to_texture`] = #063 と同じ「別 submit なら安全」、 CLAUDE.md
-    /// wgpu 罠「LAST WRITE WINS の対」)。 **履歴 (feedback) target** も「前 frame の write (submit) → 今 frame の
+    /// (submit B)」 は安全 ([`Self::composite_scene_to_texture`] = #063 と同じ「別 submit なら安全」、
+    /// ui/docs/known_traps.md の wgpu 罠「LAST WRITE WINS の対」)。 **履歴 (feedback) target** も「前 frame の write (submit) → 今 frame の
     /// sample (submit)」 の順なので安全。 ただし **同一 render pass で同じ texture を sample と render target の
     /// 両方にしない** (ping-pong で読みと書きを別 texture に分ける)。
     ///

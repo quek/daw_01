@@ -57,12 +57,18 @@ VOICEVOX 歌声合成を組み込んだ Rust 製 DAW。Clip ベースのタイ�
 
 ### identity — 安定 device_id (u64)
 
-デバイス (プラグインインスタンス) のアドレスは Song が採番する
-**`PluginInstance.id` 一本** (Song-global `next_device_id`、master fx も同 allocator)。
-IPC・automation (`AutomationTarget::PluginParam { device_id }`)・MIDI binding・
-plugin_host の bookkeeping (`HashMap<u64, InstanceRecord>`)・shmem 名
-(`process_data_shmem_id(pid, device_id)`)・worker dispatch token (WorkerBridge の
-AtomicU64) がすべて同じ id を使う。chain 内 index は表示順序のみ。
+デバイス (chain の要素 `Device` = plugin / 内蔵 native / Parallel、`common/src/model/device.rs`) の
+アドレスは Song が採番する **`Device::id()` 一本** (plugin / native / Parallel と Parallel の中の chain が
+1 つの id 空間 `Song.ids.next_device_id` を共有。master fx も同 allocator)。
+automation (`AutomationTarget::PluginParam { device_id }` / `NativeParam { device_id }` /
+`ChainGain { chain_id }` など)・MIDI binding・IPC・plugin_host の bookkeeping がこの id で引く。
+id は Song ごとの採番 (プロジェクトごとに 1 から) なので、プロセス境界ではプロジェクトの `ProjectKey` と
+組にして運ぶ (`DeviceAddr { project, device_id }`。plugin_host の帳簿は `HashMap<DeviceAddr, InstanceRecord>`、
+`docs/plan_project_tabs.md` §1.2)。chain 内 index は表示順序のみ。
+OS リソース名と RT の 1 ワード参照だけは、再利用されない別の番号を使う: `ProcessData` shmem 名
+(`process_data_shmem_id(pid, device_id, incarnation)`) の一意性は plugin_host が load ごとに採番する
+incarnation が担い、worker dispatch (WorkerBridge) と per-plugin 計測は同じ値の `InstanceToken` で
+instance を名指しする (同 §1.3)。
 
 これにより「削除/並べ替えで参照を貼り替える補償機構」(旧 ReorderChain の 3 プロセス
 貫通再キー、callback に焼き込まれた座標の stale 化) が**存在しなくなる** — reorder は
@@ -136,8 +142,8 @@ event 名は **generation** 込みで、旧世代の依頼や signal が新 pool
 
 ### daw_plugin_host
 
-- **`HashMap<u64 /*device_id*/, InstanceRecord>` 一本** (plugin / editor window /
-  track_id / loaded meta / shmem を 1 record に集約)。順序概念なし。
+- **`HashMap<DeviceAddr, InstanceRecord>` 一本** (`DeviceAddr` = プロジェクトの `ProjectKey` + device_id。
+  plugin / editor window / loaded meta / shmem / `InstanceToken` を 1 record に集約)。順序概念なし。
 - **split-half**: `LoadedPlugin` (main-thread half: lifecycle / GUI / state / ARA /
   param) と `AudioProcessorHalf` (process バッファ・event scratch を所有) を型で分離。
   worker registry には audio half のみ渡り、main の `&mut` と worker の `&mut` が
@@ -168,10 +174,15 @@ event 名は **generation** 込みで、旧世代の依頼や signal が新 pool
   チョークポイント一本 (song field は private): undo snapshot (gesture squash 対応) /
   dirty (epoch 比較) / 子プロセス sync 予約を無条件で実施。export 中は編集自体を
   拒否する (イベント whitelist は存在しない)。
-- **AppEvent は 3 分類**: `Edit(EditEvent)` / `System(SystemEvent)` (IPC event の
-  直 wrap + tick + job 完了) / `Ui(UiEvent)`。state は
-  `state/{song_doc,transport,selection,ipc,voicevox,media,recording,ui_prefs,
-  ui_ephemeral}` に分割、reducer は `handler/` 配下。
+- **AppEvent は 1 本の enum** (`daw_gui/src/event.rs`)。子プロセスからの event は
+  `AppEvent::Audio(AudioEvent)` / `AppEvent::Plugin(PluginEvent)` に直 wrap (bridge match なし)、
+  variant の多い面は `Launcher` / `Device` / `Tab` などのサブ enum (`event_*.rs`) を 1 arm で受ける。
+  Edit / System / Ui の 3 分類 (`docs/plan_arch_refactor.md` §7.5) は landed していない — undo /
+  dirty / sync は `edit_song()` を通ったかで決まり、export 中に落とす event は
+  `AppData::dispatch_app_event` の block-list (host 上の plugin を組み直す round-trip 3 種) だけ。state は
+  `daw_gui/src/state/` 配下に分割 (song_doc / transport / selection / ipc / … 一覧はディレクトリを見る)。
+  プロジェクト (タブ) ごとの状態は `ProjectState` (`state/project.rs`) にまとまり、見えているタブが
+  `AppData.cur`、他のタブは `AppData.tabs` に parked (`docs/plan_project_tabs.md` §5.1)。reducer は `handler/` 配下。
 - **sync は pull 型一本**: frame 末に `edit_epoch != last_synced_epoch` なら
   unified sync (ports 解決 → SetProjectDir → blob-less LoadSong → vocal metadata →
   ARA → lipsync) を 1 回。scrub の coalesce は frame flush が構造的に担う。
@@ -194,7 +205,7 @@ event 名は **generation** 込みで、旧世代の依頼や signal が新 pool
 ## データモデル
 
 ```
-Song ─ tracks: Vec<Track> ─ devices: Vec<PluginInstance>   (id: u64 安定)
+Song ─ tracks: Vec<Track> ─ devices: Vec<Device>   (Plugin / Native / Parallel、id: u64 安定)
      │                    ─ clips: Vec<Clip> ── content_id ─→ Song.clip_contents
      │                    ─ sends: Vec<Send> (id: u32 安定)
      │                    ─ automation_lanes / mod_routings
@@ -203,7 +214,7 @@ Song ─ tracks: Vec<Track> ─ devices: Vec<PluginInstance>   (id: u64 安定)
      │    ClipContent = Midi(notes: id 付き) | Audio(events: id 付き)
      │                | Automation(points: id 付き) | Video | Image | Text
      ├ audio/video/image_sources (メタデータ pool、バッファは各プロセスで decode)
-     ├ master_fx_chain: Vec<PluginInstance>
+     ├ master_fx_chain: Vec<Device>
      ├ song_lanes (tempo/time-sig automation) / mod_sources / sections
      └ 各種 stable id allocator (next_*_id、0 = 未採番 sentinel)
 ```

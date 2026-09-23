@@ -40,6 +40,9 @@ Bespoke/Logic/Live)。
 サブメニューのゲートが読むのは「foreground window をどのプロセスが所有しているか」だけ。よって
 **プラグインエディタのトップレベル窓を plugin-host プロセス (B) 側が plugin-main スレッド上で所有**
 するよう作り直す。これで `GA_ROOTOWNER` がプロセスB に解決する。
+(※ 2026-08-22 の 9bfdaa85 で owner を daw_gui の本体窓にしたので、今の `GA_ROOTOWNER` は A に解決する。
+効いているのは「窓が B のプロセスに属する」ことのほうで、`GA_ROOTOWNER` は救済パスでしかない —
+下の「注意 (FFI / window)」の 2026-08-22 撤回の項。)
 
 **鍵となる自然な挙動**: メニューを開くにはユーザーがエディタ内をクリックする必要があり、その
 クリックはエディタのルート窓 (B 所有) をアクティブ化 → **プロセスB が foreground process になる**
@@ -60,14 +63,24 @@ Bespoke/Logic/Live)。
 
 ## 変更内容
 
+※ この節と「現状 (修正前)」は FIXME #31 (2026-06-10 の ededd6c2) 時点の計画で、型名・key は当時のもの。
+その後 `MainToChild` / `ChildToMain` は 2026-07-04 の d6c8d09b (arch-refactor) で `PluginCommand` /
+`PluginEvent` に分かれ、`(track,slot)` keyed の帳簿は安定 id keyed になった (plugin_host は同 d6c8d09b の
+`device_id` keyed `InstanceRecord`、daw_gui は 2026-08-28 の ecf259db)。wire 上の住所は 2026-09-12 の
+76837672 (プロジェクトタブ) で `DeviceAddr`。今の契約は下の「§窓契約」。
+
 ### common/protocol.rs
 - `MainToChild::OpenSlotGuiEmbedded { track, slot, host_hwnd }` → `{ track, slot, title: String }`。
   `host_hwnd` 廃止 (もうクロスプロセス parent にしない)。`title` で窓キャプション。
 - resize は B 内で完結させるため `ChildToMain::SlotGuiRequestResize` と
   `MainToChild::ResizeSlotGui` を **削除** (round-trip 廃止)。各 match site を更新。
   → **r.md #65 で更に更新**: `OpenSlotGuiEmbedded` は
-  `{ device_id, title, geometry: Option<EditorWindowGeometry> }`、
+  `{ device_id, title, geometry: Option<EditorWindowGeometry>, owner_main_window: Option<PlatformWindowHandle> }`
+  (`owner_main_window` は 9bfdaa85)、
   `SlotGuiOpened { width, height }` は `SlotGuiGeometry { device_id, geometry }` に置き換え。
+  → 2026-09-12 の 76837672 (プロジェクトタブ) で `device_id: u64` は `device: DeviceAddr` になった。
+  今の形は `PluginCommand::OpenSlotGuiEmbedded { device, title, geometry, owner_main_window }` /
+  `PluginEvent::SlotGuiGeometry { device, geometry }`。
   下の「§窓契約」を参照。
 
 ### daw_plugin_host (新規 `editor_window.rs` + main.rs 配線)
@@ -75,6 +88,9 @@ Bespoke/Logic/Live)。
   window class 登録、WNDPROC は WM_CLOSE で close フラグを立てて hide (DefWindowProc しない)、
   `EditorWindow { hwnd, state }`、`set_client_size` / `take_close_request` / `destroy` (DestroyWindow)。
   GWLP_USERDATA に (close_requested AtomicBool) を leak で貼り Drop/destroy で回収。
+  → 実装には `destroy` メソッドは無く、drop が `DestroyWindow` する (下の `editor.destroy` も同じ)。
+  USERDATA は FIXME #31 では `Arc<AtomicBool>`、r.md #65 (c86b289b) からは `EditorShared`
+  (全フィールド `Cell`、plugin-main 専用) を `Rc::into_raw` で貼り、`Drop` で回収する。
 - plugin_main_loop:
   - `editor_windows: HashMap<(track,slot), EditorWindow>` を持つ (v29 で
     `InstanceRecord.editor` へ統合)。
@@ -111,9 +127,14 @@ Bespoke/Logic/Live)。
 - 子プロセス spawn 時の PID を保持して `AllowSetForegroundWindow(child_pid)` を open 直前に呼ぶ
   (polish; 必須でない。"started by foreground process" 条件でも SetForegroundWindow は通る)。
   → 初版では省略可。窓が前面に出ない場合のみ追加。
+  → 実装 (ededd6c2) は PID を持たず、`open_slot_gui` (`daw_gui/src/handler/devices.rs`) が
+  `OpenSlotGuiEmbedded` を送る前に `AllowSetForegroundWindow(ASFW_ANY)` を呼ぶ (無いと Windows の
+  focus-steal 防止で plugin_host の `SetForegroundWindow` が拒否され得る)。
 
 ## 検証 (実機, Scaler 2 必須)
 1. `cargo build --workspace` (protocol 変更 → 子バイナリ再生成必須)。
+   ※ 今は `make build` で 3 exe を揃える (2026-07-03 の 75d32d4d から Makefile が SSoT。素の
+   `--workspace` は examples までビルドするので使わない — CLAUDE.md「Development Workflow」)。
 2. daw_gui を起動 (二重起動チェック)。track に Scaler 2 (VST3) を instrument で挿入、editor を開く。
 3. editor が plugin-host プロセス所有のトップレベル窓として現れることを確認。
 4. Scaler 2 の **カスケード(2段)メニュー** をホバー (~150ms, 親項目から外さずに)。
@@ -138,7 +159,8 @@ Bespoke/Logic/Live)。
   #31 を踏んだ真因は「A が窓を**作って**いた」= 窓が A のプロセスに属し
   `Process::isForegroundProcess()` (前面窓の **プロセス ID** 比較) が false になったこと。
   **editor 窓は B が作り、owner は A の本体窓**にする (r.md #65。REAPER と同じ構成)。
-  詳細は CLAUDE.md「プラグインエディタ窓と Win32」節。
+  CLAUDE.md「プラグインエディタ窓 (Windows)」節はこの結論の要約 (2026-08-29 の 21d48aa7 で
+  「プラグインエディタ窓と Win32」から改名・圧縮)。owner と `WS_EX_TOOLWINDOW` の契約は下の §窓契約 1-1。
 - 既存 GetMessageW ポンプ / WM_COMMAND_WAKE drain は残す (JUCE async menu が依存)。
 - builtin / voicevox は `gui_is_embed_supported()==false` で open_gui が早期 return、窓を作らない。
 
@@ -199,10 +221,17 @@ r.md #65 の申告は 2 つ:
    `DefWindowProc` 直行)。枠だけ伸びて中身が追従しない = 症状 B の literal な説明。
 5. **`canResize()==false` を無視して `WS_OVERLAPPEDWINDOW` (= `WS_THICKFRAME` +
    `WS_MAXIMIZEBOX`) を出していた**。Redux は false を返すので、本来この窓は固定枠。
+   ※ 2026-08-22 の 694e4d2a で方針を format ごとに分けた。CLAP は `can_resize()` の申告を尊重する
+   (`gui.h` L41-45 が drag の前提条件として規定) が、VST3 は `canResize()==kResultFalse` でも枠を出し、
+   `checkSizeConstraint` に丸めさせる (`iplugview.h` に禁止規定が無く、Redux は REAPER では枠で
+   リサイズでき UI も追従する)。よって今の Redux の窓は固定枠ではない。方針は
+   `plugin_instance::should_offer_resize_frame` (`ResizableProbe::drag_requires_verdict`)。
 6. **フォーカスを子窓へ渡していなかった** (`SetFocus` の呼び出しがプロセス全体で 0 件)。
    `DefWindowProc` は `WM_ACTIVATE` でフォーカスを *アクティブ化された窓自身* に置くので、
    コンテナがフォーカスを持ったまま = 打鍵が `editor_window.rs` の relay に積まれ
    `main.rs::handle_editor_key` が転送対象外を捨てる = **キーが 1 つも通らない**。
+   (※ `main.rs::handle_editor_key` は 2026-09-12 の 367200e9 で `editor_keys.rs` の `KeyRouter`
+   = plugin-main の `WH_GETMESSAGE` フックに置き換わった。)
 7. **`gui_set_size` がプラグイン起点 resize にまで `checkSizeConstraint` を掛けていた**。
    実ログで `IPlugView::onSize -> 0x1` の WARN が全 VST3 に出ていた原因
    (`kResultFalse` を `ensure!` で hard error 扱いしていた)。
@@ -276,15 +305,17 @@ L79-131) と clap-wrapper standalone が独立に同じ結論。`CS_HREDRAW|CS_V
 open シーケンス (`PluginHost::open_gui`) — **窓は隠したまま作り、最後に 1 回だけ見せる**:
 
     gui_create_embedded()            (VST3: createView + setFrame / CLAP: gui.create)
-      -> gui_sizer().can_resize()    pre-attach の可否
+      -> gui_sizer().can_resize()    pre-attach の申告 -> should_offer_resize_frame() で枠の有無
       -> gui_get_size()              初期サイズ
-      -> EditorWindow::create(..., resizable, saved_position)   <- WS_VISIBLE 無し
-      -> editor.attach_sizer(...)    ★ attach より前 (attached の中から resizeView が来る)
-      -> gui_set_scale(dpi)
+      -> EditorWindow::create(..., resizable, saved_position, owner)   <- WS_VISIBLE 無し
+      -> gui_set_scale(dpi)          (scale != 1.0 なら gui_get_size を取り直して set_client_size)
+      -> editor.attach_sizer(...)    ★ attach の直前 (attached の中から resizeView が来る。
+                                       scale 反映のリサイズより後なので attached 前に onSize を呼ばない)
       -> gui_set_parent_hwnd(hwnd)   (VST3: attached / CLAP: set_parent)
       -> pump_pending_messages()
+      -> record_view_baseline()      view が WS_POPUP に化けたかを後で突き合わせる基準値
       -> gui_show()
-      -> can_resize() 再 query -> 変わっていれば set_resizable()   ★ attach 後の値が正
+      -> can_resize() 再 query -> should_offer_resize_frame() が変われば set_resizable()   ★ attach 後の値が正
       -> set_client_size(saved か plugin の値)
       -> show_and_focus()            <- SWP_SHOWWINDOW + SetForegroundWindow を **ここ 1 回だけ**
 
@@ -400,7 +431,7 @@ Redux は `SetWindowLong` で `WS_CHILD` を落として `WS_POPUP` を立てる
 
 ## 5. ジオメトリの永続化
 
-`PluginEvent::SlotGuiGeometry { device_id, geometry }` を open 直後 / **rect が変化したとき** /
+`PluginEvent::SlotGuiGeometry { device, geometry }` (`device: DeviceAddr`) を open 直後 / **rect が変化したとき** /
 close 直前に送る (ドラッグ**中**は poll が回らないので、確定後に 1 回だけ届く)。
 
 ### 5.1 rect の変化を漏れなく捕捉する不変条件
@@ -439,14 +470,16 @@ close 直前に送る (ドラッグ**中**は poll が回らないので、確�
 **プロセス終了時 (`teardown_device`) では emit しない**。上の 3 点で全ての変化が既に届いて
 おり、終了時の emit は 4 つ目の重複になるうえ、daw_gui は `Shutdown` を送った後 drain に
 入っているので**届く保証が無い** (「たまに効く」経路を足すことになる)。
-daw_gui は `ui_prefs.plugin_editor_windows` に貯め、`ViewState.plugin_editor_windows` として
+daw_gui は project ごとの `ProjectView.plugin_editor_windows` (`AppData.cur.view`。2026-09-12 の
+76837672 で `ui_prefs` から移った) に貯め、`ViewState.plugin_editor_windows` として
 プロジェクトに保存する。**`Song` ではなく `ViewState`** = 窓の位置は「見方の都合」なので
 動かしても `*` は付かない (memory `project_dirty_flag_rule`)。key は安定 id
 (`PluginInstance.id`)、save 時に現存 device の分だけへ GC。
 
 復元は `OpenSlotGuiEmbedded { geometry }`。**位置は常に**復元し (画面外なら既定位置へ)、
-**サイズは resizable のときだけ** (CLAP `gui.h` の手順 9 と同じ規約 — 固定サイズ GUI に
-前回のサイズを押し付けない)。
+**サイズは枠を出したとき (attach 後の `should_offer_resize_frame`) だけ** (CLAP `gui.h` の手順 9 と
+同じ規約 — 固定サイズ GUI に前回のサイズを押し付けない)。VST3 は `canResize()==false` でも枠を出すので
+(694e4d2a)、前回のサイズを `checkSizeConstraint` で丸めてから当てる。
 
 ## 6. modal move/size ループ
 
@@ -485,6 +518,10 @@ command / notify の drain はここでやらない: `CloseSlotGui` / `HostNotif
 - **プラグインが view を owned popup へ逃がす挙動そのもの** (Redux の内部 Editor)。同期
   resize で必要性は消えるはずだが、プラグイン側の実装次第で残る可能性がある。残る場合、
   コンテナが空になったことを検出して窓を隠す / 追従する等の対処が要るかを実機で見てから決める。
+  ※ 「同期 resize で必要性は消える」の前提は 2026-08-22 の 05af8758 で反証済み (§0-2 の注意:
+  style の反転は Editor ボタンを押した時点の Redux の無条件動作で、`SetParent` も呼ばない中間状態)。
+  その後、逃げた view へフォーカスを渡さない (`accepts_forwarded_focus`、17a0b370) と、`onSize` を
+  無視する view をホスト側で追従させる (`enforce_view_size_if_ignored`、1e149fe9) を入れた (§4 / §4-1)。
 
 ## 9. CLAP GUI 仕様の落とし穴
 

@@ -2,8 +2,8 @@
 name: debug-plugin-gui
 description: |
   CLAP / VST3 プラグインの埋め込み GUI が期待どおり開かない・前面に出ない・閉じない・
-  リサイズしない・カスケード(2段)メニューが開かない等の症状を、ホスト構成 (FIXME #31 で
-  エディタ窓を plugin-host プロセス所有へ移行) と IPC / スレッド / Win32 foreground に
+  リサイズしない・カスケード(2段)メニューが開かない等の症状を、ホスト構成 (エディタ窓は
+  daw_plugin_host が作る top-level、owner は daw_gui の本体窓) と IPC / スレッド / Win32 foreground に
   照らして切り分ける手順。
   「プラグイン GUI が表示されない」「エディタが裏に出る」「サブメニューが開かない」
   「✕ で閉じても状態が残る」「show が false を返す」「VST3 エディタが極小/出ない」等のとき発動。
@@ -14,21 +14,23 @@ allowed-tools: Read, Grep, Glob, Edit, Bash(cargo build *), Bash(./target/debug/
 
 daw_plugin_host のプラグイン GUI が動かないとき、どの層で止まっているかを切り分ける。
 
-## アーキテクチャ (FIXME #31 以降 — 重要)
+## アーキテクチャ
 
 **エディタのトップレベル窓は daw_plugin_host (= プラグインをロードするプロセス) が
-plugin-main スレッド上で所有する** (`daw_plugin_host/src/editor_window.rs`)。daw_gui は
-窓を持たず、開閉状態を `open_plugin_guis: HashSet<(track,slot)>` で追跡するだけ。
+plugin-main スレッド上で作る** (`daw_plugin_host/src/editor_window.rs`。窓は plugin-host プロセスに属する)。
+Win32 の owner は daw_gui の本体窓 (「所属プロセス」と「owner」の区別は CLAUDE.md
+「プラグインエディタ窓 (Windows)」)。daw_gui は
+窓を作らず、開閉状態を `open_plugin_guis: HashMap<u64, String>` (device_id → 送ったタイトル) で追跡するだけ。
 
 ```
 daw_gui (UI 側)
   ↓ open_slot_gui: AllowSetForegroundWindow(ASFW_ANY)  ← 前面化許可を付与
-  ↓ PluginCommand::OpenSlotGuiEmbedded { track, slot, title } ──▶
+  ↓ PluginCommand::OpenSlotGuiEmbedded { device, title, geometry, owner_main_window } ──▶
                                           daw_plugin_host (tokio recv → PluginCommand)
                                           ↓                     plugin-main std::thread
                                           ↓                     ├ gui_create_embedded
                                           ↓                     ├ can_resize / gui_get_size (pre-attach)
-                                          ↓                     ├ EditorWindow::create  ← 窓は B 所有・**非表示**
+                                          ↓                     ├ EditorWindow::create  ← 窓は B が作る・**非表示**
                                           ↓                     ├ editor.attach_sizer   ← attach より前
                                           ↓                     ├ gui_set_parent_hwnd(editor.hwnd)
                                           ↓                     ├ pump_pending_messages
@@ -36,7 +38,7 @@ daw_gui (UI 側)
                                           ↓                     ├ can_resize 再 query → set_resizable
                                           ↓                     ├ editor.set_client_size
                                           ↓                     └ editor.show_and_focus ← 表示 + 前面化はここ 1 回
-                                          ↓ PluginEvent::SlotGuiGeometry { geometry } ◀──
+                                          ↓ PluginEvent::SlotGuiGeometry { device, geometry } ◀──
 daw_gui: on_gui_geometry が窓の位置/サイズを記録 (ViewState に保存 → 次回 open で復元)
 ```
 
@@ -53,23 +55,36 @@ daw_gui: on_gui_geometry が窓の位置/サイズを記録 (ViewState に保存
     VST3 は "in the same callstack" が仕様 (`iplugview.h`)。非同期にすると Redux が view を
     owned popup へ逃がす。窓が無い / 別スレッド発だけ `HostNotify::Resize` へ落ちる。
   - *ユーザー起点* (枠ドラッグ) は `WM_SIZING` で `checkSizeConstraint` / `adjust_size` 矯正 →
-    OS が resize → `WM_SIZE` で通知。`canResize()==false` の窓には `WS_THICKFRAME` を出さない。
-- **削除/降格でエディタ追従**: `editor_windows` は close/resize は `(track,slot)` keyed だが、
-  **削除は安定 `plugin_id` で照合**（slot ずれ耐性）。降格は `DemoteInstrumentToGenerator`
-  でライブ移動し editor 窓を同 HWND のまま維持。詳細は memory `project-plugin-slot-rekey`。
+    OS が resize → `WM_SIZE` で通知。枠 (`WS_THICKFRAME`) を出すかは `should_offer_resize_frame`
+    (`plugin_instance.rs`) が決める: CLAP は `can_resize()==false` なら出さない (`gui.h` が drag の
+    前提条件にしている)、VST3 は `canResize()==false` でも出して `checkSizeConstraint` に丸めさせる
+    (`iplugview.h` は禁止していない)。
+- **削除・並べ替えでのエディタ追従**: エディタ窓は plugin_host の `InstanceRecord.editor` に載り、
+  key は安定 `DeviceAddr` (CLAUDE.md 不変条件 1)。削除・並べ替えで key を貼り替えるコードは無い
+  (`daw_plugin_host/src/main.rs` 冒頭の module doc)。削除時の流れは ⑦。
 
 ## 典型的な症状と切り分け
 
 ### ① ボタンを押しても何も起きない
-- daw_gui が送信したか: `sending to plugin_host msg=OpenSlotGuiEmbedded { ... }`
-- B が受信したか: `received OpenSlotGuiEmbedded`。出ない → IPC 切れ (`pipe_loop` のエラー)
+- daw_gui が押下を受けたか: `toggle_slot_gui (GUI button)` → `open_slot_gui` (どちらも info。`caller` で
+  自動 open と区別できる)。送った中身は `sending to plugin_host msg=OpenSlotGuiEmbedded { ... }` だが、
+  これは debug レベルなので `RUST_LOG=info,daw_gui=debug` を付けて起動したときだけ出る
+- B が受信したか: `received command other=OpenSlotGuiEmbedded { ... }`。出ない → IPC 切れ (`pipe_loop` のエラー)
 - plugin-main が `PluginCommand` を drain しているか。`PostThreadMessageW` の `thread_id` が 0 でないか
+- そもそも窓を開かない経路: 埋め込み GUI を持たないプラグイン (`has_embedded_gui` が false) は
+  インスペクタの汎用 param パネルをトグルするだけ。無効トラックの device は開かない (`is_live_device`)。
+  plugin_host が `plugin does not support embedded win32 gui` を出したら即 `SlotGuiClosed` が返る。
 
 ### ② エディタが裏 (メイン窓の後ろ) に出る / 前面に来ない
 - **原因**: B の `SetForegroundWindow` が Win32 のフォーカス奪取防止で拒否される (B は foreground
   でない)。**修正**: daw_gui が open 直前に `AllowSetForegroundWindow(ASFW_ANY)` を呼ぶ
-  (`app.rs::open_slot_gui`)。B は started-by-foreground-process なので許可されれば前面化が通る。
+  (`daw_gui/src/handler/devices.rs` の `open_slot_gui`)。B は started-by-foreground-process なので許可されれば前面化が通る。
+  拒否されると plugin_host のログに `SetForegroundWindow refused` が出る。
 - メニューを開くだけなら不要 (エディタをクリックした時点で B が foreground になる)。前面化は polish。
+- **本体窓の後ろ**に回るなら owner が付いていない。エディタ窓の owner は daw_gui の本体窓
+  (`OpenSlotGuiEmbedded.owner_main_window`) で、owned 窓は owner より常に上に出る
+  (設計正本 §窓契約 1-1)。owner 無しで開くと daw_gui が `opening plugin editor without an owner window`、
+  plugin_host が `no owner window supplied` を warn で出す。
 
 ### ③ VST3 エディタが極小 / まったく出ない (例: Analog Lab)
 - **原因**: 一部 VST3 は `attached` **前**の `getSize` で 0×0 (or placeholder) を返し、本当のサイズは
@@ -85,14 +100,16 @@ daw_gui: on_gui_geometry が窓の位置/サイズを記録 (ViewState に保存
     `GetAncestor(hwnd, GA_ROOTOWNER)` を辿り foreground 窓の所有プロセスと一致すれば通る (#401 fix)。
   - **サブメニュー**は `Options::forSubmenu()` で `targetComponent = nullptr` → 上記 escape hatch が
     使えず `Process::isForegroundProcess()` = `getProcess(GetForegroundWindow()) == GetCurrentProcessId()`
-    のみに落ちる。**エディタ窓を別プロセス (daw_gui) が所有していると plugin-host プロセス内で
-    常に false → サブメニューだけ即 dismiss**。
-- **修正**: エディタのトップレベル窓を **plugin-host プロセスが所有** (FIXME #31 で実施)。クリックで
-  B が foreground になり成立。`AttachThreadInput` では直らない (foreground 窓の所有プロセスは
-  変わらない)。詳細根拠は `docs/plan_plugin_editor_topwindow.md`。
+    のみに落ちる。**エディタ窓を別プロセス (daw_gui) が作っている (窓が daw_gui のプロセスに属する) と
+    plugin-host プロセス内で常に false → サブメニューだけ即 dismiss**。
+- **修正**: エディタのトップレベル窓を **plugin-host プロセスが作る** (FIXME #31)。クリックで
+  B が foreground になり成立。`AttachThreadInput` では直らない (foreground 窓の所属プロセスは
+  変わらない)。Win32 の owner を daw_gui の本体窓にしても再発しない — `GA_ROOTOWNER` を見るのは
+  述語の `||` の右側 (救済パス) で、判定を緩める向きにしか効かない。詳細根拠は
+  `docs/plan_plugin_editor_topwindow.md` (「注意 (FFI / window)」の 2026-08-22 撤回を含む)。
 
 ### ⑤ `gui.show returned false`
-1. CLAP spec の呼び出し順序を守っているか (create → set_scale → get_size → set_parent → show)。
+1. CLAP spec の呼び出し順序を守っているか (create → set_scale → can_resize → get_size → set_parent → show)。
    初回 open で `set_size` を呼んでいないか (VCV Rack 等が拒否)
 2. `set_parent` と `show` の間にメッセージポンプ (`pump_pending_messages`) が入っているか
 3. false でも GUI が実際に表示される例 (VCV Rack)。`Ok(false)` で警告ログに留め destroy しないのが正
@@ -100,43 +117,53 @@ daw_gui: on_gui_geometry が窓の位置/サイズを記録 (ViewState に保存
 ### ⑥ ✕ で閉じても状態が残る / 次のクリックが効かない
 - B の WNDPROC `WM_CLOSE` を `DefWindowProcW` に流すと Windows が `DestroyWindow` して RAII Drop と
   二重解放。必ず `ShowWindow(SW_HIDE)` + close フラグ + `LRESULT(0)` で傍受 (editor_window.rs)。
-- WNDPROC → Rust state は `GWLP_USERDATA` に `Arc::into_raw`、Drop で `Arc::from_raw` 回収。
+- WNDPROC → Rust state は `GWLP_USERDATA` に `Rc::into_raw`、Drop で `Rc::from_raw` 回収。
 - close は B のループが close フラグを poll → `close_slot_gui` で `gui_destroy` → 窓 Drop →
   `SlotGuiClosed` 送信 → daw_gui の `on_gui_closed` が `open_plugin_guis` から除去。
 
-### ⑦ プラグイン削除でエディタが閉じない / 別のエディタが閉じる
-- `editor_windows` は `(track,slot)` keyed だが、エディタを開いたまま slot がずれる (下位 Fx 削除 /
-  降格) と key が陳腐化。**削除は安定 `plugin_id` で照合**して破棄 (`destroy_editor_windows_where`)。
-- daw_gui は削除前に `cleanup_slot_gui` (CloseSlotGui) を送ってから RemoveSlotPlugin (順序重要 —
-  逆だとチェーンずれ後に隣のプラグイン GUI を誤破棄)。詳細 memory `project-plugin-slot-rekey`。
+### ⑦ プラグイン削除でエディタが閉じない
+- 開閉の帳簿は両プロセスとも安定 id keyed (daw_gui の `open_plugin_guis` は device_id、plugin_host は
+  `DeviceAddr` keyed の `InstanceRecord.editor`)。削除・並べ替えで key を貼り替えるコードは無い
+  (CLAUDE.md 不変条件 1)。
+- daw_gui は削除時に `cleanup_slot_gui` (開いていれば `CloseSlotGui`) を送ってから `RemoveSlotPlugin` を送る。
+  plugin_host の `teardown_device` (`RemoveSlotPlugin` / 差し替えの `SetSlotPlugin` / `UnloadProject` / 終了) も
+  窓を壊して `SlotGuiClosed` を返すので、二重でも idempotent。閉じ残るなら
+  `received command other=RemoveSlotPlugin` と `editor window destroyed` のログを見る。
 
 ### ⑧ リサイズが反映されない / 一部しか見えない
 - コンテナの *client* 領域が plugin の希望サイズと合っているか。`SetWindowPos` は **outer rect**
   (`AdjustWindowRectExForDpi` で client→outer 変換。style は窓から読む = SSoT)。
 - 動的リサイズは B 内完結で **同期** (上の「リサイズ」節)。daw_gui を経由しない。
-- 枠でリサイズできない場合、まず `plugin gui initial size ... resizable=false` のログを見る。
-  `canResize()==false` なら**仕様どおり固定枠**で、プラグイン自身のグリップ経由
-  (`resizeView`) でしか変わらない。
+- 枠でリサイズできない場合、まず `plugin gui opened ... resizable=false` のログを見る (attach 後に再 query
+  した最終値。`plugin gui initial size` の `resizable` は attach 前の値で、Arturia 系は attach 後に変わる)。
+  枠を出すかは `should_offer_resize_frame` の方針で、CLAP は `can_resize()==false` なら**仕様どおり固定枠**
+  (プラグイン自身のグリップ = `request_resize` でしか変わらない)、VST3 は `canResize()==false` でも枠を出す。
+  申告の生の値は target `editor_resize` の `canResize / can_resize probed` (`phase` で pre / post-attach を区別) に出る。
 - `RUST_LOG=info,editor_win=trace` で `WM_SIZING` / `WM_SIZE` / `WM_NCACTIVATE` などを
   相手 HWND の PID/TID/クラス名つきで採れる。daw_gui 抜きの最小再現は
   `daw_plugin_host --editor-selftest "<path>.vst3"`。
 
 ### ⑨ プラグインが panic / 不正終了 / ハング
-- すべての CLAP/VST3 呼び出しが **plugin-main std::thread 上で直列化**されているか (tokio に混ぜない)。
+- main-thread 系の CLAP/VST3 呼び出しが **plugin-main std::thread 上で直列化**されているか (tokio に混ぜない)。
+  `process()` だけは process_server の worker スレッドで走る。
 - GUI 呼び出し中に同時に process() が走るとプラグイン実装のバグで落ちる例あり。疑わしければ
   GUI 操作時は playback を stop。
-- `clap_host_thread_check` を実装すればプラグイン側から main-thread 検証ができる。
+- `clap_host_thread_check` は実装済み (`daw_plugin_host/src/clap_host.rs`)。process_server の worker
+  (`mark_audio_thread` 済み) を audio thread、それ以外を main thread と答えるので、plugin-main 以外の
+  非 audio スレッドからの main-thread API 呼び出しはこれでは検出できない。
 
 ## デバッグ用ログ追加のコツ
-- IPC 送受信を全てログ化: `sending to plugin_host msg=...` / `received <PluginCommand>` /
-  `<PluginEvent>` (protocol は宛先ごとに型が分かれている。CLAUDE.md 不変条件 3)。
+- IPC 送受信のログ: 送信は daw_gui の `sending to plugin_host msg=...` (debug レベル)、受信は plugin_host の
+  `received command other=<PluginCommand>` (info。`SetSlotPlugin` など一部は専用の `received <名前>`)。
+  daw_gui は受け取った `PluginEvent` を汎用にはログしないので、要るなら `daw_gui/src/handler/ipc.rs` の
+  分岐に足す (protocol は宛先ごとに型が分かれている。CLAUDE.md 不変条件 3)。
 - プラグイン本体の stderr ログも見る (VCV Rack の `guiSetParent()`/`guiDestroy()` 等)。
 - foreground 周りを疑うときは B 側で `GetWindowThreadProcessId(GetForegroundWindow())` vs
   `GetCurrentProcessId()` をログして「どのプロセスが foreground か」を確認。
 
 ## 参考ファイル
-- `daw_plugin_host/src/editor_window.rs` — B 所有のエディタ窓 (FIXME #31)
-- `daw_plugin_host/src/main.rs` — plugin-main thread / open_gui / close_slot_gui / Demote / 各 re-key
+- `daw_plugin_host/src/editor_window.rs` — B が作るエディタ窓 (FIXME #31)
+- `daw_plugin_host/src/main.rs` — plugin-main thread / open_gui / close_slot_gui / teardown_device / poll_editor_close_requests
 - `daw_plugin_host/src/clap_plugin.rs` / `vst3_plugin.rs` — gui_* メソッド群
 - `daw_plugin_host/src/clap_host.rs` — `clap_host_gui` 実装
 - `daw_gui/src/handler/devices.rs` — open_slot_gui / on_gui_geometry / on_gui_closed / open_plugin_guis

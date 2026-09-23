@@ -78,9 +78,9 @@ impl AppData {
 
         // 内蔵映像効果は GUI 描画パスで処理する device。plugin_host に
         // load せず (load_builtin に該当無し)、モデルへ append するだけ。engine の
-        // `process_track_owned` は `slot_to_plugin_id` 未登録の index を skip し
-        // (= 音声バス素通り)、append は既存 device の index をずらさないので
-        // audio 側は完全に不変。param は GUI が automation/変調を評価して描画に使う。
+        // `process_track_owned` は `plugin_refs` (device_id → entry) に無い device を skip し
+        // (= 音声バス素通り)、audio の出力は変わらない。param は GUI が automation/変調を
+        // 評価して描画に使う。
         // v29: 新規 device の安定 id を Song allocator で採番する
         // (0 のまま送る/積むのは禁止 — id addressing の根)。
         let Some(device_id) = self.edit_song(|song| song.alloc_device_id()) else {

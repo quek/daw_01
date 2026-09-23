@@ -166,12 +166,24 @@ source rack を種別対応に拡張 (既存 follower row は据え置き):
   入力: 空白ダブルクリック=点追加 (`AppData::last_click` 400ms/5px 判定)、ハンドルドラッグ=
   time/value、segment 中央縦ドラッグ=curve(tension)、右クリック/Delete=削除 (両端固定)。
   Edit は `hctx.push_edit(Edit::mutate(|app| app.handle_event(AppEvent::MsegMovePoint{..})))`。
+  > ※ 実装はこの案と違う: エディタは daw-ui core の汎用 widget `Ui::mseg_editor` / `Ui::step_grid`
+  > (`ui/crates/ui/src/widgets/modulator_editor.rs`) になり、空白のダブルクリックは
+  > `Ui::take_double_click_in_rect` で取る (前回の click と閾値は `UiHost` が持つ。既定 400ms / 5px)。
+  > `AppData::last_click` は `da0bdf58` (2026-05-04) で撤去されていて、この計画を書いた時点で既に無かった。
+  > Edit は `AppEvent::EditModSource { id, edit: ModSourceEdit::MsegAddPoint { .. } }` などで積む
+  > (`daw_gui/src/view/track_inspector/modulation_rack/bodies.rs`)。
 - ライブ位相カーソル: `scalar(source_id)` を playhead beat から算出してエディタに重畳描画。
 - 新イベント: `AddModSource{kind}` / `SetModSourceKind` / `SetLfoShape` / `SetModRate` /
   `SetLfoPhase` / `SetRandomSeed`(re-roll) / `SetRandomMode` / `MsegAddPoint` / `MsegMovePoint` /
   `MsegSetCurve` / `MsegRemovePoint` / `SetMsegPlayMode` / `StepsSetValue` / `SetStepsCount` /
   `SetStepsDirection` / `SetModRetrigger`。すべて `sync_song_to_plugin_host()` 経由 (generator は
   schedule recompile 不要だが song 保存・プレビュー反映のため既存 sync 経路に乗せる)。
+  > ※ 実装では、上の event を 1 つずつ AppEvent の variant にはしなかった: 生成は `AppEvent::AddModSource { kind }`、
+  > 設定の編集は `AppEvent::EditModSource { id, edit }` 1 本 (`edit` は `daw_gui/src/app_types.rs` の
+  > `ModSourceEdit`。`MsegAddPoint` / `MsegMovePoint` / `MsegSetCurve` / `MsegRemovePoint` はその variant) にまとめた
+  > (`309ca9ec` の時点から)。`sync_song_to_plugin_host()` は arch-refactor の S3b-i (`4434efff`, 2026-07-04) で
+  > なくなり、今は `edit_song()` で編集すれば frame 末の `flush_song_sync` が LoadSong などをまとめて送る pull 型
+  > (`docs/plan_arch_refactor.md` §7.5「sync 一本化」)。
 - **per-param depth リング割当 UI** は既存 follower と共通の pending gui_01 widget 待ち
   (`routing_redesign §6`)。#56 の新規 UI 自体はブロックされない。
 

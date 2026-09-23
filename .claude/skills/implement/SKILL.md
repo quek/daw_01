@@ -5,7 +5,7 @@ description: |
   「実装して」「追加して」「修正して」「対応して」「機能を作って」「バグを直して」等、
   コード変更を伴う指示で発動。
 argument-hint: "[実装したい機能の説明]"
-allowed-tools: Read, Grep, Glob, Edit, Write, Bash(cargo test *), Bash(cargo build *), Bash(cargo clippy *), Bash(cargo run *), Bash(git add *), Bash(git commit *), Bash(git status *), Bash(git diff *), Agent, Skill, Workflow
+allowed-tools: Read, Grep, Glob, Edit, Write, Bash(make build), Bash(make clippy), Bash(make arch-lint), Bash(cargo check -p *), Bash(cargo build -p *), Bash(cargo clippy -p *), Bash(cargo test -p *), Bash(python scripts/loc_budget.py *), Bash(git add *), Bash(git commit *), Bash(git status *), Bash(git diff *), Agent, Skill, Workflow
 ---
 
 # 機能実装ワークフロー (daw_01)
@@ -15,12 +15,17 @@ $ARGUMENTS を実装する。
 調査 → 要件整理 → (必要なら統合テスト) → 実装 → 実機検証 → commit の順で進める。
 テストはリグレッション防止を目的とし、可能な限り高いレイヤーで書く。
 
+この skill は長く、会話が compaction されると先頭の約 5,000 token しか戻らない (後半の検証・
+`/review`・sign-off・commit の手順が落ちる)。compaction の後に続けるときは、この skill を同じ
+引数で呼び直して全文を戻してから進む。
+
 ## 大原則 (CLAUDE.md より、 この skill の全段に優先)
 
 - **理想とベストプラクティスを追求する。実装コストは無視して大胆に作り直す。**
   「実装コスト」「影響範囲」「現実的に」「妥協」が思考に出た時点で principle 違反。
-- **最終形まで一気に完成させる。フェーズ分けをしない。**「Phase 1 完成、次に進みますか」は禁止。
-  ゴールまで完走する。
+- **最終形まで実装する。** 禁じているのは途中で報告して承認を待つこと (「Phase 1 完成、次に進みますか」) で、
+  計画を段階に割ることではない (大規模改修を `docs/plan_*.md` で段階に割るのはむしろ推奨)。
+  止まって聞いてよいのは CLAUDE.md「最終形まで実装する」の 4 場面だけ。それ以外はゴールまで完走する。
 - **まず調べる。推測で実装しない。** 一次情報 (DAW manual / CLAP spec / 参照実装 / gui_01 doc)
   を引用付きで確認してから書く。
 - **worktree session ではファイル操作を worktree パスに向ける** (`feedback_worktree_path_discipline`)。
@@ -39,6 +44,9 @@ $ARGUMENTS を実装する。
    (`/debug-gui` skill)。フリーズ系は `/debug-plugin-gui` / `reference_freeze_debugging` memory。
 4. **原因が確定してから修正する**: 「可能性がある」で修正しない。新機能が「動かない」報告は、
    操作ミス/環境でなく **自分の未配線を第一容疑** にする (`feedback_new_feature_bug_suspect_own_wiring`)。
+5. **直す前に同件を全件洗う**: 根 (この語 / この API / この呼び出し方 / この型) を 1 文に一般化し、リポジトリ全体を
+   grep して同種箇所を全部挙げてから、同じ commit で class ごと直す (対象外にするものは理由を書く)。報告には
+   「根: 1 文 / 対象箇所: N 件 (表)」を入れる (`feedback_sibling_occurrence_check`)。
 
 特に CLAP プラグインの初期化処理 (`create` → `init` → `activate` → `start_processing`) は、`?` や `.ok()` で
 エラーが握りつぶされて**初期化自体が失敗しているケース**がある。各ステップの成功を個別に検証する。
@@ -65,8 +73,9 @@ $ARGUMENTS を実装する。
    ことを確認 (`~/.cargo/registry/src/.../clap-sys-*/src/ext/` を grep)
 2. プラグイン側拡張 (`clap_plugin_gui` 等) は `plugin.get_extension(CLAP_EXT_*)` で取得。
    戻りが null のプラグインもあるので `Option<*const _>` で保持
-3. ホスト側拡張 (`clap_host_gui` 等) は `Host::new()` で struct を埋め、`Host::get_extension`
-   callback から `&host.clap_gui as *const _ as *const c_void` を返す。`host_data` から `&Host` を復元
+3. ホスト側拡張 (`clap_host_gui` 等) は `Host` (`daw_plugin_host/src/clap_host.rs`) にフィールドを足して `Host::new()` で埋め、
+   `get_extension` callback で id を比べて `std::ptr::from_ref(&this.clap_gui) as *const c_void` のように返す。
+   callback 内では `Host::from_clap(host)` で `host_data` から `&Host` を復元する
 4. CLAP spec の `gui.h` 等ヘッダの**呼び出し順序を厳守** (`create → set_scale → can_resize →
    get_size → set_parent → show` が正典)。順序変更/省略で壊れるプラグインがある
 5. 各拡張メソッドの `[main-thread]` / `[audio-thread]` / `[any]` を確認。`@[main-thread]` は
@@ -91,7 +100,7 @@ $ARGUMENTS を実装する。
 
 該当しない場合 (内部リファクタ、単純なバグ修正) はスキップしてよい。
 
-### 3. 要件の整理 (ユーザー承認ゲート)
+### 3. 要件の整理
 
 調査結果と既存コード (Read/Grep) をもとに要件を整理する。
 **参照製品が当然備える操作を完全列挙し、core 操作 (命名/改名・色・削除・undo 等) を polish 扱いで後回しにしない**
@@ -109,7 +118,8 @@ $ARGUMENTS を実装する。
 #### アーキテクチャ影響チェック (CLAUDE.md「アーキテクチャ不変条件」)
 
 実装前に以下を列挙し、1 つでも該当したら `docs/plan_arch_refactor.md` の該当節を読んで
-不変条件に整合する形で設計する (整合しない要求はユーザーへ設計相談):
+不変条件に整合する形で設計する (整合しない要求は、要求と不変条件のどちらを変えるかで作るものが変わるので、
+着手前にユーザーへ 1 問で設計相談する。CLAUDE.md「止まって聞く場面」の着手前の問いに当たる):
 
 - **新しい参照/アドレスを導入するか?** → 安定 id (device_id / send_id / 要素 id) 一本。
   positional index・「削除時に貼り替える補償コード」は禁止 (不変条件 1)
@@ -126,10 +136,11 @@ $ARGUMENTS を実装する。
   インデント 6 段) → 先に分割 (不変条件 9)。現在値は `python scripts/loc_budget.py --report`、
   検査は `make arch-lint`。**物理行ではない** — テスト / doc comment / 空行は数えない
 
-**要件一覧をユーザーに提示し、過不足の確認を取る。承認を得てから次へ進む**
-(`feedback_no_redundant_verification` — 未完成段階で実機確認を求めない)。
+**要件一覧は書き出して見える形にする。止まってユーザーに聞くのは、CLAUDE.md「止まって聞く場面は 4 つだけ」の
+着手前の 2 つ (UI の見せ方・操作 / 2 通りに読めて作るものが変わる要件) に当たる点だけ**。それ以外は聞かずに次へ進む
+(未完成の段階で実機確認を求めないのも同じ — `feedback_no_redundant_verification`)。
 
-- 設計判断が多い／分岐が深い機能は **`/grill-me`** で決定木を一問ずつ潰す (#49-54/#56 の確立パターン)。
+- 設計判断が多い／分岐が深い機能は **`/grill-me`** で決定木を一問ずつ潰す。
 - ユーザーへの質問は **「見える挙動」の言葉** で、 **番号付き選択肢** (推奨を 1 番)、 **最も上流から 1 問ずつ**
   (`feedback_plain_language_questions` / `feedback_numbered_question_options` / `feedback_one_question_at_a_time`)。
 - 大きめプランは `docs/plan_<feature>.md` に最終形を書く (`feedback_plan_location`)。
@@ -149,14 +160,16 @@ $ARGUMENTS を実装する。
 
 ### 4. 統合テストの作成
 
-承認された要件をもとに統合テストを書く (TDD: 失敗するテスト → 実装 → 通す)。
+整理した要件をもとに統合テストを書く (TDD: 失敗するテスト → 実装 → 通す)。
 
-#### テストをスキップしてよいケース
+#### テストを書く範囲
 
-以下のすべてに該当する場合のみスキップ可:
-- UI 操作 (メニュー、キーバインド、ドラッグ) やプロセス起動が主で自動テストが困難
-- 一度ビルド・実行すれば正しさが確認できる
-- 既存ロジック (model 変換、serialize/deserialize、イベント変換、DSP) に変更がない
+テストは非自明なロジック (純粋関数の境界計算・写像・状態機械の分岐) と、外部で定義された真実との突き合わせ
+(規格の信号・移植元の実装との一致・往復同一性などの不変条件) に書く。自明な修正 (ホワイトリストへの 1 行追加・
+1:1 の dispatch 配線・既存パターンの踏襲) には書かない。本番の算術をテスト側に写して突き合わせるだけのテストも
+書かない (`feedback_no_tests_for_simple_cases`)。GUI / IPC / 再生を跨ぐ確認も `daw_gui --script <js>` で自分で回し
+(足りない操作は script API に足す)、「自動では確かめにくい」を理由にユーザーの実機確認へ回さない。
+ユーザーに頼むのは最終 sign-off だけ (CLAUDE.md「テスト」、§9)。
 
 視覚出力 (video preview / texture) は build/test/clippy をすり抜ける。`--smoke-test` で別途担保 (§6)。
 
@@ -166,7 +179,7 @@ $ARGUMENTS を実装する。
 
 | レイヤー | 方法 | 例 |
 |---|---|---|
-| **コマンド／イベント層** | `AppData::handle_event` / `command/*` を呼び Song/Track/Clip の変化を検証 | トラック追加、Clip 編集、プラグインロード、変調 routing CRUD |
+| **コマンド／イベント層** | `AppData::handle_event` / `handler/*` の AppData メソッドを呼び Song/Track/Clip の変化を検証 | トラック追加、Clip 編集、プラグインロード、変調 routing CRUD |
 | **モデル操作** | `Song`/`Track`/`Clip`/`Row` のメソッドや `ensure_ids`/save-load 往復を検証 | copy/paste、undo/redo、bincode round-trip、歌詞分割 |
 | **純粋ロジック** | 関数に入力を与え出力を検証 | DSP、BPM/サンプル変換、`apply_modulation`、変調器の `f(beat)`、正規化 |
 
@@ -178,28 +191,8 @@ protocol/model 型 (bincode derive) を変えたら `make build`
 
 - **1 テスト = 1 つのユーザーシナリオ**
 - 期待値は `assert_eq!` で具体値を検証 (`starts_with()` / `> 0` は使わない)
-- 単純な入出力はパラメタライズドテストにまとめる:
-
-```rust
-#[test]
-fn lfo_は_beat_の純粋関数で各シェイプの値を返す() {
-    // (shape, rate_beats, beat, expected_unipolar_0_1)
-    let cases = [
-        (LfoShape::Sine,   1.0, 0.0,  0.5),   // sine は phase0 で中央
-        (LfoShape::Sine,   1.0, 0.25, 1.0),   // 1/4 で頂点
-        (LfoShape::SawUp,  1.0, 0.0,  0.0),
-        (LfoShape::SawUp,  1.0, 0.5,  0.5),
-        (LfoShape::Square, 1.0, 0.0,  1.0),
-        (LfoShape::Square, 1.0, 0.6,  0.0),
-    ];
-    for (shape, rate, beat, expected) in cases {
-        let cfg = LfoConfig { shape, rate_beats: rate, phase: 0.0, ..Default::default() };
-        let got = eval_lfo(&cfg, beat);
-        assert!((got - expected).abs() < 1e-6, "shape={shape:?} beat={beat} got={got}");
-    }
-}
-```
-
+- 単純な入出力はパラメタライズドテストにまとめる (`(入力, 期待値)` の配列を 1 ループで回し、失敗メッセージに入力を出す)。
+  実例: `common/src/modulators.rs` の `lfo_各shapeが既知点で正しい値を返す`
 - 自明な初期値テスト (`assert_eq!(x.field(), 0)`) は書かない
 - テストヘルパーを積極的に作り Arrange を簡潔に保つ
 - 変調器の **決定論** (同じ beat → 同じ値、ランダムは `f(seed,beat)` の純ハッシュ) を必ずテストする
@@ -212,15 +205,18 @@ fn lfo_は_beat_の純粋関数で各シェイプの値を返す() {
 #### テスト失敗の確認
 
 ```bash
-make test-nolaunch          # 起動を伴う target を除いた全テスト
-cargo test -p <crate> --test <name>   # 対象が 1 crate に閉じているならこちらまで絞る
+cargo test -p <crate> --test <name>   # 変更に関係する target だけを名指しで回す
+cargo test -p <crate> --lib <filter>
 ```
 
 - コンパイルが通る / 新規テストがアサーション失敗で落ちる (意味のある検証の証拠) / 既存テストは壊れていない
-- **素の `make test` は使わない**。`daw_gui/tests/` の一部が daw_gui 本体を `--script` で
-  subprocess 起動して audio device を開き、ユーザーが開いているプロジェクトの再生を壊す
-  (`feedback_cargo_tests_launches_app`)。起動を伴う target まで回す必要があるときは
-  **ユーザーの許可を得てから** `DAW01_ALLOW_LAUNCH=1 make test`。
+- **全件 (`make test-nolaunch`) は自分の判断で回さない**。全件が要ると判断したら回す前に一言断る
+  (`feedback_gates_cadence`)。`--test` で名指ししても、CLAUDE.md「`make test` は daw_gui を起動する」の
+  判定基準に当たる target は daw_gui を起動する (起動に許可は要らない)
+- **素の `make test` は全件なので自分の判断では回さない** (上の項目)。`daw_gui/tests/` の一部が daw_gui 本体を
+  `--script` で subprocess 起動して audio device を開くが、起動そのものに許可は要らない
+  (`feedback_cargo_tests_launches_app`)。ユーザーの daw_gui が動いていれば preflight が止めるので、kill せず
+  閉じてもらうよう頼む (`feedback_no_kill_running_app`)。
 
 ### 5. 実装
 
@@ -233,7 +229,9 @@ cargo test -p <crate> --test <name>   # 対象が 1 crate に閉じているな�
   バッファは再生前に確保し使い回す
 - **FFI 境界**: 整数キャストは `try_from`/`saturating_*`、ポインタ null/境界、配列長を検証
 - **エラーを握りつぶさない**: `?` を安易に `ok()`/`unwrap_or_default()` にしない
-- **要件にない変更を入れない**: 既存挙動を勝手に変えない。ついでのリファクタは別コミット
+- **要件にない挙動変更を入れない**: 既存挙動を勝手に変えない。ついでのリファクタは別コミット。ただし作業中に見つけた
+  問題 (バグ・RT 経路の非効率・古いコメント等) はタスク外でもその場で直す (`feedback_fix_found_problems_no_scars`。
+  r.md の backlog 項目に勝手に着手するのとは別 — `feedback_fixme_is_backlog_not_donow`)
 
 #### 5.5 GUI/UX の配置・操作性 (UI を足す・変える時は必読)
 
@@ -244,15 +242,15 @@ cargo test -p <crate> --test <name>   # 対象が 1 crate に閉じているな�
 - **配置 = トリガの近く**: パネル/セクションは、 それを開閉するボタンの**近く**に出す。 トリガ (例: チェーン行の
   「Par」ボタン) と表示が画面の遠く (例: インスペクタ最上部) に分かれると、 押しても効いたか分からず操作不能感。
 - **トグル安定性 = 他を動かさない**: パネルの開閉で**他のコントロール (特にトリガ自身) が動いてはいけない**。
-  daw_01 インスペクタは `track_inspector.rs` で **param viewport (上・縦 scroll) + chain band (下・pinned)** の
-  2 分割 (`boundary_y` で分かれる)。 viewport の content 高が変わると `boundary_y` が動いて chain band (=
-  「Par」ボタン) ごと下にずれ、 「押した瞬間ボタンが逃げる / 表示してすぐ非表示」 という操作不能を生む
-  (2026-06-20 実例)。 → 開閉で高さが変わらないよう **viewport 高を固定** する等、 レイアウトを安定させる。
+  daw_01 インスペクタ (`daw_gui/src/view/track_inspector/mod.rs`) は title 下の全部が 1 本の縦 scroll viewport で、
+  各セクションを `(app, ui, area, pad, y) -> f32` の関数で上から積む (y カーソル 1 本、 並び順がそのまま画面の上下順)。
+  トリガより上で高さが変わると、 トリガごと下にずれて 「押した瞬間ボタンが逃げる / 表示してすぐ非表示」 という
+  操作不能を生む (2026-06-20 実例)。 → 開閉するパネルはトリガの直下 (行内アコーディオン) に出し、 トリガより上の高さを変えない。
 - **重複編集面を作らない**: 同じ param を**2 箇所で編集できる状態にしない** (既存の専用セクション + 新パネルの
   二重表示)。 表示面は 1 つに集約し、 もう片方は gate で隠す (SSoT を「画面」 にも適用)。 2026-06-20 に
   字幕 X/Y・talk 話速を専用欄と新パネルで二重表示して手戻り。
-- **no-scroll / 固定 band の制約**: インスペクタは縦 scroll の param 領域 + 下端固定 band。 背の高いパネルは
-  scroll 領域に入れる / overflow がボタンを覆わないか確認する。 widget の縦 budget (行数 cap・`*_section_h`) を読む。
+- **縦 scroll の制約**: インスペクタは 1 本の縦 scroll viewport で、 content 高には前フレームの測定値 (`inspector_body_h`、
+  immediate-mode の lag-by-one) を使う。 背の高いパネルもこの流れの中に積む。
 - **既存 UI idiom を流用**: `scrubable_number` / `dropdown` / video_fx param パネル (`inspector_video_fx_params`) /
   clip voice picker。 bespoke な edit-buffer widget を新設しない (`feedback_reuse_inspector_idiom`)。
 - **配置・操作性は build/clippy/test をすり抜ける**: §6 の自動検証では**絶対に分からない**。 必ず実機で
@@ -265,15 +263,19 @@ cargo test -p <crate> --test <name>   # 対象が 1 crate に閉じているな�
   auto-contrast のいずれかでコントラストを保証し、 **明るいクリップと暗いクリップの両方で目視** する
   (`track_color` の明色プリセットで 1 つ着色して確認)。 color / contrast も build/clippy/test をすり抜ける。
 - **「上/下/近く/見づらい/やりにくい」等の配置 feedback は、 まず描画コードの y フロー・領域分割を Read してから直す**。
-  どの領域 (scroll viewport / pinned band) のどの `y` に出ているかを特定してから動かす。
+  どのセクション関数のどの `y` に出ているかを特定してから動かす。
 
-### 6. 全テスト通過 + 実機ビルドの確認
+### 6. テスト・lint 通過 + 実機ビルドの確認
 
 ```bash
-make test-nolaunch   # 素の make test は daw_gui を起動する (上記)
+cargo test -p <crate> --test <name>   # 変更に関係する target だけ (§4 と同じ。全件は回す前に一言断る)
 make clippy
 make arch-lint       # 新規違反ゼロ (exit 0 = 違反ゼロ or baseline 済みのみ)
 ```
+
+実機で挙動を往復している間は、修正のたびに clippy / テストを挟まない (`cargo check -p <crate>` → build → 起動で回す)。
+clippy / arch-lint / 関連テストは修正が固まってから 1 回にまとめる。並列 worktree の 1 タスクでは `make clippy` も回さず
+`cargo clippy -p <crate> --all-targets -- -D warnings` まで、全件は統合後に main で 1 回 (`feedback_gates_cadence`)。
 
 **実機検証前の再ビルド (必須)**: clippy/check/test は実行 exe を生成しない (or test exe のみ)。
 `./target/debug/daw_gui.exe` で検証する前に必ず `cargo build` を明示 (`feedback_build_after_clippy`):
@@ -301,14 +303,14 @@ cargo run -p daw_gui -- --smoke-test daw_gui/tests/fixtures/smoke_test.mp4
 
 ### 7. リファクタリング (必要に応じて)
 
-全テストが通った状態で整理する。
+関連テストが通った状態で整理する。
 OK: リネーム、関数抽出、重複排除、clippy 警告修正、テストヘルパー整理。
-NG: 新機能追加 (次サイクル)。リファクタ後も全テスト通過を確認。
+NG: 新機能追加 (次サイクル)。リファクタ後も関連テストの通過を確認。
 
 ### 8. コミット前レビュー
 
 `/review` を呼び、変更箇所の correctness・パフォーマンス・セキュリティ・RT 安全性をチェックして直す
-(`feedback_review_before_commit` — わかっているバグは spawn_task に回さずその場で修正)。
+(`feedback_review_before_commit` — わかっているバグは別タスクや「残件」に回さずその場で直す)。
 
 ### 9. 実機検証 → コミット
 
@@ -320,8 +322,8 @@ NG: 新機能追加 (次サイクル)。リファクタ後も全テスト通過�
 承認を得たら:
 
 ```bash
-make test-nolaunch
-make clippy
+# 最後に回した検証 (§6 / §8 の /review) の後にコードを変えたときだけ、関連 test target と make clippy / make arch-lint を
+# 1 回回し直す (同じ検証を 2 度回さない — feedback_gates_cadence)
 git add <変更ファイルを全列挙>        # -A / . / ディレクトリ指定は不可 (feedback_git_add_one_file)
 git commit -m "<日本語メッセージ>"
 ```
@@ -331,15 +333,16 @@ git commit -m "<日本語メッセージ>"
 
 ## テストが間違っていると気づいた場合
 
-1. 根拠を明確にする (調査結果、実際の動作、CLAP/DAW 仕様)
-2. ユーザーに報告し、テスト修正の承認を得る
-3. 承認後にテストを修正し、実装を続ける
+期待値を直してよいのは、根拠 (調査結果・実際の動作・CLAP/DAW 仕様) で期待値の誤りを示せるときだけ。
+実装を通すために期待値を合わせにいかない。直した期待値と根拠は最終報告に書く。
+誤りが要件の読み違いから来ていて、どちらを取るかで作るものが変わるなら、CLAUDE.md の
+「止まって聞く場面」(要件が 2 通りに読めるとき) として 1 問で聞く。
 
 ## 禁止事項
 
 - 推測で実装しない (調査してから)
 - `#[ignore]` でテストをスキップしない
-- ユーザーの承認なしにテストの期待値を変更しない
+- 根拠なしにテストの期待値を変えない (上の「テストが間違っていると気づいた場合」)
 - 要件にない挙動変更 (デフォルト値、初期状態、キーバインド) を勝手に入れない
 - 機能を消したまま新機能に進まない (`feedback_recovery_priority` — 復旧を優先)
 - やれる作業が残っているのに進捗報告だけして turn を終えない (`feedback_dont_stop_prematurely`)

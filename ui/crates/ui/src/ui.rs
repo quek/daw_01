@@ -190,8 +190,8 @@ pub struct UiHost<M: ?Sized + 'static> {
     injected_shortcuts: Vec<&'static str>,
     /// M14 Phase 58: text shape による proportional font の実 advance 計算器。`Ui::measure_text`
     /// 経由で text_input の cursor / selection の x 位置を pixel-accurate に取得する。
-    /// renderer 側の `GlyphPipeline` 内 `FontSystem` とは別 instance だが、同じ system fonts を
-    /// 読むので shape 結果は一致する (キャッシュは別)。
+    /// `FontSystem` は持たず、frame ごとに注入されたもので測る (daw_gui の runner は
+    /// `frame_with_fonts` で renderer 所有のものを渡す。下の `owned_font_system` 参照)。
     text_metrics: TextMetrics,
     /// 通常 (headless / example) パス用の measure FontSystem。renderer を持つ runner は
     /// `frame_with_fonts` で renderer 所有の FontSystem を注入するので、このフィールドは
@@ -2066,8 +2066,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// text_input の cursor / selection の x 位置計算に使うと pixel-accurate。
     /// 空文字列なら 0.0。
     ///
-    /// 内部の `cosmic_text::FontSystem` は renderer 側 (`GlyphPipeline`) のものとは別 instance だが、
-    /// 同じ system fonts を読むので shape 結果は一致する (キャッシュは別)。
+    /// 測る `cosmic_text::FontSystem` は frame ごとに注入される。daw_gui の runner は
+    /// `UiHost::frame_with_fonts` で renderer 所有のもの (`Renderer::font_system_mut`) を渡すので、
+    /// 描画と同じ instance で測る。`UiHost::frame` / `frame_to_edits` を直接使う headless /
+    /// example では `UiHost` が別 instance を lazy 生成して持つ (同じ system fonts を読むので
+    /// shape 結果は一致する。キャッシュは別)。
     pub fn measure_text(&mut self, text: &str, font_size: f32) -> f32 {
         self.text_metrics.measure_advance(&mut *self.font_system, text, font_size)
     }

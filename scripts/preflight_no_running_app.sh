@@ -11,7 +11,8 @@
 # **daw_gui 本体を subprocess として起動**し、それが daw_audio / daw_plugin_host まで
 # spawn して audio device を開く。`--script` は窓を出さず single-instance gate も
 # 素通りするので、実機を触っている最中に回すと **誰も気付かないまま** audio device を
-# 奪い合う。`make run` の二重起動も同じ (IPC を奪い合って後発の窓が入力を受け付けなくなる)。
+# 奪い合う。`make run` の二重起動も止める (対話起動は single-instance gate が 2 つ目を既存の窓の前面化だけで
+# 終わらせるので、新しくビルドした方ではなく古い窓を見て確かめたつもりになる。起動中は build も ERROR 5 で落ちうる)。
 #
 # これは Claude だけの問題ではない。**ユーザーが DAW を開いたまま手で `make test` を
 # 打っても同じことが起きる**。だから知識を Makefile 側に置く。
@@ -26,7 +27,7 @@
 # ----------------
 # tasklist も pgrep も ps も無ければ **警告して通す**。「検査できなかった」ことを
 # 見えるようにするのが目的で、緑に見せかけないこと自体が要件
-# (memory: reference_make_argv_backslash_loss / 偽グリーンを作らない)。
+# (memory: reference_msys_make_traps の reference_make_argv_backslash_loss 節 / 偽グリーンを作らない)。
 set -u
 
 caller="${1:-make}"
@@ -49,7 +50,8 @@ listing=""
 if command -v tasklist >/dev/null 2>&1; then
     how="tasklist"
     # **引数を渡さない**。`//FI "IMAGENAME eq ..."` は MSYS のパス変換に晒されるうえ、
-    # make 経由だとクロスランタイム起動で引数が壊れる (reference_make_argv_backslash_loss)。
+    # make 経由だとクロスランタイム起動で引数が壊れる (memory reference_msys_make_traps の
+    # reference_make_argv_backslash_loss 節)。
     # 素の tasklist は 1 行目からイメージ名で始まるので、行頭一致で足りる。
     listing="$(tasklist 2>/dev/null)"
     pattern="^$APP([.]exe)?[[:space:]]"

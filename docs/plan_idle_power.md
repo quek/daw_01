@@ -57,6 +57,9 @@ buffer が抜けたこと (`EngineShared::live_rendering` が下りた) を見�
   (`daw_plugin_host/src/editor_window.rs`)。daw_gui を owner にするのは設計上禁止
   (`GetAncestor(GA_ROOTOWNER)` が daw_gui に解決すると JUCE の cascade サブメニューが
   `isForegroundProcess()` 判定で即 dismiss される)。
+  ※ 2026-08-22 に撤回 (b79edc64 / 9bfdaa85)。今の owner は daw_gui の本体窓。禁止されるのは daw_gui が
+  窓を「作る」こと (窓が daw_gui のプロセスに属すと `Process::isForegroundProcess()` が false になる) で、
+  下の帰結 (daw_gui は foreground プロセスですらない) は変わらない。
   **帰結: プラグイン GUI 操作中、daw_gui は非フォーカスどころか foreground プロセスですらない。
   daw_gui 内の情報だけでは原理的に判定できない**
 
@@ -65,6 +68,11 @@ buffer が抜けたこと (`EngineShared::live_rendering` が下りた) を見�
 `is_playing = true` の代入は `handler/transport.rs:54` の 1 箇所のみ。`start_recording`
 (`handler/midi.rs:450-485`) は `AudioCommand::Play` を送るが `is_playing` を立てない。
 → **Rec 単独の録音中は `is_playing == false`**。これを park 条件に使うと録音中に音が切れる。
+
+※ この節は計画時点 (e150c960) の調査。同じ 2026-08-15 の後の cbe3cc13 (r.md #51 録音とトランスポートの
+一本化) で前提が変わり、`is_playing` は engine の Tick の観測値になった (`handler/tick.rs` の
+`on_transport_tick` が書く)。録音も `start_transport` を通るので、今は Rec 単独の録音中も true。
+park 可否を engine が決める設計 (§2.1) はそのまま。
 
 ## 2. 設計
 
@@ -230,6 +238,11 @@ preview を 2 回描いている**。main のフレームに従属させ、自�
   ただし**裏で再生 / 録音が続いている間は 33ms を維持する** (`needs_fast_ticks`) —
   曲末の自動停止判定・オートメーション録音の 1/64 拍間引き・再生追従スクロールが
   `on_tick` に同居しているので、粗くすると停止位置がずれ録音カーブが階段になる
+  (※ `needs_fast_ticks` という名前は e150c960 の時点からコードには無い。実装は poller
+  (`daw_gui/src/main.rs` の `spawn_playhead_poller`) が `activity.awake` を見て 33ms / 250ms を選び、
+  `awake` は runner が event を処理するたびと frame を描く前に (`refresh_activity`)
+  `should_keep_rendering` (= 窓がアクティブ || 進捗表示中 || `transport_rolling()`) の値を書く。
+  描画条件と tick レートの条件は同じ 1 つの判定)
 
 ## 3. 変更点
 

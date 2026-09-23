@@ -125,6 +125,9 @@ Celemony 公式も out-of-process ARA を `TestHost/IPC` でデモしており�
 - bind の `kARAEditorViewRole` で plugin の ARA エディタ (Melodyne 画面) が有効化。
 - 表示は既存の plugin GUI 埋め込み経路 (`editor_window.rs` / `view/plugin_embed.rs`) を流用。
   トラックの ARA device の GUI を開く = Melodyne エディタが出る。
+  ※ `view/plugin_embed.rs` は FIXME #31 (2026-06-10 の ededd6c2) で削除済みで、この計画の時点で既に無い。
+  経路は `daw_plugin_host/src/editor_window.rs` (plugin_host が作る top-level 窓) だけ (§11 手順 6 の
+  `plugin_embed` も同じ)。
 - `ARAEditorViewInterface` の selection 通知等は最小実装 (まず GUI が出て編集できる所まで)。
 
 ## 10. 永続化 (archive)

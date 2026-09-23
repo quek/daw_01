@@ -21,7 +21,8 @@
   ProcessScaffold 抽出、split-half aliasing 解消、VocalSynth capability 分離
 - S3 daw_gui (§7,7.5) — state 9 分割、edit_song チョークポイント (song private)、sync pull
   一本化 (flush_song_sync)、handler/ 25 モジュールで app.rs 24840→2097、IPC direct-wrap、
-  export gate 反転 (positive-default + block-list)
+  export gate 反転 (positive-default + block-list)。§7.5 の AppEvent 3 分類 (Edit / System / Ui の
+  2 段 enum) は作らず、この 2 つで置き換えた (§7.5 の注記)
 - S4a — lib undo 撤去 (Edit::Undoable/history.rs)、widget_state 公開、死んだ label 引数全廃
 - S4b (§8) — arrangement を daw_gui/src/widgets/arrangement/ へ移設、mirror 型/EditRequest 58/
   make_edit 736 全廃、**二相描画マジックインセットバグ修正** (単一 SSoT clip_content_inset_top)、
@@ -125,6 +126,13 @@ build / clippy + clip_rename/video smoke)。**S8 実機 sign-off 完了 = arch-r
 - **plugin_host の session `plugin_id: u32` 概念を廃止**。shmem 名 (`process_data_shmem_id`)、
   WorkerBridge の dispatch token (AtomicU32→AtomicU64)、イベント addressing、editor window
   keying、全部 `device_id: u64`。
+  > ※ その後の変更 (安定 id で引く原則はそのまま): shmem 名は `2bfcbf0b` (2026-08-09) で
+  > `process_data_shmem_id(pid, device_id, incarnation)` になった — device_id は開き直しで再利用されるので、
+  > それだけで名前を作ると開き直した project の plugin load が `already exists` で失敗した。
+  > プロジェクトタブ (`76837672`, 2026-09-12) 以降、device_id は Song ごとの採番なので、イベント addressing・
+  > editor window・plugin_host の帳簿 (§6) は `DeviceAddr { project, device_id }` で引き、WorkerBridge の
+  > dispatch token と metrics slot は plugin_host が load ごとに採番する非再利用の `InstanceToken` を使う
+  > (`docs/plan_project_tabs.md` §1.2 / §1.3)。
 - protocol の `(track, index)` addressing を全廃:
   `SetSlotPlugin { device_id, track_id, .. }` / `RemoveSlotPlugin { device_id }` /
   `RequestSlotState { device_id }` / `OpenSlotGui { device_id, title }` /
@@ -253,6 +261,10 @@ daw_gui/src/
   widgets/          -- §8 で移設される arrangement / piano_roll (common::model 直結)
 ```
 
+> ※ 上の `event/` 行 (AppEvent の Edit / System / Ui 2 段化と、「Edit を一括 drop」する export gate) は
+> landed していない。`event/` ディレクトリも作らず、AppEvent は `daw_gui/src/event.rs` へ切り出しただけ
+> (`handler/` は `daw_gui/src/handler/`)。実際の形は §7.5「AppEvent 3 分類」と「export gate の再設計」の注記。
+
 - `is_undoable` whitelist (102 variants)、手動 `push_undo_snapshot` 28 箇所、view からの
   song 直接編集 (SetTrackParent 二重実装) を全廃 — song private 化で迂回はコンパイルエラー。
 - sync: `sync_song_to_plugin_host` (命名も嘘) を解体。edit_song の epoch bump →
@@ -271,6 +283,17 @@ daw_gui/src/
 ## 7.5 S3b 詳細設計 (daw_gui 再構成の実装仕様)
 
 ### AppEvent 3 分類 (2 段 enum)
+
+> **この節の 2 段 enum は landed していない** (下のコードと分類規約は当時の案として残す)。
+> S3b-ii (`ac4195cd`, 2026-07-04) は Edit / System / Ui に分けず、同じ目的を次の形で果たして S3 を完了した:
+> - AppEvent は `daw_gui/src/event.rs` の 1 本の enum のまま。子プロセスからの event だけ
+>   `AppEvent::Audio(AudioEvent)` / `AppEvent::Plugin(PluginEvent)` に直 wrap した (旧 1:1 bridge と
+>   `*FromChild` variant を削除。処理は `handler/ipc.rs` の `dispatch_audio_event` / `dispatch_plugin_event`)。
+>   variant の多い面 (`Launcher` / `Device` / `Tab` など) は `event_*.rs` のサブ enum を 1 arm で受けるが、
+>   これは面ごとのまとまりで、発火元や song を変えるかでは分けていない。
+> - undo / dirty / sync に乗るかは event の種類でなく `edit_song()` を通ったかで決まる
+>   (今は 1 event = 1 undo step の範囲を `AppData::handle_event` の `SongDoc::begin_event` / `end_event` が決める)。
+> - export gate は次節の注記のとおり positive-default + block-list (`AppData::dispatch_app_event`)。
 
 ```rust
 pub enum AppEvent {
@@ -297,6 +320,12 @@ Edit)。Undo/Redo は Edit (song_doc 内の専用復元経路)。
 **`edit_song()` が export_active 中は編集を拒否** (status message + None) する 1 箇所で
 保証。transport 系 (Play 等) の export 中挙動は各 handler の既存 exporting チェックに委譲。
 「新 variant の分類し忘れ = deadlock」という故障モードが型ごと消える。
+
+> ※ 実装 (`ac4195cd`, 2026-07-04) は System / Ui の分類を作らなかったので、「System/Ui は全部流す」ではなく
+> **全 event を原則流し、走行中の plugin instance を組み直す host round-trip 3 種 (`PluginEvent::SlotPluginLoaded` /
+> `PluginEvent::AllPluginStates` / `AudioEvent::BounceClipFxComplete`) だけを落とす** block-list にした
+> (`AppData::dispatch_app_event`。範囲ラウドネス解析の間も同じ)。song の凍結を `edit_song()` の 1 箇所
+> (`SongDoc` の `export_lock`) で保証する点と、判断に迷う event は流すので「分類し忘れ = deadlock」が起きない点は上のとおり。
 
 ### edit_song チョークポイント (state/song_doc.rs)
 
@@ -352,12 +381,21 @@ GPU テクスチャ (`TextureHandle`) と HWND は AppData から runner 側 `Me
 4. 周辺退去 (PreviewCompositor / MediaResources / BPM 編集バッファ→scrubable /
    ClipRef→ClipKey / 選択の stable-id retain / resource_monitor の device_id メトリクス)
 
+> ※ 1 の `event/` と 3 の tier dispatch は作っていない — AppEvent は `daw_gui/src/event.rs` へ切り出し、
+> handle_event を `handler/` へ分割しただけ (`ac4195cd`、上の「AppEvent 3 分類」の注記)。
+
 ### metrics の device_id 化 (S2b 要望への対応)
 
 `MetricsBridge.plugin_dsp_us[u32 slot]` を `PluginMetricSlot { device_id: AtomicU64,
 us: AtomicU32 }` の配列に変更。plugin_host が load 時 (非 RT) に空きスロットを claim し
 RT は小さい slot index へ store、GUI は device_id で scan して読む。u64 単調増加 id が
 slot 上限を超えて計測が silently drop する問題の根治。
+
+> ※ その後の変更: プロジェクトタブ (`76837672`, 2026-09-12) で slot の鍵は device_id から `InstanceToken`
+> (plugin_host が load ごとに採番・非再利用) に変わった — device_id はプロジェクトをまたいで衝突するため。
+> さらに `9660fb5c` (2026-09-14) で固定長の `PluginMetricSlot` 配列は MetricsBridge から外れ、足りなければ
+> 別名で作り直す別 shmem の `PluginMetricsPlane` (`common/src/metrics_bridge/plugins.rs`、
+> `MetricsBridge.plugin_plane_id` が指す) になった (`docs/plan_unbounded_tracks.md` §4)。
 
 ## 8. daw-ui 境界 [B5]
 

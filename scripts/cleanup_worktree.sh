@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 # PowerShell-free removal of a merged daw_01 git worktree.
 #
-# Why bash (not PowerShell): `make rm-worktree` used to shell out to a .ps1, but
+# Why bash (not PowerShell): `make rm-worktree` (now `make worktree-rm`) used to shell out to a .ps1, but
 # make spawns powershell from Git Bash in a context where powershell cannot
 # reliably locate/spawn git, so the script saw zero worktrees and aborted. Bash
 # recipes (like `make fetch-ffmpeg`) run fine here.
 #
-# `make fetch-ffmpeg` vendors ffmpeg as a REAL COPY (cp -r), so worktrees contain
-# no junction; `git worktree remove --force` deletes only the worktree's own
-# files (never the main repo's gitignored, unrecoverable vendored ffmpeg).
+# `make fetch-ffmpeg` (scripts/fetch_ffmpeg.sh) vendors ffmpeg as a REAL COPY, and
+# Claude Code worktrees get /third_party/ as a real copy via `.worktreeinclude`, so
+# such worktrees contain no junction and `git worktree remove --force` deletes only
+# the worktree's own files. This script does NOT detect or detach junctions: a
+# hand-made junction inside a worktree (e.g. third_party -> the main repo's) IS
+# followed by `git worktree remove --force`, deleting the main repo's gitignored,
+# unrecoverable vendored ffmpeg. Detach it with `cmd //c rmdir <junction>` before
+# removing (CLAUDE.md "vendored FFmpeg").
 #
-# Invocation is MANUAL/EXPLICIT (Makefile: `make rm-worktree NAME=...`). It is
+# Invocation is MANUAL/EXPLICIT (Makefile: `make worktree-rm NAME=...`). It is
 # deliberately NOT wired into a git hook: an earlier auto-on-merge hook removed a
 # sibling agent's active worktree (2026-06-15). Removal stays explicit/targeted.
 #

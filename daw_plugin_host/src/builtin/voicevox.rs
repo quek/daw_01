@@ -294,7 +294,8 @@ impl AudioProcessorHalf for VoicevoxAudioHalf {
 
         // 共有 synth 結果 (lock-free load)。 `load()` (Guard 借用) を使い `load_full()` は
         // 使わない: buffer は multi-MB なので、 audio thread が snapshot の最後の所有者になって
-        // process() 末尾で drop = RT スレッド上で解放、 を避ける (CLAUDE.md「解放禁止」)。
+        // process() 末尾で drop = RT スレッド上で解放、 を避ける (CLAUDE.md 不変条件 4「RT スレッドは
+        // 無限待ち・確保・解放をしない」)。
         // daw_audio の RT パスと同じ idiom (automation.rs / audio_worker.rs)。
         //
         // **`load()` だけでは解放を防ぎ切れない** (r.md #75 で判明。以前ここには

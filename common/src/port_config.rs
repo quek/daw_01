@@ -8,8 +8,9 @@
 //!
 //! 内蔵映像効果用に `has_video_input` /
 //! `has_video_output` を追加。映像 device は GUI 描画パスで処理されるため、
-//! audio engine / plugin host から見ると `slot_to_plugin_id` 未登録の index で、
-//! `process_track_owned` がそのまま skip する (= 音声バスを素通り)。
+//! plugin host には load されず、audio engine から見ると `plugin_refs` (device_id → entry) に
+//! 無い device なので、`process_track_owned` の chain 実行 (`run_plugin`) がそのまま skip する
+//! (= 音声バスを素通り)。
 
 #[derive(
     Debug,

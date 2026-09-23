@@ -17,9 +17,13 @@
 //! process owns → this process becomes the foreground process → JUCE's
 //! `isForegroundProcess()` is true → first-level AND cascade menus work.
 //!
-//! The window must be a standalone top-level window with **no owner** — if it
-//! were owned by daw_gui's main window, `GetAncestor(.., GA_ROOTOWNER)` would
-//! climb back into the GUI process and reintroduce the bug.
+//! What matters is which process *created* the window (that is what "owned by
+//! daw_gui" means above), not its Win32 owner: since r.md #65 (2026-08-22,
+//! 9bfdaa85) the container is owned by daw_gui's main window
+//! (`OwnerBinding::OwnedBy`, same as REAPER's FX windows). `GA_ROOTOWNER` then
+//! resolves into the GUI process, but JUCE only consults it in the
+//! `isEmbeddedInForegroundProcess` escape hatch, which can only loosen the check
+//! (`docs/plan_plugin_editor_topwindow.md`, 注意 (FFI / window)).
 //!
 //! # 窓契約 (r.md #65)
 //!
@@ -27,9 +31,11 @@
 //! ホスト窓の契約を全部実装した窓**である。契約の正本は
 //! `docs/plan_plugin_editor_topwindow.md` §窓契約。要点:
 //!
-//! - **スタイルは `canResize` / `can_resize` から決める**。プラグインが「ユーザーは
-//!   リサイズ不可」と言ったら `WS_THICKFRAME` / `WS_MAXIMIZEBOX` を出さない
-//!   (VST3 SDK editorhost `window.cpp` L107-131 と同じ)。attach 後にしかサイズを
+//! - **スタイルは `canResize` / `can_resize` と format の仕様から決める**
+//!   (`plugin_instance::should_offer_resize_frame`)。CLAP はプラグインが「ユーザーは
+//!   リサイズ不可」と言ったら `WS_THICKFRAME` / `WS_MAXIMIZEBOX` を出さない (`gui.h` L41-45 が
+//!   前提条件として規定)。VST3 は禁止規定が無いので申告が false でも枠を出し、
+//!   `checkSizeConstraint` に丸めさせる (2026-08-22 の 694e4d2a)。attach 後にしかサイズを
 //!   答えないプラグイン (Arturia 系) のために **attach 後に再 query して貼り替える**。
 //! - **ホスト起点リサイズ** = `WM_SIZING` で矯正 (`checkSizeConstraint` /
 //!   `adjust_size`) → OS が窓をリサイズ → `WM_SIZE` で通知 (`onSize` / `set_size`)。
@@ -39,8 +45,9 @@
 //!   窓をリサイズし `WM_SIZE` 経由で `onSize` まで済ませる。`iplugview.h` の
 //!   "Sizing of a view" が *"Afterwards, **in the same callstack**, the host has to
 //!   call IPlugView::onSize ()"* と明記している。非同期に回すと `getSize` が旧サイズを
-//!   返し続け、実測では Renoise Redux が **自分の view をコンテナから切り離して
-//!   WS_POPUP の owned top-level に作り替える** (2026-08-22 `--editor-selftest`)。
+//!   返し続ける。(Renoise Redux の view が `WS_POPUP` に化けるのはこれとは無関係な Redux の
+//!   無条件動作。当初はこれが原因と見ていたが、2026-08-22 の 05af8758 で実ログにより
+//!   反証した — `docs/plan_plugin_editor_topwindow.md` §0-2)
 //! - **フォーカスは子窓へ渡す**。`DefWindowProc` は `WM_ACTIVATE` でフォーカスを
 //!   *アクティブ化された窓自身* に置く (MSDN WM_ACTIVATE Remarks) ので、明示的に
 //!   `SetFocus(child)` しない限りプラグインは永久にキーを受け取らない。
@@ -386,7 +393,8 @@ unsafe fn resize_client_area(hwnd: HWND, w: u32, h: u32) {
 /// スタイル写像で、`WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN|WS_CLIPSIBLINGS` を
 /// 基本に、枠ありのとき `WS_THICKFRAME|WS_MAXIMIZEBOX` を足す
 /// (VST3 SDK editorhost `window.cpp` L107-131 と同じ組み合わせ)。
-/// `WS_MINIMIZEBOX` は DAW の窓としては最小化できるほうが自然なので常に付ける。
+/// `WS_MINIMIZEBOX` はここでは常に付ける (単独の窓なら最小化できるほうが自然)。owner があるとき
+/// (tool window) は [`EditorWindow::create`] が落とす ([`OwnerBinding::allows_minimize`])。
 ///
 /// `WS_CLIPCHILDREN` はプラグインの子 HWND の領域を親が描かないためのもので必須。
 #[must_use]
@@ -506,16 +514,16 @@ impl OwnerBinding {
 }
 
 /// WNDPROC (= `extern "system"` で Rust の状態に触れない) と `EditorWindow` の
-/// 共有状態。`GWLP_USERDATA` に `Arc::into_raw` で貼り、`Drop` で回収する。
+/// 共有状態。`GWLP_USERDATA` に `Rc::into_raw` で貼り、`Drop` で回収する。
 ///
-/// 全フィールドが plugin-main スレッド専用なので `Cell` で足りる。`Arc` に包むのは
+/// 全フィールドが plugin-main スレッド専用なので `Cell` で足りる。`Rc` に包むのは
 /// 「WNDPROC が生ポインタで借りる」ためだけで、スレッドを跨がない。
 struct EditorShared {
     /// Set by the WNDPROC when the user clicks the window's ✕. The
     /// plugin-main loop polls this each iteration and runs the close flow
     /// (`plugin.gui_destroy()` then drop this window) over IPC notify.
     close_requested: Cell<bool>,
-    /// 窓の位置 / サイズが確定した (ドラッグ終了 / プラグイン起点 resize 完了)。
+    /// 窓の位置 / サイズが変わった (`WM_MOVE` / `WM_SIZE` だけが立てる)。
     /// pump が [`EditorWindow::take_geometry_change`] で拾って daw_gui へ流す。
     geometry_dirty: Cell<bool>,
     /// WNDPROC がプラグインを叩くための **借用**ポインタ。実体 (`Box`) は
@@ -639,10 +647,11 @@ pub struct EditorWindow {
 unsafe impl Send for EditorWindow {}
 
 impl EditorWindow {
-    /// Create a standalone top-level container window with a `width × height`
-    /// client area. **Must be called on the plugin-main thread** (the one
-    /// running the `GetMessageW` pump) so its window messages land on that
-    /// thread's queue. The window has no owner (see module docs).
+    /// Create a top-level container window, belonging to this plugin-host process,
+    /// with a `width × height` client area. **Must be called on the plugin-main
+    /// thread** (the one running the `GetMessageW` pump) so its window messages land
+    /// on that thread's queue. Its Win32 owner comes from `owner` (see below and the
+    /// module docs).
     ///
     /// **窓は隠したまま返る**。表示は [`Self::show_and_focus`] で、プラグインを
     /// attach し終えてから 1 回だけ行う。VST3 SDK editorhost も
@@ -2058,7 +2067,7 @@ fn shared_of(hwnd: HWND) -> Option<&'static EditorShared> {
         return None;
     }
     // SAFETY: `EditorWindow::drop` が `DestroyWindow` より前に 0 を書き戻すので、
-    // 非 null の間は `Arc` が生きている。参照は WNDPROC の呼び出し内でのみ使う。
+    // 非 null の間は `Rc` が生きている。参照は WNDPROC の呼び出し内でのみ使う。
     Some(unsafe { &*raw })
 }
 

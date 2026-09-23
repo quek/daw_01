@@ -9,7 +9,7 @@
 //!
 //! gui_01 (daw-ui) は immediate-mode + `Edit<M>` クロージャ方式:
 //! - 状態は plain mutable field
-//! - 派生は method (`pub fn track_headers(&self) -> Vec<TrackHeader>` 等)
+//! - 派生は method (`pub fn chain_rows(&self) -> Vec<ChainRow>` 等)
 //! - background thread → UI event は `EventLoopProxy<AppEvent>` 経由
 
 use std::path::PathBuf;

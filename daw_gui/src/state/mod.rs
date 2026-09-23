@@ -3,6 +3,9 @@
 //! AppData は 9 つの group struct の合成になった。 フィールドの帰属は
 //! 「undo 対象か / 発火元は何か」 で判断する (§7.5 の表)。 group struct は
 //! 純データ (メソッドは AppData 側 / SongDoc のみ振る舞いを持つ)。
+//! ※ プロジェクトタブ (76837672) 以降は、タブごとの group を `cur: ProjectState` (`project.rs`) に
+//! まとめ、他のタブは `tabs` に parked する (`docs/plan_project_tabs.md` §5.1)。今の構成は下の
+//! `AppData` の定義を見る。
 
 pub mod loudness;
 /// `docs/plan_project_tabs.md`: タブ (= プロジェクト) ごとの状態と、タブの集合。

@@ -1,11 +1,13 @@
 ---
 name: debug-ui
 description: |
-  UI のクリック・ドラッグ・キーバインド・focus・IME が期待どおり動かないときの切り分け手順。
+  daw-ui ライブラリ (ui/) の入力取り込み・widget・Edit の 3 層で、クリック・ドラッグ・キーバインド・
+  focus・IME が期待どおり動かないときの切り分け手順 (ui/crates/examples で再現して追う)。
   「クリックが効かない」「ドラッグが反応しない」「Ctrl+key が拾われない」「focus が外れる」
   「IME 候補が変な位置に出る」等、可視フィードバックでは原因が特定できないときに発動。
+  daw_gui アプリのショートカット・AppEvent・handler の配線で消えているなら debug-gui。
   トレース挿入 → 再ビルド → 実行 → ログ確認 → 該当層を修正の流れを提供する。
-allowed-tools: Read, Grep, Glob, Edit, Bash(cargo build *), Bash(cargo run *), Bash(cargo test *)
+allowed-tools: Read, Grep, Glob, Edit, Bash(cargo build *), Bash(cargo run *), Bash(cargo test -p *)
 ---
 
 # UI デバッグワークフロー (gui_01)
@@ -13,6 +15,7 @@ allowed-tools: Read, Grep, Glob, Edit, Bash(cargo build *), Bash(cargo run *), B
 GUI のイベント (クリック / ドラッグ / キー / focus / IME) が動作不明なとき、どの層で
 止まっているかを切り分ける。本プロジェクトは **winit + 自作 `Ui<'a, M>` + `Edit<M>`**
 スタックなので、Vizia / iced とは違う固有の落とし穴がある。
+このスキル内のパス (`crates/...`) は `ui/` からの相対 (リポジトリ root からは `ui/crates/...`)。
 
 ## 3 層モデル
 
@@ -27,7 +30,7 @@ GUI のイベント (クリック / ドラッグ / キー / focus / IME) が動�
 ┌─ 2. widget 層 ──────────────────────────────────┐
 │ Ui::frame closure 内で widget が                │
 │ self.pointer (PointerFrame) / take_keyboard_..  │
-│ を読む。hit-test / drag_anchor / press_started  │
+│ を読む。hit-test / drag_anchor / press の所有者  │
 └────────────────────────────────────────────────┘
            ↓
 ┌─ 3. Edit 層 ─────────────────────────────────┐
@@ -51,11 +54,10 @@ GUI のイベント (クリック / ドラッグ / キー / focus / IME) が動�
 #### Edit 層 (最上流、Model に到達したかが一目で見える)
 
 ```rust
-// crates/examples/<name>/src/main.rs の build_ui の戻り側で:
-let edits = self.ui.frame(...);
+// crates/ui/src/ui.rs の UiHost::frame_with_fonts (UiHost::frame から呼ばれる) の apply ループ:
 for e in edits {
-    eprintln!("[edit] applying"); // ← 一時的に。released で削除
-    e.apply(&mut self.model);
+    eprintln!("[edit] applying"); // ← 一時的に。確認後に削除
+    e.apply(model);
 }
 ```
 
@@ -112,11 +114,12 @@ pub fn ingest(&mut self, ev: &AppEvent) {
 ```bash
 cargo run --bin mixer                   # 例: mixer で再現させる
 # または
-cargo build && ./target/debug/mixer.exe
+cargo build -p daw-ui-example-mixer && ./target/debug/mixer.exe
 ```
 
 `cargo clippy` / `cargo check` / `cargo test` だけでは **exe が更新されない**。
-古いバイナリで検証すると「直したはずなのに動かない」になるので必ず `cargo run` か `cargo build` を明示。
+古いバイナリで検証すると「直したはずなのに動かない」になるので必ず `cargo run --bin <name>` か
+`cargo build -p <package>` を明示 (素の `cargo build` は workspace 全体をビルドする)。
 
 ### 4. 操作 → ログを確認
 
@@ -133,9 +136,9 @@ grep -E "\[edit\]|\[fader\]|\[winit\]|\[input\]" output.log
 |---|---|---|
 | `[winit] MouseInput` すら出ない | OS が winit にイベントを届けていない / focus が他ウィンドウ | OS 側を疑う、別アプリで確認 |
 | `[winit] MouseInput` は出るが `[input] PointerInput` が出ない | `InputAccumulator::ingest` の match 漏れ / `MouseButton::Left` 以外で来ている | match の他ボタン (Middle/Right/Other) を追加、`primary` 限定の判定を見直す |
-| `[input]` は出るが widget の press 判定 trace が出ない | widget が hit-test に失敗 (`pointer.pos = None` / rect.contains が false) | **Alt-Tab 復帰直後の罠**: `cur_pos = None` のまま MouseInput が来るケース。winit_backend の `query_cursor_pos_in_window` が動いているか確認 (CLAUDE.md「既知の罠」参照) |
+| `[input]` は出るが widget の press 判定 trace が出ない | widget が hit-test に失敗 (`pointer.pos = None` / rect.contains が false) | **Alt-Tab 復帰直後の罠**: `cur_pos = None` のまま MouseInput が来るケース。winit_backend の `query_cursor_pos_in_window` が動いているか確認 (ui/CLAUDE.md「既知の罠」参照) |
 | widget は press 判定通るが Edit が出ない | `(displayed_value - value).abs() > f32::EPSILON` を満たしていない / on_change closure が呼ばれていない | drag 中の値計算が止まっていないか、`drag_anchor` が None になっていないか |
-| Edit は出るが画面が更新されない | `apply` 後に `request_redraw` が呼ばれていない / `had_edits` 検出パスが動いていない | mixer の `App::on_render` の `if had_edits || ... { request_redraw }` を確認 (CLAUDE.md「immediate-mode + Edit queue の必然」参照) |
+| Edit は出るが画面が更新されない | 自動 `request_redraw` が効かない構築 (`UiHost::no_redraw()` / `set_redraw_suppressed(true)` の間) / `frame_to_edits` を使っていて caller が apply か `request_redraw` を落としている | `UiHost::frame` は Edit / focus 変化があれば自動で `request_redraw` する。`UiHost::with_window` で構築しているか、抑止していないかを確認 (ui/CLAUDE.md「immediate-mode + Edit queue」参照) |
 | Ctrl+drag が効かない | `pointer.modifiers.ctrl` が false / `WindowEvent::ModifiersChanged` が拾えていない | winit_backend の ModifiersChanged 分岐を確認、winit 0.30 の `mods.state().control_key()` を使っているか |
 | ダブルクリックが反応しない | `last_click` が None のまま / 距離 / 時間しきい値外 | `Instant::now()` の duration、`hypot` の閾値、thumb_rect.contains が両方の press で true か |
 | focus が外れて keyboard が拾われない | クリック先が誰も `set_focus` を呼ばない widget なので blur した | text_input 等の focus を持つ widget が pending_focus 経由で同フレーム反映できているか確認 |
@@ -154,11 +157,11 @@ eprintln!("[fader] press pos={:?}", pointer.pos);
 
 ## gui_01 固有のハマりどころ
 
-CLAUDE.md「既知の罠」と一部重複するが、デバッグ視点で再掲:
+ui/CLAUDE.md「既知の罠」と一部重複するが、デバッグ視点で再掲:
 
 - **Alt-Tab 復帰直後のクリックで hit-test が空振り**: `cur_pos = None` のまま MouseInput が来る Windows の挙動。`winit_backend.rs` の `query_cursor_pos_in_window` workaround が動いているか先に確認。これを疑う前に他の原因を追うと時間を溶かす。
 - **convenience method の widget は cursor + next_y で full-width 配置**: `Ui::button` 等は `cursor.w - pad*2` で横幅 100% を取る。右側に別領域 (例: mixer のチャンネルストリップ) を置くと視覚的に重なる。`button_at` で rect 限定するか、ストリップの y を下にずらす。
-- **press_started_inside パターン**: button / checkbox は press 時に `inside` を state に保持し、release 時の click 判定で使う。armed 状態を見ずに pure pointer event だけ見るとクリックが拾えない。
+- **click は press の所有者で決まる**: button / checkbox 等は `ui.primary_click(wid, inside)` を毎フレーム呼び、press も release も自分の上だったときだけ `clicked` になる。同じ press を後に描いた widget が `primary_click` / `claim_press` で名乗ると所有者が上書きされ、先の widget の click は成立しない。`rect 内 && primary_just_released` を直接読む判定は、別 widget で始めたドラッグの終わりまで click に化ける (ui/CLAUDE.md の `Ui::primary_click` の節)。
 - **focus の即時反映**: `set_focus` 呼び出しは `pending_focus` 経由で同フレーム内に `is_focused()` に反映される。前フレームの focused widget を見るには `UiHost::focused_widget()` 経由。
 - **Ctrl mid-drag toggle で値 jump**: drag 中に Ctrl 状態が変わったら anchor を `(現在 py, 現在 value, 現在 ctrl)` に張り直す。さもなくば cumulative-from-anchor delta が一気にスケール変わって jump する (Phase 4d)。
 

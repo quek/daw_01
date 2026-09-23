@@ -11,7 +11,7 @@
 //!
 //! # なぜ `GWLP_USERDATA` を使わないか
 //!
-//! `daw_plugin_host::editor_window` の idiom (`GWLP_USERDATA` に `Arc` を leak) は
+//! `daw_plugin_host::editor_window` の idiom (`GWLP_USERDATA` に `Rc` を leak) は
 //! **自分で `RegisterClassExW` した窓専用**。メインウィンドウは winit が作り、
 //! winit 自身が `GWLP_USERDATA` に `WindowData` ポインタを入れて全メッセージ処理に
 //! 使っている (`WM_NCDESTROY` で 0 に戻す)。ここを奪うと winit が壊れる。

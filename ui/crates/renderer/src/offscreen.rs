@@ -735,7 +735,7 @@ impl OffscreenRenderer {
         let encoder = self.encode_scene_into(scene, &view, &target, &staging, padded);
         let submission = self.queue.submit(std::iter::once(encoder.finish()));
 
-        // map_async を **登録だけ** する (poll は finish_readback 側で)。 CLAUDE.md wgpu 罠:
+        // map_async を **登録だけ** する (poll は finish_readback 側で)。 ui/docs/known_traps.md の wgpu 罠:
         // 「map_async 登録 → poll」 の順を守る (逆だとコールバックが永遠に呼ばれない)。
         let (tx, rx) = sync_channel::<Result<(), wgpu::BufferAsyncError>>(1);
         staging.slice(..).map_async(wgpu::MapMode::Read, move |result| {

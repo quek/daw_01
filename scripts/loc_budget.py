@@ -51,7 +51,7 @@ stdout を読むだけに留め、パターンを shell に持たせないこと
 
 このスクリプトは「行分類の SSoT」でもある
 -----------------------------------------
-`arch_lint.sh` の `strip_comments` (check 1/2/3/5/12 の共有フィルタ) が `--filter-comments`
+`arch_lint.sh` の `strip_comments` (check 1/2/3/5/12/14/15 の共有フィルタ) が `--filter-comments`
 を呼ぶので、**「コメント内の言及は違反に数えない」の定義もここが決める**。
 旧実装は「行頭が `//`」を見るだけの近似で、2 方向に間違えていた:
   - raw string 中の行頭 `//` をコメントと誤判定して落とす = 違反の取りこぼし
@@ -1230,7 +1230,7 @@ def filter_comments(rows: Iterable[str], read=_read_source) -> Iterator[str]:
 
     `read` を差し替えられるようにしてあるのは **self-test がこの関数そのものを通せる
     ようにするため**。lex() の行分類だけを別に assert すると、フィルタの落とす / 残すの
-    向きが反転しても canary が緑のままになる (= check 1/2/3/5/12 の違反が全部消えても
+    向きが反転しても canary が緑のままになる (= check 1/2/3/5/12/14/15 の違反が全部消えても
     誰も気付けない)。"""
     cache: dict[str, Lexed | None] = {}
     for row in rows:
@@ -1571,7 +1571,7 @@ def self_test() -> int:
 
     # ---- (C) --filter-comments -------------------------------------------------
     # **フィルタ本体 (filter_comments) を通す。** lex の分類だけを assert すると、
-    # 落とす / 残すの向きが反転しても canary が緑のままになり、check 1/2/3/5/12 の
+    # 落とす / 残すの向きが反転しても canary が緑のままになり、check 1/2/3/5/12/14/15 の
     # 違反が全部消えても誰も気付けない。合成ファイルは read の差し替えで与える。
     FIXTURE_FILES = {
         "selftest/c_raw.rs": 'fn f() {\n    let s = r#"\n// pool: HashMap<(u32, u32), Bogus>\n"#;\n}\n',

@@ -354,7 +354,7 @@ pub struct ProjectView {
     pub snap_on_draw: bool,
     /// r.md #65: プラグインエディタ窓の位置 / client サイズ (device_id → geometry)。
     /// 窓を所有するのは daw_plugin_host なので、値の一次情報は
-    /// `PluginEvent::SlotGuiGeometry` (open 時 + ドラッグ確定時 + close 直前) だけ。
+    /// `PluginEvent::SlotGuiGeometry` (open 時 + rect が変わったとき + close 直前) だけ。
     /// ここは **その最新値のキャッシュ**で、`ViewState.plugin_editor_windows` として
     /// プロジェクトに保存され、次に開くときに `OpenSlotGuiEmbedded` へ載って復元される。
     /// 「見方の都合」なので更新しても dirty は立てない (memory `project_dirty_flag_rule`)。

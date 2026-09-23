@@ -390,14 +390,15 @@ impl IPlugFrameTrait for Vst3PlugFrame {
     /// > current (old) size not the wanted one!!"*
     ///
     /// 旧実装は channel に投げて即 `kResultOk` を返すだけで、窓も直さず `onSize` も
-    /// 呼んでいなかった。実測では Renoise Redux がこれを見て **自分の view を
-    /// コンテナから切り離し WS_POPUP の owned top-level に作り替える** ため、
-    /// コンテナ窓が空になり activation が popup へ飛んでタイトルバーが点滅した
-    /// (2026-08-22 `--editor-selftest` + `EnumChildWindows` で確認)。
+    /// 呼んでいなかった (仕様違反)。なお Renoise Redux の view が `WS_POPUP` に化けて
+    /// タイトルバーが点滅した件は、当初これが原因と見ていたが 2026-08-22 の 05af8758 で
+    /// 実ログにより反証した (style の反転が `resizeView` より 111ms 先行する。
+    /// `docs/plan_plugin_editor_topwindow.md` §0-2)。
     ///
     /// 戻り値はヘッダ未規定なので editorhost / JUCE の実装合意に合わせる:
-    /// 成功 = `kResultTrue`、引数不正 = `kInvalidArgument`、窓が無い / 別スレッド =
-    /// `kInternalError`、再入中 = `kResultFalse`。
+    /// 成功 = `kResultTrue`、引数不正 = `kInvalidArgument`、再入中 = `kResultFalse`。
+    /// 窓が無い / 別スレッドは plugin-main の非同期経路 (`on_request_resize`) へ積んで
+    /// `kResultTrue` を返す (2026-08-22 の 3147089e から)。
     unsafe fn resizeView(&self, _view: *mut IPlugView, new_size: *mut ViewRect) -> tresult {
         if new_size.is_null() {
             return kInvalidArgument;

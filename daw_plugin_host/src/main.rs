@@ -1018,7 +1018,7 @@ impl PluginHost {
             }
             // r.md #55: 開いている窓は host 自身が知っている。daw_gui から
             // device を並べてもらう形にすると、open 応答が返る前の窓が
-            // 列挙から漏れて閉じ残る (UnloadAllPlugins と同じ理由)。
+            // 列挙から漏れて閉じ残る (`UnloadProject` と同じ理由)。
             PluginCommand::CloseAllSlotGuis => {
                 let ids: Vec<DeviceAddr> = self
                     .instances
@@ -1656,7 +1656,10 @@ impl PluginHost {
         }
         // CLAP embedded GUI sequence per gui.h:
         //   create → set_scale → can_resize → get_size → set_parent → show
-        // set_size は初回 open では呼ばない (VCV Rack 対策、CLAUDE.md 参照)。
+        // ここでは set_scale を窓の作成後に呼ぶ (scale は host HWND の DPI から取るので)。
+        // scale != 1.0 なら get_size を取り直して窓に当てる (下の `dpi_scale` の分岐)。
+        // 全体の順序は `docs/plan_plugin_editor_topwindow.md` §窓契約 1 の open シーケンス。
+        // set_size は初回 open では呼ばない (VCV Rack 対策、`docs/plan_plugin_editor_topwindow.md` §9-1)。
         plugin.gui_create_embedded()?;
 
         // pre-attach の可否。attach 後に再 query して貼り替える (Arturia 系は
@@ -1837,7 +1840,7 @@ impl PluginHost {
     /// then notify daw_gui. Idempotent.
     fn close_slot_gui(&mut self, device: DeviceAddr) {
         // r.md #65: 窓を壊す前に最後のジオメトリを送る (次回 open で復元する)。
-        // ドラッグ確定時にも送っているが、閉じる直前の 1 発が「最後に見た形」を確定させる。
+        // rect が変わるたびにも送っているが、閉じる直前の 1 発が「最後に見た形」を確定させる。
         // **最小化したまま閉じた場合は送らない** (`persistable_geometry` が None) —
         // `(-32000,-32000)` / `0×0` を保存すると次回 1×1 の窓で開いてしまう。
         let last_geometry = self
@@ -1937,9 +1940,9 @@ impl PluginHost {
         }
     }
 
-    /// r.md #65: エディタ窓の位置 / サイズが確定した分を daw_gui へ流す。
-    /// ドラッグ中は送らない (`WM_EXITSIZEMOVE` / プラグイン起点 resize 完了で
-    /// 1 回 dirty が立つ)。
+    /// r.md #65: エディタ窓の位置 / サイズが変わった分を daw_gui へ流す。
+    /// dirty を立てるのは `WM_MOVE` / `WM_SIZE` だけ (`EditorWindow::take_geometry_change`)。
+    /// ドラッグ中は modal ループでこの poll が回らないので、確定後に 1 回だけ送る。
     fn poll_editor_geometry(&mut self) {
         let changes: Vec<(DeviceAddr, common::model::EditorWindowGeometry)> = self
             .instances
@@ -2044,8 +2047,8 @@ impl PluginHost {
     /// (CLAP `plugin.h`: `destroy` は `[main-thread & !active]`、
     /// "It is required to deactivate the plugin prior to this call")。
     ///
-    /// `UnloadAllPlugins` と同じ列挙 (= plugin_host 自身の `instances`) と
-    /// 同じ teardown を通すので、「全部畳め」の実装は 1 つしかない。
+    /// `UnloadProject` と同じ列挙 (= plugin_host 自身の `instances`。こちらは project で
+    /// 絞らない) と同じ teardown を通すので、「全部畳め」の実装は 1 つしかない。
     fn shutdown(mut self) {
         // (1) worker pool を先に止める。`shutdown` は全 worker thread を join
         //     するので、以後 registry を触る RT スレッドは存在しない

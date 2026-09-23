@@ -437,7 +437,7 @@ pub fn builtin_descriptors() -> Vec<PluginEntry> {
     // docs/plan_video_fx.md §9: 内蔵映像効果 (`builtin.video.*`) を
     // SSoT (`crate::video_fx` カタログ) から列挙する。映像 device は GUI 描画パスで
     // 処理されるため audio/note port は全 false、video in/out を立てる。これにより
-    // engine の `process_track_owned` は `slot_to_plugin_id` 未登録の index として
+    // engine の `process_track_owned` は `plugin_refs` (device_id → entry) に無い device として
     // skip し (= 音声バス素通り)、plugin host へは load 要求が飛ばない (daw_gui 側で抑止)。
     for def in crate::video_fx::builtin_video_fx() {
         entries.push(PluginEntry {

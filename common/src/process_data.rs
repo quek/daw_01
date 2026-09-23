@@ -49,7 +49,7 @@ pub const MAX_AUX_IN: usize = 2;
 /// VCV Rack; Battery / Geist); plugins that declare more have the extras
 /// ignored (the host warns at load). Symmetric to `MAX_AUX_IN`. Cost:
 /// `16 * 2ch * 1024f * 4B = 128 KB`/plugin (妥当)。 Bumping this is an ABI
-/// break (shmem layout) → `cargo build --workspace`.
+/// break (shmem layout) → `make build` (3 exe を揃える)。
 pub const MAX_AUX_OUT: usize = 16;
 
 #[repr(C)]

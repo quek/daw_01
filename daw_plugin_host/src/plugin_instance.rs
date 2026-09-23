@@ -169,9 +169,10 @@ pub struct HostCallbacks {
     /// **`on_request_resize` (非同期 channel) では VST3 の契約を満たせない**ので置く。
     /// `iplugview.h` の "Sizing of a view" は「`IPlugFrame::resizeView` の後、
     /// **同じコールスタックで** ホストが窓をリサイズして `IPlugView::onSize` を呼ぶ」
-    /// と規定していて、次周回に回すと `getSize` が旧サイズを返し続ける。実測では
-    /// Renoise Redux がこれを見て **自分の view をコンテナから切り離し WS_POPUP の
-    /// owned top-level に変える** (2026-08-22、`--editor-selftest` で確認)。
+    /// と規定していて、次周回に回すと `getSize` が旧サイズを返し続ける。
+    /// (Renoise Redux の view が `WS_POPUP` に化けるのはこれとは無関係な Redux の無条件動作。
+    /// 当初はこれが原因と見ていたが、2026-08-22 の 05af8758 で実ログにより反証した —
+    /// `docs/plan_plugin_editor_topwindow.md` §0-2)
     ///
     /// 書き込むのは `gui_set_parent_hwnd` / `gui_destroy` の 1 対だけ (= 「今どの窓に
     /// attach しているか」がそのまま値になる = SSoT)。読むのは `Vst3PlugFrame` /
@@ -234,7 +235,7 @@ impl ResizableProbe {
 ///   枠を出して `checkSizeConstraint` に丸めさせる (同 API が
 ///   *"if not adjust the rect to the allowed size"* とまさにその用途で規定されている)。
 ///
-/// **これは多数派の選択ではない**: VST3 SDK の editorhost / JUCG / Ardour / ossia score は
+/// **これは多数派の選択ではない**: VST3 SDK の editorhost / JUCE / Ardour / ossia score は
 /// いずれも申告を尊重して枠を出さない (Qtractor は枠を出すがプラグインへ伝えない、
 /// Carla は `canResize` を見ない)。「枠を出して追従もさせる」OSS ホストは見つかっていない。
 /// spec 違反ではないが慣習からは外れる選択で、`onSize` に追従しないプラグインでは

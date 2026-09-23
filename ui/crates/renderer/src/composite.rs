@@ -12,10 +12,11 @@
 //! command が走る **前** に flush」 する。 よって
 //! `composite(A) submit → composite(B) submit → render() submit` は各 submit 時点で
 //! それぞれの screen uniform / instance buffer が個別に flush され、 各 draw が正しい値を読む。
-//! LAST WRITE WINS trap (CLAUDE.md wgpu 節 / M9 Phase 44a / M14 Phase 78) は **1 つの submit 内**で
+//! LAST WRITE WINS trap (ui/docs/known_traps.md「wgpu (29.x 系)」/ M9 Phase 44a / M14 Phase 78) は **1 つの submit 内**で
 //! buffer を複数回書いて複数 draw が読む場合のみ起きる。 別 submit なら起きないので、 専用
-//! pipeline (= GlyphPipeline の FontSystem 二重ロード等) を増やさず `rect/line/glyph/texture` を
-//! そのまま流用する。
+//! pipeline を増やさず `rect/line/glyph/texture` をそのまま流用する (当時は専用 pipeline の
+//! 費用に GlyphPipeline ごとの FontSystem 二重ロードがあったが、d91f871d で FontSystem が
+//! `FontAssets` に括り出されて共有になったので、今はその費用は無い)。
 //!
 //! ## render target の format
 //!

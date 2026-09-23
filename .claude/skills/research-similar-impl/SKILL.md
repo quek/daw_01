@@ -3,10 +3,10 @@ name: research-similar-impl
 description: |
   類似 DAW / CLAP ホスト / Rust オーディオプロジェクト（clap-host, clap-validator, clack,
   nih-plug, Meadowlark 等）、gui_01 (daw-ui)、VOICEVOX のソースコードと公式リファレンスを調査し、
-  実装方針レポートを出力する。
-  「実装して」「追加して」「修正して」「対応して」「機能を作って」「バグを直して」等、
-  コード変更を伴う指示があったとき、または CLAP / cpal / gui_01 / VOICEVOX API の使い方が
-  不明なときに発動。調査のみ行い、コードの編集は行わない。
+  実装方針レポートを出力する。調査のみ行い、コードの編集は行わない。
+  実装方針や参考実装の調査を頼まれたとき、implement skill の調査段 (手順 2) から呼ばれるとき、
+  または CLAP / VST3 / cpal / gui_01 / VOICEVOX API の使い方が不明なときに発動。
+  「実装して」「バグを直して」等のコード変更の指示は implement が受ける (この skill を呼ぶ条件は implement 側にある)。
 argument-hint: "[調査対象の機能名]"
 allowed-tools: Bash(git clone *), Bash(git pull *), Read, Grep, Glob, WebSearch, WebFetch, Agent
 ---
@@ -32,6 +32,8 @@ $ARGUMENTS に関する調査を行い、daw_01 での実装方針を立てる�
 [ -d /tmp/nih-plug ]       || git clone --depth 1 https://github.com/robbert-vdh/nih-plug.git /tmp/nih-plug
 [ -d /tmp/clap-validator ] || git clone --depth 1 https://github.com/free-audio/clap-validator.git /tmp/clap-validator
 [ -d /tmp/meadowlark ]     || git clone --depth 1 https://github.com/MeadowlarkDAW/Meadowlark.git /tmp/meadowlark
+[ -d /tmp/vst3_pluginterfaces ] || git clone --depth 1 https://github.com/steinbergmedia/vst3_pluginterfaces.git /tmp/vst3_pluginterfaces
+[ -d /tmp/vst3_public_sdk ] || git clone --depth 1 https://github.com/steinbergmedia/vst3_public_sdk.git /tmp/vst3_public_sdk
 ```
 
 - クローン先は `/tmp` 配下（作業ディレクトリを汚さない）
@@ -42,8 +44,9 @@ gui_01 (daw-ui) は **`ui/`** に置いてある同梱プロジェクトなの�
 
 ### 3. 自プロジェクトの参照
 
-- gui_01 のサンプル: `ui/crates/examples/{mixer, arrangement, piano_roll, automation,
-  embedded_host, sample_editor, ...}` — daw_01 に近い使い方の reference
+- gui_01 のサンプル: `ui/crates/examples/{mixer, automation, embedded_host, sample_editor,
+  ...}` — daw-ui の使い方の reference。DAW 固有 widget (arrangement / piano_roll) は
+  `daw_gui/src/widgets/` にある (CLAUDE.md 不変条件 8)
 - gui_01 のコア: `ui/crates/{platform,renderer,ui}/src/` — Widget API、scene 構造、
   HeavyCtx、LayoutPass の挙動を確認
 - 前作 sing_like_coding (作者ローカルの別リポジトリ) — IPC / CLAP ホスト / オーディオエンジン
@@ -56,6 +59,8 @@ gui_01 (daw-ui) は **`ui/`** に置いてある同梱プロジェクトなの�
 
 クローン済みリポジトリ + gui_01 を Grep / Read で横断検索。調査ポイント:
 - CLAP インターフェース（`clap_plugin_*`, `clap_host_*`, `clap_process`, `clap_event_*`）の呼び出し順序・契約
+- VST3 インターフェース (`IPlugView` / `IComponent` / `IEditController` / `IAudioProcessor`) の呼び出し順序・契約
+  (`vst3_pluginterfaces` のヘッダ、`vst3_public_sdk` の `samples/vst-hosting/editorhost`)
 - RT オーディオスレッドの設計（ロックフリー・SPSC キュー・事前確保）
 - プラグインのライフサイクル
 - CLAP スキャン
@@ -99,11 +104,7 @@ API が違うことがある。**main だけ見てレポートすると誤った
 3. `/tmp/<crate>` の情報と食い違ったら **crates.io 側（実際にビルドされる方）を信じる**
 4. Agent に指示するときは「crates.io の `<crate> = \"X.Y.Z\"` を基準に調査」と明示
 
-既知の差分例:
-- `windows` crate は 0.58 / 0.61 で HANDLE が `isize` → `*mut c_void` に変更
-- `tokio` の `net::windows::named_pipe` は 1.x 前提
-- `bincode` 2.x は `Encode`/`Decode` に刷新（1.x とは別 API）
-- `wgpu` 29 は `Renderer::new` に `Arc<W: WindowBackend>` を要求 (`InstanceDescriptor::new_without_display_handle` 等)
+既知の差分例は [references.md](references.md) の「crates.io 版と GitHub main で API が違う場合」にまとめてある。
 
 ### 6. レポート出力
 
@@ -113,6 +114,7 @@ API が違うことがある。**main だけ見てレポートすると誤った
 
 - **調査のみ**。ファイルの編集・作成・ビルド・インストール等は一切行わない
 - CLAP 仕様に関わる機能では `clap-host` と `clap` 本体を最優先で参照する
+- VST3 に関わる機能では `vst3_pluginterfaces` のヘッダと `vst3_public_sdk` の editorhost を最優先で参照する
 - Rust 設計パターンは `clack` / `nih-plug` を参照する
 - 自プロジェクト前作 (`sing_like_coding`) の既存パターンも参照する
 - gui_01 関連は `ui/crates/examples/` と `ui/crates/ui/src/` を参照

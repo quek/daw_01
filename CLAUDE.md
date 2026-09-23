@@ -42,8 +42,8 @@ make fetch-ffmpeg   # third_party/ffmpeg 取得 (gitignore なので fresh machi
 (license-check + lockfile-guard + 「`Cargo.lock` を変えたのに `make audit` を通していない」の検出)。
 `audit` 本体は advisory DB にネットワークが要るので前提条件にはしない — 代わりに
 **lock が HEAD と違うのに監査済みスタンプと一致しなければ落ちる**。`cargo update` を打ったら
-`make audit`。方針は `deny.toml`、`ignore` を足すときは「RUSTSEC-ID: 理由 / 見直し期限」を
-コメントで必ず書く (無言の ignore は禁止)。
+`make audit`。方針は `deny.toml`、`ignore` を足すときは「何を / なぜ / どうなったら見直すか」を
+コメントで必ず書く (見直しは期限ではなくイベントで書く。無言の ignore は禁止)。
 
 `worktree-rm` / `worktree-rm-merged` は `test-worktree-rm` (削除ツールの回帰テスト、約 25 秒) を
 前提条件に持つ。取り返しがつかない操作なので、その直前が唯一漏れない位置。
@@ -55,17 +55,26 @@ daw_plugin_host まで spawn して audio device を開く。窓を出さず sin
 するので **起動したことに誰も気付けない**。実機を触っている最中に回すと、開いているプロジェクトの
 再生を壊す。
 
-- **判定基準は 1 つだけ**: `grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs`。**名前で判断しない**
+- **判定基準は 1 つだけ**: `grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs` (ディレクトリ形式の target
+  `daw_gui/tests/<name>/main.rs` は配下全体を `grep -rl`)。**名前で判断しない**
   — `pdc_real_vst3` / `sidechain_real_vst3` は smoke が付かないのに起動し、`arr_widget` /
   `pr_widget` / `font_picker` は起動しない。`--test` で名指ししても基準に当たれば起動する。
 - **起動を伴わない検証だけなら `make test-nolaunch`**。対象は Makefile が上の基準から毎回導出する
-  ので、手で列挙しないこと。許可を得て回すときは `DAW01_ALLOW_LAUNCH=1` を頭に付ける。
+  ので、手で列挙しないこと。起動する test (`make test`・基準に当たる `--test`・`--script` の headless) は
+  許可を取らずに回してよい。守るのは、ユーザーが起動している daw_gui / daw_audio / daw_plugin_host を
+  kill しないこと (build が ERROR 5 で止まっても閉じてもらうよう頼む。[[feedback_no_kill_running_app]])。
+  窓が前に出る起動 (`--gui`・`make run`・`--smoke-test`) だけは起動前に一声かける (知らせるだけで、返事は
+  待たない。[[feedback_ask_before_launching_app]])。
+- **全件 (`make test` / `make test-nolaunch`) は自分の判断で回さない**。変更に関係する target を
+  `cargo test -p <crate> --test <name>` / `--lib <filter>` で名指しで回し、全件が要ると判断したら
+  回す前に一言断る。全件は統合後に 1 回 ([[feedback_gates_cadence]])。
 - `make test` / `make run` / `make run-release` は `scripts/preflight_no_running_app.sh` が前提条件で
   止める (ユーザーが手で打っても効く)。迂回は `DAW01_SKIP_PREFLIGHT=1`。
 
 ### ビルドと検証の区別
 
-`clippy` / `check` / `test` は実行バイナリを作らない。`target/debug/daw_gui.exe` を走らせる前に
+`clippy` / `check` は実行バイナリを作らず、`cargo test` / `make test-nolaunch` も 3 exe を揃えない
+(test 系で 3 exe を揃えるのは、`build` を前提条件に持つ `make test` だけ)。`target/debug/daw_gui.exe` を走らせる前に
 必ずビルドする。**子プロセスの挙動を変えたら `make build` で 3 exe を揃える** — 子 exe が古いと
 IPC の decode に失敗し、「再生が止まる」形で出る ([[feedback_workspace_build_for_protocol_changes]])。
 起動中のプロセスのバイナリは上書きされないことがある (Windows の ERROR 5)。
@@ -94,6 +103,9 @@ SSoT は `scripts/fetch_ffmpeg.sh`。詳細と LGPL 上の義務は [docs/ffmpeg
 ## 応答・コミット
 
 - 応答は日本語 / コミットメッセージは日本語 / 技術用語は英語のまま可
+- 会話を compaction するときは、要約に次を残す: 作業中の worktree パスと branch / この session で
+  作った commit (hash と件名) / 未 commit の変更ファイル / 回した検証とまだ回していない検証 /
+  ユーザーの sign-off 待ちの項目。再開後の確かめ方は [[feedback_verify_git_state_after_compaction]]。
 
 ## Coding Principles
 
@@ -112,6 +124,13 @@ SSoT は `scripts/fetch_ffmpeg.sh`。詳細と LGPL 上の義務は [docs/ffmpeg
   番号付きの選択肢で** ([[feedback_one_question_at_a_time]] / [[feedback_numbered_question_options]])。
 - **commit の直前** — 実機 / 視覚の sign-off ([[feedback_confirm_before_commit]])。
 - **完全に手詰まりのとき** — 権限・外部要因で先へ進めないと確定したとき。
+
+作業が残っているのに、次の形で turn を終えない — 次にやることを書いただけの要約で終える /
+「よければ続けます」と申し出て返事を待つ / 残りの作業を止めない決定事項を並べて返す /
+turn が長くなった・区切りがついたという理由で報告する。
+
+聞くとき (と、ユーザーの質問に答えるとき) は、その文をターン最後のメッセージに書いて止まる。
+tool 呼び出しの前や合間に書いた文はユーザーに届かないことがある ([[feedback_answer_in_final_message]])。
 
 ### 妥協を選択肢に上げない
 
@@ -164,7 +183,7 @@ Plugin Host → プラグイン本体) の順で切り分ける。個別関数�
 
 ## Real-Time Audio の制約（最重要）
 
-オーディオコールバック (daw_audio の再生スレッド、および CLAP `process()` に至るパス) では
+オーディオコールバック (daw_audio の再生スレッド、および CLAP / VST3 / builtin プラグインの `process()` に至るパス) では
 次を厳守する。違反するとドロップアウト・クラックルが起きる。
 
 - **ヒープ確保禁止**: `Vec::new()` / `format!()` / `String` / `.collect()` / `Box::new()` を
@@ -182,15 +201,17 @@ Plugin Host → プラグイン本体) の順で切り分ける。個別関数�
 **`make arch-lint` の exit 0 は「違反ゼロ、または `scripts/arch_lint_baseline.txt` に記録済みの
 ものだけ」を意味する。** baseline に無い違反が 1 件でもあれば exit 1 (行単位 ratchet)。
 以前は違反があっても常に exit 0 で、終了コードだけ見て「OK」と報告され続けていた。
-**恒久的に正当な箇所は baseline ではなく行内マーカー** `// arch-lint: allow-<check>`
+**恒久的に正当な箇所は baseline ではなく行内マーカー** `// arch-lint: allow-<名前>`
 (区別しないと負債が「正当」として永久に隠れる)。baseline の書式は同ファイル冒頭が正本。
+`<名前>` は check 名そのままではなく、`scripts/arch_lint.sh` の `strip_allowed` と `scripts/loc_budget.py` の
+`ALLOW_MARKER` に渡している語 (例 `allow-infinite` / `allow-fn-nesting`)。
 
 > **arch-lint のパターンにバックスラッシュを使わないこと。** make (MSYS2) 経由だと grep へ渡す
 > argv のバックスラッシュが落ちる。POSIX ブラケット式 (`[(]` `[]]` `[[:space:]]`) と `grep -w` で
 > 書く。これを踏んで **8 チェック中 6 つが無言で無効化されたまま「OK (違反なし)」を出していた**。
 
 1. **安定 id addressing**: プロセス境界・イベント・永続参照に positional index を使わない。
-   device = `PluginInstance.id`、send = `Send.id`、note/point/audio event = 要素 id。
+   device = `Device::id()` (plugin / native / parallel が同じ id 空間)、send = `Send.id`、note/point/audio event = 要素 id。
    **「削除/並べ替えで参照を貼り替える補償コード」を書き始めたら設計が誤り**。
 2. **wire は blob-less**: `LoadSong` の Song は `state` / `ara_archive` を構造的に除外する
    (PluginInstance の手書き bincode Encode)。protocol に `Vec<f32>` / `Arc<[u8]>` の bulk を
@@ -217,7 +238,9 @@ Plugin Host → プラグイン本体) の順で切り分ける。個別関数�
    1 ファイル **1,000 行** / 1 関数 **300 行** / インデント **6 段**。超過したら分割してから
    足す。**テストコードは対象外**。現在値は `python scripts/loc_budget.py --report`。
 
-**不変条件 2 / 5 / 6 / 8 に対応する arch-lint チェックは無い。** この 4 件は上の本文が唯一の
+**不変条件 5 / 6 に対応する arch-lint チェックは無い。2 / 8 のチェック (`BLOB-IN-PROTOCOL` / `UI-DOMAIN`) も、
+`common/src/protocol.rs` の `Vec<f32>` / `Arc<[u8]>` と、daw-ui core (`ui/crates/ui/src`) から撤去した
+既知の 3 symbol を grep するだけで、本文の大半は検査しない。** この 4 件は上の本文が実質唯一の
 強制手段なので、圧縮しないこと。
 
 ## FFI 境界

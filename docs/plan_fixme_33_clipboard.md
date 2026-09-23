@@ -160,6 +160,9 @@ enum ClipboardPayload {
   現存 → 共有。それ以外 → 独立 (inline 中身から新 ContentId)。
 - 別ウィンドウで同 .daw を二重起動するケースは未サポート (IPC 衝突、`feedback_no_duplicate_app_launch`)
   なので考慮外。
+  ※ 「IPC 衝突」は当時の memory の説明。Windows の対話起動は 2026-06-10 の ad719569 から single-instance
+  (`daw_gui/src/single_instance.rs`) で、2 つ目の daw_gui は既存の窓を前面化して終わるので、同じ .daw を 2 つの daw_gui で開くことは起きない。
+  プロジェクトタブ (r.md #129) でも、既に開いているファイルは 2 つ目のタブで開かずそのタブへ切り替える (`daw_gui/src/handler/tabs.rs`)。
 
 ### 3. 文脈 arbiter の一本化
 
