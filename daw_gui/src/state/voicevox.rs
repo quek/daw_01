@@ -3,8 +3,6 @@
 
 use std::sync::Arc;
 
-use crate::dispatcher::JobDispatcher;
-
 /// (r.md #61) lazy spawn した VOICEVOX engine の受け渡し口。
 ///
 /// **spawn は background thread**、**停止は終了シーケンス** という 2 者が
@@ -33,11 +31,6 @@ pub struct VoicevoxState {
     /// (= `/singers`) とは別 id 空間。engine 起動時に background thread が
     /// `AppEvent::SpeakersLoaded` で投入。未取得なら焼き込み声名 + 「取得中…」表示。
     pub talk_speakers: Vec<crate::voicevox_client::VoiceVoxSinger>,
-    /// VOICEVOX engine の auto-kill 用 Job dispatcher。
-    /// production は `Win32JobDispatcher` (`JobHandle::assign_std` ラップ)、
-    /// test は `NoopJobDispatcher`。 trait DI により AppData::new の
-    /// 引数は OS-API 抽象だけで完結する。
-    pub voicevox_job: Arc<dyn JobDispatcher>,
     /// (r.md #61) **我々が spawn した** VOICEVOX engine の子プロセス。
     /// ユーザーが自分で立ち上げていた engine (`is_running()` が true だった
     /// ケース) はここに入らない = 終了時に殺さない。
@@ -61,13 +54,18 @@ impl VoicevoxState {
     /// に並べると、field を 1 つ足すたびに app.rs の実コード行が増えてサイズ budget
     /// (不変条件 9) を押し上げる。`state/*` へ分けた意図どおり、group ごとに閉じる。
     #[must_use]
-    pub fn new(voicevox_job: Arc<dyn JobDispatcher>) -> Self {
+    pub fn new() -> Self {
         Self {
             singers: Vec::new(),
             talk_speakers: Vec::new(),
-            voicevox_job,
             spawned_engine: Arc::new(std::sync::Mutex::new(VoicevoxEngineSlot::default())),
             voicevox_launch_attempted: false,
         }
+    }
+}
+
+impl Default for VoicevoxState {
+    fn default() -> Self {
+        Self::new()
     }
 }

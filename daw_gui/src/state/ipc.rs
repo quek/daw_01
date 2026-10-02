@@ -7,7 +7,7 @@ use common::plugin_db::PluginDatabase;
 use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::dispatcher::BackgroundDispatcher;
+use crate::dispatcher::{BackgroundDispatcher, JobDispatcher};
 
 /// `(device_id, param_id)` の複合キー。 生タプルにしないのは、 positional
 /// キーと見分けが付かなくなる (arch-lint / 読み手の双方) ため。
@@ -72,4 +72,9 @@ pub struct IpcState {
     /// dispatcher。 production は `WinitDispatcher` (winit `EventLoopProxy`
     /// ラップ)、 test は `RecordingDispatcher` (Mutex<Vec> に蓄積)。
     pub event_proxy: Arc<dyn BackgroundDispatcher>,
+
+    /// daw_gui が spawn する使い捨ての子プロセス (VOICEVOX engine・plugin の scan / probe) を
+    /// Job Object に入れる口。daw_gui を閉じたら一緒に止まる。production は `Win32JobDispatcher`、
+    /// test は `NoopJobDispatcher`。
+    pub child_job: Arc<dyn JobDispatcher>,
 }

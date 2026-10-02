@@ -10,6 +10,8 @@ use common::plugin_format::PluginFormat;
 use common::port_config::PluginProbe;
 use tokio::process::{Child, Command};
 
+use crate::dispatcher::JobDispatcher;
+
 /// Windows: 子プロセスのコンソール窓を抑制する creation flag。 release では
 /// `CREATE_NO_WINDOW` (親が windows-subsystem で console を持たないとき、
 /// console-subsystem の子が新しいコンソール窓を開くのを防ぐ belt-and-suspenders。
@@ -28,7 +30,16 @@ const CHILD_CREATION_FLAGS: u32 = if cfg!(debug_assertions) { 0 } else { CREATE_
 /// (plugin DB JSON は容易に超える)。 並行 reader が buffer を drain し続けることで
 /// これを回避する。 `cmd` の stdout / stderr / creation_flags は本関数が設定する。
 /// timeout / spawn 失敗 / I/O 異常はすべて `None`。
-fn run_capture_stdout(mut cmd: std::process::Command, timeout: Duration, label: &str) -> Option<String> {
+///
+/// 子は `job` (daw_gui の Job Object) に入れる。入れないと daw_gui を閉じても子が残り、
+/// scan / probe を最後まで続けてしまう (scan は最長 `TIMEOUT` = 120 s)。Job に入れられない
+/// (= 終了処理で Job が閉じた後) ときは、孤児を作らないようにその場で殺して `None` を返す。
+fn run_capture_stdout(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+    label: &str,
+    job: &dyn JobDispatcher,
+) -> Option<String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)]
     {
@@ -36,6 +47,12 @@ fn run_capture_stdout(mut cmd: std::process::Command, timeout: Duration, label: 
         cmd.creation_flags(CHILD_CREATION_FLAGS);
     }
     let mut child = cmd.spawn().ok()?;
+    if let Err(e) = job.assign_std(&child) {
+        tracing::warn!(label, error = ?e, "failed to attach child to job; killing it");
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
     // stdout を take して専用スレッドで drain する (pipe-buffer deadlock 回避)。
     let stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
@@ -83,6 +100,7 @@ pub fn probe_plugin_ports(
     format: PluginFormat,
     path: &Path,
     target_id: &str,
+    job: &dyn JobDispatcher,
 ) -> Option<PluginProbe> {
     const TIMEOUT: Duration = Duration::from_secs(8);
     let flag = match format {
@@ -94,7 +112,7 @@ pub fn probe_plugin_ports(
     let mut cmd = std::process::Command::new(&exe);
     cmd.args([flag, &path.display().to_string(), target_id]);
     // stdout を並行 drain して読む (pipe-buffer deadlock 回避、 scan と共通経路)。
-    let out = run_capture_stdout(cmd, TIMEOUT, "plugin port probe")?;
+    let out = run_capture_stdout(cmd, TIMEOUT, "plugin port probe", job)?;
     out.lines().find_map(PluginProbe::parse_line)
 }
 
@@ -103,7 +121,7 @@ pub fn probe_plugin_ports(
 /// `std::thread` から呼ぶ)。プラグイン DLL の実ロードは **このサブプロセス** が行い、GUI プロセスは
 /// dlopen しない (arch-refactor S5-3。probe subprocess と同じ crash 隔離)。timeout / spawn 失敗 /
 /// 異常終了 / JSON parse 失敗はすべて `None` を返す (呼び元は builtin fallback で退行しない)。
-pub fn scan_plugins() -> Option<common::plugin_db::PluginDatabase> {
+pub fn scan_plugins(job: &dyn JobDispatcher) -> Option<common::plugin_db::PluginDatabase> {
     // scan は多数の DLL を load するので probe より長い timeout。
     const TIMEOUT: Duration = Duration::from_secs(120);
     let exe = resolve_sibling_binary("daw_plugin_host").ok()?;
@@ -112,7 +130,7 @@ pub fn scan_plugins() -> Option<common::plugin_db::PluginDatabase> {
     // stdout を並行 drain して読む。 旧実装は wait 完了後に read していたため、
     // plugin DB JSON が pipe buffer を超える (プラグイン多数の) 環境で子が write で
     // block → timeout まで cold-start が deadlock していた (H1)。
-    let out = run_capture_stdout(cmd, TIMEOUT, "plugin scan")?;
+    let out = run_capture_stdout(cmd, TIMEOUT, "plugin scan", job)?;
     // scan は最後に DB を 1 行 JSON で出す。 雑音行を弾いて JSON 行を探す (probe と同 idiom)。
     out.lines()
         .find_map(|line| serde_json::from_str::<common::plugin_db::PluginDatabase>(line).ok())

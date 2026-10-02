@@ -56,6 +56,7 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("appOpenProject", daw_app_open_project, 1),
     ("appPlay", daw_app_play, 0),
     ("appStop", daw_app_stop, 0),
+    ("appRescanPlugins", daw_app_rescan_plugins, 0),
     ("play", daw_play, 0),
     ("stop", daw_stop, 0),
     ("startRecording", daw_start_recording, 1),
@@ -423,6 +424,13 @@ fn daw_app_play(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsRes
 /// `daw.appStop()` — `AppEvent::Stop` (GUI の停止と同じ経路)。
 fn daw_app_stop(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     with_app(|app, _side, _io| app.handle_event(AppEvent::Stop));
+    Ok(JsValue::undefined())
+}
+
+/// `daw.appRescanPlugins()` — メニューの「プラグインを再走査」と同じ `AppEvent::RescanPluginDb`。
+/// 走査 / probe の子プロセスが daw_gui の終了と一緒に止まるかを、窓を出さずに確かめるのに使う。
+fn daw_app_rescan_plugins(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    with_app(|app, _side, _io| app.handle_event(AppEvent::RescanPluginDb));
     Ok(JsValue::undefined())
 }
 

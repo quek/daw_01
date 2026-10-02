@@ -167,7 +167,7 @@ impl AppData {
             return;
         }
         self.voicevox.voicevox_launch_attempted = true;
-        let job = Arc::clone(&self.voicevox.voicevox_job);
+        let job = Arc::clone(&self.ipc.child_job);
         let slot = Arc::clone(&self.voicevox.spawned_engine);
         std::thread::spawn(move || {
             if crate::voicevox_engine::is_running() {
@@ -235,7 +235,8 @@ impl AppData {
         self.ipc.is_rescanning = true;
         let slot = Arc::clone(&self.ipc.rescan_result);
         let proxy = self.ipc.event_proxy.clone();
-        std::thread::spawn(move || match crate::subprocess::scan_plugins() {
+        let job = Arc::clone(&self.ipc.child_job);
+        std::thread::spawn(move || match crate::subprocess::scan_plugins(&*job) {
             Some(mut db) => {
                 // VST3 / CLAP とも descriptor からは port 構成が分からない
                 // (VST3 は category tag 無し、 CLAP は feature に note 出力の有無が無い)。
@@ -263,7 +264,8 @@ impl AppData {
                         let e = &db.entries()[i];
                         (e.format, e.path.clone(), e.id.clone())
                     };
-                    if let Some(probe) = crate::subprocess::probe_plugin_ports(format, &path, &id)
+                    if let Some(probe) =
+                        crate::subprocess::probe_plugin_ports(format, &path, &id, &*job)
                     {
                         db.update_entry(i, |e| apply_probe(e, &probe));
                     }

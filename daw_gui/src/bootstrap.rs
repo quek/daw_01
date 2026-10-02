@@ -628,7 +628,8 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         Arc::clone(&shutting_down),
     ));
 
-    let plugin_db = load_or_build_plugin_db();
+    let plugin_db =
+        load_or_build_plugin_db(&crate::dispatcher::Win32JobDispatcher::new(Arc::clone(&job)));
 
     let supervisor = Arc::new(ChildSupervisor {
         pid,
@@ -1053,7 +1054,9 @@ async fn plugin_pipe_loop(
     tracing::info!("plugin pipe loop ended");
 }
 
-fn load_or_build_plugin_db() -> Option<Arc<PluginDatabase>> {
+fn load_or_build_plugin_db(
+    job: &dyn crate::dispatcher::JobDispatcher,
+) -> Option<Arc<PluginDatabase>> {
     use common::plugin_db::default_cache_path;
     if let Some(cache) = default_cache_path() {
         match PluginDatabase::load_from_file(&cache) {
@@ -1079,7 +1082,7 @@ fn load_or_build_plugin_db() -> Option<Arc<PluginDatabase>> {
         }
         // DLL 実ロードによる scan は plugin-host の `--scan-plugins` 使い捨てプロセスが行う
         // (GUI プロセスは dlopen しない、S5-3)。失敗時は builtin のみで起動する。
-        match crate::subprocess::scan_plugins() {
+        match crate::subprocess::scan_plugins(job) {
             Some(db) => {
                 if let Err(e) = db.save_to_file(&cache) {
                     tracing::warn!(error = ?e, "failed to write plugin cache");

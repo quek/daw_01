@@ -111,7 +111,7 @@ impl AppData {
         _clap_plugin_path: Option<PathBuf>,
         plugin_db: Option<Arc<PluginDatabase>>,
         event_proxy: Arc<dyn BackgroundDispatcher>,
-        voicevox_job: Arc<dyn JobDispatcher>,
+        child_job: Arc<dyn JobDispatcher>,
         supervisor: Option<Arc<crate::bootstrap::ChildSupervisor>>,
         app_dirs: Option<common::app_dirs::AppDirs>,
         // (A1 r.md #8) 解決済みデバイス実サンプルレート (= bootstrap.sample_rate)。
@@ -166,8 +166,9 @@ impl AppData {
                 child_disconnect_log: Vec::new(),
                 is_rescanning: false,
                 event_proxy,
+                child_job,
             },
-            voicevox: VoicevoxState::new(voicevox_job),
+            voicevox: VoicevoxState::new(),
             ui_prefs: UiPrefs {
                 preview_window_visible: false,
                 // 既定 ON: クリップを動かしたら automation も付いてくる方が期待に近い。
