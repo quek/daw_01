@@ -675,6 +675,14 @@ pub trait LoadedPlugin: Send {
         0
     }
 
+    /// 読み込んだ instance が実際に持つ port 構成 (note / audio の入出力)。`SlotPluginLoaded` で
+    /// daw_gui へ報告し、プロジェクトに保存された写しより優先させる (写しは、port の調べが
+    /// 失敗していた頃の値で固まることがある)。`None` は「instance からは分からない」で、
+    /// 保存された写しと plugin DB の解決に任せる (builtin は code が SSoT なのでこちら)。
+    fn port_config(&self) -> Option<common::port_config::PortConfig> {
+        None
+    }
+
     /// VOICEVOX capability downcast. Default `None` (external plugins).
     fn as_vocal_synth(&mut self) -> Option<&mut dyn VocalSynth> {
         None

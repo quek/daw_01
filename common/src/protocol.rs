@@ -1239,6 +1239,10 @@ pub enum PluginEvent {
         /// r.md #110: how many `is_main=false` audio **input** ports (= sidechain
         /// 候補) this plugin declared。 inspector の SC 制御の表示 gate。
         aux_input_count: u8,
+        /// 読み込んだ instance が実際に持つ port 構成 (note / audio の入出力)。daw_gui は
+        /// プロジェクトに保存された写しより優先する (写しは、port の調べが失敗していた頃の値で
+        /// 固まることがある)。`None` = instance からは分からない (builtin など)。
+        ports: Option<crate::port_config::PortConfig>,
         generation: u64,
     },
     /// `SetSlotPlugin` の load が失敗した。 song の slot は touch されない。
@@ -1767,6 +1771,11 @@ mod tests {
             state_load_error: None,
             aux_output_count: 0,
             aux_input_count: 1,
+            ports: Some(crate::port_config::PortConfig {
+                has_note_input: true,
+                has_audio_output: true,
+                ..Default::default()
+            }),
             generation: 3,
         };
         assert_eq!(roundtrip(&msg), msg);

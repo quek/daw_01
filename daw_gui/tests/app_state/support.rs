@@ -128,6 +128,17 @@ pub fn load_instrument(app: &mut AppData) {
 /// pending generation をそのまま返す (= production の echo と同じ)。
 /// 戻り値は device_id (以後の `ClosePluginShmem` 等の assert 用)。
 pub fn fake_plugin_loaded(app: &mut AppData, track_id: u32, index: u32, id: &str) -> u64 {
+    fake_plugin_loaded_with_ports(app, track_id, index, id, None)
+}
+
+/// [`fake_plugin_loaded`] に、instance が報告する port 構成 (`SlotPluginLoaded::ports`) を足したもの。
+pub fn fake_plugin_loaded_with_ports(
+    app: &mut AppData,
+    track_id: u32,
+    index: u32,
+    id: &str,
+    ports: Option<common::port_config::PortConfig>,
+) -> u64 {
     let device_id = daw_gui::app::device_id_at(app.cur.song_doc.song(), track_id, index)
         .expect("fake_plugin_loaded: no device at (track_id, index)");
     let generation = app
@@ -146,6 +157,7 @@ pub fn fake_plugin_loaded(app: &mut AppData, track_id: u32, index: u32, id: &str
         state_load_error: None,
         aux_output_count: 0,
         aux_input_count: 0,
+        ports,
         generation,
     }));
     device_id

@@ -1027,6 +1027,25 @@ fn enumerate_vst3_params(
     out
 }
 
+/// 初期化済みの component の bus 構成から port 構成を読む。probe (`--probe-vst3`) と、読み込んだ
+/// instance が `SlotPluginLoaded` で報告する値 ([`crate::plugin_instance::PluginInstance::port_config`])
+/// の両方がこれを使う。
+pub(crate) fn vst3_port_config(component: &ComPtr<IComponent>) -> common::port_config::PortConfig {
+    let ev_in = unsafe { component.getBusCount(MediaTypes_::kEvent, BusDirections_::kInput) };
+    let ev_out = unsafe { component.getBusCount(MediaTypes_::kEvent, BusDirections_::kOutput) };
+    let au_in = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kInput) };
+    let au_out = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput) };
+    common::port_config::PortConfig {
+        has_note_input: ev_in > 0,
+        has_note_output: ev_out > 0,
+        has_audio_output: au_out > 0,
+        has_audio_input: au_in > 0,
+        // VST3 は映像 port を持たない。
+        has_video_input: false,
+        has_video_output: false,
+    }
+}
+
 /// VST3 のクラスを一時 instantiate して、bus 構成から port 構成を、`createView` から
 /// 埋め込みエディタの有無を読む (`--probe-vst3` one-shot モード)。
 ///
@@ -1071,10 +1090,7 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
     let _ = unsafe { ComPtr::<FUnknown>::from_raw(host_app_ptr) };
     anyhow::ensure!(init_res == kResultOk, "initialize returned {:#x}", init_res);
 
-    let ev_in = unsafe { component.getBusCount(MediaTypes_::kEvent, BusDirections_::kInput) };
-    let ev_out = unsafe { component.getBusCount(MediaTypes_::kEvent, BusDirections_::kOutput) };
-    let au_in = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kInput) };
-    let au_out = unsafe { component.getBusCount(MediaTypes_::kAudio, BusDirections_::kOutput) };
+    let ports = vst3_port_config(&component);
 
     // 埋め込みエディタの有無。controller が取れなければ「無し」。
     let has_embedded_gui = component
@@ -1083,15 +1099,7 @@ pub fn probe_ports(path: &Path, target_id: &str) -> Result<common::port_config::
     let _ = unsafe { component.terminate() };
 
     Ok(common::port_config::PluginProbe {
-        ports: common::port_config::PortConfig {
-            has_note_input: ev_in > 0,
-            has_note_output: ev_out > 0,
-            has_audio_output: au_out > 0,
-            has_audio_input: au_in > 0,
-            // VST3 は映像 port を持たない。
-            has_video_input: false,
-            has_video_output: false,
-        },
+        ports,
         has_embedded_gui,
     })
 }
@@ -1462,6 +1470,10 @@ impl LoadedPlugin for Vst3Plugin {
 
     fn aux_input_port_count(&self) -> usize {
         self.aux_input_port_count
+    }
+
+    fn port_config(&self) -> Option<common::port_config::PortConfig> {
+        Some(vst3_port_config(&self.component))
     }
 
     /// **load 経路からは呼ばない** (`createView` = エディタ実体の生成)。plugin DB の

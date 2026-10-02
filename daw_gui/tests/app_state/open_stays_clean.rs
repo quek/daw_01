@@ -200,6 +200,68 @@ fn reopening_project_whose_saved_ports_differ_from_the_db_stays_clean() {
     assert!(!app.cur.song_doc.is_dirty(), "load 応答で '*' が付いてはいけない");
 }
 
+/// 保存済み device の `ports` が、port の調べが失敗していた頃の値で固まっていても (Renoise Redux:
+/// note 入力が無いことになっていて、シーンの音符が届かなかった)、読み込んだ instance が報告した
+/// port 構成で正される。正すのは曲の中身 (音の届き方) が変わる直しなので `*` が付く。
+#[test]
+fn load_response_ports_correct_a_stale_saved_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("stale_ports.daw");
+
+    let (mut app, _audio_rx, _plugin_rx, _dispatcher) = support::build_app();
+    let stale = PortConfig { has_audio_output: true, ..PortConfig::default() };
+    let actual = PortConfig { has_note_input: true, has_audio_output: true, ..PortConfig::default() };
+    let (flat_index, plugin_index) = app
+        .edit_song(|song| {
+            let devices = &mut song.tracks[0].devices;
+            devices.push(Device::Plugin(PluginInstance {
+                id: 5002,
+                ..PluginInstance::with_ports("test.fx".into(), PluginFormat::Clap, stale)
+            }));
+            let plugins = common::model::plugins(devices).count();
+            (devices.len() - 1, (plugins - 1) as u32)
+        })
+        .expect("edit_song");
+    common::project::save(&proj, app.cur.song_doc.song()).expect("write project file");
+    app.cur.song_doc.mark_saved();
+
+    app.handle_event(AppEvent::OpenRecent(proj.clone()));
+    let track_id = app.cur.song_doc.song().tracks[0].id;
+    support::fake_plugin_loaded_with_ports(&mut app, track_id, plugin_index, "test.fx", Some(actual));
+    assert_eq!(
+        app.cur.song_doc.song().tracks[0].devices[flat_index].as_plugin().unwrap().ports, actual,
+        "instance が報告した port 構成が、保存された古い写しより優先される"
+    );
+    assert!(app.cur.song_doc.is_dirty(), "音の届き方が変わる直しなので '*' が付く");
+}
+
+/// instance が報告した port 構成が保存された写しと同じなら、開いただけで `*` は付かない (r.md #9)。
+#[test]
+fn load_response_ports_matching_the_saved_copy_stay_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("same_ports.daw");
+
+    let (mut app, _audio_rx, _plugin_rx, _dispatcher) = support::build_app();
+    let ports = PortConfig { has_note_input: true, has_audio_output: true, ..PortConfig::default() };
+    let plugin_index = app
+        .edit_song(|song| {
+            let devices = &mut song.tracks[0].devices;
+            devices.push(Device::Plugin(PluginInstance {
+                id: 5003,
+                ..PluginInstance::with_ports("test.fx".into(), PluginFormat::Clap, ports)
+            }));
+            (common::model::plugins(devices).count() - 1) as u32
+        })
+        .expect("edit_song");
+    common::project::save(&proj, app.cur.song_doc.song()).expect("write project file");
+    app.cur.song_doc.mark_saved();
+
+    app.handle_event(AppEvent::OpenRecent(proj.clone()));
+    let track_id = app.cur.song_doc.song().tracks[0].id;
+    support::fake_plugin_loaded_with_ports(&mut app, track_id, plugin_index, "test.fx", Some(ports));
+    assert!(!app.cur.song_doc.is_dirty(), "保存された写しと同じなら '*' は付かない");
+}
+
 /// r.md #129 F-G3: v38 (内蔵ストリップ時代) の曲を開いた直後も clean。migration が組み込み native を
 /// 補い、レーンの住所を実 id に書き換えるのは **読み込みの一部** で、編集ではない。新規タブも同じ。
 #[test]

@@ -62,7 +62,11 @@ impl PortConfig {
         *self == PortConfig::default()
     }
 
-    /// device が持つべき port 構成を決める **唯一の規則**。
+    /// **instance が読み込まれていないとき**に、device が持つべき port 構成を決める規則。
+    /// 読み込まれた instance が `SlotPluginLoaded` で port 構成を報告したら、そちらが正で、
+    /// この規則より優先する (daw_gui `handler::devices::reloaded_instance`)。保存された写しは、
+    /// port の調べが失敗していた頃の値で固まっていることがあるため。instance の報告は
+    /// 正しい写しとは一致するので、正しく保存された project を開いても `*` は付かない。
     ///
     /// - 既に解決済み (= どれかの port が true) ならそれを保つ。 保存済み project /
     ///   picker で挿した device の構成であり、 plugin DB が未 scan・scan 失敗・

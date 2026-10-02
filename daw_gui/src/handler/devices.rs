@@ -50,19 +50,20 @@ fn reloaded_instance(
     plugin_id: String,
     aux_output_count: u8,
     aux_input_count: u8,
+    instance_ports: Option<common::port_config::PortConfig>,
     db_ports: Option<common::port_config::PortConfig>,
 ) -> common::model::PluginInstance {
     use common::port_config::PortConfig;
+    // 読み込んだ instance が報告した port 構成が正。保存された写し (と plugin DB) は、
+    // instance から分からないときの代わりでしかない — 写しは port の調べが失敗していた頃の値で
+    // 固まることがあり、そのままだと note が届かない楽器になる (Renoise Redux で実際に起きた)。
+    let ports = |existing: PortConfig| instance_ports.unwrap_or_else(|| PortConfig::resolve(existing, db_ports));
     let base = match prev {
-        Some(p) => common::model::PluginInstance {
-            plugin_id,
-            ports: PortConfig::resolve(p.ports, db_ports),
-            ..p.clone()
-        },
+        Some(p) => common::model::PluginInstance { plugin_id, ports: ports(p.ports), ..p.clone() },
         None => common::model::PluginInstance::with_ports(
             plugin_id,
             PluginFormat::Clap,
-            PortConfig::resolve(PortConfig::default(), db_ports),
+            ports(PortConfig::default()),
         ),
     };
     common::model::PluginInstance { id: device_id, aux_output_count, aux_input_count, ..base }
@@ -128,6 +129,9 @@ impl AppData {
         aux_output_count: u8,
         // r.md #110: plugin が宣言した aux 入力ポート数 (SC 制御の表示 gate)。
         aux_input_count: u8,
+        // 読み込んだ instance が実際に持つ port 構成。保存された写しより優先する
+        // (`reloaded_instance`)。`None` は instance からは分からない (builtin など)。
+        instance_ports: Option<common::port_config::PortConfig>,
         // v29 世代 guard: `SetSlotPlugin` に載せた要求世代の echo。
         generation: u64,
     ) {
@@ -229,6 +233,7 @@ impl AppData {
                     id,
                     aux_output_count,
                     aux_input_count,
+                    instance_ports,
                     db_ports,
                 );
                 // no-op 検出 (r.md #9): 再構築結果が既存と同一なら epoch を bump

@@ -280,6 +280,7 @@ impl AppData {
                 state_load_error,
                 aux_output_count,
                 aux_input_count,
+                ports,
                 generation,
             } => {
                 self.on_plugin_loaded_from_child(
@@ -291,6 +292,7 @@ impl AppData {
                     state_load_error,
                     aux_output_count,
                     aux_input_count,
+                    ports,
                     generation,
                 );
             }

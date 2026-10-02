@@ -157,6 +157,7 @@ fn plugin_events_for_a_background_tab_land_in_that_tab() {
         state_load_error: None,
         aux_output_count: 0,
         aux_input_count: 0,
+        ports: None,
         generation,
     }));
     assert_eq!(app.pk(), b, "delivery does not switch the active tab");

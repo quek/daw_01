@@ -999,6 +999,14 @@ impl LoadedPlugin for ClapPlugin {
         self.aux_input_port_count
     }
 
+    fn port_config(&self) -> Option<common::port_config::PortConfig> {
+        if self.plugin.is_null() {
+            return None;
+        }
+        let get_ext = unsafe { (*self.plugin).get_extension }?;
+        Some(clap_port_config(self.plugin, get_ext))
+    }
+
     // --- ARA -------------------------------------------------------------
 
     /// ARA bind at load (before the first activate / state load / GUI).
@@ -1990,16 +1998,10 @@ fn probe_ports_after_entry_init(
     cfg
 }
 
-fn clap_plugin_port_config(
-    plugin_ptr: *const clap_plugin,
-) -> Result<common::port_config::PluginProbe> {
-    let plugin_init = unsafe { (*plugin_ptr).init }.context("plugin.init is null")?;
-    anyhow::ensure!(
-        unsafe { plugin_init(plugin_ptr) },
-        "plugin.init returned false"
-    );
-    let get_ext = unsafe { (*plugin_ptr).get_extension }.context("get_extension is null")?;
-
+/// init 済みの plugin の note-ports / audio-ports 拡張から port 構成を読む ([main-thread])。probe
+/// (`--probe-clap`) と、読み込んだ instance が `SlotPluginLoaded` で報告する値
+/// ([`crate::plugin_instance::PluginInstance::port_config`]) の両方がこれを使う。
+fn clap_port_config(plugin_ptr: *const clap_plugin, get_ext: GetExtFn) -> common::port_config::PortConfig {
     let (note_in, note_out) = {
         let ext = unsafe { get_ext(plugin_ptr, CLAP_EXT_NOTE_PORTS.as_ptr()) }
             as *const clap_plugin_note_ports;
@@ -2021,6 +2023,27 @@ fn clap_plugin_port_config(
             _ => (0, 0),
         }
     };
+    common::port_config::PortConfig {
+        has_note_input: note_in > 0,
+        has_note_output: note_out > 0,
+        has_audio_output: audio_out > 0,
+        has_audio_input: audio_in > 0,
+        // CLAP は映像 port を持たない。
+        has_video_input: false,
+        has_video_output: false,
+    }
+}
+
+fn clap_plugin_port_config(
+    plugin_ptr: *const clap_plugin,
+) -> Result<common::port_config::PluginProbe> {
+    let plugin_init = unsafe { (*plugin_ptr).init }.context("plugin.init is null")?;
+    anyhow::ensure!(
+        unsafe { plugin_init(plugin_ptr) },
+        "plugin.init returned false"
+    );
+    let get_ext = unsafe { (*plugin_ptr).get_extension }.context("get_extension is null")?;
+    let ports = clap_port_config(plugin_ptr, get_ext);
     // CLAP は `is_api_supported` で聞けるので、VST3 と違って GUI を作らずに分かる。
     // それでも答えの置き場は plugin DB (クラス単位) で揃える — device 行のボタンが
     // 「窓を開く」か「param パネル」かは、instance ごとに聞き直す性質ではない。
@@ -2031,15 +2054,7 @@ fn clap_plugin_port_config(
             .is_some_and(|f| unsafe { f(plugin_ptr, CLAP_WINDOW_API_WIN32.as_ptr(), false) })
     };
     Ok(common::port_config::PluginProbe {
-        ports: common::port_config::PortConfig {
-            has_note_input: note_in > 0,
-            has_note_output: note_out > 0,
-            has_audio_output: audio_out > 0,
-            has_audio_input: audio_in > 0,
-            // CLAP は映像 port を持たない。
-            has_video_input: false,
-            has_video_output: false,
-        },
+        ports,
         has_embedded_gui,
     })
 }
