@@ -1,4 +1,4 @@
-.PHONY: help build run test test-nolaunch test-rt preflight-no-app gates clippy license-check audit arch-lint clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror test-worktree-rm worktree-rm worktree-rm-merged
+.PHONY: help build run test test-nolaunch test-rt preflight-no-app gates clippy license-check audit arch-lint clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror test-worktree-rm worktree-rm-gate worktree-rm worktree-rm-merged
 
 # ライセンス検査スクリプト用の Python (stdlib のみ)。Windows の公式インストーラは
 # `python`、Linux / macOS は `python3` が正なので、あるほうを使う。
@@ -255,7 +255,7 @@ help:
 	@echo "  make fetch-ffmpeg-force  third_party/ffmpeg を取り直す"
 	@echo "  make ffmpeg-mirror ミラー用の成果物を dist/ffmpeg-mirror/ に用意 (上げはしない)"
 	@echo "  make clean         target/ を削除"
-	@echo "  make test-worktree-rm         削除ツールの回帰テスト (worktree-rm* の前提条件、約 25 秒)"
+	@echo "  make test-worktree-rm         削除ツールの回帰テスト (約 25 秒。worktree-rm* は削除ツールかテストが前回の合格から変わったときだけ回す)"
 	@echo "  make worktree-rm NAME=<name>   マージ済み worktree を安全に削除 (junction 安全 + ロック解除 + branch 削除)"
 	@echo "  make worktree-rm-merged       マージ済み worktree を全部削除"
 
@@ -458,11 +458,23 @@ CLEANUP_WT := $(CURDIR)/scripts/cleanup_worktree.sh
 # 使い捨て repo 内で完結し、実 repo には触れない。
 test-worktree-rm:
 	$(BASH) "$(CURDIR)/scripts/test_cleanup_worktree.sh"
+	@cat $(WT_RM_SOURCES) | sha256sum | cut -d' ' -f1 > "$(WT_RM_STAMP)"
+
+# 合格の印 = 削除ツールとテストの中身の hash (git の共通 dir に置くので worktree 全部で共有)。
+# 削除の前提条件は、前回の合格から削除ツールかテストが変わったときだけテストを回す
+# (何本も続けて消すたびに 25 秒かかっていた — 2026-10-07)。中身で比べるので checkout で
+# mtime が替わっても回し直さず、1 文字でも替われば必ず回す。
+WT_RM_SOURCES := scripts/cleanup_worktree.sh scripts/test_cleanup_worktree.sh
+WT_RM_STAMP := $(shell git rev-parse --git-common-dir 2>/dev/null)/daw01_worktree_rm_ok
+worktree-rm-gate:
+	@want=$$(cat $(WT_RM_SOURCES) | sha256sum | cut -d' ' -f1); \
+	have=$$(cat "$(WT_RM_STAMP)" 2>/dev/null || echo none); \
+	if [ "$$want" != "$$have" ]; then $(MAKE) --no-print-directory test-worktree-rm; fi
 
 # マージ済み worktree を安全に削除する (vendored ffmpeg を巻き込まず、rust-analyzer /
 # daw exe のロックを外し、git worktree 解除 + branch 削除まで一括)。手動で消したいときだけ使う。
 # 使い方: make worktree-rm NAME=fixme-64-...   (未マージ/dirty は拒否。FORCE=1 で強制)
-worktree-rm: test-worktree-rm
+worktree-rm: worktree-rm-gate
 	@[ -n "$(NAME)" ] || { echo "usage: make worktree-rm NAME=<worktree-name> [FORCE=1]"; exit 1; }
 	$(BASH) "$(CLEANUP_WT)" --name "$(NAME)" $(if $(FORCE),--force,)
 
@@ -474,5 +486,5 @@ worktree-rm: test-worktree-rm
 # 結果) も削除対象 — これが「マージしたのに消えない」の正体だった。未保存/dirty/locked は
 # remove_one のガードが守る。さらに git 登録が外れた空ディレクトリ
 # (.claude/worktrees/<dir>) も掃除する (prune_orphan_dirs)。
-worktree-rm-merged: test-worktree-rm
+worktree-rm-merged: worktree-rm-gate
 	$(BASH) "$(CLEANUP_WT)" --all

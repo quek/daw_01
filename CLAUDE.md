@@ -46,7 +46,8 @@ make fetch-ffmpeg   # third_party/ffmpeg 取得 (gitignore なので fresh machi
 コメントで必ず書く (見直しは期限ではなくイベントで書く。無言の ignore は禁止)。
 
 `worktree-rm` / `worktree-rm-merged` は `test-worktree-rm` (削除ツールの回帰テスト、約 25 秒) を
-前提条件に持つ。取り返しがつかない操作なので、その直前が唯一漏れない位置。
+前提条件に持つ。取り返しがつかない操作なので、その直前が唯一漏れない位置。ただし削除ツールとテストの中身が
+前回の合格から変わっていなければ回さない (中身の hash の印 — 何本も続けて消すたびに 25 秒かかっていた)。
 
 ### `make test` は daw_gui を起動する
 
