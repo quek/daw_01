@@ -38,7 +38,8 @@ use common::model::Song;
 use common::protocol::RenderScope;
 use hound::{SampleFormat, WavSpec, WavWriter};
 
-use crate::engine::{EngineShared, ProjectShared};
+use crate::audio_worker::PoolRun;
+use crate::engine::{EngineShared, ProjectShared, WorkerRig};
 use crate::graph::{compile_schedule, render_master_buffer};
 use crate::mixer::TrackScratch;
 
@@ -185,6 +186,7 @@ pub fn run_export(
     write_video_sidecars: bool,
     on_progress: impl FnMut(u64, u64),
 ) -> Result<ExportOutcome> {
+    let song = Arc::new(song);
     let win = RenderWindow::resolve(&song, sample_rate, span, true)?;
     let (write_start, write_end, walk_start, total_samples) =
         (win.write_start, win.write_end, win.walk_start, win.total_samples);
@@ -352,8 +354,9 @@ impl RenderWindow {
 }
 
 /// live の buffer が抜けきるのを待つ上限。live の 1 buffer の中で timeout まで待つ dispatch は pair ごとに高々
-/// 1 回 (timeout した pair は poison されて以後叩かない) で、pool の完了待ちの打ち切りは進みが
-/// `DISPATCH_TIMEOUT_MS * 2` 止まったとき。その合計を越えて抜けないのは詰まった callback。
+/// 1 回 (timeout した pair は poison されて以後叩かない) で、pool の stall の判定は進み (手と dispatch) が
+/// `DISPATCH_TIMEOUT_MS * 2` 止まったとき。その合計を越えて抜けない callback は詰まったものとして書き出しを
+/// 失敗させる (期限内に返る遅い plugin が 1 buffer に積み重なる分は数えていない — それだけ遅い live は鳴っていない)。
 const LIVE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
     common::plugin_ref::DISPATCH_TIMEOUT_MS as u64 * (common::worker_bridge::MAX_WORKERS as u64 + 2),
 );
@@ -375,6 +378,25 @@ fn wait_for_live_exit(engine_shared: &EngineShared) -> Result<()> {
     Ok(())
 }
 
+/// stall の窓 (`render_master_buffer` が `PoolRun::InFlight`) が閉じるのを待つ上限。窓が続くのは止められた runner が
+/// 動き出すまでで、動き出した runner は進行中の dispatch 1 回 (期限つき) を終えると残りの plugin を叩かない
+/// (`crate::audio_worker` の module doc)。止められた thread がいつ動き出すかには上限が無いので、これは待つ方針の値 — live の buffer が
+/// 抜けるのを待つ上限と揃える。
+const WINDOW_CLOSE_TIMEOUT: std::time::Duration = LIVE_EXIT_TIMEOUT;
+
+/// `rig` の pool の stall の窓が閉じるのを有界に待つ (書き出しのスレッドは off-RT なので寝てよい)。`false` = 閉じない。
+fn wait_window_closed(rig: &WorkerRig) -> bool {
+    let Some(pool) = rig.pool.as_ref() else { return true };
+    let deadline = std::time::Instant::now() + WINDOW_CLOSE_TIMEOUT;
+    while pool.window_open() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
+}
+
 /// r.md #54: 範囲のラウドネスをオフラインで解析する。
 ///
 /// [`run_export`] と**同じ走査** (`render_loop` → `render_master_buffer`) を通り、
@@ -393,6 +415,7 @@ pub fn run_loudness_analysis(
     span: RenderSpan,
     on_progress: impl FnMut(LoudnessReport),
 ) -> Result<LoudnessOutcome> {
+    let song = Arc::new(song);
     let win = RenderWindow::resolve(&song, sample_rate, span, false)?;
     let (range_start_beat, range_end_beat) = match span {
         RenderSpan::Full => (0.0, song.length_beats),
@@ -492,7 +515,8 @@ struct RenderOutcome {
 fn render_loop(
     engine_shared: &EngineShared,
     project: &ProjectShared,
-    song: &Song,
+    // `Arc` で受けるのは、stall の窓が閉じないとき走査の物と一緒に leak するため (`PoolRun::InFlight`)。
+    song: &Arc<Song>,
     scope: RenderScope,
     sample_rate: u32,
     max_frames: usize,
@@ -505,15 +529,15 @@ fn render_loop(
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<RenderOutcome> {
     // heap 確保はここで一度だけ (この走査は off-RT)。器は曲が要る分だけ (上限を置かない)。
-    let mut scratch: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
-    let mut master_l: Vec<f32> = vec![0.0; max_frames];
-    let mut master_r: Vec<f32> = vec![0.0; max_frames];
+    let mut scratch_buf: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
+    let mut master_l_buf: Vec<f32> = vec![0.0; max_frames];
+    let mut master_r_buf: Vec<f32> = vec![0.0; max_frames];
     // r.md #129: master Limiter の状態は **書き出しごとに新品** (= 決定論的)。内蔵 device の状態も
     // この走査で compile する schedule の新品の scratch に居る (live の `adopt_state_from` を通らない)。
     let mut master_limiter = crate::native_dsp::MasterLimiterState::new();
-    let scratch = &mut scratch[..];
-    let master_l = &mut master_l[..];
-    let master_r = &mut master_r[..];
+    let scratch = &mut scratch_buf[..];
+    let master_l = &mut master_l_buf[..];
+    let master_r = &mut master_r_buf[..];
     // Tail-silence cutoff: stop early if the master bus stays under
     // -60 dB for half a second once we're past the song body.
     let silence_thresh: f32 = 0.001;
@@ -733,10 +757,11 @@ fn render_loop(
         let playing = !tail_started;
 
         // Snapshot the same wait-free state the notify thread sees (mirrors —
-        // this thread is off-RT, so ArcSwap loads are fine here).
-        let plugin_refs_g = project.plugin_refs.load(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
+        // this thread is off-RT, so ArcSwap loads are fine here)。`Arc` で持つのは、stall の窓が閉じないときに
+        // leak できるように (下の `PoolRun::InFlight`)。
+        let plugin_refs_g = project.plugin_refs.load_full(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         let worker_g = engine_shared.worker.load_full(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
-        let audio_renderer_g = project.audio_clip_renderer.load(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
+        let audio_renderer_g = project.audio_clip_renderer.load_full(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         let audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer =
             &audio_renderer_g;
 
@@ -782,7 +807,7 @@ fn render_loop(
         if write_video_sidecars {
             launcher_sidecar.record(launcher.rows(), span);
         }
-        render_master_buffer(
+        let rendered = render_master_buffer(
             song,
             &song_index,
             &mut schedule,
@@ -815,6 +840,34 @@ fn render_loop(
             // 書き込みも WAV に乗らない (構造的な保証)。
             crate::graph::NativeIo::default(),
         );
+        match rendered {
+            PoolRun::Finished => {}
+            // 描き切れなかった buffer を無音で書いて成功にしない。
+            PoolRun::Stalled => anyhow::bail!("worker pool stalled while rendering offline"),
+            PoolRun::InFlight => {
+                // 文脈を持ったまま走る runner (生き残り) が居る (`render_master_buffer` の doc): 文脈が指すこの走査の
+                // 物を、窓が閉じるまで手放さない。閉じなければ (止められた runner が戻らない) leak する — 解放すると
+                // 生き残りが解放済みに触り、待ち続けると書き出しの予約を持ったまま live が無音から戻らない。
+                if !worker_g.as_deref().is_some_and(wait_window_closed) {
+                    std::mem::forget((
+                        scratch_buf,
+                        master_l_buf,
+                        master_r_buf,
+                        schedule,
+                        song_index,
+                        mod_tick,
+                        follower_cols,
+                        launcher,
+                        empty_recording_lanes,
+                        plugin_refs_g,
+                        worker_g,
+                        audio_renderer_g,
+                        Arc::clone(song),
+                    ));
+                }
+                anyhow::bail!("worker pool stalled while rendering offline");
+            }
+        }
 
         // docs/plan_modulation.md §7: record this buffer's modulator values
         // (buffer 頭の刻みの値 — live engine が GUI へ publish するのと同じ点)
@@ -959,7 +1012,7 @@ mod tests {
             let outcome = render_loop(
                 &engine,
                 &project,
-                &song,
+                &Arc::new(song.clone()),
                 RenderScope::Mix,
                 48_000,
                 common::process_data::MAX_FRAMES,
@@ -1104,7 +1157,7 @@ mod tests {
         let outcome = render_loop(
             engine,
             project,
-            song,
+            &Arc::new(song.clone()),
             RenderScope::Mix,
             BOUNCE_SR,
             common::process_data::MAX_FRAMES,
@@ -1454,6 +1507,24 @@ mod tests {
         let pooled = render_mix_on(&pooled_engine(3), &song, 0.0, 2.0);
         assert!(peak(&serial) > 0.1, "前提: 鳴っている");
         assert_bit_identical(&serial, &pooled, "pool 経路の音が直列と違う");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// pool 経路で描き切った buffer も master の段 (master 音量) を通る — stall の窓の早期 return (`PoolRun::InFlight`)
+    /// が、描き切った buffer を素通しにしない。
+    #[test]
+    fn pool_経路でも_master_音量が効く() {
+        let dir = bounce_temp_dir("pool_master_gain");
+        let (mut song, content) = source_only_song(&dir);
+        push_tracks(&mut song, 3, content, &[0, 1, 2]);
+        song.enforce_edit_invariants();
+        let engine = pooled_engine(3);
+        let unity = render_mix_on(&engine, &song, 0.0, 2.0);
+        let project = ProjectShared::new(common::protocol::ProjectKey(1), 0);
+        project.master_gain.store(0.5f32.to_bits(), Ordering::Relaxed);
+        let half = render_mix_in(&engine, &project, &song, 0.0, 2.0);
+        assert!(peak(&unity) > 0.1, "前提: 鳴っている");
+        assert!(peak(&half) < peak(&unity) * 0.75, "master 音量が pool 経路の出力に効いていない");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

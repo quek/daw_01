@@ -48,8 +48,9 @@ pub struct BufferParams<'a> {
     pub transpose: i32,
 }
 
-/// 1 buffer の描画の文脈。**dispatch 窓の間だけ** 生きる (callback スレッドのスタック上に作り、並列実行では
-/// pool の worker へポインタで渡す)。可変な資源は生ポインタで持ち、手ごとに `unsafe` 引き口で借りる。
+/// 1 buffer の描画の文脈。**dispatch 窓の間だけ** 生きる (直列実行では呼び側のスタック上、並列実行では pool の器へ
+/// 移して worker へポインタで渡す — stall で呼び側が先に戻っても生き残りが読めるように。`crate::audio_worker` の
+/// module doc の「窓」)。可変な資源は生ポインタで持ち、手ごとに `unsafe` 引き口で借りる。
 pub struct RenderCtx<'a> {
     pub song: &'a Song,
     /// `song` と同じ snapshot の索引。

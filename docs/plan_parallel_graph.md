@@ -107,7 +107,7 @@ T を先頭から走査し、資源ごとに `last_writer` と「その後の re
     空振りの起床を生んだ)。1 回の `ReleaseSemaphore` で全員を起こすと kernel が全員を ready にし終えるまで起こす側が
     止まる (8 本で 6.5 µs 実測) ので、起こすのは 1 本ずつ。
   - 前の buffer の worker は `inside` を持ったまま bit を立ててから抜ける (callback スレッドは `inside` が 0 になって
-    から戻る) ので、buffer の頭で寝ている worker は全部 bit を立て終えている。
+    から戻る。stall した pool はもう dispatch しない) ので、buffer の頭で寝ている worker は全部 bit を立て終えている。
   - callback スレッドは buffer 周期の 1/50 まで回って待ち (グラフが終わるまで他にすることが無い。起床遅延 ~5 µs を
     buffer ごとに払わない)、それを過ぎたら自分の bit を立てて event で bounded に寝る (合流の job を積んだ worker と
     グラフを終えた worker が起こす)。
@@ -115,12 +115,18 @@ T を先頭から走査し、資源ごとに `last_writer` と「その後の re
 - plugin の dispatch は runner 自身の `SyncSlot` (callback スレッド = 0、worker i = i + 1) — 旧 pass 1 と同じ契約。
   bus の plugin も任意の slot で走る (旧 pass 1 の leaf が既にそうしている)。
 - pool が無い (起動直後 / 書き出しで rig 無し) ときは T の順に `run_step` を直列に回す。
-- stall: **どの runner も `POOL_WAIT_TIMEOUT_MS` の間 1 手も終えられなかった** ときだけ pool を stalled にし、
-  この buffer の全 scratch と master を 0 にする (「stalled = 無音」の契約)。runner ごとに終えた手を数え
-  (cache line を分けて自分だけが書く)、callback スレッドは寝て起きるたびに合計の進みを見る。1 回の待ちの時刻で
-  打ち切ると、別々の slot の bounded な dispatch (各 `DISPATCH_TIMEOUT_MS`) が依存の鎖に沿って順に積み重なる
-  だけの **生きた worker** を置いて戻り、スタック上の文脈を読ませてしまう (旧 pass 2 は callback スレッド上で
-  直列だったので起きなかった)。
+- stall: **どの runner も `POOL_WAIT_TIMEOUT_MS` の間 1 手も 1 回の dispatch も終えられなかった** ときだけ pool を
+  stalled にし、この buffer の全 scratch と master を 0 にする (「stalled = 無音」の契約)。runner ごとに終えた手と
+  dispatch を数え (cache line を分けて自分だけが書く)、callback スレッドは寝て起きるたびに合計の進みを見る。1 回の
+  待ちの時刻で打ち切ると、別々の slot の bounded な dispatch (各 `DISPATCH_TIMEOUT_MS`) が依存の鎖に沿って順に
+  積み重なるだけの **生きた worker** を置いて戻ってしまう。手だけを数えても、1 つの手 (track の chain) の中で期限内の
+  遅い plugin が積み重なると同じことが起きる。
+- stall の **窓**: 進みが止まるのは OS に止められた runner (debugger / ページング / suspend) で、それは後で動き出し
+  うる。callback スレッドは待たずに戻る (RT は無限に待たない) が、描画は文脈を読んだ runner が全員それを手放す
+  (`inside` = 0) まで終わらない — 文脈は pool の器に置き (呼び側のスタックに置かない)、`PoolRun::InFlight` を受けた
+  呼び側は窓が閉じるまで文脈の指す物を解放も再利用もしない。live はその project を凍結し (描画・便の取り込み・
+  transport・コマンド・bus の合算から外し、生き残りが借りる rig を持つ)、書き出しは有界に待って失敗する (閉じなければ
+  走査の物を leak)。動き出した生き残りは残りの plugin を叩かない (`PairLease::slot` が stall 後は `None`)。
 
 RT 規約: 確保・解放・ロックなし (作業領域は `Schedule` と一緒に届く)。待ちは同一プロセスの event と bounded な
 terminal 待ちだけ (不変条件 4)。

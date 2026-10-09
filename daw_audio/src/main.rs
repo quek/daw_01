@@ -921,8 +921,9 @@ fn start_output_stream(
 }
 /// グラフの内訳 (自分の仕事 / plugin 待ち / 実効並列度) を metrics 面へ publish する。
 ///
-/// callback の末尾で 1 回だけ呼ぶ。このとき runner は全員グラフを抜けている
-/// (`AudioWorkerPool::run` が `inside` 0 を待って戻る) ので `take` は安全。
+/// callback の末尾で 1 回だけ呼ぶ。ふつうこのとき runner は全員グラフを抜けている
+/// (`AudioWorkerPool::run` が `inside` 0 を見て戻る)。stall の窓の生き残りが重なっても
+/// counter は atomic で、害は内訳のずれだけ (`crate::graph::profile` の module doc)。
 /// 1 buffer も流れていない窓 (song 未ロード / 停止直後) は何も足さない。
 /// RT-safe: atomic の読み書きだけ。
 #[inline]

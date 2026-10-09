@@ -21,8 +21,10 @@
 //! # 測り方
 //!
 //! runner ごとに cache line を分けた counter へ加算する (取り合わない)。読み出しは
-//! callback スレッドが buffer の最後に 1 回 ([`GraphProfile::take`]) — このとき
-//! runner は全員グラフを抜けている (`AudioWorkerPool::run` が `inside` 0 を待つ)。
+//! callback スレッドが buffer の最後に 1 回 ([`GraphProfile::take`]) — ふつうこのとき
+//! runner は全員グラフを抜けている (`AudioWorkerPool::run` が `inside` 0 を見て戻る)。
+//! stall の窓の生き残り (`audio_worker` の module doc) は抜けた後も足しうるが、counter は
+//! atomic なので、害は内訳のずれ (取り出しと重なった 1 回ぶんを二重に数えうる) だけ。
 //!
 //! RT 制約: `Instant::now()` (= `QueryPerformanceCounter`、実測 ~25 ns) と atomic の
 //! 加算だけ。確保・ロック・I/O は無い。1 buffer の手の数は 40 track で ~120 なので
@@ -104,7 +106,7 @@ impl GraphProfile {
     }
 
     /// 溜まったぶんを取り出して 0 に戻す。**callback スレッドが buffer の最後に呼ぶ**
-    /// (runner は全員グラフを抜けている)。
+    /// (ふつう runner は全員グラフを抜けている。stall の窓の生き残りは module doc)。
     pub fn take(&self) -> GraphBreakdown {
         let mut s = GraphBreakdown {
             wall_ns: self.wall_ns.swap(0, Ordering::Relaxed),

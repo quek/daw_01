@@ -207,7 +207,6 @@ FN-NESTING | daw_gui/src/view/runner/preview_events.rs::Runner::handle_preview_w
 FN-NESTING | daw_plugin_host/src/main.rs::PluginHost::handle_command          | 9/39  | 巨大 match。未起票
 FN-NESTING | daw_gui/src/handler/ipc.rs::AppData::dispatch_audio_event        | 9/28  | 巨大 match。未起票
 FN-NESTING | daw_gui/src/handler/ipc.rs::AppData::dispatch_plugin_event       | 9/25  | 巨大 match。未起票
-FN-NESTING | daw_audio/src/engine.rs::DeviceRt::pump_commands                 | 8/16  | 巨大 match。未起票。 r.md #129 (プロジェクトタブ) で `LocalState` → `DeviceRt` に改名、project 宛 command の振り分け +1。
 FN-NESTING | daw_gui/src/view/root.rs::dispatch_shortcuts                     | 7/17  | 巨大 match。未起票
 FN-NESTING | daw_gui/src/handler/export.rs::AppData::handle_file_dialog_result | 7/14 | 巨大 match。未起票
 # `root.rs::paste_from_clipboard` (7/8) は #71 で **解消**。 貼り付け 1 件分の

@@ -434,6 +434,10 @@ pub struct ProjectRt {
     /// live 用の 1 個 — 書き出しは `export` が毎回新品を作る。同じタブで別ファイルを開いたら
     /// `refresh_bundle` が reset する (§18-M)。
     pub master_limiter: MasterLimiterState,
+    /// stall の窓 (`crate::audio_worker` の module doc): この project の描画が `PoolRun::InFlight` で戻ってから、
+    /// 文脈を持ったまま走る runner (生き残り) がそれを手放すまでの間、生き残りが借りている rig を持つ (`Some` の
+    /// 間、RT はこの project に触らない — `DeviceRt` の module doc)。窓が閉じたら `DeviceRt` が off-thread へ返す。
+    pub window: Option<Arc<WorkerRig>>,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -449,7 +453,8 @@ pub struct ProjectRt {
 
 /// [`ProjectRt::render_buffer`] に渡す、デバイス側が所有する資源。
 pub struct DeviceCtx<'a> {
-    pub worker: Option<&'a WorkerRig>,
+    /// `Arc` で渡すのは、描画が stall の窓を開けたら project がその rig を持ち続けるため (`ProjectRt::window`)。
+    pub worker: Option<&'a Arc<WorkerRig>>,
     /// この project が Global Sampler の録音源に縛られているときだけ `Some`。
     pub sampler: Option<&'a SamplerRig>,
     pub sampler_rt: &'a mut SamplerRt,
@@ -515,6 +520,7 @@ impl ProjectRt {
             mod_tick: crate::mod_tick::ModTickRunner::new(),
             follower_maps: FollowerMaps::default(),
             master_limiter: MasterLimiterState::new(),
+            window: None,
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
             #[cfg(debug_assertions)]
@@ -1121,13 +1127,13 @@ impl ProjectRt {
             // live/export 共通の単一 render 経路 (§5): dispatch → schedule →
             // master fx → master gain → master limiter。
             let master_gain = f32::from_bits(self.shared.master_gain.load(Ordering::Relaxed));
-            render_master_buffer(
+            let rendered = render_master_buffer(
                 song,
                 &self.song_index,
                 &mut self.cached_schedule,
                 &mut self.scratch,
                 &self.plugin_refs,
-                ctx.worker,
+                ctx.worker.map(|rig| &**rig),
                 audio_renderer,
                 &mut self.bus_l[..n],
                 &mut self.bus_r[..n],
@@ -1145,6 +1151,12 @@ impl ProjectRt {
                 &mut self.master_limiter,
                 native_io,
             );
+            // stall の窓が開いた: 生き残りが文脈を通して project の物を触っているので、この buffer の残り (scope /
+            // sampler / metronome / transport) も含めて何もせず、窓が閉じるまで rig を持つ (`Self::window`)。
+            if rendered == crate::audio_worker::PoolRun::InFlight {
+                self.window = ctx.worker.cloned();
+                return;
+            }
 
             // 走行状態の GUI への publish は **transport を進めた後** (この関数の末尾)。
             // 理由は同所のコメントと [`crate::launcher::LauncherRuntime::publish`] の doc。
@@ -1392,309 +1404,8 @@ fn native_io_for_buffer<'a>(
     NativeIo { sc_listen, scopes }
 }
 
-/// CPAL クロージャ専有の状態 (`docs/plan_project_tabs.md` §3.1)。開いている
-/// [`ProjectRt`] の列とデバイス最終ミックス。project の追加 / 撤去は
-/// [`ProjectDelivery`] で off-thread から届く (RT で確保しない)。
-pub struct DeviceRt {
-    /// デバイス最終ミックス (全 project の bus を加算したもの)。
-    pub master_l: Vec<f32>,
-    pub master_r: Vec<f32>,
-    /// 開いている project (容量 `MAX_PROJECTS` を事前確保、`push` / `swap_remove`
-    /// は再確保しない)。並びに意味は無い (ミックスは加算)。
-    ///
-    /// `Box` なのは意図: `ProjectRt` は scratch 込みで数 MB あり、`Vec<ProjectRt>` だと
-    /// push / swap_remove / ring の move が RT で MB 級の memcpy になる。Box なら
-    /// ポインタ 1 本の move。
-    #[allow(clippy::vec_box)]
-    pub projects: Vec<Box<ProjectRt>>,
-    /// project slot の生成 / 撤去便 (recv loop → RT)。
-    pub project_rx: rtrb::Consumer<ProjectDelivery>,
-    /// 撤去した `ProjectRt` を off-thread で drop させる口 (RT で free しない)。
-    pub project_recycle_tx: rtrb::Producer<Box<ProjectRt>>,
-    /// Pending preview / launcher commands from the receive loop ([`EngineCommandSender`]).
-    /// Drained at the top of every `process_buffer`.
-    pub cmd_rx: rtrb::Consumer<EngineCommand>,
-    /// Resources shared with the export / notify threads.
-    pub shared: Arc<EngineShared>,
-    /// デバイス全体 snapshot (worker rig / sampler ring) の配送 ring 対。
-    pub device_rx: rtrb::Consumer<DeviceBundle>,
-    pub device_recycle_tx: rtrb::Producer<DeviceBundle>,
-    /// RT が使う worker rig (bundle 由来 Arc clone)。
-    pub worker: Option<Arc<WorkerRig>>,
-    /// Global Sampler のリング (bundle 由来 Arc clone)。
-    pub sampler: Option<Arc<SamplerRig>>,
-    /// Global Sampler の RT 走行状態 (セグメント / 試聴)。
-    pub sampler_rt: SamplerRt,
-    /// stream 開始からの累積 render フレーム数 (MIDI 試聴シーケンスの時計)。
-    pub frames_rendered: u64,
-    /// r.md #129 §11.2: device scope の slot ごとに、最後に書いた見出し `(project, device id)`。
-    /// 表と違う slot だけ見出しを書き換える (毎 buffer 16 slot の atomic を読み書きしない)。
-    pub scope_headers: [(ProjectKey, u64); MAX_DEVICE_SCOPES],
-}
-
-impl DeviceRt {
-    pub fn new(
-        max_frames: usize,
-        cmd_rx: rtrb::Consumer<EngineCommand>,
-        shared: Arc<EngineShared>,
-        project_rx: rtrb::Consumer<ProjectDelivery>,
-        project_recycle_tx: rtrb::Producer<Box<ProjectRt>>,
-        device_rx: rtrb::Consumer<DeviceBundle>,
-        device_recycle_tx: rtrb::Producer<DeviceBundle>,
-    ) -> Self {
-        Self {
-            master_l: vec![0.0; max_frames],
-            master_r: vec![0.0; max_frames],
-            projects: Vec::with_capacity(MAX_PROJECTS),
-            project_rx,
-            project_recycle_tx,
-            cmd_rx,
-            shared,
-            device_rx,
-            device_recycle_tx,
-            worker: None,
-            sampler: None,
-            sampler_rt: SamplerRt::new(),
-            frames_rendered: 0,
-            scope_headers: [(ProjectKey::NONE, 0); MAX_DEVICE_SCOPES],
-        }
-    }
-
-    /// 「どれか 1 つでも走っている (count-in 込み)」 — idle park 判定用。
-    #[must_use]
-    pub fn any_rolling(&self) -> bool {
-        self.projects.iter().any(|p| p.is_rolling())
-    }
-
-    /// 「どれか 1 つでも再生中」 — xrun 計数用 (停止中の cold start を除外する)。
-    #[must_use]
-    pub fn any_playing(&self) -> bool {
-        self.projects.iter().any(|p| p.playing)
-    }
-
-    fn project_mut(&mut self, key: ProjectKey) -> Option<&mut ProjectRt> {
-        self.projects.iter_mut().find(|p| p.key == key).map(|b| &mut **b)
-    }
-
-    /// project slot の生成 / 撤去便を取り込む。`Open` は容量内 push (再確保なし)、
-    /// `Close` は `swap_remove` して recycle ring へ (drop は off-thread)。
-    fn refresh_projects(&mut self) {
-        while let Ok(delivery) = self.project_rx.pop() {
-            match delivery {
-                ProjectDelivery::Open(rt) => {
-                    if self.projects.len() < self.projects.capacity() {
-                        self.projects.push(rt);
-                    } else {
-                        // 容量超過 (recv loop が cap を守るので届かない)。捨てるのも
-                        // off-thread — recycle へ返す。
-                        let _ = self.project_recycle_tx.push(rt);
-                    }
-                }
-                ProjectDelivery::Close(key) => {
-                    // 閉じたタブが握っていた試聴の走行状態を降ろす
-                    // (`docs/plan_project_tabs.md` §5.5)。
-                    self.sampler_rt.forget_project(key);
-                    if let Some(i) = self.projects.iter().position(|p| p.key == key) {
-                        let rt = self.projects.swap_remove(i);
-                        let _ = self.project_recycle_tx.push(rt);
-                    }
-                }
-            }
-        }
-    }
-
-    /// デバイス全体 snapshot (worker / sampler) の install。最新だけ残し、
-    /// 旧値は recycle ring で off-thread drop。
-    fn refresh_device_bundle(&mut self) {
-        let mut newest: Option<DeviceBundle> = None;
-        while let Ok(bundle) = self.device_rx.pop() {
-            if let Some(skipped) = newest.take() {
-                let _ = self.device_recycle_tx.push(skipped);
-            }
-            newest = Some(bundle);
-        }
-        let Some(new) = newest else { return };
-        let old_worker = std::mem::replace(&mut self.worker, new.worker);
-        // Global Sampler: 世代が変わった (別 Arc) ら走行状態を捨てる。旧リングは
-        // recycle bundle で off-thread unmap。
-        let sampler_changed = !match (&self.sampler, &new.sampler) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        };
-        let old_sampler = std::mem::replace(&mut self.sampler, new.sampler);
-        if sampler_changed {
-            self.sampler_rt.reset();
-        }
-        let _ = self.device_recycle_tx.push(DeviceBundle {
-            worker: old_worker,
-            sampler: old_sampler,
-        });
-    }
-
-    /// Drain pending commands. Called at the top of `process_buffer`.
-    fn pump_commands(&mut self) {
-        while let Ok(cmd) = self.cmd_rx.pop() {
-            match cmd {
-                // r.md #87: ランチャーの操作。発火拍の解決は buffer 頭の
-                // `launcher.update` (= song snapshot が入ってから) が行う。
-                EngineCommand::Launch { project, req } => {
-                    if let Some(p) = self.project_mut(project) {
-                        p.launcher.push_request(req);
-                    }
-                }
-                EngineCommand::SamplerPreview { start, end } => {
-                    self.sampler_rt.set_preview(start, end);
-                }
-                EngineCommand::SamplerPreviewStop => self.sampler_rt.stop_preview(),
-                EngineCommand::PreviewNoteOn {
-                    project,
-                    track,
-                    pitch,
-                    velocity,
-                } => {
-                    // 鍵盤プレビュー: 該当 track の pending_preview に積む。
-                    // process_track_owned が次の dispatch で frame 0 に注入する。
-                    if let Some(p) = self.project_mut(project) {
-                        p.push_preview(
-                            track,
-                            NoteTransition::On {
-                                note_id: PREVIEW_NOTE_ID,
-                                key: pitch,
-                                velocity,
-                            },
-                        );
-                    }
-                }
-                EngineCommand::PreviewNoteOff { project, track, pitch } => {
-                    if let Some(p) = self.project_mut(project) {
-                        p.push_preview(
-                            track,
-                            NoteTransition::Off {
-                                note_id: PREVIEW_NOTE_ID,
-                                key: pitch,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Render `frames` of device output into `master_l/r` = 全 project の bus の加算
-    /// (`docs/plan_project_tabs.md` §3.2)。
-    ///
-    /// buffer の間は `EngineShared::live_rendering` を立てておく (書き出しとの Dekker handshake。
-    /// 予約 `export_running` は立てた **後** に読む)。
-    pub fn process_buffer(
-        &mut self,
-        shared: &SharedState,
-        bridge: &AudioBridgeHandle,
-        scope: &common::scope_bridge::ScopeBridgeHandle,
-        device_scope: &DeviceScopeBridgeHandle,
-        sample_rate: u32,
-        frames: usize,
-    ) {
-        let _ = shared;
-        self.shared.live_rendering.store(true, Ordering::SeqCst);
-        self.process_buffer_body(bridge, scope, device_scope, sample_rate, frames);
-        self.shared.live_rendering.store(false, Ordering::SeqCst);
-    }
-
-    fn process_buffer_body(
-        &mut self,
-        bridge: &AudioBridgeHandle,
-        scope: &common::scope_bridge::ScopeBridgeHandle,
-        device_scope: &DeviceScopeBridgeHandle,
-        sample_rate: u32,
-        frames: usize,
-    ) {
-        self.refresh_projects();
-        self.refresh_device_bundle();
-        self.pump_commands();
-
-        // recv loop が schedule compile の buffer_frames (leaf sidechain の
-        // 1-buffer 補償量) に使う実測値。変化時のみ store (steady state では
-        // load 1 回で済む)。
-        if self.shared.last_buffer_frames.load(Ordering::Relaxed) != frames as u32 {
-            self.shared
-                .last_buffer_frames
-                .store(frames as u32, Ordering::Release);
-        }
-
-        let n = frames;
-        self.master_l[..n].fill(0.0);
-        self.master_r[..n].fill(0.0);
-
-        let export_running = self.shared.export_running.load(Ordering::SeqCst);
-        let scope_project = self.shared.scope_project();
-        // Global Sampler の録音源が縛られている project: `Master` はアクティブなタブ
-        // (= scope と同じ)、`Track` はその tap の project。
-        let sampler_project = match self.sampler.as_deref().map(|r| r.source) {
-            Some(SamplerSource::Track { project, .. }) => project,
-            Some(SamplerSource::Master) | None => scope_project,
-        };
-
-        // r.md #51: transport の要求 (Play / Stop) と seek の消費、および
-        // 「今どういう状態か」の publish は **どの早期 return よりも先に、全 project
-        // について**行う。
-        //
-        // 旧実装は count-in と書き出しの早期 return より後ろに置いていたため、
-        // その間に届いた Stop が永久に消費されず、
-        // - count-in を取り消したのに preroll が 0 になった瞬間に曲が鳴り出す
-        // - 書き出しが終わった瞬間に (誰も押していないのに) 再生が再開する
-        // という 2 つの取りこぼしが起きていた。要求は届いた順に必ず消費する。
-        for p in &mut self.projects {
-            p.begin_buffer(bridge.project(p.telemetry_slot));
-        }
-
-        // freewheel export: while the export thread holds the audio
-        // resources, write silence and skip dispatch so the worker pool
-        // and plugin instances are exclusively driven by the export
-        // render loop. **全 project が止まる**。
-        if export_running {
-            for p in &mut self.projects {
-                // r.md #87: 書き出し中に届いたローンチ操作は捨てる。溜めておくと
-                // 書き出し明けに **全部同時に**発火し、64 件で溢れた分は無言で消える。
-                p.launcher.clear_requests();
-                // 停止中も現在の playhead をそのまま publish する。
-                bridge
-                    .project(p.telemetry_slot)
-                    .set_playhead_samples(p.shared.playhead.load(Ordering::Acquire));
-            }
-            return;
-        }
-
-        let frames_rendered = self.frames_rendered;
-        for p in &mut self.projects {
-            let is_scope = p.key == scope_project;
-            let is_sampler = p.key == sampler_project;
-            let ctx = DeviceCtx {
-                worker: self.worker.as_deref(),
-                sampler: if is_sampler { self.sampler.as_deref() } else { None },
-                sampler_rt: &mut self.sampler_rt,
-                scope: is_scope.then_some(scope),
-                device_scope: is_scope
-                    .then_some(DeviceScopeCtx { bridge: device_scope, headers: &mut self.scope_headers }),
-                frames_rendered,
-            };
-            let slot = bridge.project(p.telemetry_slot);
-            p.render_buffer(ctx, slot, sample_rate, n);
-            // A2: publish the engine's playhead to shmem so the GUI
-            // can draw the cursor. 停止中も現在の playhead をそのまま
-            // publish する (= ruler click で動かした位置や、 Stop 直前
-            // の位置を GUI に反映、 業界標準の挙動)。
-            slot.set_playhead_samples(p.shared.playhead.load(Ordering::Acquire));
-            // デバイス最終ミックスへ加算 (1 project なら加算 1 回 = 従来と同じコスト)。
-            for i in 0..n {
-                self.master_l[i] += p.bus_l[i];
-                self.master_r[i] += p.bus_r[i];
-            }
-        }
-
-        self.frames_rendered = self.frames_rendered.wrapping_add(n as u64);
-    }
-}
+mod device_rt;
+pub use device_rt::DeviceRt;
 
 #[cfg(test)]
 mod engine_command_tests {

@@ -247,17 +247,26 @@ pub struct PairLease<'a> {
 
 impl<'a> PairLease<'a> {
     /// この buffer でこの runner が使う pair。buffer の途中で poison されたら、残りの plugin は呼び側の gate が弾く
-    /// (借り替えは次の buffer の頭の [`WorkerRig::heal`] — 1 buffer の中で 1 runner が timeout まで待つのは高々 1 回
-    /// なので、pool の stall 判定の前提 (`audio_worker::POOL_WAIT_TIMEOUT_MS`) が崩れない)。
+    /// (借り替えは次の buffer の頭の [`WorkerRig::heal`] — 1 buffer の中で 1 runner が timeout まで待つのは高々 1 回)。
+    /// pool が stall した (master がこの buffer を見捨てた) 後は `None` — 動き出した生き残りは手の中の残りの plugin を
+    /// 叩かない (窓を長引かせず、立て直される host へ捨てる buffer の依頼を送らない。`crate::audio_worker`)。
     pub fn slot(&self) -> Option<&'a SyncSlot> {
+        if self.rig.pool.as_ref().is_some_and(AudioWorkerPool::is_stalled) {
+            return None;
+        }
         let lease = self.rig.leases.get(self.runner)?;
         self.rig.slots.get(lease.load(Ordering::Relaxed) as usize)
     }
 
-    /// この runner が plugin の完了を `ns` 待った、と内訳へ記録する。
+    /// この runner が plugin の完了を `ns` 待った、と内訳へ記録し、dispatch を 1 回終えたことを pool の stall の判定の
+    /// 進みに数える (`AudioWorkerPool::note_progress` — 期限内の遅い plugin が 1 つの手に積み重なっても、生きた runner
+    /// を stall と判定しない)。
     #[inline]
     pub fn record_dispatch_wait(&self, ns: u64) {
         self.rig.profile.add_dispatch(self.runner, ns);
+        if let Some(pool) = &self.rig.pool {
+            pool.note_progress(self.runner);
+        }
     }
 }
 

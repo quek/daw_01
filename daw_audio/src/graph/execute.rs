@@ -25,6 +25,7 @@ use common::process_data::EventKind;
 use common::song_index::SongIndex;
 
 use crate::audio_clip_renderer::AudioClipRenderer;
+use crate::audio_worker::PoolRun;
 use crate::engine::{PairLease, PluginEntry, PluginRefs, SyncSlot, WorkerRig};
 use crate::graph::native::{NativeIo, apply_listen_override};
 use crate::graph::program::Pass1Role;
@@ -749,6 +750,12 @@ pub(super) fn advance_follower(
 /// metronome / panic declick 等 **monitoring 専用** の処理はここに入れない
 /// (live 側にだけ存在する)。live と export の違いは `native_io` (聴き方・見方) だけで、
 /// export は `NativeIo::default()` を渡す。RT-safe: 確保・ロック・I/O なし。
+///
+/// 戻り値は worker pool の結果 (pool が無ければ常に `Finished`)。**[`PoolRun::InFlight`] なら、渡した物
+/// (曲・索引・schedule・scratch・master バス・plugin の表・renderer・rig と、`recording_lanes` / `mod_plane` /
+/// `follower_drive` / `rows` / `native_io` が指す物) を、窓が閉じる (`AudioWorkerPool::window_open` が false) まで
+/// 解放も再利用もしてはならない** — 文脈を持ったまま走る runner が居る (`audio_worker` の module doc)。そのとき
+/// master バスには何も書いていない。
 #[allow(clippy::too_many_arguments)]
 pub fn render_master_buffer(
     song: &Song,
@@ -779,7 +786,7 @@ pub fn render_master_buffer(
     master_limiter: &mut MasterLimiterState,
     // r.md #129: 「聴き方・見方」(SC Listen / device scope)。書き出しは既定値。
     native_io: NativeIo<'_>,
-) {
+) -> PoolRun {
     let n = (frames as usize).min(master_l.len()).min(master_r.len());
     let frames = n as u32;
     master_l[..n].fill(0.0);
@@ -827,7 +834,7 @@ pub fn render_master_buffer(
     // グラフの壁時計は **並列 / 直列の両経路を覆う 1 箇所**で測る (`crate::graph::profile`)。
     // 経路ごとに測ると、片方だけ計測が抜けたまま「内訳が合わない」ことになる。
     let graph_started = std::time::Instant::now();
-    let ran = {
+    let ran: PoolRun = {
         let ctx = RenderCtx::new(
             song,
             index,
@@ -841,7 +848,7 @@ pub fn render_master_buffer(
             params,
         );
         match pool {
-            Some(pool) => pool.run(&ctx),
+            Some(pool) => pool.run(ctx),
             None => {
                 let profile = ctx.rig.map(|rig| &rig.profile);
                 for &step in &ctx.graph.trace {
@@ -851,7 +858,7 @@ pub fn render_master_buffer(
                         pf.add_step(0, started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
                     }
                 }
-                true
+                PoolRun::Finished
             }
         }
     };
@@ -859,10 +866,15 @@ pub fn render_master_buffer(
         rig.profile
             .add_buffer(graph_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
     }
+    // 生き残りが文脈を持っている (窓が開いている): 渡した物には何も書かずに戻る — master の段も通さない
+    // (`PoolRun::InFlight` の契約。呼び側は窓が閉じるまで渡した物を解放も再利用もしない)。
+    if ran == PoolRun::InFlight {
+        return ran;
+    }
     // stall した pool はこの buffer を描き切っていない (plan §4: stalled = 無音)。途中までの track 出力 / 合流を
     // master の段へ流すと耳障りな stuck tone になるので、scratch と master を明示的に 0 にする
     // (RT-safe: 事前確保済みの buffer への fill のみ)。
-    if !ran {
+    if ran == PoolRun::Stalled {
         for ts in scratch.iter_mut() {
             ts.track_l[..n].fill(0.0);
             ts.track_r[..n].fill(0.0);
@@ -874,7 +886,7 @@ pub fn render_master_buffer(
     // bounce (`RenderScope::PostFx` / `Sources`) は master の段を通さない = 合流をそのまま出力する
     // (compile 時に焼いた値。master の fx chain の op も Limiter の遅延も焼いていない)。
     if !schedule.master_stage {
-        return;
+        return ran;
     }
 
     // ---- master fx chain ----
@@ -931,6 +943,7 @@ pub fn render_master_buffer(
     #[allow(clippy::cast_precision_loss)]
     let sr_f32 = sample_rate as f32;
     master_limiter.process(&limiter, schedule.master_limiter_latency, &mut master_l[..n], &mut master_r[..n], n, sr_f32);
+    ran
 }
 
 /// テスト用 `PluginRefs` helper (shmem を立てずに heap の `ProcessData` を
@@ -1476,7 +1489,7 @@ mod render_master_tests {
         let mut master_r = vec![7.0f32; 64];
         let plugin_refs: PluginRefs = HashMap::new();
         let renderer = crate::audio_clip_renderer::AudioClipRenderer::empty();
-        render_master_buffer(
+        let _ = render_master_buffer(
             &song,
             &SongIndex::build(&song),
             &mut schedule,
@@ -1540,7 +1553,7 @@ mod render_master_tests {
             let mut schedule = compile_schedule_for_test(song, 48_000, 0).unwrap();
             let mut scratch: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
             let (mut l, mut r) = (vec![0.0f32; 64], vec![0.0f32; 64]);
-            render_master_buffer(
+            let _ = render_master_buffer(
                 song,
                 &SongIndex::build(song),
                 &mut schedule,
