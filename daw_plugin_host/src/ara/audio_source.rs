@@ -2,8 +2,8 @@
 //! `ARAAudioAccessControllerInterface::readAudioSamples`.
 //!
 //! daw_01 audio sources are either file-backed (any imported audio format) or in-memory
-//! (`AudioSourcePath::Generated`, e.g. VOICEVOX vocals sent over
-//! `SetGeneratedAudio` — no file on disk). Both decode to whole-source
+//! (`AudioSourcePath::Generated` — no file of its own; the wire is blob-less, so daw_gui
+//! materialises it to a WAV before handing the path over). Both decode to whole-source
 //! interleaved f32 PCM held in memory: ARA model objects want whole-timeline
 //! access, and daw_01 sources are short (sung phrases / loops), so serving
 //! reads from a slice keeps `readAudioSamples` trivial and lock-free. Streaming
@@ -26,8 +26,8 @@ pub struct AraAudioSourceHost {
 }
 
 impl AraAudioSourceHost {
-    /// Build from already-decoded interleaved PCM (e.g. VOICEVOX-generated
-    /// audio that never touches disk).
+    /// Build from already-decoded interleaved PCM (the back end of
+    /// [`Self::from_audio_file`]; tests build sources with it directly).
     pub fn from_interleaved(samples: Arc<[f32]>, sample_rate: f64, channel_count: u32) -> Self {
         let frame_count = if channel_count == 0 {
             0

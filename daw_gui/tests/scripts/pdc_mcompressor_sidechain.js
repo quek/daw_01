@@ -1,90 +1,102 @@
-// PR4 sidechain integration test (wired version): MCompressor with
-// sidechain hooked from Track 1 (impulse) into Track 2 (constant DC).
-// 期待される観測: Track 2 の出力は MCompressor が Track 1 の impulse を
-// trigger として gain reduction を加える分、 sample 0 周辺で振幅が落ち、
-// release で 0.5 (元 DC) に戻る → 時間方向に variation がある。
+// PR4 sidechain integration smoke: MCompressor (Track 2) の aux 入力へ Track 1 を
+// sidechain としてつないだ状態で書き出しが最後まで走り、両 track の音が master に届くこと。
+// harness: daw_gui/tests/sidechain_real_vst3.rs (trigger / bass の WAV を書いて --arg で渡し、
+// 書き出しの判定もそちらが持つ)。
 //
-// Test runner (Rust 側) は同じ song で sidechain を 「外した版」 (unwired)
-// も render し、 wired vs unwired の **WAV 差分** が閾値以上であることを
-// 検証する (= sidechain 経路が実際に plugin に届いている証明)。 plugin の
-// 具体的 compression curve を仮定しない portability の高いテスト。
+// MCompressor は既定で external sidechain を検出に使わない (= internal detection) ので、
+// sidechain による gain reduction の形は見ない (理由は harness の module doc)。
 
-const SR = 48000;
-const FRAMES = SR * 1;
+function fail(msg) {
+  throw new Error("pdc_mcompressor_sidechain.js: " + msg);
+}
 
-const wired = daw.scriptArgs.wireSidechain === "true";
+// 音源と plugin の場所は harness が渡す (開発機のパスをここに書かない — 別マシンでは必ず外れ、
+// 個人の環境が repo に焼き付く)。
+const args = daw.scriptArgs;
+if (!args.trigger || !args.bass || !args.frames || !args.sr) {
+  fail("--arg trigger=<WAV> bass=<WAV> frames=<N> sr=<Hz> が要る");
+}
+if (!args.plugin) fail("--arg plugin=<MCompressor.vst3 のパス> が要る");
+const FRAMES = Number(args.frames);
+const BPM = 120.0;
+const CLIP_BEATS = (FRAMES / Number(args.sr)) * (BPM / 60.0);
 
-// PR8: vocal の inject 経路は `setGeneratedAudio` に変わり、 vocal mix は
-// track が clip を持つ範囲しか走らない。 各 track に length 8 beats の clip
-// を 1 つ用意して、 SR=48000 / 1 sec の buffer を全範囲カバーさせる。
+// 音源 `sourceId` を曲頭から最後まで鳴らす audio clip の中身 (本番の import と同じ形の AudioContent)。
+function wholeSourceContent(sourceId) {
+  return {
+    events: [
+      {
+        source_id: sourceId,
+        event_start_in_clip_beats: 0.0,
+        event_length_beats: CLIP_BEATS,
+        source_start_frames: 0,
+        source_end_frames: FRAMES,
+        gain_db: 0.0,
+        pan: 0.0,
+        pitch_semitones: 0.0,
+        formant_semitones: 0.0,
+        stretch_mode: "Raw",
+        fade_in_beats: 0.0,
+        fade_out_beats: 0.0,
+        fade_in_curve: "Linear",
+        fade_out_curve: "Linear",
+        reversed: false,
+        muted: false,
+      },
+    ],
+  };
+}
+
+function audioTrack(id, name, contentId, devices) {
+  return {
+    id: id,
+    name: name,
+    volume: 1.0,
+    pan: 0.0,
+    muted: false,
+    solo: false,
+    clips: [{ id: 1, name: name, start_beat: 0.0, length_beats: CLIP_BEATS, content_id: contentId }],
+    next_clip_id: 2,
+    devices: devices,
+  };
+}
+
+function wavSource(path) {
+  return { path: { Absolute: path }, sample_rate: Number(args.sr), channels: 2, frames: FRAMES };
+}
+
 const song = {
-  bpm: 120.0,
+  bpm: BPM,
   time_sig: [4, 4],
   length_beats: 8.0,
   tracks: [
-    {
-      id: 1,
-      name: "Trigger",
-      volume: 1.0,
-      pan: 0.0,
-      muted: false,
-      solo: false,
-      clips: [{ id: 1, name: "trigger", start_beat: 0.0, length_beats: 8.0 }],
-    },
-    {
-      id: 2,
-      name: "Bass",
-      volume: 1.0,
-      pan: 0.0,
-      muted: false,
-      solo: false,
-      clips: [{ id: 1, name: "bass", start_beat: 0.0, length_beats: 8.0 }],
-      devices: [
-        {
-          plugin_id: "MCompressor",
-          format: "Vst3",
-          state: null,
-          sidechain_sources: wired ? [1] : [],
-          ports: { has_note_input: false, has_note_output: false, has_audio_output: true },
-        },
-      ],
-    },
+    audioTrack(1, "Trigger", 1, []),
+    audioTrack(2, "Bass", 2, [
+      {
+        plugin_id: "MCompressor",
+        format: "Vst3",
+        state: null,
+        // aux 入力 0 番 = Track 1 の fader 後。
+        aux_inputs: [{ tap: { source_track: 1, tap_point: "PostFader" } }],
+        ports: { has_note_input: false, has_note_output: false, has_audio_input: true, has_audio_output: true },
+      },
+    ]),
   ],
   next_track_id: 3,
+  clip_contents: { 1: wholeSourceContent(1), 2: wholeSourceContent(2) },
+  next_content_id: 3,
+  audio_sources: { 1: wavSource(args.trigger), 2: wavSource(args.bass) },
+  next_audio_source_id: 3,
 };
 daw.loadSongFromObject(song);
-
-// プラグインの絶対パスは呼び出し側 (sidechain_real_vst3.rs) が --arg plugin=... で渡す。
-// 開発機のパスをここに書かない (別マシンでは必ず外れ、個人の環境が repo に焼き付く)。
-const pluginPath = daw.scriptArgs.plugin;
-if (!pluginPath) {
-  throw new Error(
-    "pdc_mcompressor_sidechain.js: --arg plugin=<MCompressor.vst3 のパス> が必要です",
-  );
-}
 
 daw.setSlotPlugin(
   2,
   0,
   "vst3",
-  pluginPath,
+  args.plugin,
   "",
 );
 daw.waitForPluginLoaded(2, 0, 30000);
 
-// Track 1: 短い loud burst (1.0 を 100 sample 続けて MCompressor の
-// envelope を確実に超えさせる)。
-const trigger = new Float32Array(FRAMES);
-for (let i = 0; i < 100; i++) trigger[i] = 1.0;
-
-// Track 2: 一定 DC bias 0.5。 MCompressor が gain reduction を加えれば
-// この値から落ちる。
-const bass = new Float32Array(FRAMES);
-for (let i = 0; i < FRAMES; i++) bass[i] = 0.5;
-
-// PR8: vocal_gen_id(track_id, clip_id) = (track_id << 32) | clip_id
-const genId = (track, clip) => track * 0x1_0000_0000 + clip;
-daw.setGeneratedAudio(genId(1, 1), trigger, SR);
-daw.setGeneratedAudio(genId(2, 1), bass, SR);
-
-daw.exportWav(daw.scriptArgs.output, 60000);
+daw.exportWav(args.output, 60000);

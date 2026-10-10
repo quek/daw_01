@@ -1,6 +1,7 @@
 //! PR4 sidechain integration smoke test: 実 VST3 plugin (MeldaProduction
 //! MCompressor) を sidechain 入力付きでロードした状態でも export pipeline
-//! 全体が落ちずに WAV を生成することを確認する。
+//! 全体が落ちずに WAV を生成し、 両 track の音が master に届き、 MCompressor が
+//! 実際に音を処理している (= 経路に居る) ことを確認する。
 //!
 //! 注意: MCompressor は default で external sidechain 入力を「使わない」
 //! (= internal detection を使う) 仕様。 そのため wired vs unwired で
@@ -19,104 +20,74 @@
 //!   (= 本 integration test の存在自体: plugin 側で aux 入力を持つ
 //!   bus arrangement / clap_audio_buffer で setBusArrangements が
 //!   通り、 export が正常に完了すること)
+//!
+//! 回し方は `make test-real-vst3` (env と `-- --ignored` の扱いは `real_vst3_support` の module doc)。
 
-use std::path::{Path, PathBuf};
+mod real_vst3_support;
+
+use real_vst3_support as rv;
 
 /// 実 VST3 の場所を渡す環境変数 (対象は **MeldaProduction MCompressor**)。
 ///
 /// **開発機の絶対パスを既定値にしない** — 理由は `pdc_real_vst3.rs` の同名定数と同じ。
 const MCOMPRESSOR_ENV: &str = "DAW01_TEST_VST3_MCOMPRESSOR";
 
-/// 環境変数から実 VST3 の絶対パスを解決する。 未設定 / 不在なら **理由を stderr に出して**
-/// `None` (= テストは SKIP)。 商用プラグインなので clone した人の環境にも CI にも無いのが
-/// 普通で、 黙って通ると「なぜ何も検証されていないのか」 が分からなくなる。
-fn vst3_from_env(var: &str, product: &str) -> Option<PathBuf> {
-    let Some(raw) = std::env::var_os(var) else {
-        eprintln!(
-            "SKIP: {var} が未設定です。{product} (VST 3) の .vst3 パスを \
-             {var} に入れて実行すると、このテストが走ります。"
-        );
-        return None;
-    };
-    let path = PathBuf::from(raw);
-    if !path.exists() {
-        eprintln!("SKIP: {var} が指す {} が存在しません。", path.display());
-        return None;
-    }
-    Some(path)
-}
+/// Track 1 (sidechain の元) の音: 曲頭に **負** の矩形 burst。
+const TRIGGER_AMP: f32 = -0.5;
+const TRIGGER_FRAMES: usize = 100;
+/// Track 2 (MCompressor) の音: 曲頭から **正** に立ち上がるサイン波 (半周期 ≈ 218 sample なので、
+/// trigger の区間ではずっと正)。符号を分けて、曲頭の負の山は Track 1 からしか来ないようにする。
+///
+/// 振幅は既定の MCompressor の threshold を越える大きさにする。出力が入力より小さいことが
+/// 「MCompressor が経路に居る」唯一の証拠になる (素通りなら同じ振幅が出る)。2026-10 の実測:
+/// 0.9 → 0.544 (約 -4.4 dB)。0.25 は素通り (threshold の下)。
+const BASS_AMP: f32 = 0.9;
+const BASS_HZ: f32 = 110.0;
 
 #[test]
-#[ignore = "PR-V4: pdc_real_mcenter と同様、 setGeneratedAudio 経路廃止で click inject の書き直しが必要。 別 PR で test 用 inject path を整備"]
+#[ignore = "実物の VST3 (MeldaProduction MCompressor) が要る — make test-real-vst3 で回す"]
 fn sidechain_real_mcompressor_pipeline_does_not_crash() {
-    // プラグインの場所が渡されていなければ SKIP (理由は helper が stderr に出す)。
-    let Some(plugin) = vst3_from_env(MCOMPRESSOR_ENV, "MeldaProduction MCompressor") else {
-        return;
-    };
+    let plugin = rv::vst3_from_env(MCOMPRESSOR_ENV, "MeldaProduction MCompressor");
 
-    let exe = env!("CARGO_BIN_EXE_daw_gui");
-    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("scripts")
-        .join("pdc_mcompressor_sidechain.js");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let frames = rv::SOURCE_SR as usize;
+    let trigger_wav = dir.path().join("trigger.wav");
+    let mut trigger = vec![0.0f32; frames];
+    trigger[..TRIGGER_FRAMES].fill(TRIGGER_AMP);
+    rv::write_source_wav(&trigger_wav, &trigger);
+    let bass_wav = dir.path().join("bass.wav");
+    let bass: Vec<f32> = (0..frames)
+        .map(|i| BASS_AMP * (std::f32::consts::TAU * BASS_HZ * i as f32 / rv::SOURCE_SR as f32).sin())
+        .collect();
+    rv::write_source_wav(&bass_wav, &bass);
 
-    let tmp = tempfile::Builder::new()
-        .suffix(".wav")
-        .tempfile()
-        .expect("create temp wav");
-    let out_path = tmp.path().to_path_buf();
-    drop(tmp);
-
-    // wireSidechain=true で実行 (sidechain pipeline 全体を経由)。
+    let out = dir.path().join("out.wav");
+    let mut args = rv::source_shape_args(frames);
+    args.push(rv::path_arg("trigger", &trigger_wav));
+    args.push(rv::path_arg("bass", &bass_wav));
     // プラグインの場所は script にも渡す (JS 側にも絶対パスを持たせない)。
-    let plugin_arg = format!("plugin={}", plugin.display());
-    let status = std::process::Command::new(exe)
-        .args([
-            "--script",
-            script.to_str().unwrap(),
-            "--output",
-            out_path.to_str().unwrap(),
-            "--arg",
-            "wireSidechain=true",
-            "--arg",
-            &plugin_arg,
-        ])
-        .status()
-        .expect("spawn daw_gui");
-    assert!(
-        status.success(),
-        "daw_gui --script (wired sidechain) exited non-zero (status={status:?})"
-    );
+    args.push(rv::path_arg("plugin", &plugin));
+    rv::run_script(env!("CARGO_BIN_EXE_daw_gui"), "pdc_mcompressor_sidechain.js", &out, &args);
 
-    // WAV が読み戻せて空でないこと (export 自体が機能していること)。
-    let mut reader = hound::WavReader::open(&out_path).expect("open wav");
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 2, "expected stereo WAV");
-    let n_samples = reader.duration();
-    assert!(
-        n_samples > 0,
-        "WAV is empty — export pipeline crashed mid-render"
-    );
-
-    // Track 1 の trigger (1.0 で 100 sample) と Track 2 の bass (0.5 DC) が
-    // master に届いていること (= 全 sample silence では無い)。
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read float samples"),
-        hound::SampleFormat::Int => {
-            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader
-                .samples::<i32>()
-                .map(|s| s.map(|v| v as f32 / max))
-                .collect::<Result<Vec<_>, _>>()
-                .expect("read int samples")
-        }
-    };
-    let max_amp = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-    assert!(
-        max_amp > 0.01,
-        "WAV is all-silent (max_amp={max_amp}) — sidechain pipeline likely lost signal"
-    );
+    // 書き出しが最後まで走り (= run_script が成功)、両 track が master に届き、Track 2 が
+    // MCompressor で圧縮されていること。閾値は実測 (BASS_AMP の doc) との中点。
+    let (l, r) = rv::read_export(&out);
+    let quarter = frames / 4;
+    for (name, ch) in [("L", &l), ("R", &r)] {
+        let head_min = ch[..TRIGGER_FRAMES.min(ch.len())].iter().copied().fold(0.0f32, f32::min);
+        let tail = rv::peak(ch, quarter..3 * quarter);
+        eprintln!("{name}: 曲頭の負の山 {head_min:.4} / Track 2 の区間の山 {tail:.4} (入力 {BASS_AMP})");
+        assert!(
+            head_min < 0.5 * TRIGGER_AMP,
+            "{name}: 曲頭に Track 1 (sidechain の元) の負の burst が無い: {head_min:.4}",
+        );
+        assert!(
+            tail > 0.3 * BASS_AMP,
+            "{name}: Track 2 (MCompressor + sidechain) の音が master に届いていない: {tail:.4}",
+        );
+        assert!(
+            tail < 0.8 * BASS_AMP,
+            "{name}: Track 2 が圧縮されていない ({tail:.4} / 入力 {BASS_AMP}) — MCompressor が経路に居ない",
+        );
+    }
 }

@@ -42,11 +42,16 @@ use crate::bootstrap::ChildEvent;
 
 /// `daw.*` に並べる関数の表 `(JS 名, 実装, 引数の数)`。**binding はここ 1 か所に並べる**
 /// (どの API があるかを 1 画面で見渡せるように)。実装は分野ごとに `script/*.rs` へ置いてよい。
+///
+/// **働かなくなった口は no-op にせず表から消す** (呼んだ script が `TypeError` で落ちる)。警告だけ
+/// 出して返す口を残すと、それを呼ぶ検査が黙って空振りする — 音源の注入口 `setGeneratedAudio` を
+/// PR-V4 (2026-05) で no-op にしたあと、それを呼ぶ実物の VST3 の検査 2 本は無音の WAV しか
+/// 書けないまま 5 か月残った。
 const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("loadSongFromObject", daw_load_song_from_object, 1),
-    ("setSlotPlugin", daw_set_slot_plugin, 6),
-    ("waitForPluginLoaded", daw_wait_for_plugin_loaded, 4),
-    ("setGeneratedAudio", daw_set_generated_audio, 3),
+    ("setSlotPlugin", daw_set_slot_plugin, 5),
+    ("waitForPluginLoaded", daw_wait_for_plugin_loaded, 3),
+    ("waitForPluginLatency", daw_wait_for_plugin_latency, 3),
     ("exportWav", daw_export_wav, 2),
     // ----- headless export-range test harness ----------------
     ("loadSongFile", daw_load_song_file, 1),
@@ -302,19 +307,43 @@ fn daw_wait_for_plugin_loaded(
     Ok(JsValue::undefined())
 }
 
-/// PR-V4: JS test API `daw.setGeneratedAudio` は無効化 (= no-op)。 旧
-/// 旧 `SetGeneratedAudio` IPC 経路を IPC から削除したため。
-/// 新しい builtin VOICEVOX 経路では plugin が自前で synth するので、
-/// JS 側から audio buffer を直接注入する API は不要。
-fn daw_set_generated_audio(
+/// `daw.waitForPluginLatency(track, index, timeoutMs)` — `waitForPluginLoaded` の直後に呼び、
+/// plugin_host が load の応答に続けて送る latency の報告 (`PluginLatencyChanged`) を待って、
+/// その sample 数を返す (報告は受け取った時点で engine へ中継済み)。
+///
+/// PDC は「latency があっても出力を遅延なしと同じにする」仕組みなので、書き出しだけでは
+/// 「latency 0 のまま (plugin が経路に居ない)」と区別できない。PDC の検査はこれで latency が
+/// 実際に届いたことを確かめる (`tests/scripts/pdc_mcenter.js`)。
+fn daw_wait_for_plugin_latency(
     _this: &JsValue,
-    _args: &[JsValue],
-    _ctx: &mut Context,
+    args: &[JsValue],
+    ctx: &mut Context,
 ) -> JsResult<JsValue> {
-    tracing::warn!(
-        "daw.setGeneratedAudio: PR-V4 で削除済 (= builtin VOICEVOX plugin 経由に移行)、 no-op"
-    );
-    Ok(JsValue::undefined())
+    let track_id = u32::try_from_js(args.get_or_undefined(0), ctx)?;
+    let want_index = u32::try_from_js(args.get_or_undefined(1), ctx)?;
+    let timeout_ms = u64::try_from_js(args.get_or_undefined(2), ctx).unwrap_or(30_000);
+
+    let want_device = with_app(move |app, _, _| device_id_at_app(app, track_id, want_index));
+    let res = with_host(|h| -> Result<ChildEvent> {
+        let want_device = want_device.ok_or_else(|| {
+            anyhow!("waitForPluginLatency: no device at (track {track_id}, index {want_index})")
+        })?;
+        h.pump_until(
+            |msg| {
+                matches!(
+                    msg,
+                    ChildEvent::Plugin(PluginEvent::PluginLatencyChanged { device: DeviceAddr { device_id, .. }, .. })
+                        if *device_id == want_device
+                )
+            },
+            Duration::from_millis(timeout_ms),
+        )
+    });
+    match res {
+        Ok(ChildEvent::Plugin(PluginEvent::PluginLatencyChanged { samples, .. })) => Ok(JsValue::from(samples)),
+        Ok(_) => unreachable!(),
+        Err(e) => Err(js_native(format!("waitForPluginLatency: {e}"))),
+    }
 }
 
 fn daw_export_wav(

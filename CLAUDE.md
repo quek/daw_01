@@ -26,6 +26,7 @@ make build          # 実行 3 exe をビルド (debug)
 make run            # daw_gui をビルド × 起動
 make test           # テストを持つ package のみ (daw_gui を起動する。下記)
 make test-nolaunch  # そのうち daw_gui を起動しない target だけ
+make test-real-vst3 DAW01_TEST_VST3_<名前>=<.vst3>  # 実物の VST3 の検査 (#[ignore]。env は make の引数で)
 make clippy         # -D warnings
 make check          # 型検査のみ
 make arch-lint      # アーキテクチャ不変条件の機械検査

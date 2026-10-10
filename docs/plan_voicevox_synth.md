@@ -158,6 +158,10 @@ click が clip / note (`playhead_beats` 基準) と別グリッドに載る。
     `sidechain_real_mcompressor_pipeline_does_not_crash`) を `#[ignore]`
     化。 別 PR で「audio clip + ImportAudio 経由の test 用 inject path」
     を整備する想定
+    - (2026-10 済) no-op の口は `DAW_API` から削除 (呼べば `TypeError`)。
+      2 件は harness が WAV を書き、 script が Song の `audio_sources` +
+      audio clip で鳴らす形に書き直した。 `#[ignore]` は「実物の VST3 が
+      要る」 理由で残し、 回し方の正本は `make test-real-vst3`
 
 すべての PR-V (V1 / V2.1〜V2.5 / V3 前後段 / V4) が完了。 VOICEVOX
 専用 codepath は audio engine / IPC / GUI から完全に消え、 業界標準どおり

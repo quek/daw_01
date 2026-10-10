@@ -1,4 +1,4 @@
-.PHONY: help build run test test-nolaunch test-rt preflight-no-app gates clippy license-check audit arch-lint clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror test-worktree-rm worktree-rm-gate worktree-rm worktree-rm-merged
+.PHONY: help build run test test-nolaunch test-rt test-real-vst3 preflight-no-app gates clippy license-check audit arch-lint clean release run-release fmt check fetch-ffmpeg fetch-ffmpeg-force ffmpeg-mirror test-worktree-rm worktree-rm-gate worktree-rm worktree-rm-merged
 
 # ライセンス検査スクリプト用の Python (stdlib のみ)。Windows の公式インストーラは
 # `python`、Linux / macOS は `python3` が正なので、あるほうを使う。
@@ -243,6 +243,8 @@ help:
 	@echo "  make test          テストを持つ package のみ実行 (daw_gui を起動する)"
 	@echo "  make test-nolaunch そのうち daw_gui を起動しない target だけ"
 	@echo "  make test-rt       RT (audio thread) の無確保検査 (test / test-nolaunch から呼ばれる)"
+	@echo "  make test-real-vst3 DAW01_TEST_VST3_<名前>=<.vst3 のパス> ..."
+	@echo "                     実物の VST3 を読む検査 (env が欠けていれば落ちる。test の最後でも回る)"
 	@echo "  make clippy        clippy をエラー扱いで走らせる"
 	@echo "  make gates         常設ゲート (license-check + lockfile-guard + audit スタンプ)"
 	@echo "                     clippy / test / test-nolaunch の前提条件。単体でも打てる"
@@ -303,6 +305,15 @@ preflight-no-app:
 # build 自体も daw_gui 起動中は ERROR 5 で落ちうるので、先に止めるのが正しい。
 test: preflight-no-app gates build test-rt
 	cargo test $(TEST_PKGS) --features daw_gui/script
+	@$(BASH) "$(CURDIR)/scripts/test_real_vst3.sh" --if-configured
+
+# 実物の VST3 (商用プラグイン) を読む検査。`#[ignore]` なので素の `cargo test` では回らない。
+# 対象と env の対応・`-- --ignored` の付け方は scripts/test_real_vst3.sh が SSoT
+# (env が欠けていれば落ちる。`make test` の最後は「渡された env の分だけ回し、残りを表示」)。
+# **env は make の引数で渡す** (`make test-real-vst3 DAW01_TEST_VST3_MCENTER=<path> ...`) —
+# シェルの環境変数は make に継承されない (冒頭「Windows のログオン環境の復元」)。
+test-real-vst3: preflight-no-app build
+	@$(BASH) "$(CURDIR)/scripts/test_real_vst3.sh"
 
 # 起動を伴わない検証だけを回す。`make test` が前提条件で止まる状況 (実機を触っている
 # 最中) でも安全に通せる。対象 target は上の DAW_GUI_SAFE_TESTS が基準から導く。
