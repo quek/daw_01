@@ -250,7 +250,6 @@ FN-NESTING | daw_gui/src/handler/automation.rs::AppData::move_automation_points 
 #    (memory: feedback_no_dead_judgment_at_ffi)。
 #    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
 FN-NESTING | daw_plugin_host/src/builtin/voicevox.rs::VoicevoxBuiltin::start_synth_thread          | 10/138 | FFI/状態機械。r.md #75 でレンダリングを voicevox_render.rs へ出し 11/173 から下げた。落とし所は「job ループの本体 (retry backoff / coalesce / 報告) も切り出して 6 段以下」。未起票
-FN-NESTING | daw_audio/src/main.rs::build_stream                                                   | 8/32   | FFI/状態機械。未起票
 FN-NESTING | daw_plugin_host/src/builtin/voicevox.rs::VoicevoxAudioHalf[AudioProcessorHalf]::process | 7/39 | FFI/状態機械。未起票
 FN-NESTING | daw_plugin_host/src/editor_window.rs::editor_wnd_proc                                 | 7/15   | FFI/状態機械。未起票
 FN-NESTING | daw_plugin_host/src/main.rs::PluginHost::poll_editor_close_requests                   | 7/12   | FFI/状態機械。未起票

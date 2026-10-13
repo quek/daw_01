@@ -640,7 +640,7 @@ fn create_anonymous_event() -> Result<HANDLE> {
 /// CPAL buffer deadlines aren't missed. Failures are logged and ignored
 /// — without admin rights some priority changes silently no-op, which
 /// is fine for development.
-fn boost_thread_priority(label: &str) {
+pub(crate) fn boost_thread_priority(label: &str) {
     unsafe {
         let h = GetCurrentThread();
         if let Err(e) = SetThreadPriority(h, THREAD_PRIORITY_TIME_CRITICAL) {

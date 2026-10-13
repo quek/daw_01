@@ -72,6 +72,12 @@ pub struct MetricsBridge {
     /// DSP load の平均と xrun 数だけでは「毎 buffer が締め切り近くまで重い (仕事量の合計の問題)」と
     /// 「普段は軽いが、たまに遅い buffer が来る (ばらつきの問題)」を区別できない。直す場所が違う。
     pub load_hist: [AtomicU64; LOAD_HIST_BUCKETS],
+
+    /// デバイスが飢えた回数 (累積、monotonic)。callback が受け取ったフレーム数が開始直後の回
+    /// (= デバイスのバッファ全体) 以上だった回 = デバイスが前の回までの音を出し切っていた。
+    /// `xrun_count` は描き方 (callback 内で描く / 描画スレッドが先に描く) で定義が違うので、
+    /// 両者を同じ物差しで比べるための指標。
+    pub starve_count: AtomicU64,
 }
 
 /// [`MetricsBridge::load_hist`] の bucket 数 (5% 刻みで 0〜200%、最後は 200% 以上)。
@@ -233,6 +239,15 @@ impl MetricsBridgeHandle {
     pub fn load_hist(&self) -> [u64; LOAD_HIST_BUCKETS] {
         let b = self.bridge();
         std::array::from_fn(|i| b.load_hist[i].load(Ordering::Relaxed))
+    }
+
+    /// daw_audio (RT): デバイスが飢えた回を 1 件記録 ([`MetricsBridge::starve_count`])。
+    pub fn add_starve(&self) {
+        self.bridge().starve_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn starve_count(&self) -> u64 {
+        self.bridge().starve_count.load(Ordering::Relaxed)
     }
 
     pub fn xrun_count(&self) -> u64 {

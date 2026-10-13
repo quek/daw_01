@@ -43,6 +43,7 @@ mod mod_tick;
 mod native_dsp;
 mod note_ledger;
 mod offline_jobs;
+mod output_render;
 mod project_ctl;
 mod sampler;
 mod sequencer;
@@ -939,6 +940,14 @@ fn publish_graph_profile(
 }
 
 
+/// CPAL コールバックが 1 周期分を得る先 (`output_render` の module doc)。
+enum OutputSink {
+    /// N = 0: コールバックの中で描く。
+    Inline(Box<output_render::OutputRenderer>),
+    /// N ≥ 1: 描画スレッドが先に描いたものをリングから渡す。
+    Pipeline(output_render::RenderPipeline),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_stream(
     device: &cpal::Device,
@@ -953,36 +962,33 @@ fn build_stream(
     // `DeviceRt` is the CPAL closure's exclusive heap. It holds
     // master_l/r and the per-project scratch — pre-allocated, never
     // touched outside the audio thread.
-    mut local: DeviceRt,
+    local: DeviceRt,
 ) -> Result<cpal::Stream> {
     let channels_usize = channels as usize;
-    let max_frames = common::process_data::MAX_FRAMES;
-
-    // panic-button master declick. `AudioCommand::Panic` sets
-    // `shared.panic_declick`; the callback consumes that edge and fades the
-    // master out, then HOLDS it at zero until `AudioCommand::PanicRelease`
-    // (`shared.panic_release`) arrives — which daw_gui sends only once the
-    // plugin host has actually finished `ReinitAllPlugins` (reply
-    // `PluginsReinitDone`). Holding until the real reinit completion (rather
-    // than a fixed timer) means a stalled GUI main thread or a slow/large
-    // reinit can never un-mute the master while plugins are still ringing in
-    // the mix (the step-discontinuity click / re-exposed reverb tail this whole
-    // mechanism exists to prevent). A `declick_max_hold` safety auto-releases if
-    // the reply never comes (plugin-host hang) so the master can't get stuck.
-    //
-    // `declick_t` = samples since the envelope started (`None` = inactive).
-    // `declick_released_at` = the `declick_t` at which the fade-in began
-    // (`None` = still fading out / holding). Durations derive from the sample rate.
-    let sr64 = u64::from(session_sample_rate);
-    let declick_fade_out = (sr64 * 5 / 1000).max(1); // 5 ms
-    let declick_fade_in = (sr64 * 20 / 1000).max(1); // 20 ms
-    let declick_max_hold = sr64 * 2; // 2 s safety: auto-release if no reply
-    let mut declick_t: Option<u64> = None;
-    let mut declick_released_at: Option<u64> = None;
-    // resource monitor (r.md #3): DSP load average の EMA 状態。 callback 間で保持。
-    let mut dsp_load_ema: f32 = 0.0;
-    // r.md #49: アイドル park に入るまでの連続無音サンプル数。
-    let idle_park_samples = sr64 * engine::IDLE_PARK_DELAY_SECS;
+    let mmcss_failed = Arc::clone(&local.shared);
+    let renderer = output_render::OutputRenderer::new(
+        local,
+        shared,
+        bridge,
+        Arc::clone(&metrics),
+        scope,
+        device_scope,
+        session_sample_rate,
+        channels_usize,
+    );
+    // 試作 (先読みのパイプライン): N ≥ 1 なら描画スレッドが先に描き、コールバックはリングから渡すだけ
+    // (`output_render` の module doc)。起動時に 1 回だけ決め、再生中に変えない。
+    let n = output_render::pipeline_n_from_env();
+    tracing::info!(pipeline_n = n, "audio output: render-ahead periods");
+    let mut sink = if n == 0 {
+        OutputSink::Inline(Box::new(renderer))
+    } else {
+        OutputSink::Pipeline(
+            output_render::RenderPipeline::spawn(renderer, n)
+                .context("failed to spawn audio render thread")?,
+        )
+    };
+    let mut starve = output_render::StarveProbe::new();
     // E (plan §5): callback thread を MMCSS "Pro Audio" に自前 join する
     // one-shot フラグ (per-thread once — CPAL は単一 stream thread で callback
     // を直列に呼ぶ)。
@@ -1000,159 +1006,16 @@ fn build_stream(
                     // 保持 (revert は thread 終了時に OS 側で行われる)。 失敗は
                     // フラグに立て、 notify thread が 1 回だけ warn する
                     // (RT では tracing 禁止)。
-                    match common::mmcss::join_pro_audio() {
-                        Some(join) => std::mem::forget(join),
-                        None => local
-                            .shared
-                            .mmcss_join_failed
-                            .store(true, Ordering::Release),
+                    if let Some(join) = common::mmcss::join_pro_audio() {
+                        std::mem::forget(join);
+                    } else {
+                        mmcss_failed.mmcss_join_failed.store(true, Ordering::Release);
                     }
                 }
-                // resource monitor (r.md #3): callback 全体の処理時間を測る。
-                // plugin 処理は worker pool でブロッキング同期されるため、 この
-                // 区間に plugin 負荷が含まれる。 `Instant::now()` は RT 許容。
-                let cb_start = std::time::Instant::now();
-                let frames = (data.len() / channels_usize).min(max_frames);
-
-                local.process_buffer(&shared, &bridge, &scope, &device_scope, session_sample_rate, frames);
-
-                // consume the panic edge to (re)start the master
-                // declick envelope at sample 0 of this buffer.
-                if shared.panic_declick.swap(false, Ordering::AcqRel) {
-                    declick_t = Some(0);
-                    declick_released_at = None;
-                }
-                // Once the fade-out is done and we're holding at zero, release
-                // (begin the fade-in) when daw_gui signals the reinit finished,
-                // or when the safety hold cap is hit (reply never arrived).
-                if let Some(t) = declick_t
-                    && declick_released_at.is_none()
-                    && t >= declick_fade_out
-                    && (shared.panic_release.swap(false, Ordering::AcqRel)
-                        || t >= declick_fade_out + declick_max_hold)
-                {
-                    declick_released_at = Some(t);
-                }
-
-                // Interleave master_l/r into the device buffer, applying
-                // the panic declick envelope when active (master gain は
-                // render_master_buffer 内で適用済み — live/export 統一 §5)。
-                // Lanes beyond stereo on the device are zeroed.
-                unsafe {
-                    let dst = data.as_mut_ptr();
-                    for i in 0..frames {
-                        let dg = match declick_t {
-                            Some(t) => panic_declick_gain(
-                                t + i as u64,
-                                declick_fade_out,
-                                declick_fade_in,
-                                declick_released_at,
-                            ),
-                            None => 1.0,
-                        };
-                        let l = local.master_l[i] * dg;
-                        let r = local.master_r[i] * dg;
-                        let out = dst.add(i * channels_usize);
-                        *out = l;
-                        if channels_usize > 1 {
-                            *out.add(1) = r;
-                        }
-                        for c in 2..channels_usize {
-                            *out.add(c) = 0.0;
-                        }
-                    }
-                }
-                // Advance the envelope; clear it once the fade-in has finished
-                // so the master returns to full gain.
-                if let Some(t) = declick_t {
-                    let next = t + frames as u64;
-                    declick_t = match declick_released_at {
-                        Some(r) if next >= r + declick_fade_in => None,
-                        _ => Some(next),
-                    };
-                }
-                let filled = frames * channels_usize;
-                for s in &mut data[filled..] {
-                    *s = 0.0;
-                }
-
-                // r.md #49 のアイドル判定用「実際にデバイスへ出た音の無音判定」。
-                // r.md #50 でメーター表示の測定点は `render_master_buffer` 直後
-                // (= メトロノーム前) へ移したが、park してよいかは**スピーカーへ
-                // 出ている音**で決めなければならない (メトロノームが鳴っている
-                // 間に park すると click が切れる)。目的が違うので共有しない。
-                let (peak_l, peak_r) = block_peaks_stereo(data, channels_usize);
-
-                // resource monitor (r.md #3): DSP load を publish。 load =
-                // 処理時間 ÷ バッファ周期。 peak は直近窓の worst-case (GUI が
-                // swap でリセット)、 avg は EMA。 load>1.0 は dropout として記録。
-                let elapsed = cb_start.elapsed().as_secs_f32();
-                let load =
-                    common::metrics_bridge::dsp_load(elapsed, frames as u32, session_sample_rate);
-                metrics.observe_dsp_load_peak(load);
-                metrics.observe_load_hist(load);
-                publish_graph_profile(local.worker.as_deref(), &metrics);
-                dsp_load_ema = common::metrics_bridge::ema(dsp_load_ema, load, 0.1);
-                metrics.set_dsp_load_avg(dsp_load_ema);
-                metrics.set_buffer_info(frames as u32, session_sample_rate);
-                // xrun は再生中のみカウントする。 停止中 (無音) の callback 処理時間
-                // スパイク (起動直後の cold start / OS scheduling jitter) は実際の
-                // 音切れではないため除外する (どれか 1 project でも rolling なら再生中)。
-                let any_playing = local.any_playing();
-                if load > 1.0 && any_playing {
-                    metrics.add_xrun();
-                }
-
-                // r.md #49: アイドル park の判定。atomic の読み書きだけなので RT 安全。
-                //
-                // 「無音」を条件に含めているので、リバーブの残響や自走プラグイン
-                // (VCV Rack 等) が鳴っている間はカウンタが進まない = 音が途中で
-                // ブツッと切れることは構造的に起きない。
-                //
-                // **コールバックの最後に置くこと** — publish を 0 に畳む処理が、
-                // 上の meters / DSP load publish に上書きされてはならない。
-                // 複数 project では「どれか 1 つでも走っている / count-in 中」で判定する。
-                let idle = engine::buffer_is_idle(
-                    shared.app_active.load(Ordering::Acquire),
-                    local.any_rolling(),
-                    0,
-                    local.shared.export_running.load(Ordering::Acquire),
-                    peak_l,
-                    peak_r,
-                );
-                let idle_n = engine::advance_idle_counter(
-                    &shared.idle_silent_samples,
-                    idle,
-                    frames as u64,
-                );
-                if idle_n >= idle_park_samples {
-                    if !shared.park_requested.swap(true, Ordering::AcqRel) {
-                        // park に入る前に「動くもの」を 0 で publish しておく。
-                        // publish が止まった後も GUI は最後の値を読み続けるので、
-                        // これが無いと止まったメーターが点灯したまま凍結する。
-                        //
-                        // mod scalars は**ゼロにしない** — メーターではなく
-                        // パラメータ値なので、最後の値のまま凍結するのが正しい
-                        // (ゼロにすると画像 / 映像効果の見た目が飛ぶ)。
-                        //
-                        // r.md #50 のマスターメーターはここで何もしない: 解析器は
-                        // 「新しいフレームが来なかった経過時間ぶんの無音」を自分で
-                        // 流し込んで落ちるので、書き手側の後始末が要らない。
-                        for p in &local.projects {
-                            p.clear_meters(bridge.project(p.telemetry_slot));
-                        }
-                        dsp_load_ema = 0.0;
-                        metrics.set_dsp_load_avg(0.0);
-                    }
-                } else if shared.park_requested.load(Ordering::Acquire) {
-                    // 条件が崩れた (= resume 済み or 音が鳴り始めた)。要求を取り下げ
-                    // れば notify thread の reconciler が stream を起こす。
-                    //
-                    // `swap` でなく load してから store するのは、定常状態
-                    // (park 要求が無い) で **書き込みを一切出さない**ため。毎バッファ
-                    // RMW すると notify thread と共有するキャッシュラインを 10ms ごとに
-                    // 汚す。
-                    shared.park_requested.store(false, Ordering::Release);
+                starve.observe(data.len() / channels_usize, &metrics);
+                match &mut sink {
+                    OutputSink::Inline(r) => r.render(data, true),
+                    OutputSink::Pipeline(p) => p.on_callback(data, channels_usize),
                 }
             },
             |err| tracing::error!(?err, "audio stream error"),
