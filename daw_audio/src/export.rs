@@ -38,9 +38,10 @@ use common::model::Song;
 use common::protocol::RenderScope;
 use hound::{SampleFormat, WavSpec, WavWriter};
 
+use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::audio_worker::PoolRun;
-use crate::engine::{EngineShared, ProjectShared, WorkerRig};
-use crate::graph::{compile_schedule, render_master_buffer};
+use crate::engine::{EngineShared, PluginRefs, ProjectShared, WorkerRig};
+use crate::graph::{Schedule, compile_schedule, render_master_buffer};
 use crate::mixer::TrackScratch;
 
 /// Hard ceiling on the rendered tail (10 s past `length_beats`). Stops
@@ -186,6 +187,37 @@ pub fn run_export(
     write_video_sidecars: bool,
     on_progress: impl FnMut(u64, u64),
 ) -> Result<ExportOutcome> {
+    export_wav(
+        path,
+        engine_shared,
+        project,
+        song,
+        sample_rate,
+        max_frames,
+        span,
+        scope,
+        write_video_sidecars,
+        WINDOW_CLOSE_TIMEOUT,
+        on_progress,
+    )
+}
+
+/// [`run_export`] の本体。`window_close_timeout` = stall の窓が閉じるのを待つ上限 (本番は [`WINDOW_CLOSE_TIMEOUT`]。
+/// 検査は、閉じないまま諦める枝を短く通すために縮める)。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn export_wav(
+    path: PathBuf,
+    engine_shared: Arc<EngineShared>,
+    project: Arc<ProjectShared>,
+    song: Song,
+    sample_rate: u32,
+    max_frames: usize,
+    span: RenderSpan,
+    scope: RenderScope,
+    write_video_sidecars: bool,
+    window_close_timeout: std::time::Duration,
+    on_progress: impl FnMut(u64, u64),
+) -> Result<ExportOutcome> {
     let song = Arc::new(song);
     let win = RenderWindow::resolve(&song, sample_rate, span, true)?;
     let (write_start, write_end, walk_start, total_samples) =
@@ -237,6 +269,7 @@ pub fn run_export(
             write_end,
             walk_start,
             write_video_sidecars,
+            window_close_timeout,
             &mut sink,
             on_progress,
         )
@@ -384,17 +417,14 @@ fn wait_for_live_exit(engine_shared: &EngineShared) -> Result<()> {
 /// 抜けるのを待つ上限と揃える。
 const WINDOW_CLOSE_TIMEOUT: std::time::Duration = LIVE_EXIT_TIMEOUT;
 
-/// `rig` の pool の stall の窓が閉じるのを有界に待つ (書き出しのスレッドは off-RT なので寝てよい)。`false` = 閉じない。
-fn wait_window_closed(rig: &WorkerRig) -> bool {
-    let Some(pool) = rig.pool.as_ref() else { return true };
-    let deadline = std::time::Instant::now() + WINDOW_CLOSE_TIMEOUT;
-    while pool.window_open() {
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
+/// `rig` の pool の stall の窓が閉じるのを `timeout` まで待つ (書き出しのスレッドは off-RT なので寝てよい)。閉じたかは
+/// 走査の持ち主 (`WalkOwner`) が drop のときに見る。
+fn wait_window_closed(rig: &WorkerRig, timeout: std::time::Duration) {
+    let Some(pool) = rig.pool.as_ref() else { return };
+    let deadline = std::time::Instant::now() + timeout;
+    while pool.window_open() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    true
 }
 
 /// r.md #54: 範囲のラウドネスをオフラインで解析する。
@@ -458,6 +488,7 @@ pub fn run_loudness_analysis(
         win.write_end,
         win.walk_start,
         false,
+        WINDOW_CLOSE_TIMEOUT,
         &mut sink,
         |_, _| {},
     )?;
@@ -511,11 +542,155 @@ struct RenderOutcome {
     cancelled: bool,
 }
 
+/// 走査の物のうち、描画の器 (`RenderCtx`) が番地で指しうる物。持ち主は [`WalkOwner`] (heap に 1 つ置く)。
+///
+/// 器の referent は全部この heap の中か、これが持つ `Arc` の先に居る (`crate::audio_worker` の module doc の「窓」の
+/// 規則: 器は走査のスレッドのスタックの値を指さない)。1 buffer を描く口は [`Self::render`] だけで、
+/// `render_master_buffer` へ渡す借用は全部 `self` から取る — 走査の局所を器へ渡す口が無い。
+struct Walk {
+    song: Arc<Song>,
+    /// live と同じく、描画は song の索引で lane / routing / node を引く (書き出し中 song は変わらないので 1 回)。
+    song_index: common::song_index::SongIndex,
+    schedule: Schedule,
+    scratch: Vec<TrackScratch>,
+    master_l: Vec<f32>,
+    master_r: Vec<f32>,
+    /// r.md #129: master Limiter の状態は **書き出しごとに新品** (= 決定論的)。内蔵 device の状態も
+    /// この走査で compile する schedule の新品の scratch に居る (live の `adopt_state_from` を通らない)。
+    master_limiter: crate::native_dsp::MasterLimiterState,
+    /// r.md #89: 変調の制御グリッド。**live engine と同じ 1 本** (`crate::mod_tick`、アーキ不変条件 6)。
+    mod_tick: crate::mod_tick::ModTickRunner,
+    /// `Schedule` の follower slot → 係数表の列 (live と同じ `FollowerMaps::cols`)。
+    follower_cols: Vec<u16>,
+    /// r.md #87: 行ごとの時間軸の供給元 (ランチャーの走行状態)。
+    launcher: crate::launcher::LauncherRuntime,
+    /// Phase 4 Step C-2: offline export 中は recording lane なし
+    /// (= GUI が active gesture を持たない、 transport が freewheel)。
+    recording_lanes: std::collections::HashSet<(u32, common::model::AutomationTarget)>,
+    tables: BufferTables,
+}
+
+/// buffer ごとに読み直す表 (live の notify thread が見るのと同じ wait-free の snapshot。この走査は off-RT なので
+/// ArcSwap を load してよい)。
+struct BufferTables {
+    plugin_refs: Arc<PluginRefs>,
+    worker: Option<Arc<WorkerRig>>,
+    audio_renderer: Arc<AudioClipRenderer>,
+}
+
+impl BufferTables {
+    fn load(engine_shared: &EngineShared, project: &ProjectShared) -> Self {
+        Self {
+            plugin_refs: project.plugin_refs.load_full(), // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
+            worker: engine_shared.worker.load_full(), // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
+            audio_renderer: project.audio_clip_renderer.load_full(), // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
+        }
+    }
+}
+
+/// 1 buffer の transport (刻みが解いた値)。
+struct BufferTransport {
+    /// `write_end` を越えたら false = live の Stop と同じ状態 ([`render_loop`] の `tail_started`)。tail は減衰だけを録る。
+    playing: bool,
+    /// live 側 (engine.rs `current_bpm`) と同じ effective tempo。base `song.bpm` を渡すと、event 収集窓
+    /// (frames×bpm/(60·SR)) とループ末尾の beat 累算 (effective tempo) が乖離し、tempo automation 中の書き出しで
+    /// ノートが欠落 / 二重発音する。
+    bpm: f32,
+    playhead_beats: f64,
+    /// buffer 頭の絶対サンプル位置 (フォロワーの刻み境界)。
+    playhead: u64,
+}
+
+/// [`Walk`] の唯一の持ち主。drop のとき、最後の描画の窓がまだ開いていれば中身を解放せずに忘れる (leak) — 生き残りが
+/// 器を通して触りうる (`crate::audio_worker` の module doc の「窓」の規則: leak は referent を番地ごと持つ持ち主を忘れる
+/// 形でだけ行う。live の `DeviceRt` の Drop が窓の開いた project を忘れるのと同じ形)。書き出しのスレッドは戻って
+/// スタックを返すが、heap の中身は番地ごと残る。忘れるか解放するかを決めるのはこの Drop だけで、途中の `?` や panic の
+/// unwind で抜けても窓の間は解放しない。中身は借用でだけ見せる (`Deref` / `DerefMut`) ので、値を持ち出して一部だけを
+/// 残す口も無い。
+struct WalkOwner(std::mem::ManuallyDrop<Box<Walk>>);
+
+impl WalkOwner {
+    fn new(walk: Walk) -> Self {
+        Self(std::mem::ManuallyDrop::new(Box::new(walk)))
+    }
+}
+
+impl std::ops::Deref for WalkOwner {
+    type Target = Walk;
+    fn deref(&self) -> &Walk {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for WalkOwner {
+    fn deref_mut(&mut self) -> &mut Walk {
+        &mut self.0
+    }
+}
+
+impl Drop for WalkOwner {
+    fn drop(&mut self) {
+        if self.0.window_open() {
+            return;
+        }
+        // SAFETY: 中身を落とすのはここだけで、この後 `self.0` に触らない。
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.0) };
+    }
+}
+
+impl Walk {
+    /// 最後の描画 ([`Self::render`]) の stall の窓がまだ開いている (文脈を持ったまま走る runner が居る)。
+    fn window_open(&self) -> bool {
+        self.tables.worker.as_deref().and_then(|rig| rig.pool.as_ref()).is_some_and(|pool| pool.window_open())
+    }
+
+    /// 1 buffer を live と同一の単一 render 経路 (§5: dispatch → schedule → master fx → master gain) で `master_l` /
+    /// `master_r` の頭 `frames` に描く。器へ渡る借用は全部 `self` から取る (struct の doc)。
+    fn render(
+        &mut self,
+        engine_shared: &EngineShared,
+        project: &ProjectShared,
+        sample_rate: u32,
+        frames: usize,
+        t: &BufferTransport,
+    ) -> PoolRun {
+        self.tables = BufferTables::load(engine_shared, project);
+        let master_gain = f32::from_bits(project.master_gain.load(Ordering::Relaxed));
+        render_master_buffer(
+            &self.song,
+            &self.song_index,
+            &mut self.schedule,
+            &mut self.scratch,
+            &self.tables.plugin_refs,
+            self.tables.worker.as_deref(),
+            &self.tables.audio_renderer,
+            &mut self.master_l[..frames],
+            &mut self.master_r[..frames],
+            sample_rate,
+            frames as u32,
+            t.playing,
+            // export (freewheel render) は loop しない。
+            common::model::LoopRegion::default(),
+            &self.recording_lanes,
+            t.bpm,
+            t.playhead_beats,
+            self.mod_tick.plane(),
+            self.mod_tick.follower_drive(&self.follower_cols, t.playhead),
+            self.launcher.rows(),
+            master_gain,
+            &mut self.master_limiter,
+            // r.md #129: 書き出しは「聴き方・見方」を持たない = SC Listen の音も device scope への
+            // 書き込みも WAV に乗らない (構造的な保証)。
+            crate::graph::NativeIo::default(),
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
     engine_shared: &EngineShared,
     project: &ProjectShared,
-    // `Arc` で受けるのは、stall の窓が閉じないとき走査の物と一緒に leak するため (`PoolRun::InFlight`)。
+    // `Arc` で受けるのは、走査の持ち主 ([`Walk`]) が曲を持つため (stall の窓が閉じないとき一緒に leak する)。
     song: &Arc<Song>,
     scope: RenderScope,
     sample_rate: u32,
@@ -525,19 +700,13 @@ fn render_loop(
     write_end: u64,
     walk_start: u64,
     write_video_sidecars: bool,
+    // stall の窓が閉じるのを待つ上限 (本番は [`WINDOW_CLOSE_TIMEOUT`])。
+    window_close_timeout: std::time::Duration,
     sink: &mut dyn RenderSink,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<RenderOutcome> {
     // heap 確保はここで一度だけ (この走査は off-RT)。器は曲が要る分だけ (上限を置かない)。
-    let mut scratch_buf: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
-    let mut master_l_buf: Vec<f32> = vec![0.0; max_frames];
-    let mut master_r_buf: Vec<f32> = vec![0.0; max_frames];
-    // r.md #129: master Limiter の状態は **書き出しごとに新品** (= 決定論的)。内蔵 device の状態も
-    // この走査で compile する schedule の新品の scratch に居る (live の `adopt_state_from` を通らない)。
-    let mut master_limiter = crate::native_dsp::MasterLimiterState::new();
-    let scratch = &mut scratch_buf[..];
-    let master_l = &mut master_l_buf[..];
-    let master_r = &mut master_r_buf[..];
+    let mut scratch: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
     // Tail-silence cutoff: stop early if the master bus stays under
     // -60 dB for half a second once we're past the song body.
     let silence_thresh: f32 = 0.001;
@@ -611,7 +780,7 @@ fn render_loop(
     // PDC の入力 (device 単位の報告 latency) と読み込み中の device (r.md #131) は live publish と同じ表を読む
     // (`compile_schedule` は live / export 共通なので入力も共通)。GUI はオフライン描画を plugin の読み込みが全部
     // 確定するまで待ってから始める (`AppData::resume_after_plugin_loads`) ので、ここで表は空のはず。
-    let mut schedule = compile_schedule(
+    let schedule = compile_schedule(
         song,
         &project.device_latencies.load(), // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
         &project.loading_devices.load(), // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
@@ -646,7 +815,6 @@ fn render_loop(
     // フォローアクションがどこで次の列へ移ったかを知らないので、焼かないと
     // 「音は Scene2 へ移ったのに絵は Scene1 を延々ループ」になる。
     let mut launcher_sidecar = crate::launcher::sidecar::SidecarRecorder::new();
-    // live と同じく、描画は song の索引で lane / routing / node を引く (書き出し中 song は変わらないので 1 回)。
     let song_index = common::song_index::SongIndex::build(song);
     // r.md #89: 変調の制御グリッド。**live engine と同じ 1 本** (`crate::mod_tick`、
     // アーキ不変条件 6) を通すので、刻みの割り方も transport の進め方も
@@ -681,12 +849,6 @@ fn render_loop(
     let crate::mod_tick::FollowerMaps { cols: follower_cols, env_of_slot: follower_env_of_slot } =
         crate::mod_tick::FollowerMaps::build(&plan, &schedule.follower_keys);
 
-    // Phase 4 Step C-2: offline export 中は recording lane なし
-    // (= GUI が active gesture を持たない、 transport が freewheel)。
-    let empty_recording_lanes: std::collections::HashSet<
-        (u32, common::model::AutomationTarget),
-    > = std::collections::HashSet::new();
-
     // Frame counter for the WAV output. The walk starts at `walk_start`
     // (= 0 for full / warm bounce so plugin state at `write_start` is built
     // up; = `write_start` for a cold range). Samples before `write_start` are
@@ -712,6 +874,21 @@ fn render_loop(
     // その前提 (§1.4)。
     let mut launcher = crate::launcher::LauncherRuntime::for_song(song);
     launcher.arm_reseed();
+    // ここから先、描画の器が指しうる物は全部この持ち主の中 (`Walk` / `WalkOwner` の doc)。
+    let mut walk = WalkOwner::new(Walk {
+        song: Arc::clone(song),
+        song_index,
+        schedule,
+        scratch,
+        master_l: vec![0.0; max_frames],
+        master_r: vec![0.0; max_frames],
+        master_limiter: crate::native_dsp::MasterLimiterState::new(),
+        mod_tick,
+        follower_cols,
+        launcher,
+        recording_lanes: std::collections::HashSet::new(),
+        tables: BufferTables::load(engine_shared, project),
+    });
     // グローバルローンチ量子化は engine と同じ値を使う (セルの `Global` の解決先)。
     // r.md #87: 生成と同じく `Song` が SSoT (engine.rs の同名変数と同じ理由)。
     // 書き出しは曲頭から freewheel で描き直すので、実行時の速報ではなく
@@ -748,28 +925,20 @@ fn render_loop(
         let remaining = total_samples - playhead;
         let frames = (remaining as usize).min(max_frames);
 
+        let w = &mut *walk;
         // 本体を描き終えた最初の buffer で 1 度だけ transport を止める (上の doc)。
         if !tail_started && playhead >= write_end {
             tail_started = true;
-            crate::mixer::queue_all_notes_off(scratch);
-            launcher.silence_all();
+            crate::mixer::queue_all_notes_off(&mut w.scratch);
+            w.launcher.silence_all();
         }
         let playing = !tail_started;
-
-        // Snapshot the same wait-free state the notify thread sees (mirrors —
-        // this thread is off-RT, so ArcSwap loads are fine here)。`Arc` で持つのは、stall の窓が閉じないときに
-        // leak できるように (下の `PoolRun::InFlight`)。
-        let plugin_refs_g = project.plugin_refs.load_full(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
-        let worker_g = engine_shared.worker.load_full(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
-        let audio_renderer_g = project.audio_clip_renderer.load_full(); // arch-lint: allow-arcswap-load (off-RT: 書き出しの走査スレッド)
-        let audio_renderer: &crate::audio_clip_renderer::AudioClipRenderer =
-            &audio_renderer_g;
 
         // r.md #89: 刻みを回して、この buffer の変調値面と transport を解く
         // (live engine と同じ `ModTickRunner`)。テンポも `next_mark` が解くので、
         // ここで `evaluate_song_tempo` を別に呼ぶと live と規則が食い違う。
         let head_mark = {
-            let sched = &schedule;
+            let sched = &w.schedule;
             let env_of = &follower_env_of_slot;
             let follower_env = |plan_slot: u16, tick: i64| {
                 match env_of.get(usize::from(plan_slot)).copied() {
@@ -781,20 +950,17 @@ fn render_loop(
                 }
             };
             // r.md #117: live と同じ規則で `Note` 起点の最新ノートを渡す (書き出しの再現)。
-            let plan = std::sync::Arc::clone(&mod_tick.plan);
-            let scratch_ref = &*scratch;
+            let plan = std::sync::Arc::clone(&w.mod_tick.plan);
+            let scratch_ref = &w.scratch;
             let note_anchor = |plan_slot: u16| -> Option<common::mod_graph::NoteAnchor> {
                 let idx = plan.nodes.get(usize::from(plan_slot))?.owner_track_index?;
                 scratch_ref.get(idx as usize)?.state.latest_note
             };
-            mod_tick.run_buffer(song, &song_index, playhead, frames as u32, sample_rate, follower_env, note_anchor)
+            w.mod_tick.run_buffer(song, &w.song_index, playhead, frames as u32, sample_rate, follower_env, note_anchor)
         };
         playhead_beats = head_mark.beat;
         let smoothed_current_bpm_freewheel = head_mark.bpm;
 
-        // live と同一の単一 render 経路 (§5): dispatch → schedule → master fx
-        // → master gain。 export (freewheel render) は loop しない。
-        let master_gain = f32::from_bits(project.master_gain.load(Ordering::Relaxed));
         // 行ごとの時間軸を live と同じ解き方で更新する (不変条件 6 — 片方だけ
         // 別経路にすると「聴こえた通りに書き出す」が成立しない)。
         let span = crate::launcher::runtime::BufferSpan::new(
@@ -803,67 +969,27 @@ fn render_loop(
             sample_rate,
             frames as u32,
         );
-        launcher.update(song, &song_index, span, global_launch_quantize, playing);
+        w.launcher.update(song, &w.song_index, span, global_launch_quantize, playing);
         if write_video_sidecars {
-            launcher_sidecar.record(launcher.rows(), span);
+            launcher_sidecar.record(w.launcher.rows(), span);
         }
-        let rendered = render_master_buffer(
-            song,
-            &song_index,
-            &mut schedule,
-            scratch,
-            &plugin_refs_g,
-            worker_g.as_deref(),
-            audio_renderer,
-            &mut master_l[..frames],
-            &mut master_r[..frames],
-            sample_rate,
-            frames as u32,
-            // `write_end` を越えたら false = live の Stop と同じ状態 (上の
-            // `tail_started` の doc)。tail は減衰だけを録る。
+        let transport = BufferTransport {
             playing,
-            // export (freewheel render) は loop しない。
-            common::model::LoopRegion::default(),
-            &empty_recording_lanes,
-            // live 側 (engine.rs `current_bpm`) と同じ effective tempo を渡す。
-            // base `song.bpm` を渡すと、 event 収集窓 (frames×bpm/(60·SR)) と
-            // ループ末尾の beat 累算 (effective tempo) が乖離し、 tempo
-            // automation 中の書き出しでノートが欠落 / 二重発音する。
-            smoothed_current_bpm_freewheel as f32,
+            bpm: smoothed_current_bpm_freewheel as f32,
             playhead_beats,
-            mod_tick.plane(),
-            mod_tick.follower_drive(&follower_cols, playhead),
-            launcher.rows(),
-            master_gain,
-            &mut master_limiter,
-            // r.md #129: 書き出しは「聴き方・見方」を持たない = SC Listen の音も device scope への
-            // 書き込みも WAV に乗らない (構造的な保証)。
-            crate::graph::NativeIo::default(),
-        );
-        match rendered {
+            playhead,
+        };
+        match w.render(engine_shared, project, sample_rate, frames, &transport) {
             PoolRun::Finished => {}
             // 描き切れなかった buffer を無音で書いて成功にしない。
             PoolRun::Stalled => anyhow::bail!("worker pool stalled while rendering offline"),
-            PoolRun::InFlight => {
-                // 文脈を持ったまま走る runner (生き残り) が居る (`render_master_buffer` の doc): 文脈が指すこの走査の
-                // 物を、窓が閉じるまで手放さない。閉じなければ (止められた runner が戻らない) leak する — 解放すると
-                // 生き残りが解放済みに触り、待ち続けると書き出しの予約を持ったまま live が無音から戻らない。
-                if !worker_g.as_deref().is_some_and(wait_window_closed) {
-                    std::mem::forget((
-                        scratch_buf,
-                        master_l_buf,
-                        master_r_buf,
-                        schedule,
-                        song_index,
-                        mod_tick,
-                        follower_cols,
-                        launcher,
-                        empty_recording_lanes,
-                        plugin_refs_g,
-                        worker_g,
-                        audio_renderer_g,
-                        Arc::clone(song),
-                    ));
+            PoolRun::InFlight(_) => {
+                // 文脈を持ったまま走る runner (生き残り) が居る (`render_master_buffer` の doc): 窓が閉じるのを有界に
+                // 待ってから失敗で戻る。文脈が指す物 (全部 `walk` の中) は、窓が閉じていなければ持ち主の drop が忘れる
+                // (`WalkOwner`) — 解放すると生き残りが解放済みに触り、待ち続けると書き出しの予約を持ったまま live が
+                // 無音から戻らない。
+                if let Some(rig) = w.tables.worker.as_deref() {
+                    wait_window_closed(rig, window_close_timeout);
                 }
                 anyhow::bail!("worker pool stalled while rendering offline");
             }
@@ -875,7 +1001,7 @@ fn render_loop(
         // (750Hz) ではなく buffer (≒50〜100Hz) の粒度で足りる。
         if env_sidecar.n_sources() > 0 {
             #[allow(clippy::cast_possible_truncation)]
-            env_sidecar.push(playhead_beats as f32, mod_tick.publish_plane().values());
+            env_sidecar.push(playhead_beats as f32, w.mod_tick.publish_plane().values());
         }
 
         // Compute block peak across the full block (for tail-silence
@@ -884,8 +1010,8 @@ fn render_loop(
         let block_end = playhead + frames as u64;
         let mut block_peak: f32 = 0.0;
         for i in 0..frames {
-            let l = master_l[i];
-            let r = master_r[i];
+            let l = w.master_l[i];
+            let r = w.master_r[i];
             block_peak = block_peak.max(l.abs()).max(r.abs());
         }
 
@@ -897,7 +1023,7 @@ fn render_loop(
         // state advances) but skipped from the output.
         if block_end > write_start {
             let local_start = ((write_start.saturating_sub(block_start)) as usize).min(frames);
-            sink.accept(&master_l[local_start..frames], &master_r[local_start..frames])?;
+            sink.accept(&w.master_l[local_start..frames], &w.master_r[local_start..frames])?;
             frames_written += (frames - local_start) as u64;
         }
 
@@ -1021,6 +1147,7 @@ mod tests {
                 win.write_end,
                 win.walk_start,
                 false,
+                WINDOW_CLOSE_TIMEOUT,
                 &mut sink,
                 |_, _| {},
             )
@@ -1166,6 +1293,7 @@ mod tests {
             win.write_end,
             win.walk_start,
             false,
+            WINDOW_CLOSE_TIMEOUT,
             &mut sink,
             |_, _| {},
         )
@@ -1525,6 +1653,51 @@ mod tests {
         let half = render_mix_in(&engine, &project, &song, 0.0, 2.0);
         assert!(peak(&unity) > 0.1, "前提: 鳴っている");
         assert!(peak(&half) < peak(&unity) * 0.75, "master 音量が pool 経路の出力に効いていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 書き出しは buffer ごとに rig と plugin の表を読み直す (書き出しの途中の plugin host の立て直しで差し替わる)。
+    /// 途中で差し替えた rig は、次の buffer の描画から使う。
+    #[test]
+    fn 書き出しの途中で差し替えた_rig_は次の_buffer_から使う() {
+        let dir = bounce_temp_dir("rig_swap");
+        let rig = |tag: &str| {
+            Arc::new(WorkerRig::new(
+                None,
+                Vec::new(),
+                1,
+                common::worker_bridge::WorkerBridgeHandle::create(&format!("daw01_test_rig_swap_{tag}_{}", std::process::id()))
+                    .expect("worker bridge"),
+            ))
+        };
+        let (first, second) = (rig("first"), rig("second"));
+        let engine = Arc::new(EngineShared::new());
+        engine.worker.store(Some(Arc::clone(&first)));
+        let project = Arc::new(ProjectShared::new(common::protocol::ProjectKey(1), 0));
+        let mut buffers = 0;
+        let mut on_second_after_swap = None;
+        run_export(
+            dir.join("swap.wav"),
+            Arc::clone(&engine),
+            project,
+            Song::default(),
+            BOUNCE_SR,
+            common::process_data::MAX_FRAMES,
+            RenderSpan::RangeCold { start_beat: 0.0, end_beat: 4.0 },
+            RenderScope::Mix,
+            false,
+            |_, _| {
+                buffers += 1;
+                match buffers {
+                    1 => engine.worker.store(Some(Arc::clone(&second))),
+                    2 => on_second_after_swap = Some(second.profile.take().buffers),
+                    _ => {}
+                }
+            },
+        )
+        .expect("export");
+        assert!(buffers > 2, "前提: 何 buffer か描いた");
+        assert_eq!(on_second_after_swap, Some(1), "差し替えた rig を次の buffer の描画で使わない (buffer ごとに読み直さない)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

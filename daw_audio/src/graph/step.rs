@@ -51,6 +51,9 @@ pub struct BufferParams<'a> {
 /// 1 buffer の描画の文脈。**dispatch 窓の間だけ** 生きる (直列実行では呼び側のスタック上、並列実行では pool の器へ
 /// 移して worker へポインタで渡す — stall で呼び側が先に戻っても生き残りが読めるように。`crate::audio_worker` の
 /// module doc の「窓」)。可変な資源は生ポインタで持ち、手ごとに `unsafe` 引き口で借りる。
+///
+/// 文脈が指す物 ([`Self::referents`]) は、呼び側のスレッドのスタックに置かない — 呼び側は窓が閉じる前に戻りうる
+/// (同じ module doc の規則。`AudioWorkerPool::run` が debug build で番地を見る)。
 pub struct RenderCtx<'a> {
     pub song: &'a Song,
     /// `song` と同じ snapshot の索引。
@@ -127,6 +130,92 @@ impl<'a> RenderCtx<'a> {
             params: BufferParams { frames: n as u32, ..params },
             _borrow: PhantomData,
         }
+    }
+
+    /// この文脈が番地で指す物 (名前と番地) の全部。窓の規則 (器は呼び側のスレッドのスタックの値を指さない) を手の
+    /// 列挙でなく機械で見るための列で、field を残らず分解する — 指す物を足すと、ここに足さない限り組めない。
+    /// 空の slice の番地は dangling (どのスタックにも無い)。読むのは debug build の `audio_worker::gate::in_flight` だけ。
+    #[cfg(debug_assertions)]
+    pub fn referents(&self) -> [(&'static str, usize); 30] {
+        fn at<T: ?Sized>(r: &T) -> usize {
+            std::ptr::from_ref(r).cast::<u8>() as usize
+        }
+        let Self {
+            song,
+            index,
+            scratch,
+            n_scratch: _,
+            programs,
+            n_programs: _,
+            master_program,
+            master_l,
+            master_r,
+            n: _,
+            delay_lines,
+            n_delay_lines: _,
+            follower_slots,
+            n_followers: _,
+            nodes,
+            input_delays,
+            solo,
+            graph,
+            rig,
+            plugin_refs,
+            audio_renderer,
+            params,
+            _borrow: _,
+        } = self;
+        let BufferParams {
+            sample_rate: _,
+            frames: _,
+            playing: _,
+            any_solo: _,
+            recording_lanes,
+            current_bpm: _,
+            playhead_beats: _,
+            loop_region: _,
+            mod_plane,
+            follower_drive,
+            rows,
+            native_io,
+            transpose: _,
+        } = params;
+        let ModTickPlaneRef { ids, col_of, values, depth_ids, depth_col_of, depths, lead: _, first_sample: _, nodes: mod_nodes } =
+            mod_plane;
+        let FollowerDrive { spans, first_sample: _, col_of_slot, eff, n_cols: _ } = follower_drive;
+        let NativeIo { sc_listen: _, scopes } = native_io;
+        [
+            ("song", at(*song)),
+            ("index", at(*index)),
+            ("scratch", *scratch as usize),
+            ("track_programs", *programs as usize),
+            ("master_program", *master_program as usize),
+            ("master_l", *master_l as usize),
+            ("master_r", *master_r as usize),
+            ("delay_lines", *delay_lines as usize),
+            ("follower_slots", *follower_slots as usize),
+            ("nodes", at(*nodes)),
+            ("input_delays", at(*input_delays)),
+            ("solo", at(*solo)),
+            ("graph", at(*graph)),
+            ("rig", rig.map_or(0, at)),
+            ("plugin_refs", at(*plugin_refs)),
+            ("audio_renderer", audio_renderer.map_or(0, at)),
+            ("recording_lanes", at(*recording_lanes)),
+            ("mod_plane.ids", at(*ids)),
+            ("mod_plane.col_of", at(*col_of)),
+            ("mod_plane.values", at(*values)),
+            ("mod_plane.depth_ids", at(*depth_ids)),
+            ("mod_plane.depth_col_of", at(*depth_col_of)),
+            ("mod_plane.depths", at(*depths)),
+            ("mod_plane.nodes", at(*mod_nodes)),
+            ("follower_drive.spans", at(*spans)),
+            ("follower_drive.col_of_slot", at(*col_of_slot)),
+            ("follower_drive.eff", at(*eff)),
+            ("rows", at(*rows)),
+            ("native_io.scopes.bridge", scopes.map_or(0, |s| at(s.bridge))),
+            ("native_io.scopes.watch", scopes.map_or(0, |s| at(s.watch))),
+        ]
     }
 
     // ---- 資源の引き口 ----

@@ -755,7 +755,8 @@ pub(super) fn advance_follower(
 /// (曲・索引・schedule・scratch・master バス・plugin の表・renderer・rig と、`recording_lanes` / `mod_plane` /
 /// `follower_drive` / `rows` / `native_io` が指す物) を、窓が閉じる (`AudioWorkerPool::window_open` が false) まで
 /// 解放も再利用もしてはならない** — 文脈を持ったまま走る runner が居る (`audio_worker` の module doc)。そのとき
-/// master バスには何も書いていない。
+/// master バスには何も書いていない。呼び側は窓が閉じる前に戻りうるので、これらは呼び側のスレッドのスタックに
+/// 置かない (heap の持ち主の中に置き、閉じないまま諦めるならその持ち主を忘れる形でだけ leak する — 同 module doc)。
 #[allow(clippy::too_many_arguments)]
 pub fn render_master_buffer(
     song: &Song,
@@ -868,7 +869,7 @@ pub fn render_master_buffer(
     }
     // 生き残りが文脈を持っている (窓が開いている): 渡した物には何も書かずに戻る — master の段も通さない
     // (`PoolRun::InFlight` の契約。呼び側は窓が閉じるまで渡した物を解放も再利用もしない)。
-    if ran == PoolRun::InFlight {
+    if matches!(ran, PoolRun::InFlight(_)) {
         return ran;
     }
     // stall した pool はこの buffer を描き切っていない (plan §4: stalled = 無音)。途中までの track 出力 / 合流を

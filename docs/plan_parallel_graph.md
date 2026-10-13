@@ -86,10 +86,10 @@ T を先頭から走査し、資源ごとに `last_writer` と「その後の re
 
 ## 3. RT 実行器 (`audio_worker.rs`)
 
-- 1 buffer の文脈は 1 本の構造体 (`graph::step::RenderCtx`、dispatch 窓の間だけ callback スレッドのスタックに
-  生きる) のポインタで worker へ渡す。worker は `inside` を立ててから読み、callback スレッドはグラフが終わったら
-  ポインタを消して `inside` が 0 になるまで待つ (Dekker 型: 立てる → 読む / 消す → 数える)。project ごとの
-  schedule が差し替わっても、戻った後に worker が触ることはない。
+- 1 buffer の文脈は 1 本の構造体 (`graph::step::RenderCtx`、pool の器に置く — 下の「窓」) のポインタで worker へ
+  渡す。worker は `inside` を立ててから読み、callback スレッドはグラフが終わったらポインタを消して `inside` が 0 に
+  なるまで待つ (Dekker 型: 立てる → 読む / 消す → 数える)。project ごとの schedule が差し替わっても、戻った後に
+  worker が触ることはない。
 - 取り方: 最初から走れる job (`roots`、track 本体の大半) は数も並びも compile 時に決まっているので queue に積まず
   `fetch_add` で取らせる (取り合いで失敗しない)。途中で走れるようになった job だけ ready queue (容量 = job 数の
   配列 + `tail` 予約 + `head` CAS、未書き込みの席は番兵) に積む。job を終えた runner は、待ちが無くなった後続の
@@ -127,6 +127,13 @@ T を先頭から走査し、資源ごとに `last_writer` と「その後の re
   呼び側は窓が閉じるまで文脈の指す物を解放も再利用もしない。live はその project を凍結し (描画・便の取り込み・
   transport・コマンド・bus の合算から外し、生き残りが借りる rig を持つ)、書き出しは有界に待って失敗する (閉じなければ
   走査の物を leak)。動き出した生き残りは残りの plugin を叩かない (`PairLease::slot` が stall 後は `None`)。
+  - 呼び側は窓が閉じる前に戻りうるので、**文脈が指す物は呼び側のスレッドのスタックに置かない** (live は
+    `Box<ProjectRt>` と `Arc`、書き出しは走査の持ち主 `export::WalkOwner` の heap)。leak は **referent を番地ごと
+    持つ持ち主 (`Box` / `Arc`) を忘れる形でだけ** 行う — スタックの値を `forget` へ動かしても、文脈が指していた番地は
+    残らない。忘れるか解放するかは持ち主の Drop が窓を見て決める (live の `DeviceRt`、書き出しの `WalkOwner`)。
+    手で列挙せず、InFlight を返す口 (`audio_worker::gate::in_flight` — `PoolRun::InFlight` の証はここでしか作れない)
+    が debug build で毎回、文脈の referent (`RenderCtx::referents` — field を全部分解するので、指す物を足すとそこを
+    直さない限り組めない) が呼び側のスレッドのスタックの範囲 (`GetCurrentThreadStackLimits`) に無いことを見る。
 
 RT 規約: 確保・解放・ロックなし (作業領域は `Schedule` と一緒に届く)。待ちは同一プロセスの event と bounded な
 terminal 待ちだけ (不変条件 4)。

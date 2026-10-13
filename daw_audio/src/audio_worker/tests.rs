@@ -33,6 +33,8 @@ const GEN: u32 = 1;
 /// 生き残りを止めておく時間。master が諦めるのは進みが最後に変わってから `POOL_WAIT_TIMEOUT_MS` (1 s) を 1〜2 回
 /// 待った後なので、その 2 倍より長く、窓の間の検査が終わるまで生き残りが動き出さない長さ。
 const SUSPEND: Duration = Duration::from_millis(2_600);
+/// [`FakeHost::hold`] で止めたままにする上限 (検査が途中で落ちても host の thread を join できるように)。
+const HOLD_MAX: Duration = Duration::from_secs(30);
 const SR: u32 = 48_000;
 const FRAMES: usize = 256;
 
@@ -56,6 +58,9 @@ struct FakeHost {
     /// 立っている間、worker (pair 1) の次の依頼で audio worker の thread を [`SUSPEND`] だけ止める。依頼は止めている
     /// 間に終えるので、起きた worker は完了を見て手を続ける (期限切れにも quarantine にもならない)。
     suspend_next: Arc<AtomicBool>,
+    /// 立っている間、[`Self::suspend_next`] で止めた worker を [`SUSPEND`] で動かさず、下ろされるまで止めたままにする
+    /// (呼び側が窓の閉じるのを諦めて戻った後に生き残りを動かす形を、時間の揺れに依らずに作る)。
+    hold: Arc<AtomicBool>,
 }
 
 impl FakeHost {
@@ -66,6 +71,7 @@ impl FakeHost {
 
     fn stop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.hold.store(false, Ordering::SeqCst);
         for &w in &self.wakes {
             unsafe {
                 let _ = SetEvent(HANDLE(w as *mut _));
@@ -96,6 +102,7 @@ fn pooled_rig(tag: &str, delays: [Duration; 2]) -> (Arc<WorkerRig>, FakeHost) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let calls = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
     let suspend_next = Arc::new(AtomicBool::new(false));
+    let hold = Arc::new(AtomicBool::new(false));
     let worker_thread = Arc::new(AtomicUsize::new(0));
     let mut slots = Vec::new();
     let mut threads = Vec::new();
@@ -117,8 +124,13 @@ fn pooled_rig(tag: &str, delays: [Duration; 2]) -> (Arc<WorkerRig>, FakeHost) {
         let done = create_named_event(&done_name).unwrap().0 as usize;
         wakes.push(wake);
         let channel = SendPtr(&host_bridge.bridge().channels[i] as *const WorkerChannel);
-        let (shutdown, calls, suspend_next, worker_thread) =
-            (Arc::clone(&shutdown), Arc::clone(&calls), Arc::clone(&suspend_next), Arc::clone(&worker_thread));
+        let (shutdown, calls, suspend_next, hold, worker_thread) = (
+            Arc::clone(&shutdown),
+            Arc::clone(&calls),
+            Arc::clone(&suspend_next),
+            Arc::clone(&hold),
+            Arc::clone(&worker_thread),
+        );
         threads.push(std::thread::spawn(move || {
             let channel = channel;
             let ch = unsafe { &*channel.0 };
@@ -129,7 +141,14 @@ fn pooled_rig(tag: &str, delays: [Duration; 2]) -> (Arc<WorkerRig>, FakeHost) {
                 let worker = HANDLE(worker_thread.load(Ordering::SeqCst) as *mut _);
                 let suspended =
                     i == 1 && suspend_next.swap(false, Ordering::SeqCst) && unsafe { SuspendThread(worker) } != u32::MAX;
-                std::thread::sleep(if suspended { SUSPEND } else { delay });
+                if suspended && hold.load(Ordering::SeqCst) {
+                    let until = Instant::now() + HOLD_MAX;
+                    while hold.load(Ordering::SeqCst) && Instant::now() < until {
+                        std::thread::sleep(ms(1));
+                    }
+                } else {
+                    std::thread::sleep(if suspended { SUSPEND } else { delay });
+                }
                 calls[i].fetch_add(1, Ordering::SeqCst);
                 ch.complete(req, done);
                 if suspended {
@@ -149,7 +168,7 @@ fn pooled_rig(tag: &str, delays: [Duration; 2]) -> (Arc<WorkerRig>, FakeHost) {
         std::thread::sleep(ms(1));
     }
     let rig = Arc::new(WorkerRig::new(Some(pool), slots, 2, bridge));
-    (rig, FakeHost { _bridge: host_bridge, shutdown, wakes, threads, calls, suspend_next })
+    (rig, FakeHost { _bridge: host_bridge, shutdown, wakes, threads, calls, suspend_next, hold })
 }
 
 fn pool(rig: &WorkerRig) -> &AudioWorkerPool {
@@ -562,37 +581,253 @@ fn 窓の間に閉じた_project_は窓が閉じてから_off_thread_へ戻る()
 /// schedule / 曲を解放しない。stall は失敗として返す (無音の続きを成功として書かない)。
 #[test]
 fn 書き出しは窓が閉じるまで資源を手放さず_stall_を失敗として返す() {
-    let (rig, host) = pooled_rig("export", [ms(20), ms(2)]);
+    offline_stall_window_closes("export", |engine, project, dir| {
+        crate::export::run_export(
+            dir.join("stall.wav"),
+            engine,
+            project,
+            chain_song(4),
+            SR,
+            common::process_data::MAX_FRAMES,
+            crate::export::RenderSpan::RangeCold { start_beat: 0.0, end_beat: 16.0 },
+            common::protocol::RenderScope::Mix,
+            false,
+            |_, _| {},
+        )
+        .is_ok()
+    });
+}
+
+/// ラウドネス解析も同じ走査 (`render_loop`) を通る — 窓が閉じるまで資源を手放さず、stall を失敗として返す
+/// (待つ上限は書き出しと同じ)。
+#[test]
+fn ラウドネス解析も窓が閉じるまで資源を手放さず_stall_を失敗として返す() {
+    offline_stall_window_closes("loudness", |engine, project, _| {
+        crate::export::run_loudness_analysis(
+            engine,
+            project,
+            chain_song(4),
+            SR,
+            common::process_data::MAX_FRAMES,
+            crate::export::RenderSpan::RangeCold { start_beat: 0.0, end_beat: 16.0 },
+            |_| {},
+        )
+        .is_ok()
+    });
+}
+
+/// オフラインの走査 (`run`、戻り値 = 成功したか) の途中で worker を [`SUSPEND`] だけ止める。窓は待つ上限 (17 s) の
+/// 内に閉じるので、走査は窓が閉じてから失敗で戻り、走査の物は解放する。
+fn offline_stall_window_closes(tag: &str, run: impl FnOnce(Arc<EngineShared>, Arc<ProjectShared>, &std::path::Path) -> bool) {
+    let (rig, host) = pooled_rig(tag, [ms(20), ms(2)]);
     let plugins = plugins(1..=8);
     let engine = Arc::new(EngineShared::new());
     engine.worker.store(Some(Arc::clone(&rig)));
     let project = Arc::new(ProjectShared::new(ProjectKey(1), 0));
     project.plugin_refs.store(Arc::clone(&plugins.refs));
-    let dir = std::env::temp_dir().join(format!("daw01_test_stall_export_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("daw01_test_stall_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     host.suspend_next.store(true, Ordering::SeqCst);
     let refs_before = Arc::strong_count(&plugins.refs);
-    let outcome = crate::export::run_export(
-        dir.join("stall.wav"),
-        Arc::clone(&engine),
-        Arc::clone(&project),
-        chain_song(4),
-        SR,
-        common::process_data::MAX_FRAMES,
-        crate::export::RenderSpan::RangeCold { start_beat: 0.0, end_beat: 16.0 },
-        common::protocol::RenderScope::Mix,
-        false,
-        |_, _| {},
-    );
+    let succeeded = run(Arc::clone(&engine), Arc::clone(&project), &dir);
     let open_at_return = window_open(&rig);
-    assert!(pool(&rig).is_stalled(), "前提: 書き出しの途中で stall した");
-    assert!(!open_at_return, "書き出しが窓の閉じる前に戻った (生き残りが読む scratch / schedule / 曲を解放した)");
-    assert!(outcome.is_err(), "stall した書き出しを成功として返した");
+    assert!(pool(&rig).is_stalled(), "前提: 走査の途中で stall した");
+    assert!(!open_at_return, "走査が窓の閉じる前に戻った (生き残りが読む scratch / schedule / 曲を解放した)");
+    assert!(!succeeded, "stall した走査を成功として返した");
     // 窓が期限内に閉じたら、走査の物は普通に解放する (leak するのは閉じなかったときだけ)。
-    assert_eq!(Arc::strong_count(&plugins.refs), refs_before, "窓が閉じたのに書き出しの物を leak した");
+    assert_eq!(Arc::strong_count(&plugins.refs), refs_before, "窓が閉じたのに走査の物を leak した");
     assert_eq!(quarantined(&plugins), 0, "前提: どの plugin も期限を過ぎていない");
     drop(host);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 書き出しの窓が期限の内に閉じない (止められた worker が戻らない): 走査は器が指す物を持ち主ごと忘れて (leak) 失敗で
+/// 戻り、書き出しのスレッドは終わる (本番の `offline_jobs` と同じく、スタックは解放される)。その後に動き出した
+/// 生き残りが器の referent に触っても、それは走査の持ち主 (heap) の中に居るので、触って戻り、窓が閉じる。待つ上限は
+/// 引数で縮める (本番は 17 s)。
+#[test]
+fn 書き出しの窓が期限の内に閉じなければ_器の指す物を番地ごと残して失敗で返す() {
+    let (rig, host) = pooled_rig("leak", [ms(20), ms(2)]);
+    let plugins = plugins(1..=8);
+    let engine = Arc::new(EngineShared::new());
+    engine.worker.store(Some(Arc::clone(&rig)));
+    let project = Arc::new(ProjectShared::new(ProjectKey(1), 0));
+    project.plugin_refs.store(Arc::clone(&plugins.refs));
+    let dir = std::env::temp_dir().join(format!("daw01_test_stall_leak_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    host.hold.store(true, Ordering::SeqCst);
+    host.suspend_next.store(true, Ordering::SeqCst);
+    let refs_before = Arc::strong_count(&plugins.refs);
+    let export = {
+        let (engine, project, path) = (Arc::clone(&engine), Arc::clone(&project), dir.join("leak.wav"));
+        std::thread::spawn(move || {
+            crate::export::export_wav(
+                path,
+                engine,
+                project,
+                chain_song(4),
+                SR,
+                common::process_data::MAX_FRAMES,
+                crate::export::RenderSpan::RangeCold { start_beat: 0.0, end_beat: 16.0 },
+                common::protocol::RenderScope::Mix,
+                false,
+                ms(50),
+                |_, _| {},
+            )
+            .map(|o| o.frames)
+            .map_err(|e| e.to_string())
+        })
+    };
+    let outcome = export.join().expect("書き出しのスレッドが panic した (器の referent が呼び側のスタックに居る?)");
+    assert!(pool(&rig).is_stalled() && window_open(&rig), "前提: 窓の閉じないまま書き出しが諦めて戻った");
+    assert!(outcome.is_err(), "stall した書き出しを成功として返した");
+    assert!(Arc::strong_count(&plugins.refs) > refs_before, "窓が閉じないのに書き出しの物を手放した");
+
+    // 書き出しのスレッドが終わった後に生き残りを動かす。
+    let calls_at_stall = host.calls_on(1);
+    host.hold.store(false, Ordering::SeqCst);
+    wait_window_closed(&rig);
+    assert!(
+        host.calls_on(1) <= calls_at_stall + 1,
+        "動き出した生き残りが、見捨てられた buffer の残りの plugin を叩いた (窓が長引く)"
+    );
+    assert_eq!(quarantined(&plugins), 0, "前提: どの plugin も期限を過ぎていない");
+    drop(host);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// live の窓: callback は窓が閉じる前に戻り、そのスタックを次の callback が使い回す。器の referent は project
+/// (`Box<ProjectRt>`) と `Arc` の中に居る (InFlight のたびに `in_flight` が debug build で番地を見る) ので、窓の間に
+/// callback のスタックを塗り潰してから生き残りを動かしても、触って戻り、窓が閉じて続きから再開する。
+#[test]
+fn live_の窓の間に_callback_のスタックを使い回しても_生き残りは器の指す物に触って戻る() {
+    let (rig, host) = pooled_rig("stack", [ms(20), ms(2)]);
+    let plugins = plugins(1..=8);
+    let mut live = Live::new("stack", &rig);
+    let key = ProjectKey(1);
+    let mut tab = live.open(key);
+    tab.bundle_tx.push(bundle(&Arc::new(chain_song(4)), &plugins.refs)).ok().unwrap();
+    host.hold.store(true, Ordering::SeqCst);
+    stall_live(&mut live, &tab, &rig, &host);
+    let calls_at_stall = host.calls_on(1);
+    let playhead = tab.shared.playhead.load(Ordering::Acquire);
+    for _ in 0..4 {
+        live.callback();
+        clobber_stack();
+    }
+    assert!(window_open(&rig), "前提: 塗り潰す間、生き残りは止まったまま");
+
+    host.hold.store(false, Ordering::SeqCst);
+    wait_window_closed(&rig);
+    assert!(
+        host.calls_on(1) <= calls_at_stall + 1,
+        "動き出した生き残りが、見捨てられた buffer の残りの plugin を叩いた (窓が長引く)"
+    );
+    live.callback();
+    live.callback();
+    assert!(tab.shared.playhead.load(Ordering::Acquire) > playhead, "窓が閉じても transport が止まったまま");
+    assert_eq!(quarantined(&plugins), 0, "前提: どの plugin も期限を過ぎていない");
+    live.reap(&mut tab);
+    drop(host);
+}
+
+/// 窓の規則の口 (`in_flight`) そのもの: 器の referent が呼び側のスレッドのスタックに居る文脈で InFlight を返したら
+/// 止め、スタックに居る物を残らず名指しする (debug build)。スタックの範囲の取り方や比較が崩れて口が黙って素通り
+/// する形と、`RenderCtx::referents` の列の項目が 0 や heap の番地にすり替わる形を捕まえる。referent 30 個のうち
+/// `Schedule` の `Vec` の中身 5 個 (track の program / delay line / follower / node / 入力遅延) は型の上で heap なので
+/// 置けず、残り 25 個を全部スタックに置く。
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "[\"song\", \"index\", \"scratch\", \"master_program\", \"master_l\", \"master_r\", \"solo\", \
+                           \"graph\", \"rig\", \"plugin_refs\", \"audio_renderer\", \"recording_lanes\", \"mod_plane.ids\", \
+                           \"mod_plane.col_of\", \"mod_plane.values\", \"mod_plane.depth_ids\", \"mod_plane.depth_col_of\", \
+                           \"mod_plane.depths\", \"mod_plane.nodes\", \"follower_drive.spans\", \
+                           \"follower_drive.col_of_slot\", \"follower_drive.eff\", \"rows\", \"native_io.scopes.bridge\", \
+                           \"native_io.scopes.watch\"] が呼び側のスレッドのスタック")]
+fn 器が呼び側のスタックを指したまま_in_flight_を返すと_スタックに居る物を全部名指しして止める() {
+    let mut song = chain_song(1);
+    song.mod_sources = vec![common::model::ModSource {
+        id: 1,
+        owner_track_id: 1,
+        color: [0.0; 3],
+        kind: common::model::ModSourceKind::Lfo(common::model::LfoConfig::default()),
+        enabled: true,
+    }];
+    let mod_nodes = [common::mod_graph::build_plan(&song, 1, |beat| beat * 0.5).nodes[0].clone()];
+    let index = SongIndex::build(&song);
+    let mut schedule = crate::graph::compile_schedule(
+        &song,
+        &crate::graph::DeviceLatencies::new(),
+        &crate::graph::LoadingDevices::new(),
+        SR,
+        FRAMES as u32,
+        common::protocol::RenderScope::Mix,
+    )
+    .unwrap();
+    let mut scratch = [(); 3].map(|()| crate::mixer::TrackScratch::new());
+    assert_eq!(scratch.len(), song.tracks.len(), "前提: track ごとの scratch");
+    let (mut master_l, mut master_r) = ([0.0f32; FRAMES], [0.0f32; FRAMES]);
+    let pid = std::process::id();
+    let rig = WorkerRig::new(None, Vec::new(), 1, WorkerBridgeHandle::create(&format!("daw01_test_stall_wb_onstack_{pid}")).unwrap());
+    let refs = PluginRefs::new();
+    let renderer = AudioClipRenderer::empty();
+    let recording_lanes = RecordingLanes::new();
+    let (mod_ids, mod_col_of, mod_values) = ([1u32], [(1u32, 0u32)], [0.0f32]);
+    let (depth_ids, depth_col_of, depths) = ([1u32], [(1u32, 0u32)], [0.0f32]);
+    let spans = [crate::mod_tick::TickSpan { row: 0, frame: 0, frames: FRAMES as u32 }];
+    let col_of_slot = [0u16];
+    let eff = [crate::mod_tick::FollowerEff { attack_ms: 1.0, release_ms: 1.0, gain: 1.0, hp_hz: 20.0, lp_hz: 20_000.0 }];
+    let rows = crate::launcher::RowSourceTable::default();
+    let scope_bridge = DeviceScopeBridgeHandle::create(&format!("daw01_test_stall_ds_onstack_{pid}")).unwrap();
+    let scope_watch = [0u64; MAX_DEVICE_SCOPES];
+    let params = crate::graph::step::BufferParams {
+        sample_rate: SR,
+        frames: FRAMES as u32,
+        playing: true,
+        any_solo: false,
+        recording_lanes: &recording_lanes,
+        current_bpm: 120.0,
+        playhead_beats: 0.0,
+        loop_region: common::model::LoopRegion::default(),
+        mod_plane: common::mod_plane::ModTickPlaneRef {
+            ids: &mod_ids,
+            col_of: &mod_col_of,
+            values: &mod_values,
+            depth_ids: &depth_ids,
+            depth_col_of: &depth_col_of,
+            depths: &depths,
+            lead: 0,
+            first_sample: 0,
+            nodes: &mod_nodes,
+        },
+        follower_drive: crate::mod_tick::FollowerDrive { spans: &spans, first_sample: 0, col_of_slot: &col_of_slot, eff: &eff, n_cols: 1 },
+        rows: &rows,
+        native_io: crate::graph::NativeIo {
+            sc_listen: 0,
+            scopes: Some(crate::graph::DeviceScopeTap { bridge: &scope_bridge, watch: &scope_watch }),
+        },
+        transpose: 0,
+    };
+    let ctx = crate::graph::step::RenderCtx::new(
+        &song,
+        &index,
+        &mut schedule,
+        &mut scratch,
+        &mut master_l,
+        &mut master_r,
+        &refs,
+        Some(&renderer),
+        Some(&rig),
+        params,
+    );
+    let _ = super::in_flight(&ctx);
+}
+
+/// 呼び側のスタックの、callback が使った辺りを塗り潰す (器がスタックを指していれば、生き残りは壊れた値を読む)。
+#[inline(never)]
+fn clobber_stack() {
+    let mut fill = [0xA5u8; 256 * 1024];
+    std::hint::black_box(&mut fill);
 }
 
 /// stall の判定は「進みが止まった」で行う。plugin の dispatch は 1 回ずつ期限で切れるので、期限内の遅い plugin が

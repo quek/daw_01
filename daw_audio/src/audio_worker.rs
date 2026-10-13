@@ -23,6 +23,14 @@
 //! 文脈が指す物 (曲 / schedule / scratch / master バス / plugin の表 / rig …) を解放も再利用もしない**。文脈そのものは
 //! pool の器に居て、生き残りは pool の共有部を `Arc` で持つので、呼び側が先に戻っても消えない。
 //!
+//! 呼び側は窓が閉じる前に戻りうる (live の callback は戻り、書き出しは有界に待って諦める) ので、**文脈が指す物は
+//! 呼び側のスレッドのスタックに置かない** — heap の持ち主の中に置く (live は `Box<ProjectRt>` と `Arc`、書き出しは
+//! 走査の持ち主 `export::WalkOwner`)。窓が閉じないまま諦めて leak するときは、**referent を番地ごと持つ持ち主
+//! (`Box` / `Arc`) を忘れる形でだけ** 行う — スタックに居る値を `forget` へ動かしても heap の中身が残るだけで、文脈が
+//! 指していた番地は残らない。忘れるか解放するかは持ち主の Drop が窓を見て決める (live の `DeviceRt`、書き出しの
+//! `WalkOwner`)。この規則は InFlight を返す口 (`gate::in_flight` — InFlight の証はここでしか作れない) が debug build
+//! で毎回番地を見る ([`RenderCtx::referents`])。
+//!
 //! plan §4 (有界化): stall の判定は **進みが止まったか** で行う。runner は手を終えるたび・plugin の dispatch を
 //! 終えるたびに進みを数え ([`AudioWorkerPool::note_progress`])、dispatch は 1 回ずつ `DISPATCH_TIMEOUT_MS` で
 //! bounded (+ timeout で pair を poison) なので、生きて走る runner の進みはその間隔より長く止まらない。どの runner
@@ -66,8 +74,9 @@ pub enum PoolRun {
     Stalled,
     /// stall (か、描き切った後に runner が文脈を手放さないまま止まった): 文脈を持ったまま走る runner (生き残り) が
     /// 居る。呼び側は [`AudioWorkerPool::window_open`] が false になるまで、文脈が指す物を解放も再利用もしない
-    /// (module doc の「窓」)。
-    InFlight,
+    /// (module doc の「窓」)。証 ([`gate::WindowChecked`]) を作れるのは `gate::in_flight` だけなので、InFlight は
+    /// 必ずその口 (器の referent が呼び側のスタックに無いことを見る) を通って返る。
+    InFlight(gate::WindowChecked),
 }
 
 /// runner の数の上限 (`idle` の bit 数)。
@@ -244,9 +253,9 @@ impl AudioWorkerPool {
     /// 1 buffer のグラフを流す。master (呼び出しスレッド) も runner として job を取り、全 job が終わって全 worker が
     /// 文脈を手放すのを待つ。文脈は pool の器へ移す (呼び側のスタックに置かない — module doc の「窓」)。
     ///
-    /// 呼び側の契約: `ctx` が借りた物 (`RenderCtx::new` の借用と、`ctx.rig` / `ctx.params` が指す物) は、
-    /// [`PoolRun::InFlight`] が返ったら [`Self::window_open`] が false になるまで解放も再利用もしない。Finished /
-    /// Stalled なら戻った時点で呼び側の物。
+    /// 呼び側の契約: `ctx` が借りた物 (`RenderCtx::new` の借用と、`ctx.rig` / `ctx.params` が指す物) は、呼び側の
+    /// スレッドのスタックに置かず、[`PoolRun::InFlight`] が返ったら [`Self::window_open`] が false になるまで解放も
+    /// 再利用もしない (module doc の「窓」)。Finished / Stalled なら戻った時点で呼び側の物。
     pub fn run(&self, ctx: RenderCtx<'_>) -> PoolRun {
         // plan §4: stalled pool は二度と dispatch しない (文脈の器を生き残りが読んでいうるので書かない)。
         if self.is_stalled() {
@@ -285,7 +294,7 @@ impl AudioWorkerPool {
                 if std::time::Instant::now() > deadline {
                     // 見直しの途中で止められた worker が居る: 窓を開けたまま戻る (下と同じ)。
                     self.stalled.store(true, Ordering::Release);
-                    return PoolRun::InFlight;
+                    return in_flight(ctx);
                 }
                 std::hint::spin_loop();
             }
@@ -296,7 +305,7 @@ impl AudioWorkerPool {
         // 叩かない (`Self::stalled`)。通知 (WorkerPoolStalled) は notify thread が `is_stalled` を poll して
         // 送る — RT からは atomic store のみ (tracing / IPC 禁止)。
         self.stalled.store(true, Ordering::Release);
-        if shared.inside.load(Ordering::SeqCst) == 0 { PoolRun::Stalled } else { PoolRun::InFlight }
+        if shared.inside.load(Ordering::SeqCst) == 0 { PoolRun::Stalled } else { in_flight(ctx) }
     }
 
     /// [`PoolRun::InFlight`] を返した描画の窓がまだ開いている (文脈を持ったまま走る runner が居る)。false を見た
@@ -365,6 +374,51 @@ impl Drop for AudioWorkerPool {
         }
     }
 }
+
+/// [`PoolRun::InFlight`] を作る唯一の口 ([`in_flight`]) と、その証 ([`WindowChecked`])。証の field はこの module の
+/// 外から見えないので、`AudioWorkerPool::run` の中でも InFlight をこの口を通さずに作れない (戻りのどれか 1 つが
+/// 検査を素通りする形を型で塞ぐ)。
+mod gate {
+    #[cfg(debug_assertions)]
+    use windows::Win32::System::Threading::GetCurrentThreadStackLimits;
+
+    use super::PoolRun;
+    use crate::graph::step::RenderCtx;
+
+    /// [`PoolRun::InFlight`] の証。作るのは [`in_flight`] だけ。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WindowChecked(());
+
+    /// 窓を開けたまま戻る。呼び側はこの後、窓が閉じる前にスタックを畳みうる (live の callback は戻り、書き出しは
+    /// 待ちを諦めると戻る) ので、器の referent (`RenderCtx::referents`) が呼び側のスレッドのスタックに無いことを
+    /// debug build で見て、居ればスタックに居る物を全部名指しして止める (module doc の「窓」の規則 — 手の列挙で
+    /// 済ませない)。
+    pub(super) fn in_flight(ctx: &RenderCtx<'_>) -> PoolRun {
+        #[cfg(debug_assertions)]
+        {
+            let (mut low, mut high) = (0usize, 0usize);
+            // SAFETY: 呼ぶスレッド自身のスタックの範囲を読むだけ (確保も待ちもしない)。
+            unsafe { GetCurrentThreadStackLimits(&raw mut low, &raw mut high) };
+            let referents = ctx.referents();
+            let mut on_stack = referents.map(|_| "");
+            let mut n = 0;
+            for (name, at) in referents {
+                if (low..high).contains(&at) {
+                    on_stack[n] = name;
+                    n += 1;
+                }
+            }
+            assert!(
+                n == 0,
+                "窓の器の referent {:?} が呼び側のスレッドのスタック [0x{low:x}, 0x{high:x}) に居る — 呼び側が戻ると、\
+                 生き残りが解放済み・再利用中のスタックを読み書きする",
+                &on_stack[..n]
+            );
+        }
+        PoolRun::InFlight(WindowChecked(()))
+    }
+}
+use gate::in_flight;
 
 /// job `job` の手を順に実行する (runner `slot` の `SyncSlot` で plugin を dispatch)。手を終えるたびに自分の
 /// 進みを数える (stall の判定、[`MasterPark::stuck`]。dispatch ごとの進みは `dispatch_bounded` が数える)。

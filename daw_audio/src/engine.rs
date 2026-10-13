@@ -1153,7 +1153,7 @@ impl ProjectRt {
             );
             // stall の窓が開いた: 生き残りが文脈を通して project の物を触っているので、この buffer の残り (scope /
             // sampler / metronome / transport) も含めて何もせず、窓が閉じるまで rig を持つ (`Self::window`)。
-            if rendered == crate::audio_worker::PoolRun::InFlight {
+            if matches!(rendered, crate::audio_worker::PoolRun::InFlight(_)) {
                 self.window = ctx.worker.cloned();
                 return;
             }
