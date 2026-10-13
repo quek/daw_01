@@ -53,6 +53,9 @@ pub struct UiPrefs {
     pub voicevox_chunk_secs: f32,
     /// Global Sampler / MIDI Capture が溜める長さ (秒)。SSoT は `app_config.json`。
     pub sampler_seconds: u32,
+    /// 出力の先読み (`AppConfig::render_ahead`)。daw_audio へは `AudioCommand::SetRenderAhead` で送る
+    /// (`AppData::send_render_ahead`)。
+    pub render_ahead: bool,
 
     /// r.md #113: 仮想鍵盤ウィンドウの位置 (app_config で永続)。 `None` = 未配置
     /// (初回は画面中央下)。 サイズは固定なので rect の w / h は描画側が決める。

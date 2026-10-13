@@ -29,20 +29,23 @@ const DEFAULT_H: f32 = 400.0;
 const MIN_W: f32 = 240.0;
 /// 最小の高さ。**固定 chrome (= 一覧以外) の合計に一覧 3 行を足した値**を下回らせないこと。
 ///
-/// chrome の内訳は `TITLE_H`(24)、余白 4、`SECTION_H`(22、VOICEVOX 見出し)、
+/// chrome の内訳は `TITLE_H`(24)、余白 4、`SECTION_H`(22、オーディオ見出し)、
+/// `AUDIO_SECTION_H`(44)、`SECTION_H`(22、VOICEVOX 見出し)、
 /// `VOX_SECTION_H`(66)、`SECTION_H`(22、テーマ見出し)、`HINT_H`(30)、
-/// `RESIZE_MARGIN`(6) で合計 174。
+/// `RESIZE_MARGIN`(6) で合計 240。
 ///
 /// r.md #75 で VOICEVOX セクションを足したぶん chrome が 86 から 174 に増えたので、
 /// 旧値 (160) のままだとテーマ一覧の高さが 0 に潰れて**テーマを選べなくなる**
-/// (しかも見出しがヒント行に重なる)。
-const MIN_H: f32 = 250.0;
+/// (しかも見出しがヒント行に重なる)。オーディオのセクションでさらに 66 増えた。
+const MIN_H: f32 = 316.0;
 const TITLE_H: f32 = 24.0;
 const CLOSE_W: f32 = 26.0;
 const ROW_H: f32 = 24.0;
 const ROW_GAP: f32 = 1.0;
 /// セクション見出し (「VOICEVOX」「テーマ」) の高さ。
 const SECTION_H: f32 = 22.0;
+/// 「オーディオ」セクション本体 (チェックボックス 1 行 + 説明 1 行) の高さ。
+const AUDIO_SECTION_H: f32 = 44.0;
 /// 「VOICEVOX」セクション本体 (数値欄 1 行 + 説明 2 行) の高さ。
 const VOX_SECTION_H: f32 = 66.0;
 /// 数値欄の幅 (px)。
@@ -192,8 +195,20 @@ fn draw_chrome_and_body(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         || Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ToggleSettings)),
     );
 
+    // セクション見出し「オーディオ」+ 先読みのチェックボックス。
+    let audio_y = rect.y + TITLE_H + 4.0;
+    ui.label_at(
+        "settings_sec_audio",
+        "オーディオ",
+        rect.x + 12.0,
+        audio_y + (SECTION_H - 12.0) * 0.5,
+        12.0,
+        p.text_dim,
+    );
+    draw_audio_section(app, ui, rect, audio_y + SECTION_H);
+
     // セクション見出し「VOICEVOX」+ 「合成の塊の長さ (秒)」。
-    let vox_y = rect.y + TITLE_H + 4.0;
+    let vox_y = audio_y + SECTION_H + AUDIO_SECTION_H;
     ui.label_at(
         "settings_sec_vox",
         "VOICEVOX",
@@ -222,8 +237,8 @@ fn draw_chrome_and_body(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         x: rect.x + 1.0,
         y: section_y + SECTION_H,
         w: (rect.w - 1.0 - RESIZE_MARGIN).max(0.0),
-        // VOICEVOX セクション (見出し + 本体) のぶん高さを引く。
-        h: (rect.h - TITLE_H - SECTION_H * 2.0 - VOX_SECTION_H - 4.0 - HINT_H - RESIZE_MARGIN)
+        // オーディオ / VOICEVOX セクション (見出し + 本体) のぶん高さを引く。
+        h: (rect.h - TITLE_H - SECTION_H * 3.0 - AUDIO_SECTION_H - VOX_SECTION_H - 4.0 - HINT_H - RESIZE_MARGIN)
             .max(0.0),
     };
     draw_theme_list(app, ui, list_rect);
@@ -250,6 +265,26 @@ fn draw_chrome_and_body(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
             0.0,
         );
     }
+}
+
+/// 「オーディオ」セクション本体: 出力の先読みの on / off (`UiPrefs::render_ahead`)。
+fn draw_audio_section(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, y: f32) {
+    let p = &app.theme.core;
+    ui.checkbox_at(
+        "settings_render_ahead",
+        Rect { x: rect.x + 12.0, y, w: (rect.w - 24.0 - RESIZE_MARGIN).max(0.0), h: ROW_H },
+        app.ui_prefs.render_ahead,
+        "先読み (2 周期分を先に描いて音切れを防ぐ)",
+        |on| Edit::mutate(move |app: &mut AppData| app.handle_event(AppEvent::SetRenderAhead(on))),
+    );
+    ui.label_at(
+        "settings_render_ahead_note",
+        "操作への反応が 2 周期分遅れます。切り替えは停止中に効きます",
+        rect.x + 12.0,
+        y + ROW_H + 4.0,
+        10.0,
+        p.text_faint,
+    );
 }
 
 /// 「VOICEVOX」セクション本体 (r.md #75): 合成の塊の長さ (秒)。

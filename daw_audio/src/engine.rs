@@ -438,6 +438,8 @@ pub struct ProjectRt {
     /// 文脈を持ったまま走る runner (生き残り) がそれを手放すまでの間、生き残りが借りている rig を持つ (`Some` の
     /// 間、RT はこの project に触らない — `DeviceRt` の module doc)。窓が閉じたら `DeviceRt` が off-thread へ返す。
     pub window: Option<Arc<WorkerRig>>,
+    /// GUI へ出す transport の観測値 (先読みのときは聞こえている回まで遅らせる — [`TransportOut`])。
+    pub transport_out: TransportOut,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -521,6 +523,7 @@ impl ProjectRt {
             follower_maps: FollowerMaps::default(),
             master_limiter: MasterLimiterState::new(),
             window: None,
+            transport_out: TransportOut::default(),
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
             #[cfg(debug_assertions)]
@@ -907,7 +910,7 @@ impl ProjectRt {
     /// 1 buffer の前段: bundle の install、stretch pool の取り込み、transport 要求の
     /// 消費、走行状態の publish。**書き出し gate より前に、全 project について**呼ぶ
     /// (r.md #51 — 要求を溜めたまま return すると溜まった Play が後で勝手に発火する)。
-    fn begin_buffer(&mut self, slot: &ProjectTelemetry) {
+    fn begin_buffer(&mut self) {
         // Install the newest off-thread snapshot (song / schedule /
         // plugin_refs) before the dispatch starts.
         self.refresh_bundle();
@@ -923,10 +926,12 @@ impl ProjectRt {
         // GUI はこの 3 つを観測して transport 表示と録音セッションを決める
         // (GUI 側に「Play を送った記憶」を持たせない = 状態の所有者は engine)。
         // count-in を止めたときの 0 もここで必ず伝わる (count-in ブロックの中だけで
-        // mirror していると、停止で捨てた preroll が GUI 側に残る)。
-        slot.set_playing(self.playing);
-        slot.set_recording_live(recording_requested && self.playing && preroll == 0);
-        slot.set_preroll_remaining(preroll);
+        // mirror していると、停止で捨てた preroll が GUI 側に残る)。publish は回の終わりに
+        // `DeviceRt` が再生位置と一緒に行う (`TransportOut`)。
+        let now = &mut self.transport_out.now;
+        now.playing = self.playing;
+        now.recording_live = recording_requested && self.playing && preroll == 0;
+        now.preroll = preroll;
     }
 
     /// Render `frames` of this project's master into `bus_l/r`. Transport 状態を
@@ -1012,7 +1017,7 @@ impl ProjectRt {
             self.shared
                 .preroll_remaining_samples
                 .store(new_preroll, Ordering::Release);
-            slot.set_preroll_remaining(new_preroll);
+            self.transport_out.now.preroll = new_preroll;
             // count-in 中のローンチ操作も溜めない (書き出し中と同じ理由)。
             self.launcher.clear_requests();
             return;
@@ -1406,6 +1411,8 @@ fn native_io_for_buffer<'a>(
 
 mod device_rt;
 pub use device_rt::DeviceRt;
+mod transport_out;
+pub use transport_out::TransportOut;
 
 #[cfg(test)]
 mod engine_command_tests {

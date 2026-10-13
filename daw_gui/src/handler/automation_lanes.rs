@@ -1008,6 +1008,11 @@ impl AppData {
         let respawn_result: anyhow::Result<()> = match kind {
             ChildKind::Audio => supervisor.respawn_audio().map(|r| {
                 self.ipc.audio_tx = Some(r.tx);
+                // 新しい daw_audio は既定値から始まるので、PC ごとの設定と窓のアクティブ状態を送り直す
+                // (dedup の記憶を消さないと、変化が無い限り二度と送られない)。
+                self.send_render_ahead();
+                self.activity.last_sent_app_active = None;
+                self.sync_app_active_with_audio();
                 // (v29 §3) 新 Hello の device_sample_rate を採用した session
                 // に合わせて、 GUI 側の拍↔sample 変換の複製も更新する。
                 if self.ipc.sample_rate != r.sample_rate {

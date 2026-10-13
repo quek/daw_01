@@ -61,6 +61,7 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("appOpenProject", daw_app_open_project, 1),
     ("appPlay", daw_app_play, 0),
     ("appStop", daw_app_stop, 0),
+    ("appSetRenderAhead", daw_app_set_render_ahead, 1),
     ("appRescanPlugins", daw_app_rescan_plugins, 0),
     ("play", daw_play, 0),
     ("stop", daw_stop, 0),
@@ -453,6 +454,15 @@ fn daw_app_play(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsRes
 /// `daw.appStop()` — `AppEvent::Stop` (GUI の停止と同じ経路)。
 fn daw_app_stop(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     with_app(|app, _side, _io| app.handle_event(AppEvent::Stop));
+    Ok(JsValue::undefined())
+}
+
+/// `daw.appSetRenderAhead(on)` — 設定窓の「先読み」チェックボックスと同じ `AppEvent::SetRenderAhead`。
+/// app_config.json に永続するのは人の操作と同じだが、`--script` の起動は隔離 root なのでユーザーの設定は変わらない。
+/// 効くのは停止中 (再生中なら次の停止で)。実際に替わったかは `perfJson().renderAhead` で確かめる。
+fn daw_app_set_render_ahead(_this: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    let on = args.get_or_undefined(0).to_boolean();
+    with_app(move |app, _side, _io| app.handle_event(AppEvent::SetRenderAhead(on)));
     Ok(JsValue::undefined())
 }
 

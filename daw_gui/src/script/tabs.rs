@@ -90,8 +90,9 @@ pub(super) fn daw_metrics_json(_this: &JsValue, _args: &[JsValue], _ctx: &mut Co
 }
 
 /// `daw.perfJson()` — 負荷の計測一式を **同じ時刻で** 返す:
-/// `{dspLoadAvg, xrunCount, starveCount, bufferFrames, sampleRate, loadHist, graph, pluginUs}`。
+/// `{dspLoadAvg, xrunCount, starveCount, renderAhead, bufferFrames, sampleRate, loadHist, graph, pluginUs}`。
 /// `starveCount` はデバイスが飢えた回 (`MetricsBridge::starve_count`。描き方によらない物差し)。
+/// `renderAhead` は今の描き手が先読みの描画スレッドか (`MetricsBridge::render_ahead`。設定ではなく実際に替わったか)。
 ///
 /// - `loadHist`: buffer ごとの DSP load の分布 (累積、5% 刻み 41 bucket。差分を取って使う)。
 /// - `graph`: 直近の窓のグラフ内訳 (`wallNs` / `busyNs` / `dispatchNs` / `dispatches` / `steps` /
@@ -119,6 +120,7 @@ pub(super) fn daw_perf_json(_this: &JsValue, _args: &[JsValue], _ctx: &mut Conte
             "dspLoadAvg": m.dsp_load_avg(),
             "xrunCount": m.xrun_count(),
             "starveCount": m.starve_count(),
+            "renderAhead": m.render_ahead(),
             "bufferFrames": buffer_frames,
             "sampleRate": sample_rate,
             "loadHist": m.load_hist().to_vec(),

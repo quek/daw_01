@@ -109,6 +109,11 @@ event 名は **generation** 込みで、旧世代の依頼や signal が新 pool
   drop-oldest (最新編集優先)。
 - CPAL callback スレッドは初回に MMCSS Pro Audio へ自前 join (cpal 0.17 の boost に
   依存しない、RT 優先度ポリシーの SSoT は自プロセス)。
+- **出力の先読み** (`daw_audio/src/output_render.rs`、環境設定で on / off、既定 on): 描き手は
+  CPAL callback の中か、2 周期分を先にリングへ描く描画スレッド (callback と同じ優先度) の**どちらか 1 つ**。
+  切り替えは描き手を持っているスレッドが停止中に自分で渡す (再生中は次の停止まで待つ)。先読み中は GUI へ出す
+  transport (再生位置・走行・count-in・録音してよいか) を 2 周期分遅らせ、聞こえている音と揃える
+  (`engine::TransportOut`)。メーター類は描いた時点のまま (20 ms 程度先行、30 Hz の表示では見えない)。
 
 ### daw_audio エンジン
 

@@ -78,6 +78,11 @@ pub struct MetricsBridge {
     /// `xrun_count` は描き方 (callback 内で描く / 描画スレッドが先に描く) で定義が違うので、
     /// 両者を同じ物差しで比べるための指標。
     pub starve_count: AtomicU64,
+
+    /// 今の描き手が先読みの描画スレッドか (0/1)。描いた回ごとに daw_audio が書く。`xrun_count` / DSP load の
+    /// 意味がこれで変わる (先読みでは xrun = リングが空だった回、load = 描画スレッドの 1 回の時間 ÷ 周期) ので、
+    /// 計測と検査が「設定を送った」でなく「実際に替わった」を確かめるために読む。
+    pub render_ahead: AtomicU32,
 }
 
 /// [`MetricsBridge::load_hist`] の bucket 数 (5% 刻みで 0〜200%、最後は 200% 以上)。
@@ -248,6 +253,19 @@ impl MetricsBridgeHandle {
 
     pub fn starve_count(&self) -> u64 {
         self.bridge().starve_count.load(Ordering::Relaxed)
+    }
+
+    /// daw_audio (RT): 今の描き手を記録 ([`MetricsBridge::render_ahead`])。変わったときだけ書く。
+    pub fn set_render_ahead(&self, ahead: bool) {
+        let v = u32::from(ahead);
+        let a = &self.bridge().render_ahead;
+        if a.load(Ordering::Relaxed) != v {
+            a.store(v, Ordering::Relaxed);
+        }
+    }
+
+    pub fn render_ahead(&self) -> bool {
+        self.bridge().render_ahead.load(Ordering::Relaxed) != 0
     }
 
     pub fn xrun_count(&self) -> u64 {

@@ -685,6 +685,9 @@ pub enum AppEvent {
     /// **オートメーションをクリップに追従させるか** のトグル
     /// (`docs/plan_range_selection.md` §5)。 アプリ設定として永続する。
     SetAutomationFollowsClips(bool),
+    /// 出力の先読みの on / off (設定窓のチェックボックス)。アプリ設定として永続し、daw_audio へ送る
+    /// (効くのは停止中 — 再生中なら次の停止で)。
+    SetRenderAhead(bool),
     /// Ctrl+A (アレンジ): 段階拡大の全選択 — `track` のトラック 1 本 (行 + 全
     /// automation lane) → 全トラック × 全 lane。 判定は「今の範囲が前段と一致するか」。
     /// `track` が `None` なら直接 全トラック。 一括選択なので view ジャンプ

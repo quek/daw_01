@@ -1,12 +1,18 @@
-//! 出力デバイスへ渡す 1 周期分を描く処理と、その描き手の置き場所 (試作: 先読みのパイプライン)。
+//! 出力デバイスへ渡す 1 周期分を描く処理と、その描き手の置き場所 (先読み)。
 //!
-//! 描き手は 2 通りで、`DAW01_PIPELINE_N` (起動時に 1 回読む。再生中に変えない) で選ぶ:
-//! - `N = 0` (既定): 今までどおり CPAL のコールバックの中で [`OutputRenderer::render`] を呼ぶ。
-//! - `N ≥ 1`: 専用の描画スレッドが周期 N 個分を先にリングへ描き溜め、コールバックは描き終わった 1 周期分を
-//!   リングから取り出して渡し、描画スレッドを起こすだけ。リングが空なら無音を渡して xrun として数える (待たない)。
+//! 描き手は 2 通り:
+//! - **先読み** (環境設定の既定): 専用の描画スレッドが [`RENDER_AHEAD_PERIODS`] 周期分を先にリングへ描き溜め、
+//!   コールバックは描き終わった 1 周期分をリングから取り出して渡し、描画スレッドを起こすだけ。重い 1 回を前の回の
+//!   余りで吸収する。リングが空なら無音を渡して xrun として数える (待たない)。
+//! - **先読みしない**: 今までどおり CPAL のコールバックの中で [`OutputRenderer::render`] を呼ぶ。
 //!
-//! どちらでも [`OutputRenderer`] (= `DeviceRt` を含む描画の状態) を持つのはちょうど 1 本のスレッドで、
-//! 描き手が混ざることは型の所有で起きない (`OutputRenderer` は描画スレッドへ move される)。
+//! [`OutputRenderer`] (= `DeviceRt` を含む描画の状態) を持つのは常にちょうど 1 本のスレッドで、描き手が混ざることは
+//! 型の所有で起きない。切り替えは `SharedState::render_ahead_wanted` を見た **今の持ち主が、停止中に** 自分で
+//! 1 枠の rtrb へ move して渡す (再生中に替わると聞こえ方と遅れの勘定が途中で変わるので、次の停止まで待つ)。
+//! 先読みから戻るときは、描き溜めた分をコールバックが出し切ってから自分で描く (時間は連続)。
+//!
+//! 遅れの勘定: 先読み中のエンジンの「今」はスピーカーより [`RENDER_AHEAD_PERIODS`] 周期先に居る。GUI が見る
+//! transport (再生位置・走行・count-in・録音してよいか) はその回数ぶん遅らせて出す (`engine::TransportOut`)。
 //!
 //! RT: コールバックと描画スレッドは確保・ロック・I/O をしない。リングは rtrb (wait-free SPSC)、
 //! 起こしは `Thread::unpark` (Windows は WakeByAddress、確保もロックも無い)。
@@ -14,7 +20,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use common::audio_bridge::AudioBridgeHandle;
 use common::metrics_bridge::MetricsBridgeHandle;
@@ -22,17 +27,9 @@ use common::scope_bridge::ScopeBridgeHandle;
 
 use crate::engine::{self, DeviceRt, SharedState};
 
-/// 先読みする周期の数 (`DAW01_PIPELINE_N`)。読めない / 未設定は 0 (= コールバックの中で描く)。
-pub(crate) fn pipeline_n_from_env() -> usize {
-    std::env::var("DAW01_PIPELINE_N")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-/// 描画スレッドが寝る上限。ふつうはコールバックの `unpark` で起きる。上限は停止の取りこぼし防止だけなので、
-/// idle park 中 (コールバックが来ない) に空回りしない長さにする。
-const RENDER_PARK_TIMEOUT: Duration = Duration::from_millis(100);
+/// 先読みで先に描く周期の数。「90% の次に 110%」の重い 1 回を前の回の余りで吸収できる最小の数
+/// (ユーザー決定 2026-10-13)。大きくすると全操作の遅れが増えるだけなので、可変にしない。
+pub(crate) const RENDER_AHEAD_PERIODS: usize = 2;
 
 /// 1 周期分を描く状態一式 (もとは CPAL クロージャが捕まえていたもの)。
 pub(crate) struct OutputRenderer {
@@ -99,15 +96,19 @@ impl OutputRenderer {
 
     /// 1 周期分 (`data.len() / channels` フレーム、`MAX_FRAMES` を超えた分は無音) を `data` (interleave) へ描く。
     ///
-    /// `count_load_xrun`: 「処理時間 > 周期」を xrun として数えるか。コールバックの中で描くとき (N = 0) だけ真 —
-    /// 先に描くとき (N ≥ 1) の xrun は「リングが空だった回」でコールバックが数える。
-    pub(crate) fn render(&mut self, data: &mut [f32], count_load_xrun: bool) {
+    /// `ahead`: 描画スレッドが先読みで描いているか。transport の publish を遅らせるか (`engine::TransportOut`) と、
+    /// 「処理時間 > 周期」を xrun として数えるか (コールバックの中で描くときだけ — 先読みの xrun は
+    /// 「リングが空だった回」でコールバックが数える) を決める。
+    pub(crate) fn render(&mut self, data: &mut [f32], ahead: bool) {
         // resource monitor (r.md #3): 描く処理全体の時間を測る。 plugin 処理は worker pool でブロッキング同期
         // されるため、 この区間に plugin 負荷が含まれる。 `Instant::now()` は RT 許容。
         let cb_start = std::time::Instant::now();
         let channels = self.channels;
         let sr = self.session_sample_rate;
         let frames = (data.len() / channels).min(common::process_data::MAX_FRAMES);
+        let count_load_xrun = !ahead;
+        self.local.render_ahead = ahead;
+        self.metrics.set_render_ahead(ahead);
 
         self.local
             .process_buffer(&self.shared, &self.bridge, &self.scope, &self.device_scope, sr, frames);
@@ -243,47 +244,134 @@ impl StarveProbe {
     }
 }
 
-/// 描画スレッドと、コールバック側の持ち物 (リングの読み口・起こし・停止)。
-///
-/// drop (= CPAL の stream とクロージャが捨てられたとき) で描画スレッドを止めて join する。
-/// `OutputRenderer` (`DeviceRt`) は描画スレッドの上で drop される。
-pub(crate) struct RenderPipeline {
-    cons: rtrb::Consumer<f32>,
+/// コールバックと描画スレッドが共有する小さな状態。
+struct Link {
     /// コールバックが最後に見たフレーム数 (`MAX_FRAMES` 以下)。描画スレッドの 1 回の描画の大きさ。0 = まだ来ていない。
-    period: Arc<AtomicUsize>,
+    period: AtomicUsize,
     /// 描画スレッドが最後に描いた回が再生中だったか (リングが空の回を xrun として数えるかの判定)。
-    playing: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-    metrics: Arc<MetricsBridgeHandle>,
+    playing: AtomicBool,
+    stop: AtomicBool,
 }
 
-impl RenderPipeline {
-    /// 描画スレッドを起こす。リングの容量 (`(n + 2) × MAX_FRAMES × channels`) はここで 1 回だけ確保する。
-    pub(crate) fn spawn(renderer: OutputRenderer, n: usize) -> std::io::Result<Self> {
-        let channels = renderer.channels;
-        let metrics = Arc::clone(&renderer.metrics);
-        let cap = (n + 2) * common::process_data::MAX_FRAMES * channels;
-        let (prod, cons) = rtrb::RingBuffer::<f32>::new(cap);
-        let period = Arc::new(AtomicUsize::new(0));
-        let playing = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread = {
-            let period = Arc::clone(&period);
-            let playing = Arc::clone(&playing);
-            let stop = Arc::clone(&stop);
-            std::thread::Builder::new()
-                .name("audio render".into())
-                .spawn(move || render_loop(renderer, prod, n, &period, &playing, &stop))?
-        };
-        Ok(Self { cons, period, playing, stop, thread: Some(thread), metrics })
+/// 停止中か (描き手を替えてよいか)。count-in も走っている扱い ([`DeviceRt::any_rolling`])。
+fn may_switch(r: &OutputRenderer) -> bool {
+    !r.local.any_rolling()
+}
+
+/// CPAL クロージャの持ち物: 描き手 (先読みしない間)・リングの読み口・描き手の受け渡し口・描画スレッド。
+///
+/// drop (= CPAL の stream とクロージャが捨てられたとき) で描画スレッドを止めて join する。描画スレッドが
+/// 持っていた `OutputRenderer` はそのスレッドの上で、こちらが持っていた分はここで drop される (どちらも RT の外)。
+pub(crate) struct OutputStage {
+    /// コールバックが描き手のとき `Some`。
+    inline: Option<Box<OutputRenderer>>,
+    cons: rtrb::Consumer<f32>,
+    to_thread: rtrb::Producer<Box<OutputRenderer>>,
+    from_thread: rtrb::Consumer<Box<OutputRenderer>>,
+    link: Arc<Link>,
+    shared: Arc<SharedState>,
+    metrics: Arc<MetricsBridgeHandle>,
+    channels: usize,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl OutputStage {
+    /// 描画スレッドを起こす (描き手は持たずに寝ている)。描き手はまずコールバックが持ち、先読みを望まれていれば
+    /// 最初の停止中のコールバックで渡す。リング (`(RENDER_AHEAD_PERIODS + 2) × MAX_FRAMES × channels`) と
+    /// 受け渡しの枠はここで 1 回だけ確保する。
+    pub(crate) fn spawn(renderer: OutputRenderer) -> std::io::Result<Self> {
+        let (mut stage, mut worker) = Self::new(renderer);
+        stage.thread =
+            Some(std::thread::Builder::new().name("audio render".into()).spawn(move || worker.run())?);
+        Ok(stage)
     }
 
-    /// CPAL コールバックの本体 (N ≥ 1)。描き終わった 1 周期分を渡して描画スレッドを起こす。待たない。
-    pub(crate) fn on_callback(&mut self, data: &mut [f32], channels: usize) {
-        let frames = data.len() / channels;
-        self.period
+    /// コールバック側と描画スレッド側の持ち物を組む (スレッドはまだ起こさない — 検査は同じスレッドで交互に回す)。
+    fn new(renderer: OutputRenderer) -> (Self, RenderThread) {
+        let channels = renderer.channels;
+        let metrics = Arc::clone(&renderer.metrics);
+        let shared = Arc::clone(&renderer.shared);
+        let cap = (RENDER_AHEAD_PERIODS + 2) * common::process_data::MAX_FRAMES * channels;
+        let (prod, cons) = rtrb::RingBuffer::<f32>::new(cap);
+        let (to_thread, thread_rx) = rtrb::RingBuffer::new(1);
+        let (thread_tx, from_thread) = rtrb::RingBuffer::new(1);
+        let link = Arc::new(Link {
+            period: AtomicUsize::new(0),
+            playing: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        });
+        let worker = RenderThread {
+            held: None,
+            prod,
+            rx: thread_rx,
+            tx: thread_tx,
+            link: Arc::clone(&link),
+            shared: Arc::clone(&shared),
+            scratch: vec![0.0; common::process_data::MAX_FRAMES * channels],
+            channels,
+        };
+        let stage = Self {
+            inline: Some(Box::new(renderer)),
+            cons,
+            to_thread,
+            from_thread,
+            link,
+            shared,
+            metrics,
+            channels,
+            thread: None,
+        };
+        (stage, worker)
+    }
+
+    /// CPAL コールバックの本体。待たない。
+    pub(crate) fn on_callback(&mut self, data: &mut [f32]) {
+        let frames = data.len() / self.channels;
+        self.link
+            .period
             .store(frames.min(common::process_data::MAX_FRAMES), Ordering::Release);
+        if self.inline.is_none()
+            && let Ok(r) = self.from_thread.pop()
+        {
+            self.inline = Some(r);
+        }
+        if self.inline.is_some() {
+            self.render_inline(data);
+        } else {
+            self.take_from_ring(data);
+        }
+        if let Some(t) = &self.thread {
+            t.thread().unpark();
+        }
+    }
+
+    /// 先読みしない間: 先読みから戻った直後に残っている描き溜めを先に出し切り (時間を連続に保つ)、残りを自分で描く。
+    /// 停止中に先読みを望まれていれば、描き溜めが空になった回の後で描き手を描画スレッドへ渡す。
+    fn render_inline(&mut self, data: &mut [f32]) {
+        let drained = self.cons.slots().min(data.len());
+        if drained > 0
+            && let Ok(chunk) = self.cons.read_chunk(drained)
+        {
+            let (a, b) = chunk.as_slices();
+            data[..a.len()].copy_from_slice(a);
+            data[a.len()..drained].copy_from_slice(b);
+            chunk.commit_all();
+        }
+        let Some(r) = self.inline.as_mut() else { return };
+        if drained < data.len() {
+            r.render(&mut data[drained..], false);
+        }
+        if self.shared.render_ahead_wanted.load(Ordering::Acquire) && may_switch(r) && self.cons.is_empty() {
+            let Some(r) = self.inline.take() else { return };
+            if let Err(rtrb::PushError::Full(r)) = self.to_thread.push(r) {
+                // 枠は 1 つで描き手も 1 つなので起きない。起きても手放さない。
+                self.inline = Some(r);
+            }
+        }
+    }
+
+    /// 先読みの間: 描き終わった 1 周期分を渡す。足りなければ全部無音にして消費しない (残りは次の回に出す)。
+    fn take_from_ring(&mut self, data: &mut [f32]) {
         match self.cons.read_chunk(data.len()) {
             Ok(chunk) => {
                 let (a, b) = chunk.as_slices();
@@ -292,22 +380,18 @@ impl RenderPipeline {
                 chunk.commit_all();
             }
             Err(_) => {
-                // 足りない: 全部無音にして消費しない (残りは次の回に出す)。
                 data.fill(0.0);
-                if self.playing.load(Ordering::Acquire) {
+                if self.link.playing.load(Ordering::Acquire) {
                     self.metrics.add_xrun();
                 }
             }
         }
-        if let Some(t) = &self.thread {
-            t.thread().unpark();
-        }
     }
 }
 
-impl Drop for RenderPipeline {
+impl Drop for OutputStage {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.link.stop.store(true, Ordering::Release);
         if let Some(t) = self.thread.take() {
             t.thread().unpark();
             if t.join().is_err() {
@@ -317,44 +401,75 @@ impl Drop for RenderPipeline {
     }
 }
 
-/// 描画スレッド: リングに `n × period` フレーム分が溜まるまで続けて描き、溜まったら寝る。
-fn render_loop(
-    mut renderer: OutputRenderer,
-    mut prod: rtrb::Producer<f32>,
-    n: usize,
-    period: &AtomicUsize,
-    playing: &AtomicBool,
-    stop: &AtomicBool,
-) {
-    // 優先度・MMCSS は CPAL のコールバックと同じ (cpal 0.17 WASAPI は TIME_CRITICAL、MMCSS は自前 join)。
-    crate::audio_worker::boost_thread_priority("audio render");
-    let _mmcss = common::mmcss::join_pro_audio();
-    if _mmcss.is_none() {
-        renderer.local.shared.mmcss_join_failed.store(true, Ordering::Release);
-    }
-    let channels = renderer.channels;
-    let cap = prod.buffer().capacity();
-    // 1 回分を描く作業場 (起動時に確保、以後使い回す)。
-    let mut scratch = vec![0.0f32; common::process_data::MAX_FRAMES * channels];
-    while !stop.load(Ordering::Acquire) {
-        let p = period.load(Ordering::Acquire);
-        if p > 0 {
-            let want = n * p * channels;
-            let len = p * channels;
-            while !stop.load(Ordering::Acquire)
-                && cap - prod.slots() < want
-                && let Ok(mut chunk) = prod.write_chunk(len)
-            {
-                let buf = &mut scratch[..len];
-                renderer.render(buf, false);
-                let (a, b) = chunk.as_mut_slices();
-                let split = a.len();
-                a.copy_from_slice(&buf[..split]);
-                b.copy_from_slice(&buf[split..]);
-                chunk.commit_all();
-                playing.store(renderer.local.any_playing(), Ordering::Release);
+/// 描画スレッドの持ち物。
+struct RenderThread {
+    /// 描き手 (先読みの間だけ `Some`)。
+    held: Option<Box<OutputRenderer>>,
+    prod: rtrb::Producer<f32>,
+    rx: rtrb::Consumer<Box<OutputRenderer>>,
+    tx: rtrb::Producer<Box<OutputRenderer>>,
+    link: Arc<Link>,
+    shared: Arc<SharedState>,
+    /// 1 回分を描く作業場 (起動時に確保、以後使い回す)。
+    scratch: Vec<f32>,
+    channels: usize,
+}
+
+impl RenderThread {
+    fn run(&mut self) {
+        // 優先度・MMCSS は CPAL のコールバックと同じ (cpal 0.17 WASAPI は TIME_CRITICAL、MMCSS は自前 join)。
+        crate::audio_worker::boost_thread_priority("audio render");
+        let _mmcss = common::mmcss::join_pro_audio();
+        let mut mmcss_reported = _mmcss.is_some();
+        while !self.link.stop.load(Ordering::Acquire) {
+            self.step();
+            if !mmcss_reported && let Some(r) = &self.held {
+                r.local.shared.mmcss_join_failed.store(true, Ordering::Release);
+                mmcss_reported = true;
             }
+            // 起こすのはコールバック (毎回) と停止 (drop)。unpark が先に来ても token が残るので取りこぼさない。
+            std::thread::park();
         }
-        std::thread::park_timeout(RENDER_PARK_TIMEOUT);
+    }
+
+    /// 1 回起きた分の仕事: 描き手を受け取り、停止中に先読みをやめるよう望まれていれば返し、
+    /// そうでなければリングに `RENDER_AHEAD_PERIODS × period` フレーム分が溜まるまで描く。
+    fn step(&mut self) {
+        if self.held.is_none() {
+            self.held = self.rx.pop().ok();
+        }
+        let Some(r) = self.held.as_mut() else { return };
+        if !self.shared.render_ahead_wanted.load(Ordering::Acquire) && may_switch(r) {
+            if let Some(r) = self.held.take()
+                && let Err(rtrb::PushError::Full(r)) = self.tx.push(r)
+            {
+                // 枠は 1 つで描き手も 1 つなので起きない。起きても手放さない。
+                self.held = Some(r);
+            }
+            return;
+        }
+        let p = self.link.period.load(Ordering::Acquire);
+        if p == 0 {
+            return;
+        }
+        let cap = self.prod.buffer().capacity();
+        let want = RENDER_AHEAD_PERIODS * p * self.channels;
+        let len = p * self.channels;
+        while !self.link.stop.load(Ordering::Acquire)
+            && cap - self.prod.slots() < want
+            && let Ok(mut chunk) = self.prod.write_chunk(len)
+        {
+            let buf = &mut self.scratch[..len];
+            r.render(buf, true);
+            let (a, b) = chunk.as_mut_slices();
+            let split = a.len();
+            a.copy_from_slice(&buf[..split]);
+            b.copy_from_slice(&buf[split..]);
+            chunk.commit_all();
+            self.link.playing.store(r.local.any_playing(), Ordering::Release);
+        }
     }
 }
+
+#[cfg(test)]
+mod tests;

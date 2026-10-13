@@ -32,8 +32,21 @@ function check(cond, msg, label, s) {
   }
 }
 
+// 出力の先読みの on / off (`--arg renderAhead=0|1`。無ければ環境設定のまま — 既定 on)。
+// 先読み中は publish が 2 周期分遅れるので、契約は両方で同じに保たれていなければならない。
+if (daw.scriptArgs.renderAhead !== undefined) {
+  daw.appSetRenderAhead(daw.scriptArgs.renderAhead === "1");
+}
+
 // CPAL stream が定常運転に入るまで待つ (起動直後は callback が前詰めで発火する)。
 daw.sleepMs(1500);
+if (daw.scriptArgs.renderAhead !== undefined) {
+  // 送っただけでなく、停止中なので実際に描き手が替わっていること。
+  const ahead = JSON.parse(daw.perfJson()).renderAhead;
+  if (ahead !== (daw.scriptArgs.renderAhead === "1")) {
+    throw new Error(`render-ahead が替わっていない: renderAhead=${ahead} (want ${daw.scriptArgs.renderAhead})`);
+  }
+}
 
 // ---- 1. Play で走り出し、プレイヘッドが進む ----------------------------
 const idle = daw.transportState();

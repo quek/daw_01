@@ -648,6 +648,11 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
                     rl.shared.idle_silent_samples.store(0, Ordering::Release);
                 }
             }
+            // 描き手の切り替えは描き手を持っているスレッドが停止中に行う (`output_render`)。ここは望みの反映だけ。
+            AudioCommand::SetRenderAhead(on) => {
+                tracing::info!(on, "render-ahead preference");
+                rl.shared.render_ahead_wanted.store(on, Ordering::Release);
+            }
             AudioCommand::Panic => {
                 // arm the master declick. The CPAL callback consumes
                 // this edge flag, fades the master out and holds at zero until
@@ -940,14 +945,6 @@ fn publish_graph_profile(
 }
 
 
-/// CPAL コールバックが 1 周期分を得る先 (`output_render` の module doc)。
-enum OutputSink {
-    /// N = 0: コールバックの中で描く。
-    Inline(Box<output_render::OutputRenderer>),
-    /// N ≥ 1: 描画スレッドが先に描いたものをリングから渡す。
-    Pipeline(output_render::RenderPipeline),
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_stream(
     device: &cpal::Device,
@@ -976,18 +973,10 @@ fn build_stream(
         session_sample_rate,
         channels_usize,
     );
-    // 試作 (先読みのパイプライン): N ≥ 1 なら描画スレッドが先に描き、コールバックはリングから渡すだけ
-    // (`output_render` の module doc)。起動時に 1 回だけ決め、再生中に変えない。
-    let n = output_render::pipeline_n_from_env();
-    tracing::info!(pipeline_n = n, "audio output: render-ahead periods");
-    let mut sink = if n == 0 {
-        OutputSink::Inline(Box::new(renderer))
-    } else {
-        OutputSink::Pipeline(
-            output_render::RenderPipeline::spawn(renderer, n)
-                .context("failed to spawn audio render thread")?,
-        )
-    };
+    // 描き手 (コールバックの中か、先読みの描画スレッドか) の切り替えは停止中に `OutputStage` が行う
+    // (`output_render` の module doc)。
+    let mut stage =
+        output_render::OutputStage::spawn(renderer).context("failed to spawn audio render thread")?;
     let mut starve = output_render::StarveProbe::new();
     // E (plan §5): callback thread を MMCSS "Pro Audio" に自前 join する
     // one-shot フラグ (per-thread once — CPAL は単一 stream thread で callback
@@ -1013,10 +1002,7 @@ fn build_stream(
                     }
                 }
                 starve.observe(data.len() / channels_usize, &metrics);
-                match &mut sink {
-                    OutputSink::Inline(r) => r.render(data, true),
-                    OutputSink::Pipeline(p) => p.on_callback(data, channels_usize),
-                }
+                stage.on_callback(data);
             },
             |err| tracing::error!(?err, "audio stream error"),
             None,

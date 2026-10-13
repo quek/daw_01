@@ -198,6 +198,7 @@ impl AppData {
                 // r.md #75: VOICEVOX 合成の塊の長さ (秒)。load 側でクランプ済。
                 voicevox_chunk_secs: app_config.voicevox_chunk_secs,
                 sampler_seconds: app_config.sampler_seconds,
+                render_ahead: app_config.render_ahead,
                 // r.md #113: 仮想鍵盤の位置 / オクターブ / ベロシティ (load 側でクランプ済)。
                 virtual_keyboard_rect: app_config.virtual_keyboard_pos.map(|[x, y]| daw_ui_renderer::Rect { x, y, w: 0.0, h: 0.0 }),
                 virtual_keyboard_base_pitch: app_config.virtual_keyboard_base_pitch,
@@ -314,6 +315,7 @@ impl AppData {
         // `LoadSong` は最初の frame flush が送る。
         app.send_audio(AudioCommand::OpenProject { project: first_key });
         app.send_audio(AudioCommand::SetScopeProject { project: first_key });
+        app.send_render_ahead();
         app.activity
             .active_project
             .store(first_key.0, std::sync::atomic::Ordering::Release);
@@ -1017,6 +1019,7 @@ impl AppData {
             AppEvent::SetClipSelection(targets) => {
                 self.set_clip_selection(targets);
             }
+            AppEvent::SetRenderAhead(on) => self.set_render_ahead(on),
             AppEvent::SetAutomationFollowsClips(on) => {
                 self.ui_prefs.automation_follows_clips = on;
                 // 「この人の作業のしかた」なのでアプリ設定側へ永続する。

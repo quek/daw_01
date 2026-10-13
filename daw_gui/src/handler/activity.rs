@@ -221,4 +221,20 @@ impl AppData {
         self.activity.last_sent_app_active = Some(active);
         self.send_audio(AudioCommand::SetAppActive(active));
     }
+
+    /// 出力の先読みの設定を daw_audio へ送る。起動時と daw_audio の再起動後 (新しいプロセスは既定値から
+    /// 始まるので必ず送り直す) と、設定を変えたとき。
+    pub(crate) fn send_render_ahead(&mut self) {
+        self.send_audio(AudioCommand::SetRenderAhead(self.ui_prefs.render_ahead));
+    }
+
+    /// 設定窓のチェックボックス: 先読みの on / off を永続して送る。
+    pub(crate) fn set_render_ahead(&mut self, on: bool) {
+        if self.ui_prefs.render_ahead == on {
+            return;
+        }
+        self.ui_prefs.render_ahead = on;
+        self.persist_app_config();
+        self.send_render_ahead();
+    }
 }

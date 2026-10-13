@@ -52,6 +52,9 @@ pub struct DeviceRt {
     /// r.md #129 §11.2: device scope の slot ごとに、最後に書いた見出し `(project, device id)`。
     /// 表と違う slot だけ見出しを書き換える (毎 buffer 16 slot の atomic を読み書きしない)。
     pub scope_headers: [(ProjectKey, u64); MAX_DEVICE_SCOPES],
+    /// 描き手が描画スレッド (先読み) か。描き手を替える `crate::output_render` だけが書く。
+    /// transport の publish を聞こえている回まで遅らせるかを決める ([`super::TransportOut`])。
+    pub render_ahead: bool,
 }
 
 impl DeviceRt {
@@ -80,6 +83,7 @@ impl DeviceRt {
             sampler_rt: SamplerRt::new(),
             frames_rendered: 0,
             scope_headers: [(ProjectKey::NONE, 0); MAX_DEVICE_SCOPES],
+            render_ahead: false,
         }
     }
 
@@ -289,8 +293,9 @@ impl DeviceRt {
         // という 2 つの取りこぼしが起きていた。要求は届いた順に必ず消費する。
         // 窓の間 (凍結中) の project の要求は atomic に残り、窓が閉じた buffer で消費される。
         for p in self.projects.iter_mut().filter(|p| !p.in_window()) {
-            p.begin_buffer(bridge.project(p.telemetry_slot));
+            p.begin_buffer();
         }
+        let ahead = self.render_ahead;
 
         // freewheel export: while the export thread holds the audio
         // resources, write silence and skip dispatch so the worker pool
@@ -302,9 +307,8 @@ impl DeviceRt {
                 // 書き出し明けに **全部同時に**発火し、64 件で溢れた分は無言で消える。
                 p.launcher.clear_requests();
                 // 停止中も現在の playhead をそのまま publish する。
-                bridge
-                    .project(p.telemetry_slot)
-                    .set_playhead_samples(p.shared.playhead.load(Ordering::Acquire));
+                p.transport_out.now.playhead = p.shared.playhead.load(Ordering::Acquire);
+                p.transport_out.publish(bridge.project(p.telemetry_slot), ahead);
             }
             return;
         }
@@ -327,8 +331,9 @@ impl DeviceRt {
             // A2: publish the engine's playhead to shmem so the GUI
             // can draw the cursor. 停止中も現在の playhead をそのまま
             // publish する (= ruler click で動かした位置や、 Stop 直前
-            // の位置を GUI に反映、 業界標準の挙動)。
-            slot.set_playhead_samples(p.shared.playhead.load(Ordering::Acquire));
+            // の位置を GUI に反映、 業界標準の挙動)。先読みのときは聞こえている回の値 (`TransportOut`)。
+            p.transport_out.now.playhead = p.shared.playhead.load(Ordering::Acquire);
+            p.transport_out.publish(slot, ahead);
             // この描画が窓を開けた (生き残りが文脈を持っている): bus はまだ生き残りの物なので混ぜない。
             if p.in_window() {
                 continue;

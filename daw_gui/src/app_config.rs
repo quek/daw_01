@@ -76,6 +76,10 @@ pub struct AppConfig {
     /// r.md #113: 仮想鍵盤の打鍵ベロシティ `1..=127`。 `load` で範囲に畳む。
     #[serde(default = "default_virtual_keyboard_velocity")]
     pub virtual_keyboard_velocity: u8,
+    /// 出力の先読み (描画スレッドが 2 周期分を先に描き、重い 1 回を前の回の余りで吸収する)。
+    /// 曲ではなく **この PC の処理能力への対処** なので app_config。default = true。
+    #[serde(default = "default_true")]
+    pub render_ahead: bool,
 }
 
 fn default_virtual_keyboard_base_pitch() -> u8 {
@@ -130,6 +134,7 @@ impl AppConfig {
             virtual_keyboard_pos: prefs.virtual_keyboard_rect.map(|r| [r.x, r.y]),
             virtual_keyboard_base_pitch: prefs.virtual_keyboard_base_pitch,
             virtual_keyboard_velocity: prefs.virtual_keyboard_velocity,
+            render_ahead: prefs.render_ahead,
         }
     }
 }
@@ -172,6 +177,7 @@ impl Default for AppConfig {
             virtual_keyboard_pos: None,
             virtual_keyboard_base_pitch: default_virtual_keyboard_base_pitch(),
             virtual_keyboard_velocity: default_virtual_keyboard_velocity(),
+            render_ahead: true,
         }
     }
 }
@@ -244,6 +250,7 @@ mod tests {
             virtual_keyboard_pos: Some([30.0, 40.0]),
             virtual_keyboard_base_pitch: 60,
             virtual_keyboard_velocity: 80,
+            render_ahead: false,
         };
         save(&path, &cfg).unwrap();
         let loaded = load(&path);
@@ -264,6 +271,7 @@ mod tests {
         assert_eq!(loaded.virtual_keyboard_pos, Some([30.0, 40.0]));
         assert_eq!(loaded.virtual_keyboard_base_pitch, 60);
         assert_eq!(loaded.virtual_keyboard_velocity, 80);
+        assert!(!loaded.render_ahead);
     }
 
     /// r.md #113: 手書きの `app_config.json` で C 揃えでない / 範囲外の鍵盤設定が来ても

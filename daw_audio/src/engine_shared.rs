@@ -62,6 +62,10 @@ pub struct SharedState {
     /// park すべき状態に達した。CPAL コールバックが立て、notify thread が
     /// `Stream::pause()` を実行する (コールバック内から stream は触れない)。
     pub park_requested: AtomicBool,
+    /// 先読み (`crate::output_render`) をしたいか。daw_gui が `AudioCommand::SetRenderAhead` で書き、
+    /// 描き手を持っているスレッドが **停止中に** 読んで描き手を替える (再生中は次の停止まで待つ)。
+    /// 起動時は true (環境設定の既定と同じ) — daw_gui の最初の報告が届けば、それに従って停止中に替わる。
+    pub render_ahead_wanted: AtomicBool,
 }
 
 /// r.md #49: 無音かつアイドルがこの秒数続いたら CPAL stream を pause する。
@@ -155,6 +159,7 @@ impl SharedState {
             app_active: AtomicBool::new(true),
             idle_silent_samples: AtomicU64::new(0),
             park_requested: AtomicBool::new(false),
+            render_ahead_wanted: AtomicBool::new(true),
         }
     }
 }

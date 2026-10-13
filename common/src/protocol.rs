@@ -614,6 +614,9 @@ pub enum AudioCommand {
     /// 出力が無音か、を engine だけが知っているため)。GUI は「窓がアクティブか」という
     /// 事実だけを運ぶ。
     SetAppActive(bool),
+    /// 出力の先読み (描画スレッドが 2 周期分を先に描く) をするか。環境設定 (PC ごと) の値で、daw_gui が起動時・
+    /// daw_audio の再起動後・設定を変えたときに送る。engine は **停止中に** 描き手を替える (再生中は次の停止まで待つ)。
+    SetRenderAhead(bool),
     /// 鍵盤レーン click のピッチプレビュー単発 note-on。 `track_id` は
     /// stable `Track::id`。 transport 状態に関係なく発音する。
     PreviewNoteOn {
@@ -814,6 +817,7 @@ impl AudioCommand {
             | PanicRelease
             | CancelExport
             | SetAppActive(_)
+            | SetRenderAhead(_)
             | OpenWorkerPool(_)
             | CloseWorkerPool
             | SamplerPreview { .. }
@@ -1489,6 +1493,7 @@ mod tests {
             AudioCommand::PanicRelease,
             AudioCommand::CancelExport,
             AudioCommand::SetAppActive(true),
+            AudioCommand::SetRenderAhead(true),
             AudioCommand::CloseWorkerPool,
             AudioCommand::SamplerPreviewStop,
             AudioCommand::Shutdown,
