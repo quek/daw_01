@@ -1278,8 +1278,8 @@ impl AppData {
             AppEvent::SetMasterGain(amp) => {
                 self.set_master_gain(amp);
             }
-            AppEvent::Tick { project, samples, preroll, playing, recording_live } => {
-                self.on_transport_tick(project, samples, preroll, playing, recording_live);
+            AppEvent::Tick { project, samples, beat, preroll, playing, recording_live } => {
+                self.on_transport_tick(project, samples, beat, preroll, playing, recording_live);
             }
             // r.md #50: マスターメーターの表示状態は解析器が丸ごと作るので、
             // ここは差し替えるだけ (GUI 側で弾道を二重に掛けない)。

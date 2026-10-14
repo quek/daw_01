@@ -373,6 +373,9 @@ pub struct ProjectRt {
     /// 判定し、 `playhead_beats` を再初期化する。 初期値 `u64::MAX` は
     /// 「未確定」 (= 最初の buffer は必ず seek 扱いで初期化される)。
     pub last_known_playhead: u64,
+    /// 直近の buffer の sample rate (`0` = まだ描いていない)。bundle の差し替え ([`Self::refresh_bundle`]) で
+    /// テンポの写像が替わったとき、再生位置を引き直すのに使う (r.md #147)。
+    last_sample_rate: u32,
     /// metronome click voice 状態 (mono single-voice)。 `Some` なら active
     /// (= まだ decay 中)。 詳細は `crate::metronome`。
     pub metronome_voice: Option<ClickVoice>,
@@ -503,6 +506,7 @@ impl ProjectRt {
             was_playing: false,
             playhead_beats: 0.0,
             last_known_playhead: u64::MAX,
+            last_sample_rate: 0,
             metronome_voice: None,
             bundle_rx,
             bundle_recycle_tx,
@@ -563,6 +567,9 @@ impl ProjectRt {
         let old_index = std::mem::replace(&mut self.song_index, new.song_index);
         self.song_bounds = new.song_bounds;
         let old_tempo = std::mem::replace(&mut self.tempo_map, new.tempo_map);
+        if !new.reset_song_scoped_state {
+            self.reanchor_after_tempo_change(&old_tempo);
+        }
         let old_refs = std::mem::replace(&mut self.plugin_refs, Arc::clone(&new.plugin_refs));
         let old_preview_sequence =
             std::mem::replace(&mut self.preview_sequence, new.preview_sequence.take());
@@ -668,6 +675,34 @@ impl ProjectRt {
             mod_phase_table: retired_table,
         };
         let _ = self.bundle_recycle_tx.push(recycled);
+    }
+
+    /// r.md #147: テンポの写像が替わったら、**拍を連続のまま**再生位置 (sample) を新しい写像で引き直す
+    /// (`.claude/herdr/p4e_tempo_anchor_decision.md` — head の (曲位置, 拍) はいつも今の写像の上)。
+    ///
+    /// 描画は拍で進む (`playhead_beats` は刻みが前の拍から積むので連続する) が、sample の再生位置は
+    /// 据え置きだと、新しい写像で読んだとき別の拍を指す。すると GUI の再生位置・ループの端・曲末の判定
+    /// (どれも sample で引く) が実際に鳴っている拍からずれていた。テンポが変わっていなければ何もしない。
+    /// seek が待っている (`shared.playhead` が前 buffer 末と違う) ときも何もしない — 行き先は新しい
+    /// 写像で決められた位置で、seek 検出がそこから拍を引く。
+    fn reanchor_after_tempo_change(&mut self, old: &common::tempo_map::TempoMap) {
+        let sr = self.last_sample_rate;
+        let p = self.shared.playhead.load(Ordering::Acquire);
+        if sr == 0 || p != self.last_known_playhead {
+            return;
+        }
+        // 拍は描画が進めた値 (= 前 buffer 末の拍) をそのまま使う。古い写像で sample から引き直すと、
+        // 刻みの積分と表の積分の差のぶん拍が動き、ノートが欠けたり二度鳴ったりし得る。
+        let beat = self.playhead_beats;
+        let moved = self.tempo_map.beat_to_samples(beat, sr);
+        if moved == old.beat_to_samples(beat, sr) {
+            return;
+        }
+        self.shared.playhead.store(moved, Ordering::Release);
+        self.last_known_playhead = moved;
+        // 刻みの連番 (sample 由来) が跳ぶので、次の buffer で今の拍から張り直す。ランチャーの拍は
+        // 動かさない (拍は連続している)。
+        self.mod_tick.request_locate();
     }
 
     /// r.md #89: 変調の位相と transport を `sample` 位置で張り直す
@@ -946,6 +981,7 @@ impl ProjectRt {
         frames: usize,
     ) {
         let song_snapshot = self.cached_song.clone();
+        self.last_sample_rate = sample_rate;
         let n = frames;
         self.bus_l[..n].fill(0.0);
         self.bus_r[..n].fill(0.0);

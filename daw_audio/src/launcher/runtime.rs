@@ -667,9 +667,13 @@ impl LauncherRuntime {
         req: LaunchRequest,
     ) {
         let at = FireAt::User { start_beat: span.start_beat, global_q, playing };
-        let global_at = at.beat(LaunchQuantize::Global, song.time_sig);
         // 量子化抜き (= この buffer の先頭)。
         let now_at = at.beat(LaunchQuantize::Off, song.time_sig);
+        // 行を止める / アレンジへ返す予約の拍。**停止中は量子化を待たない** (r.md #148) — 拍が進まないので
+        // 境界に置いた予約は再生を始めるまで発火せず、ボタンを押しても表示 (engine の走行状態) が
+        // 変わらなかった。鳴らし始める操作 (セル / シーン) と違って transport を動かさないので、
+        // 境界まで待つ理由が無い (Live も停止中の「アレンジへ戻す」はその場で効く)。
+        let release_at = if playing { at.beat(LaunchQuantize::Global, song.time_sig) } else { now_at };
         match req {
             LaunchRequest::Cell { key, clip_id, pressed, immediate } => {
                 let fire = if immediate {
@@ -699,17 +703,17 @@ impl LauncherRuntime {
             }
             // **1 行だけの操作は列の連鎖を解除しない** ([`Self::disarm_scene`])。
             LaunchRequest::StopRow { key, immediate } => {
-                let at = if immediate { now_at } else { global_at };
+                let at = if immediate { now_at } else { release_at };
                 self.queue(song.index, key, QueueTarget::Stop, at, false);
             }
             LaunchRequest::StopAll { immediate } => {
-                let at = if immediate { now_at } else { global_at };
+                let at = if immediate { now_at } else { release_at };
                 self.queue_all(QueueTarget::Stop, at);
             }
             LaunchRequest::RowToArranger { key } => {
-                self.queue(song.index, key, QueueTarget::Arranger, global_at, false);
+                self.queue(song.index, key, QueueTarget::Arranger, release_at, false);
             }
-            LaunchRequest::AllToArranger => self.queue_all(QueueTarget::Arranger, global_at),
+            LaunchRequest::AllToArranger => self.queue_all(QueueTarget::Arranger, release_at),
         }
     }
 
@@ -2305,6 +2309,32 @@ mod tests {
                 stopped,
                 "{req:?} の後に列のフォローアクションが勝手に鳴り出した"
             );
+        }
+    }
+
+    /// r.md #148: **停止中の「アレンジへ戻す」/ 行の停止は量子化を待たずにその buffer で効く。**
+    /// 境界に置くと拍が進まないので再生を始めるまで発火せず、表示も変わらなかった。
+    #[test]
+    fn 停止中のアレンジ復帰と停止はその場で効く() {
+        let song = two_rows();
+        let reqs = [
+            (LaunchRequest::RowToArranger { key: RowKey::track(1) }, RowPhase::Arranger),
+            (LaunchRequest::AllToArranger, RowPhase::Arranger),
+            (LaunchRequest::StopRow { key: RowKey::track(1), immediate: false }, RowPhase::Silent),
+            (LaunchRequest::StopAll { immediate: false }, RowPhase::Silent),
+        ];
+        for (req, want) in reqs {
+            let mut rt = LauncherRuntime::for_song(&song);
+            step(&mut rt, &song, 0.0);
+            press(&mut rt, 1, 10, true);
+            step(&mut rt, &song, 0.0);
+            assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10));
+
+            // 小節の途中で止めた (global 量子化 = 1 小節なら次の境界は 4.0)。
+            rt.push_request(req);
+            let index = SongIndex::build(&song);
+            rt.update(&song, &index, span_at(1.5), LaunchQuantize::Bars(1), false);
+            assert_eq!(rt.rows().track_row(0).tail, want, "停止中の {req:?} が境界待ちになった");
         }
     }
 

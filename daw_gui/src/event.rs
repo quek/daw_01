@@ -930,6 +930,9 @@ pub enum AppEvent {
         /// 全 slot ぶん送り、`handle_event` が `with_project` で該当タブへ配る。
         project: common::protocol::ProjectKey,
         samples: u64,
+        /// `samples` の位置の曲の拍 (engine が描画に使った拍、r.md #147)。再生位置はこれで出す
+        /// (GUI のテンポで sample を拍に直すと、テンポ変更が engine に届く前の数 tick ずれる)。
+        beat: f64,
         preroll: u64,
         playing: bool,
         recording_live: bool,

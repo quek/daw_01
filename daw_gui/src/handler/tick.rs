@@ -20,6 +20,7 @@ impl AppData {
         &mut self,
         project: common::protocol::ProjectKey,
         samples: u64,
+        beat: f64,
         preroll: u64,
         playing: bool,
         recording_live: bool,
@@ -29,7 +30,7 @@ impl AppData {
             app.cur.recording.live = recording_live;
             let stopped = app.cur.transport.is_playing && !playing;
             app.cur.transport.is_playing = playing;
-            app.on_tick(samples, stopped);
+            app.on_tick(samples, beat, stopped);
             if stopped {
                 // 手動停止・曲末 auto-stop・書き出し・パニックのどれで止まっても
                 // ここへ収束する (録音セッションのクローズ)。
@@ -38,7 +39,8 @@ impl AppData {
         });
     }
 
-    pub(crate) fn on_tick(&mut self, playhead_samples: u64, stopped: bool) {
+    /// `playhead_beat` は engine が publish した `playhead_samples` の位置の拍 (r.md #147)。
+    pub(crate) fn on_tick(&mut self, playhead_samples: u64, playhead_beat: f64, stopped: bool) {
         // r.md #67: カーソルキーの音程変更で鳴らした試聴音を期限で消音する
         // (鍵盤レーンの held preview と違い、 離すイベントが無いので時間で切る)。
         self.expire_nudge_audition(false);
@@ -113,16 +115,13 @@ impl AppData {
         // (#63 のダーティーガードが round-trip 完了を待つため)。 export watchdog と
         // 同型に、 一定時間応答が無ければ round-trip を破棄して脱出口を作る。
         self.poll_state_roundtrip_watchdog(std::time::Instant::now());
-        let next_beat = if playhead_samples == u64::MAX {
-            None
-        } else {
-            common::timing::playhead_to_beat(
-                Some(self.cur.song_doc.song()),
-                self.ipc.sample_rate,
-                playhead_samples,
-            )
-            .map(|b| b as f32)
-        };
+        // r.md #147: 拍は engine が描画に使った値をそのまま出す。ここで sample を `song.bpm` の定数換算で
+        // 拍に直していたので、テンポカーブのある曲では実際の位置から離れていき、再生中にテンポを
+        // 変えると (engine に届く前の数 tick と先読みの遅れの間、新しいテンポで古い sample を読んで)
+        // 再生位置が跳んでいた。
+        let next_beat = (playhead_samples != common::audio_bridge::PLAYHEAD_UNSET
+            && playhead_beat.is_finite())
+        .then_some(playhead_beat as f32);
         // r.md #51: 曲末の auto-stop は **engine だけ**が判定する
         // (`daw_audio/src/engine.rs` の `song_ended`)。 GUI 側にも同じ述語を
         // 複製していたが、engine 側は録音中に抑止する / GUI 側は抑止しない、の

@@ -10,9 +10,11 @@ use common::audio_bridge::{PLAYHEAD_UNSET, ProjectTelemetry};
 use crate::output_render::RENDER_AHEAD_PERIODS;
 
 /// 1 回分の transport の観測値。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TransportSnapshot {
     pub playhead: u64,
+    /// `playhead` の位置の曲の拍 (r.md #147 — engine が描画に使った拍。GUI はこれを再生位置に出す)。
+    pub beat: f64,
     pub playing: bool,
     pub preroll: u64,
     pub recording_live: bool,
@@ -20,12 +22,14 @@ pub struct TransportSnapshot {
 
 impl TransportSnapshot {
     /// まだ 1 回も描いていない (GUI には「再生位置が無い」と見える)。
-    const UNSET: Self = Self { playhead: PLAYHEAD_UNSET, playing: false, preroll: 0, recording_live: false };
+    const UNSET: Self =
+        Self { playhead: PLAYHEAD_UNSET, beat: 0.0, playing: false, preroll: 0, recording_live: false };
 
     fn publish(&self, slot: &ProjectTelemetry) {
         slot.set_playing(self.playing);
         slot.set_recording_live(self.recording_live);
         slot.set_preroll_remaining(self.preroll);
+        slot.set_playhead_beat(self.beat);
         slot.set_playhead_samples(self.playhead);
     }
 }
