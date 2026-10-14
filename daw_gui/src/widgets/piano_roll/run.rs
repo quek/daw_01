@@ -33,7 +33,9 @@ pub fn piano_roll_state_id(project: common::protocol::ProjectKey) -> WidgetId {
 pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoRollResponse {
         let p = &*app.theme.core;
         // ---- view 構築 (レイアウト SSoT) + toolbar (常時描画) ----
-        let built = view_build::build(app, area);
+        let built = view_build::build(app, area, |names, font_px| {
+            names.iter().map(|n| ui.measure_text(n, font_px)).fold(0.0, f32::max)
+        });
         draw_snap_toolbar(app, ui, built.toolbar_rect);
         let Some(content) = built.content else {
             // 表示する MIDI クリップが無い (未選択 or 非 MIDI のみ) → placeholder。
@@ -72,6 +74,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             vel_area,
             zoom_x,
             zoom_y,
+            key_names,
         } = content;
         let notes: &[Note] = &widget_notes;
         let selected: &[NoteId] = &selected;
@@ -968,6 +971,8 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     scale_key,
                     snap_drag_key,
                     sub_grid_key,
+                    // r.md #138: 鍵盤に描く音源の名前。
+                    key_names.as_ref().map(|k| k.cache_key()),
                 ),
             ),
             internal_note_hash,
@@ -1090,7 +1095,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
         ui.heavy(("piano_roll_inner", &id), move |hctx| {
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
             hctx.cached(viewport_key, |hctx| {
-                draw_grid_background(hctx, grid, kbd, view_copy, &style_copy);
+                draw_grid_background(hctx, grid, kbd, view_copy, &style_copy, key_names.as_deref());
                 hctx.ui_mut().bar_beat_grid(
                     ("pr_grid", id_for_inner),
                     grid,

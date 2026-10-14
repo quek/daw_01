@@ -22,6 +22,7 @@ mod vst3_scan;
 mod clap_host;
 mod clap_plugin;
 mod editor_keys;
+mod key_names;
 mod load_bench;
 mod module_cache;
 mod editor_window;
@@ -34,6 +35,7 @@ mod vst3_host;
 mod vst3_params;
 mod vst3_plugin;
 mod vst3_stream;
+mod vst3_units;
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -163,6 +165,8 @@ enum HostNotify {
     LatencyChanged(DeviceAddr),
     /// CLAP `clap_host_params.rescan`。
     ParamsRescan(DeviceAddr),
+    /// r.md #138: CLAP `clap_host_note_name.changed` / VST3 `notifyProgramListChange`。
+    KeyNamesChanged(DeviceAddr),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -801,6 +805,12 @@ impl PluginHost {
                     let _ = tx.send(HostNotify::ParamsRescan(device));
                 })
             },
+            on_key_names_changed: {
+                let tx = notify(&self.notify_tx);
+                Arc::new(move || {
+                    let _ = tx.send(HostNotify::KeyNamesChanged(device));
+                })
+            },
             // VST3 param gesture (IComponentHandler)。CLAP plugin はこの
             // callback を呼ばない (out_events 経由) ので二重発火しない。
             on_param_gesture_begin: {
@@ -875,6 +885,18 @@ impl PluginHost {
             tracing::info!(?device, count = params.len(), "plugin enumerated params");
         }
         self.emit(PluginEvent::PluginParamList { device, params });
+    }
+
+    /// r.md #138: 鍵盤ごとの名前を (再) 送信する (load 直後 / plugin の変更通知)。
+    fn emit_key_names(&mut self, device: DeviceAddr) {
+        let Some(rec) = self.instances.get_mut(&device) else {
+            return;
+        };
+        let names = rec.plugin.key_names();
+        if !names.is_empty() {
+            tracing::info!(?device, count = names.len(), "plugin reported key names");
+        }
+        self.emit(PluginEvent::PluginKeyNames { device, names });
     }
 
     // ----------------------------------------------------------------
@@ -1339,6 +1361,7 @@ impl PluginHost {
             tracing::info!(?device, count = params.len(), "plugin enumerated params");
         }
         self.emit(PluginEvent::PluginParamList { device, params });
+        self.emit_key_names(device);
     }
 
     /// device の instance を完全 teardown する。`emit_unloaded` は
@@ -1942,6 +1965,9 @@ impl PluginHost {
             }
             HostNotify::ParamsRescan(device) => {
                 self.emit_param_list(device);
+            }
+            HostNotify::KeyNamesChanged(device) => {
+                self.emit_key_names(device);
             }
         }
     }

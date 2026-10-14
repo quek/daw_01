@@ -95,6 +95,7 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
     kbd: Rect,
     view: PianoRollView,
     style: &PianoRollStyle,
+    key_names: Option<&KeyNames>,
 ) {
     // 鍵盤ラベルの極性判定に使う (戻りは host の `'a` 借用なので push_rect と衝突しない)。
     let p = hctx.palette();
@@ -269,6 +270,13 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                     ..GlyphArea::default()
                 });
             }
+            // r.md #138: 音源が申告する名前 (root 行は上と同じ overlay 込みの背景でコントラストを取る)。
+            if geom.row_h >= 8.0
+                && let Some(name) = key_names.and_then(|k| k.get(pitch))
+            {
+                let overlay = (Some(pitch % 12) == root_pc_opt).then_some(style.root_row_overlay);
+                draw_key_name(hctx, p, style, kbd, y, name, fill, overlay);
+            }
         }
     } else {
         // Linear (None / Highlight)
@@ -320,6 +328,13 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
                     });
                 }
             }
+            // r.md #138: 音源が申告する名前 (上の scale overlay と同じ実効背景でコントラストを取る)。
+            if geom.row_h >= 8.0
+                && let Some(name) = key_names.and_then(|k| k.get(pitch))
+            {
+                let overlay = highlight_overlay(style, scale, pitch);
+                draw_key_name(hctx, p, style, kbd, y, name, fill, overlay);
+            }
             // Label
             if geom.row_h >= 8.0 {
                 if let Some(root_pc) = root_pc_opt {
@@ -368,6 +383,45 @@ pub(super) fn draw_grid_background<M: ?Sized + 'static>(
             }
         }
     }
+}
+
+/// Linear (None / Highlight) で鍵に重なる scale overlay (上の鍵の塗りと同じ規則)。
+fn highlight_overlay(style: &PianoRollStyle, scale: Option<PianoRollScale>, pitch: u8) -> Option<Color> {
+    let sc = scale?;
+    if pitch % 12 == sc.root % 12 {
+        Some(style.root_row_overlay)
+    } else if !sc.is_in_scale(pitch) {
+        Some(style.out_of_scale_row_overlay)
+    } else {
+        None
+    }
+}
+
+/// r.md #138: 音源が申告する鍵盤の名前を、鍵盤の名前の列 (左の C / root ラベルの右) に描く。
+/// 色は鍵の実効背景 (`key_fill` に `overlay` を重ねたもの) から `keyboard_label_color` で
+/// 決めるので、白鍵・黒鍵・scale overlay のどれの上でも読める。鍵盤の右端で切る。
+#[allow(clippy::too_many_arguments)]
+fn draw_key_name<M: ?Sized + 'static>(
+    hctx: &mut daw_ui_core::widgets::heavy::HeavyCtx<'_, '_, M>,
+    p: &Palette,
+    style: &PianoRollStyle,
+    kbd: Rect,
+    y: f32,
+    name: &str,
+    key_fill: Color,
+    overlay: Option<Color>,
+) {
+    let color = keyboard_label_color(p, style, key_fill, overlay, style.c_label_color);
+    hctx.push_text(GlyphArea {
+        text: name.to_string().into(),
+        left: kbd.x + super::key_names::NAME_COLUMN_X,
+        top: y,
+        font_size: style.c_label_font_px,
+        line_height: style.c_label_font_px * 1.2,
+        color,
+        clip_rect: Some(Rect { x: kbd.x, y: kbd.y, w: (kbd.w - 1.0).max(0.0), h: kbd.h }),
+        ..GlyphArea::default()
+    });
 }
 
 /// visible note を grid 内に clip して描画。M9 Phase 44c 以降 `lyric: Some(...)` が

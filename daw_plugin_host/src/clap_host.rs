@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency};
+use clap_sys::ext::note_name::{CLAP_EXT_NOTE_NAME, clap_host_note_name};
 use clap_sys::ext::params::{CLAP_EXT_PARAMS, clap_host_params, clap_param_clear_flags,
     clap_param_rescan_flags};
 use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
@@ -49,6 +50,7 @@ pub struct Host {
     pub clap_thread_check: clap_host_thread_check,
     pub clap_latency: clap_host_latency,
     pub clap_params: clap_host_params,
+    pub clap_note_name: clap_host_note_name,
     pub callbacks: HostCallbacks,
 }
 
@@ -85,6 +87,9 @@ impl Host {
                 rescan: Some(params_rescan),
                 clear: Some(params_clear),
                 request_flush: Some(params_request_flush),
+            },
+            clap_note_name: clap_host_note_name {
+                changed: Some(note_name_changed),
             },
             callbacks,
         });
@@ -137,6 +142,9 @@ unsafe extern "C" fn get_extension(
     }
     if id_cstr == CLAP_EXT_PARAMS {
         return std::ptr::from_ref(&this.clap_params) as *const c_void;
+    }
+    if id_cstr == CLAP_EXT_NOTE_NAME {
+        return std::ptr::from_ref(&this.clap_note_name) as *const c_void;
     }
     std::ptr::null()
 }
@@ -198,6 +206,16 @@ unsafe extern "C" fn params_rescan(host: *const clap_host, flags: clap_param_res
         return;
     };
     (this.callbacks.on_params_rescan)();
+}
+
+/// CLAP `clap_host_note_name.changed` (`ext/note-name.h`: "Informs the host that the note
+/// names have changed. [main-thread]") — 鍵盤の名前を取り直して再送させる (r.md #138)。
+unsafe extern "C" fn note_name_changed(host: *const clap_host) {
+    tracing::info!("host callback: note_name.changed");
+    let Some(this) = (unsafe { Host::from_clap(host) }) else {
+        return;
+    };
+    (this.callbacks.on_key_names_changed)();
 }
 
 /// CLAP `clap_host_params.clear` — daw_gui 側の automation は param id で

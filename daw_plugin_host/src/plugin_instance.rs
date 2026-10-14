@@ -151,6 +151,10 @@ pub struct HostCallbacks {
     /// CLAP `clap_host_params.rescan` — param 一覧再送 (`PluginParamList`)
     /// の要求。
     pub on_params_rescan: Arc<dyn Fn() + Send + Sync>,
+    /// r.md #138: CLAP `clap_host_note_name.changed` / VST3
+    /// `IUnitHandler::notifyProgramListChange` — 鍵盤の名前を取り直して
+    /// `PluginKeyNames` を再送する要求。
+    pub on_key_names_changed: Arc<dyn Fn() + Send + Sync>,
     /// VST3 only: plugin GUI param gesture begin (`beginEdit`).
     pub on_param_gesture_begin: Arc<dyn Fn(u32) + Send + Sync>,
     /// VST3 only: plugin GUI param value change (`performEdit`).
@@ -329,6 +333,7 @@ impl HostCallbacks {
             on_request_callback: Arc::new(|| {}),
             on_latency_changed: Arc::new(|| {}),
             on_params_rescan: Arc::new(|| {}),
+            on_key_names_changed: Arc::new(|| {}),
             on_param_gesture_begin: Arc::new(|_| {}),
             on_param_value: Arc::new(|_, _| {}),
             on_param_gesture_end: Arc::new(|_| {}),
@@ -656,6 +661,12 @@ pub trait LoadedPlugin: Send {
     fn query_latency(&mut self) -> u32;
 
     /// Enumerate every parameter the plugin exposes (plugin-main thread).
+    /// r.md #138: 鍵盤ごとの名前 ([`crate::key_names::normalize`] で整えたもの)。
+    /// 申告しない plugin は空。[main-thread]
+    fn key_names(&self) -> Vec<common::protocol::KeyName> {
+        Vec::new()
+    }
+
     fn enumerate_params(&self) -> Vec<PluginParamInfo> {
         Vec::new()
     }

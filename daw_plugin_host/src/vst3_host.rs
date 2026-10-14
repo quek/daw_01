@@ -23,8 +23,8 @@ use vst3::Steinberg::{
     kNotImplemented, kResultFalse, kResultOk, kResultTrue, tresult,
     Vst::{
         IAttributeList, IAttributeListTrait, IComponentHandler, IComponentHandlerTrait,
-        IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait, ParamID, ParamValue,
-        String128, TChar,
+        IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait, IUnitHandler,
+        IUnitHandlerTrait, ParamID, ParamValue, ProgramListID, String128, TChar, UnitID,
     },
 };
 use vst3::Steinberg::Vst::IAttributeList_::AttrID;
@@ -300,7 +300,24 @@ impl Vst3ComponentHandler {
 }
 
 impl Class for Vst3ComponentHandler {
-    type Interfaces = (IComponentHandler,);
+    // r.md #138: `IUnitHandler` は `ivstunits.h` で「Retrieve via queryInterface from
+    // IComponentHandler」なので同じ object に載せる。
+    type Interfaces = (IComponentHandler, IUnitHandler);
+}
+
+impl IUnitHandlerTrait for Vst3ComponentHandler {
+    unsafe fn notifyUnitSelection(&self, _unit_id: UnitID) -> tresult {
+        kResultOk
+    }
+
+    /// `ivstunits.h`: "Tell host that the plug-in controller changed a program list
+    /// (rename, load, PitchName changes)." — 鍵盤の名前を取り直す (r.md #138)。
+    /// どの list / program が変わったかは区別せず全部取り直す (128 鍵を引くだけで安い)。
+    unsafe fn notifyProgramListChange(&self, list_id: ProgramListID, program_index: i32) -> tresult {
+        tracing::info!(list_id, program_index, "VST3 notifyProgramListChange");
+        (self.callbacks.on_key_names_changed)();
+        kResultOk
+    }
 }
 
 impl IComponentHandlerTrait for Vst3ComponentHandler {
