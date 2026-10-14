@@ -81,6 +81,8 @@ pub mod note_ops;
 // feature 有効時のみコンパイルする (default ビルドのコールド時間短縮)。
 #[cfg(feature = "script")]
 pub mod script;
+/// r.md #141: クリップを OS のファイルドラッグで別プロセスの窓へ渡す。
+pub mod os_file_drag;
 /// r.md #61: Windows のサインアウト / シャットダウン (`WM_QUERYENDSESSION`)。
 #[cfg(windows)]
 pub mod session_end;

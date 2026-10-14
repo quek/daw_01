@@ -7,6 +7,8 @@
 //! 運んでいる選択を copy と同じ `ClipboardEnvelope` に写して `Ui::begin_drag` に載せ、
 //! 元タブの session を捨て (Song は無変更)、タブを切り替える。落とす側は
 //! `view::capture_drop` (cross-project paste = 独立コピー)。
+//!
+//! r.md #141: もう 1 つの持ち出し先 = **別プロセスの窓** ([`promote_to_os_file_drag`])。
 
 use std::time::Instant;
 
@@ -271,4 +273,38 @@ fn track_payload(app: &AppData, ids: &[u32]) -> Option<ProjectTransferPayload> {
     let mut envelope = app.envelope_with_media(crate::clipboard::ClipboardPayload::Tracks(copy));
     envelope.source_project_id = 0;
     Some(ProjectTransferPayload { envelope, grab_beat_offset: 0.0, grab_track_offset: 0 })
+}
+
+// r.md #141: クリップの Move ドラッグで **カーソルが daw_01 の窓の外** (別プロセスの窓 —
+// daw_plugin_host のプラグインのエディタ窓 / Explorer など) に出たら、移動を取り消して
+// OS のファイルドラッグに切り替える。渡すのは素材ファイルそのもの (Explorer から落とすのと同じ)。
+//
+// エディタ窓は daw_01 の窓に重なって出るので、winit の座標 (マウスを capture しているので
+// 窓の外でも届く) では判定できない。OS にカーソルの下の窓の持ち主を聞く
+// ([`crate::os_file_drag::cursor_over_foreign_window`])。
+
+/// [`promote`] の後・`drag::advance` の前に呼ぶ。切り替えたフレームは session が消えて
+/// いるので、以降の continuation / release は何もしない (= クリップは元の位置に残る)。
+pub(super) fn promote_to_os_file_drag(app: &AppData, ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
+    let keys: Vec<ClipKey> = {
+        let st: &mut ArrangementState = ui.widget_state(f.wid);
+        match st.clip_drag.as_ref() {
+            Some(d) if d.kind == ClipDragKind::Move => d.anchors.iter().map(|a| a.key).collect(),
+            _ => return,
+        }
+    };
+    if !crate::os_file_drag::cursor_over_foreign_window() {
+        return;
+    }
+    // 素材ファイルを持たないクリップ (MIDI / 映像 ...) だけなら窓の中のドラッグを続ける。
+    if app.clips_audio_source_ids(&keys).is_empty() {
+        return;
+    }
+    {
+        let st: &mut ArrangementState = ui.widget_state(f.wid);
+        st.clip_drag = None;
+        st.tab_hover = None;
+    }
+    tracing::info!(clips = keys.len(), "arrangement clip drag promoted to OS file drag");
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| app.request_os_file_drag(&keys)));
 }
