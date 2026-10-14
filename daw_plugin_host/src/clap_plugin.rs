@@ -35,7 +35,6 @@ use clap_sys::ext::gui::{
     clap_window_handle,
 };
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
-use clap_sys::ext::note_name::{CLAP_EXT_NOTE_NAME, clap_note_name, clap_plugin_note_name};
 use clap_sys::ext::note_ports::{CLAP_EXT_NOTE_PORTS, clap_plugin_note_ports};
 use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_MODULATABLE,
@@ -983,37 +982,7 @@ impl LoadedPlugin for ClapPlugin {
 
     /// r.md #138: `clap.note-name` (`ext/note-name.h`) の `count` / `get` [main-thread]。
     fn key_names(&self) -> Vec<common::protocol::KeyName> {
-        if self.plugin.is_null() {
-            return Vec::new();
-        }
-        let Some(get_ext) = (unsafe { (*self.plugin).get_extension }) else {
-            return Vec::new();
-        };
-        let ext = unsafe { get_ext(self.plugin, CLAP_EXT_NOTE_NAME.as_ptr()) }
-            as *const clap_plugin_note_name;
-        let Some(ext) = (unsafe { ext.as_ref() }) else {
-            return Vec::new();
-        };
-        let (Some(count_fn), Some(get_fn)) = (ext.count, ext.get) else {
-            return Vec::new();
-        };
-        // count は untrusted。鍵盤 128 × channel 16 × 数 port を十分に覆う上限。
-        const MAX_NOTE_NAMES: u32 = 8192;
-        let count = unsafe { count_fn(self.plugin) }.min(MAX_NOTE_NAMES);
-        let raw = (0..count).filter_map(|i| {
-            // SAFETY: clap_note_name is plain old data; zeroed start is legal.
-            let mut nn: clap_note_name = unsafe { std::mem::zeroed() };
-            if !unsafe { get_fn(self.plugin, i, &raw mut nn) } {
-                return None;
-            }
-            Some(crate::key_names::RawKeyName {
-                port: nn.port,
-                key: nn.key,
-                channel: nn.channel,
-                name: crate::vst3_scan::c_array_to_string(&nn.name),
-            })
-        });
-        crate::key_names::normalize(raw)
+        crate::key_names::from_clap(self.plugin)
     }
 
     /// Serializes the plugin's internal state via `clap_plugin_state.save`.

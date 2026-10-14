@@ -1,7 +1,9 @@
 //! r.md #138: plugin が申告する鍵盤ごとの名前 (Kick / Snare …) を、ピアノロールが描く形
-//! ([`KeyName`] の key 昇順・重複なし) に揃える。CLAP / VST3 の取得部はそれぞれの
-//! `LoadedPlugin::key_names` にあり、ここは format に依らない整形だけを持つ。
+//! ([`KeyName`] の key 昇順・重複なし) に揃える。整形は format に依らない 1 本 ([`normalize`])。
+//! CLAP の取得 ([`from_clap`]) もここに置く (`clap_plugin.rs` のサイズ budget のため)。VST3 の取得は `vst3_units.rs`。
 
+use clap_sys::ext::note_name::{CLAP_EXT_NOTE_NAME, clap_note_name, clap_plugin_note_name};
+use clap_sys::plugin::clap_plugin;
 use common::protocol::KeyName;
 
 /// plugin が返した 1 件。`port` / `channel` の `-1` は「全 port / 全 channel」
@@ -11,6 +13,41 @@ pub struct RawKeyName {
     pub key: i16,
     pub channel: i16,
     pub name: String,
+}
+
+/// CLAP の `clap.note-name` (`ext/note-name.h`) の `count` / `get` で読む [main-thread]。
+/// 拡張が無い / plugin が null なら空。
+pub fn from_clap(plugin: *const clap_plugin) -> Vec<KeyName> {
+    if plugin.is_null() {
+        return Vec::new();
+    }
+    let Some(get_ext) = (unsafe { (*plugin).get_extension }) else {
+        return Vec::new();
+    };
+    let ext = unsafe { get_ext(plugin, CLAP_EXT_NOTE_NAME.as_ptr()) } as *const clap_plugin_note_name;
+    let Some(ext) = (unsafe { ext.as_ref() }) else {
+        return Vec::new();
+    };
+    let (Some(count_fn), Some(get_fn)) = (ext.count, ext.get) else {
+        return Vec::new();
+    };
+    // count は untrusted。鍵盤 128 × channel 16 × 数 port を十分に覆う上限。
+    const MAX_NOTE_NAMES: u32 = 8192;
+    let count = unsafe { count_fn(plugin) }.min(MAX_NOTE_NAMES);
+    let raw = (0..count).filter_map(|i| {
+        // SAFETY: clap_note_name is plain old data; zeroed start is legal.
+        let mut nn: clap_note_name = unsafe { std::mem::zeroed() };
+        if !unsafe { get_fn(plugin, i, &raw mut nn) } {
+            return None;
+        }
+        Some(RawKeyName {
+            port: nn.port,
+            key: nn.key,
+            channel: nn.channel,
+            name: crate::vst3_scan::c_array_to_string(&nn.name),
+        })
+    });
+    normalize(raw)
 }
 
 /// daw_01 が音源へ note を送るのは port 0 / channel 0 だけなので、そこに効く名前だけを採る。
