@@ -308,6 +308,7 @@ impl DeviceRt {
                 p.launcher.clear_requests();
                 // 停止中も現在の playhead をそのまま publish する。
                 p.transport_out.now.playhead = p.shared.playhead.load(Ordering::Acquire);
+                p.transport_out.now.beat = p.playhead_beats;
                 p.transport_out.publish(bridge.project(p.telemetry_slot), ahead);
             }
             return;
@@ -333,6 +334,8 @@ impl DeviceRt {
             // publish する (= ruler click で動かした位置や、 Stop 直前
             // の位置を GUI に反映、 業界標準の挙動)。先読みのときは聞こえている回の値 (`TransportOut`)。
             p.transport_out.now.playhead = p.shared.playhead.load(Ordering::Acquire);
+            // r.md #147: その位置の拍 (描画が進めた拍。テンポカーブ・再生中のテンポ変更を含む)。
+            p.transport_out.now.beat = p.playhead_beats;
             p.transport_out.publish(slot, ahead);
             // この描画が窓を開けた (生き残りが文脈を持っている): bus はまだ生き残りの物なので混ぜない。
             if p.in_window() {

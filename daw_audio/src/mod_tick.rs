@@ -531,6 +531,12 @@ impl ModTickRunner {
         self.first_tick == i64::MIN
     }
 
+    /// 次の buffer で [`Self::locate`] を通させる (r.md #147: テンポが替わって再生位置の sample を
+    /// 引き直したとき — 刻みの連番が跳ぶので、続きから進めてはいけない)。
+    pub fn request_locate(&mut self) {
+        self.first_tick = i64::MIN;
+    }
+
     /// フォロワーを刻みごとに進めるための view。`col_of_slot` は engine が
     /// `Schedule::follower_keys` から解決した写像 (schedule slot → 列)。
     #[must_use]

@@ -278,10 +278,10 @@ fn 録音中はカーソルトラックが_r_ならクリップに書き込ま�
     app.handle_event(AppEvent::ToggleTrackArmed(track_id));
     open(&mut app);
     app.handle_event(AppEvent::ToggleMidiRecording);
-    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, preroll: 0, playing: true, recording_live: true });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, beat: 0.0, preroll: 0, playing: true, recording_live: true });
     app.handle_event(key('Q', true));
     // 120 BPM / 48kHz で 1 拍 = 24000 サンプル。
-    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 24_000, preroll: 0, playing: true, recording_live: true });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 24_000, beat: 1.0, preroll: 0, playing: true, recording_live: true });
     app.handle_event(key('Q', false));
     let song = app.cur.song_doc.song();
     let clip = &song.tracks[0].clips[0];
@@ -307,10 +307,10 @@ fn 録音中でもカーソルトラックが_r_でなければ書き込まな�
     app.cur.selection.selected_track_ids = vec![first];
     open(&mut app);
     app.handle_event(AppEvent::ToggleMidiRecording);
-    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, preroll: 0, playing: true, recording_live: true });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, beat: 0.0, preroll: 0, playing: true, recording_live: true });
     let _ = drain_notes(&mut audio_rx);
     app.handle_event(key('Q', true));
-    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 24_000, preroll: 0, playing: true, recording_live: true });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 24_000, beat: 1.0, preroll: 0, playing: true, recording_live: true });
     app.handle_event(key('Q', false));
     assert_eq!(drain_notes(&mut audio_rx), vec![(true, first, 60, 100), (false, first, 60, 0)]);
     let song = app.cur.song_doc.song();

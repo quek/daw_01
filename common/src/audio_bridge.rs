@@ -68,6 +68,11 @@ pub struct ProjectTelemetry {
     /// buffer so daw_gui can poll it (once per UI tick) for playhead-row
     /// highlighting.
     pub playhead_samples: AtomicU64,
+    /// r.md #147: `playhead_samples` の位置の **曲の拍** (`f64::to_bits`)。engine が描画に使った拍
+    /// そのもの (テンポカーブ・再生中のテンポ変更を含む)。GUI が sample を自分のテンポで拍に
+    /// 直すと、テンポ変更が engine に届くまでの数 tick と先読みの遅れの間、新しいテンポで古い
+    /// sample を読んで再生位置が跳ぶ。`playhead_samples` が [`PLAYHEAD_UNSET`] の間は意味を持たない。
+    pub playhead_beat: AtomicU64,
     /// 今 audio thread が書いている [`TelemetryPlane`] の id ([`plane_id`])。**`0` = 面なし**。
     /// RT が新しい面へ一式 publish し終えた buffer の末尾で差し替えるので、読み手が見つけた id の面は
     /// 書かれた後の面。
@@ -148,6 +153,7 @@ impl ProjectTelemetry {
     /// off-RT (recv loop) で呼ぶ。`project_key` は触らない。
     fn reset(&self) {
         self.playhead_samples.store(PLAYHEAD_UNSET, Ordering::Release);
+        self.set_playhead_beat(0.0);
         self.plane_id.store(0, Ordering::Release);
         self.set_master_limiter_gr_db(0.0);
         self.preroll_remaining_samples.store(0, Ordering::Release);
@@ -161,6 +167,14 @@ impl ProjectTelemetry {
 
     pub fn playhead_samples(&self) -> u64 {
         self.playhead_samples.load(Ordering::Acquire)
+    }
+
+    pub fn set_playhead_beat(&self, beat: f64) {
+        self.playhead_beat.store(beat.to_bits(), Ordering::Release);
+    }
+
+    pub fn playhead_beat(&self) -> f64 {
+        f64::from_bits(self.playhead_beat.load(Ordering::Acquire))
     }
 
     /// audio thread が新しい [`TelemetryPlane`] へ一式 publish し終えたら呼ぶ (RT 安全: atomic store のみ)。

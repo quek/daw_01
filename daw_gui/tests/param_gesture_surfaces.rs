@@ -485,7 +485,8 @@ fn latch_で再生中にマスターパネルの_bus_comp_thr_を動かすと_ma
     let mut tick = |app: &mut AppData| {
         samples += 2_400; // 1 フレーム = 0.1 拍 (120 BPM)。録音の間引き (1/64 拍) より長い。
         let project = app.pk();
-        app.handle_event(AppEvent::Tick { project, samples, preroll: 0, playing: true, recording_live: false });
+        let beat = samples as f64 / 24_000.0;
+        app.handle_event(AppEvent::Tick { project, samples, beat, preroll: 0, playing: true, recording_live: false });
     };
     tick(&mut app);
     assert!(app.cur.transport.is_playing, "再生中");

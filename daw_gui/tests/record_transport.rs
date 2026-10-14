@@ -66,6 +66,8 @@ fn tick(app: &mut AppData, playing: bool, recording_live: bool, samples: u64) {
     app.handle_event(AppEvent::Tick {
         project: app.pk(),
         samples,
+        // engine は sample と一緒にその位置の拍を publish する (120 BPM / 48kHz)。
+        beat: samples as f64 / 24_000.0,
         preroll: 0,
         playing,
         recording_live,

@@ -650,6 +650,7 @@ fn spawn_playhead_poller(handles: PollerHandles, proxy: EventLoopProxy<AppEvent>
                     .send_event(AppEvent::Tick {
                         project: key,
                         samples: slot.playhead_samples(),
+                        beat: slot.playhead_beat(),
                         preroll: slot.preroll_remaining(),
                         playing: slot.playing(),
                         recording_live: slot.recording_live(),

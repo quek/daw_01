@@ -61,6 +61,7 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("appOpenProject", daw_app_open_project, 1),
     ("appPlay", daw_app_play, 0),
     ("appStop", daw_app_stop, 0),
+    ("appSetBpm", daw_app_set_bpm, 1),
     ("appSetRenderAhead", daw_app_set_render_ahead, 1),
     ("appRescanPlugins", daw_app_rescan_plugins, 0),
     ("play", daw_play, 0),
@@ -451,6 +452,13 @@ fn daw_app_play(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsRes
     Ok(JsValue::undefined())
 }
 
+/// `daw.appSetBpm(bpm)` — テンポ欄のドラッグと同じ `AppEvent::SetSongBpmFromScrub` (r.md #147)。
+fn daw_app_set_bpm(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let bpm = args.get_or_undefined(0).to_number(ctx)? as f32;
+    with_app(move |app, _side, _io| app.handle_event(AppEvent::SetSongBpmFromScrub(bpm)));
+    Ok(JsValue::undefined())
+}
+
 /// `daw.appStop()` — `AppEvent::Stop` (GUI の停止と同じ経路)。
 fn daw_app_stop(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     with_app(|app, _side, _io| app.handle_event(AppEvent::Stop));
@@ -514,18 +522,20 @@ fn daw_stop_recording(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) ->
 }
 
 /// `daw.transportState()` — read what the audio engine is publishing about the
-/// transport (r.md #51): `{ playing, recordingLive, prerollRemaining, playhead }`.
+/// transport (r.md #51): `{ playing, recordingLive, prerollRemaining, playhead, beat }`.
 ///
 /// This is the same shmem plane the GUI's playhead poller reads, so a headless
 /// script can verify the engine half of "who owns the transport state" without a
 /// window (`feedback_prefer_headless_verification`).
 fn daw_transport_state(_this: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let (playing, recording_live, preroll, playhead) = with_app(move |app, _side, io| {
+    let (playing, recording_live, preroll, playhead, beat) = with_app(move |app, _side, io| {
         // `docs/plan_project_tabs.md`: アクティブなタブの telemetry slot を読む
         // (まだ claim されていなければ停止状態として返す)。
         match io.bridge.find_project(app.pk()) {
-            Some(b) => (b.playing(), b.recording_live(), b.preroll_remaining(), b.playhead_samples()),
-            None => (false, false, 0, 0),
+            Some(b) => {
+                (b.playing(), b.recording_live(), b.preroll_remaining(), b.playhead_samples(), b.playhead_beat())
+            }
+            None => (false, false, 0, 0, 0.0),
         }
     });
     let obj = JsObject::default(ctx.intrinsics());
@@ -533,6 +543,8 @@ fn daw_transport_state(_this: &JsValue, _args: &[JsValue], ctx: &mut Context) ->
     obj.set(js_string!("recordingLive"), recording_live, false, ctx)?;
     obj.set(js_string!("prerollRemaining"), preroll as f64, false, ctx)?;
     obj.set(js_string!("playhead"), playhead as f64, false, ctx)?;
+    // r.md #147: `playhead` の位置の拍 (engine が描画に使った拍)。
+    obj.set(js_string!("beat"), beat, false, ctx)?;
     Ok(obj.into())
 }
 

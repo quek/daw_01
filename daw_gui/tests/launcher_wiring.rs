@@ -1523,9 +1523,9 @@ fn 停止点からの再開はセルを頭出ししない() {
     let cell = put_cell(&mut app, 1, 0);
     app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
     // engine が走り出して 9 拍目で止まったのを観測する。
-    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, preroll: 0, playing: true, recording_live: false });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, beat: 0.0, preroll: 0, playing: true, recording_live: false });
     app.cur.transport.playhead_beat = Some(9.0);
-    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, preroll: 0, playing: false, recording_live: false });
+    app.handle_event(AppEvent::Tick { project: app.pk(), samples: 0, beat: 0.0, preroll: 0, playing: false, recording_live: false });
     while audio_rx.try_recv().is_ok() {}
 
     app.handle_event(AppEvent::PlayContinue);
