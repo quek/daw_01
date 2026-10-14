@@ -375,6 +375,12 @@ pub fn c_array_to_string(buf: &[std::ffi::c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// `String128` ([TChar; 128] = u16 array) を Rust String に (最初の NUL まで)。
+pub fn utf16_buf_to_string<const N: usize>(buf: &[u16; N]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(N);
+    String::from_utf16_lossy(&buf[..end])
+}
+
 /// Format a VST3 class id (`TUID`) as uppercase hex. Shared SSoT — scan-side
 /// (writes `cid_hex` to the plugin DB) and load-side (`daw_plugin_host`,
 /// matches against it) MUST produce identical hex, so both call this.

@@ -226,6 +226,15 @@ pub struct PluginParamInfo {
     pub flags: u32,
 }
 
+/// r.md #138: 音源プラグインが申告する鍵盤 1 つの名前 (例 `36` → `"Kick"`)。
+/// CLAP `clap.note-name` / VST3 `IUnitInfo::getProgramPitchName` の host 側表現。
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct KeyName {
+    /// MIDI key (0..=127)。
+    pub key: u8,
+    pub name: String,
+}
+
 /// `PluginParamInfo.flags` のビット定数。 CLAP `clap_param_info_flags`
 /// と 1:1 対応 (VST3 backend も同 bitset に正規化して送る)。
 pub mod plugin_param_flags {
@@ -1316,6 +1325,14 @@ pub enum PluginEvent {
         device: DeviceAddr,
         params: Vec<PluginParamInfo>,
     },
+    /// r.md #138: plugin が申告する鍵盤ごとの名前 (key 昇順・重複なし。空 = 申告なし)。
+    /// load 直後に 1 度、 CLAP `clap_host_note_name.changed` / VST3
+    /// `IUnitHandler::notifyProgramListChange` で再送。 daw_gui はピアノロールの鍵盤に
+    /// 描くだけで Song には保存しない (plugin からの派生情報)。
+    PluginKeyNames {
+        device: DeviceAddr,
+        names: Vec<KeyName>,
+    },
     /// Plugin GUI で knob を **touch** した通知。
     PluginParamTouched {
         device: DeviceAddr,
@@ -1355,6 +1372,7 @@ impl PluginEvent {
             | SlotPluginUnloaded { device }
             | PluginLatencyChanged { device, .. }
             | PluginParamList { device, .. }
+            | PluginKeyNames { device, .. }
             | PluginParamTouched { device, .. }
             | PluginParamValueChanged { device, .. }
             | PluginParamGestureEnd { device, .. }

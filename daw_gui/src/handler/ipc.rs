@@ -332,6 +332,16 @@ impl AppData {
             } => {
                 self.cur.pipc.plugin_params.insert(device_id, params);
             }
+            PluginEvent::PluginKeyNames { device: DeviceAddr { device_id, .. }, names } => {
+                match crate::widgets::piano_roll::KeyNames::from_wire(names) {
+                    Some(k) => {
+                        self.cur.pipc.plugin_key_names.insert(device_id, std::sync::Arc::new(k));
+                    }
+                    None => {
+                        self.cur.pipc.plugin_key_names.remove(&device_id);
+                    }
+                }
+            }
             PluginEvent::PluginParamTouched {
                 device: DeviceAddr { device_id, .. },
                 param_id,

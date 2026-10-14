@@ -18,7 +18,7 @@ use crate::app::{AppData, ClipKey};
 use crate::view::snap;
 use crate::view::track_color;
 
-use super::{Note, NoteId, NoteStyle, PianoRollStyle, PianoRollView};
+use super::{KeyNames, Note, NoteId, NoteStyle, PianoRollStyle, PianoRollView};
 
 /// 鍵盤レーンの幅 (px)。
 pub(super) const KEYBOARD_W: f32 = 56.0;
@@ -69,11 +69,19 @@ pub(super) struct PrContent {
     pub zoom_x: f32,
     /// 縦ズーム (px/semitone)。wheel handler が anchor 保持ズームに使う。
     pub zoom_y: f32,
+    /// r.md #138: 対象トラックの音源が申告する鍵盤ごとの名前 (`None` = 申告なし)。
+    pub key_names: Option<Arc<KeyNames>>,
 }
 
 /// `AppData` から widget 入力を組み立てる (旧 `piano_roll_view::draw` L42-286)。
+/// `measure_names(names, font_px)` は鍵盤の名前のうち最も長いものの描画幅 (px) を測る
+/// (同じ名前の表につき初回だけ呼ばれる)。
 #[allow(clippy::too_many_lines)]
-pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
+pub(super) fn build(
+    app: &AppData,
+    area: Rect,
+    measure_names: impl FnOnce(&KeyNames, f32) -> f32,
+) -> BuiltPianoRoll {
     // 上部 24 px を Snap toolbar に。残りを widget 本体 (body) に渡す。
     let toolbar_rect = Rect { x: area.x, y: area.y, w: area.w, h: TOOLBAR_H };
     let body_full = Rect {
@@ -109,7 +117,13 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
 
     // 内部レイアウト (grid / kbd / ruler / vel_area) を **一度だけ** 算出 (SSoT)。
     // widget が実際に描画・hit-test する rect と一致する式 (旧 widget 内部 layout と同じ clamp)。
-    let kbd_w = KEYBOARD_W;
+    // r.md #138: 名前を申告する音源のときだけ、名前が読める分だけ鍵盤を広げる。
+    // r.md #48: 色は毎フレームのテーマから引く (`Default` はテーマ切替に追従しない)。
+    let style = PianoRollStyle::from_theme(&app.theme);
+    let key_names = target_key_names(app, target.track_id);
+    let kbd_w = key_names.as_ref().map_or(KEYBOARD_W, |k| {
+        k.keyboard_w(KEYBOARD_W, |k| measure_names(k, style.c_label_font_px))
+    });
     let ruler_h = RULER_H.max(0.0).min(body.h * 0.5);
     let vel_h = VEL_LANE_H.max(0.0).min((body.h - ruler_h) * 0.5);
     let main_h = (body.h - ruler_h - vel_h).max(1.0);
@@ -176,7 +190,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
         len_beats: f64::from(grid.w) / f64::from(zoom_x),
         pitch_top: f32::from(app.pianoroll_top_pitch()),
         pitch_visible: main_h / zoom_y,
-        keyboard_w: KEYBOARD_W,
+        keyboard_w: kbd_w,
         velocity_lane_h: VEL_LANE_H,
         // r.md #87: セルを開いているときはセル内の位相 (song の playhead ではない)。
         playhead_beat: app.editor_playhead_beat(target),
@@ -215,8 +229,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
         content: Some(PrContent {
             notes,
             view,
-            // r.md #48: 色は毎フレームのテーマから引く (`Default` はテーマ切替に追従しない)。
-            style: PianoRollStyle::from_theme(&app.theme),
+            style,
             selected,
             shown,
             target,
@@ -230,8 +243,17 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltPianoRoll {
             vel_area,
             zoom_x,
             zoom_y,
+            key_names,
         }),
     }
+}
+
+/// r.md #138: トラックの最初の音源 (MIDI を受けて音を出す device = note 入力 + audio 出力。
+/// `migrate_legacy_vocal_tracks` と同じ判定) が申告している鍵盤の名前。
+fn target_key_names(app: &AppData, track_id: u32) -> Option<Arc<KeyNames>> {
+    let track = app.cur.song_doc.song().track_by_id(track_id)?;
+    let source = track.plugins().find(|p| p.ports.has_note_input && p.ports.has_audio_output)?;
+    app.cur.pipc.plugin_key_names.get(&source.id).cloned()
 }
 
 /// 表示対象クリップ群 (`shown`) の note を **すべて** `super::Note` に変換する。
@@ -281,4 +303,82 @@ pub(super) fn build_widget_notes(app: &AppData, shown: &[ClipKey], target_track:
             .then(a.id.cmp(&b.id))
     });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::model::{Device, PluginInstance};
+    use common::plugin_format::PluginFormat;
+    use common::port_config::PortConfig;
+    use common::protocol::KeyName;
+
+    fn device(id: u64, ports: PortConfig) -> Device {
+        Device::Plugin(PluginInstance {
+            id,
+            ..PluginInstance::with_ports(format!("test.{id}"), PluginFormat::Clap, ports)
+        })
+    }
+
+    /// MIDI エフェクト → 音源 A → 音源 B のトラックで、ピアノロールを開く。
+    fn app_with_chain() -> AppData {
+        let mut app = crate::test_support::headless_app();
+        app.edit_song(|song| {
+            song.tracks.clear();
+            let cid = song.alloc_content_id();
+            song.clip_contents.insert(
+                cid,
+                common::model::ClipContent::Midi(common::model::MidiContent::default()),
+            );
+            song.tracks.push(crate::app::track_with(|t| {
+                t.id = 1;
+                let midi_fx = PortConfig { has_note_input: true, has_note_output: true, ..PortConfig::default() };
+                let synth = PortConfig { has_note_input: true, has_audio_output: true, ..PortConfig::default() };
+                t.devices = vec![device(1, midi_fx), device(2, synth), device(3, synth)];
+                t.clips = vec![common::model::Clip {
+                    id: 10,
+                    content_id: cid,
+                    length_beats: 4.0,
+                    ..common::model::Clip::default()
+                }];
+            }));
+        });
+        app.set_clip_selection(vec![ClipKey { track_id: 1, clip_id: 10 }]);
+        app
+    }
+
+    fn names(list: &[(u8, &str)]) -> Arc<KeyNames> {
+        Arc::new(
+            KeyNames::from_wire(list.iter().map(|&(key, n)| KeyName { key, name: n.into() }).collect())
+                .unwrap(),
+        )
+    }
+
+    fn content(app: &AppData) -> PrContent {
+        build(app, Rect::new(0.0, 0.0, 800.0, 400.0), |_, _| 100.0).content.unwrap()
+    }
+
+    /// r.md #138: 名前はトラックの **最初の音源** (note 入力 + audio 出力) のものを使い、
+    /// そのときだけ鍵盤を名前の分だけ広げる。
+    #[test]
+    fn key_names_come_from_the_first_instrument_and_widen_the_keyboard() {
+        let mut app = app_with_chain();
+        let c = content(&app);
+        assert!(c.key_names.is_none());
+        assert_eq!(c.kbd.w, KEYBOARD_W, "名前の無い音源は今のまま");
+
+        // MIDI エフェクト (1) と 2 番目の音源 (3) の名前は使わない。
+        app.cur.pipc.plugin_key_names.insert(1, names(&[(36, "fx")]));
+        app.cur.pipc.plugin_key_names.insert(3, names(&[(36, "second")]));
+        assert!(content(&app).key_names.is_none());
+
+        app.cur.pipc.plugin_key_names.insert(2, names(&[(36, "Kick"), (38, "Snare")]));
+        let c = content(&app);
+        let k = c.key_names.as_ref().unwrap();
+        assert_eq!(k.get(36), Some("Kick"));
+        assert_eq!(k.get(37), None);
+        assert_eq!(c.kbd.w, super::super::key_names::NAME_COLUMN_X + 100.0 + 6.0);
+        assert_eq!(c.view.keyboard_w, c.kbd.w, "widget へ渡す幅と layout の幅が一致");
+        assert_eq!(c.grid.x, c.kbd.x + c.kbd.w, "grid は広げた鍵盤の右から");
+    }
 }

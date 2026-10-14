@@ -462,6 +462,7 @@ impl AppData {
     pub(crate) fn forget_device_caches(&mut self, device_id: u64) {
         self.cur.pipc.loaded_devices.remove(&device_id);
         self.cur.pipc.plugin_params.remove(&device_id);
+        self.cur.pipc.plugin_key_names.remove(&device_id);
         self.cur.pipc
             .plugin_param_values
             .retain(|k, _| k.device_id != device_id);

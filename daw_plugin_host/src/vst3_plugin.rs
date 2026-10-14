@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
 use crate::module_cache::{ModuleCache, Vst3Module};
-use crate::vst3_scan::{c_array_to_string, tuid_to_hex};
+use crate::vst3_scan::{c_array_to_string, tuid_to_hex, utf16_buf_to_string};
 use vst3::{
     ComPtr, ComRef, ComWrapper, Interface,
     Steinberg::{
@@ -738,11 +738,6 @@ impl Vst3Plugin {
     }
 }
 
-/// `String128` ([TChar; 128] = u16 array) を Rust String に。
-fn utf16_buf_to_string<const N: usize>(buf: &[u16; N]) -> String {
-    let end = buf.iter().position(|&c| c == 0).unwrap_or(N);
-    String::from_utf16_lossy(&buf[..end])
-}
 
 /// Audio + Event bus を全 enumerate して 1 件ずつ INFO ログ。
 fn log_all_buses(component: &ComPtr<IComponent>) {
@@ -1249,6 +1244,10 @@ impl LoadedPlugin for Vst3Plugin {
 
     fn enumerate_params(&self) -> Vec<common::protocol::PluginParamInfo> {
         enumerate_vst3_params(&self.controller)
+    }
+
+    fn key_names(&self) -> Vec<common::protocol::KeyName> {
+        crate::vst3_units::key_names(&self.controller)
     }
 
     fn activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()> {

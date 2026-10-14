@@ -58,6 +58,11 @@ pub struct ProjectIpc {
     /// 使う。 session-only (save 対象外、 plugin reload で再取得)。
     /// 変わるたびに世代が進む (レーン名の世代キャッシュが読む、[`PluginParamTable`])。
     pub plugin_params: PluginParamTable,
+    /// r.md #138: plugin host が `PluginKeyNames` で送ってくる鍵盤ごとの名前 (`device_id` →)。
+    /// ピアノロールの鍵盤に描く。名前を申告しない plugin は entry 無し。session-only
+    /// (plugin からの派生情報なので Song には保存せず dirty も立てない。reload で再取得)。
+    pub plugin_key_names:
+        std::collections::HashMap<u64, std::sync::Arc<crate::widgets::piano_roll::KeyNames>>,
     /// `device_id` → 現在 plugin_host に load されている plugin の情報。
     /// Undo/Redo の reconcile (`reconcile_plugins_with_song`) で「Song の各
     /// device の plugin が host 側と一致しているか」 を device 粒度で diff する
@@ -878,6 +883,7 @@ impl ProjectState {
                 ara_pcm_materialized: std::collections::HashMap::new(),
                 plugin_param_values: std::collections::HashMap::new(),
                 plugin_params: PluginParamTable::default(),
+                plugin_key_names: std::collections::HashMap::new(),
                 loaded_devices: std::collections::HashMap::new(),
                 pending_clip_fx_bounce: None,
                 pending_glue_bake: None,
