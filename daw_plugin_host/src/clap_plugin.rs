@@ -136,6 +136,8 @@ pub struct ClapAudioHalf {
     collected_out_param_touches: Vec<u32>,
     collected_out_param_values: Vec<(u32, f64)>,
     collected_out_param_releases: Vec<u32>,
+    /// r.md #140: プラグインの窓で掴まれている param (出力 event の gesture から立てる)。
+    gestures: process_scaffold::GestureHold,
 }
 
 // SAFETY: the raw plugin pointer is only used for the CLAP audio-thread API
@@ -174,7 +176,13 @@ impl ClapAudioHalf {
         if !per_note && per_note_ok && meta.per_note_epoch == self.process_epoch {
             return;
         }
-        let amount = ev.value * (meta.max - meta.min);
+        // r.md #140: ユーザーが窓で掴んでいる間は変調を止める。modulatable は amount 0 を送って
+        // 基準値 (= 手で動かしている値) をそのまま鳴らし、それ以外は畳んだ絶対値を書かない。
+        let held = self.gestures.is_held(ev.param_id);
+        if held && !meta.modulatable {
+            return;
+        }
+        let amount = if held { 0.0 } else { ev.value * (meta.max - meta.min) };
         if meta.modulatable {
             self.pending_param_mods.push(clap_event_param_mod {
                 header: clap_event_header {
@@ -211,6 +219,24 @@ impl ClapAudioHalf {
                 key: -1,
                 value,
             });
+        }
+    }
+
+    /// r.md #140: プラグインが今の `process()` で出した param の出力 event (ユーザーが窓のノブを動かした)
+    /// を変調側へ反映する。値は非 modulatable param を畳む基準値になり (でないと次の刻みで「古い基準値 +
+    /// 変調」に戻される)、gesture の間は変調を止める。同じ buffer の中の順序は失われているので
+    /// begin → 値 → end の順に当てる (クリック 1 回で 3 つが同じ buffer に来ても掴みっぱなしにならない)。
+    fn track_plugin_param_edits(&mut self) {
+        for &id in &self.collected_out_param_touches {
+            self.gestures.begin(id);
+        }
+        for &(id, value) in &self.collected_out_param_values {
+            if let Some(slot) = self.last_param_value.get_mut(&id) {
+                *slot = value;
+            }
+        }
+        for &id in &self.collected_out_param_releases {
+            self.gestures.end(id);
         }
     }
 }
@@ -411,6 +437,7 @@ impl AudioProcessorHalf for ClapAudioHalf {
 
         let process = unsafe { (*self.plugin).process }.context("plugin.process is null")?;
         let status = unsafe { process(self.plugin, &process_ctx) };
+        self.track_plugin_param_edits();
         Ok(status)
     }
 
@@ -453,6 +480,7 @@ impl AudioProcessorHalf for ClapAudioHalf {
 
     fn on_activate(&mut self, _sample_rate: f64, max_frames: u32) {
         let mf = max_frames as usize;
+        self.gestures.clear();
         (self.input_buffers, self.input_ptrs) = alloc_planar(self.input_channels as usize, mf);
         (self.output_buffers, self.output_ptrs) = alloc_planar(self.output_channels as usize, mf);
         (self.aux_input_buffers, self.aux_input_ptrs) =
@@ -729,6 +757,7 @@ impl ClapPlugin {
             collected_out_param_touches: Vec::with_capacity(64),
             collected_out_param_values: Vec::with_capacity(256),
             collected_out_param_releases: Vec::with_capacity(64),
+            gestures: Default::default(),
         }));
 
         Ok(Some(Self {
@@ -2098,7 +2127,97 @@ fn clap_plugin_port_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugin_instance::TransportContext;
+    use crate::plugin_instance::{ParamEventKind, TimedParamEvent, TransportContext};
+
+    /// plugin 無しの audio half (`push_mod_event` / `track_plugin_param_edits` だけを回す)。
+    /// param 1 = 非 modulatable、param 2 = modulatable。どちらも 0..=10、基準値 2。
+    fn mod_half() -> ClapAudioHalf {
+        let meta = |modulatable| ClapParamMeta { min: 0.0, max: 10.0, modulatable, per_note: false, per_note_epoch: 0 };
+        ClapAudioHalf {
+            plugin: std::ptr::null(),
+            processing: true,
+            input_channels: 0,
+            output_channels: 0,
+            aux_input_channels: Vec::new(),
+            aux_output_channels: Vec::new(),
+            input_buffers: Vec::new(),
+            input_ptrs: Vec::new(),
+            output_buffers: Vec::new(),
+            output_ptrs: Vec::new(),
+            aux_input_buffers: Vec::new(),
+            aux_input_ptrs: Vec::new(),
+            aux_output_buffers: Vec::new(),
+            aux_output_ptrs: Vec::new(),
+            process_input_bufs: Vec::new(),
+            process_output_bufs: Vec::new(),
+            pending_events: Vec::new(),
+            pending_param_events: Vec::new(),
+            pending_param_mods: Vec::new(),
+            param_meta: [(1, meta(false)), (2, meta(true))].into_iter().collect(),
+            process_epoch: 0,
+            last_param_value: [(1, 2.0), (2, 2.0)].into_iter().collect(),
+            event_order: Vec::new(),
+            collected_out_notes: Vec::new(),
+            collected_out_param_touches: Vec::new(),
+            collected_out_param_values: Vec::new(),
+            collected_out_param_releases: Vec::new(),
+            gestures: Default::default(),
+        }
+    }
+
+    /// `(param_id, 値)` の列。
+    type Written = Vec<(u32, f64)>;
+
+    /// 1 buffer ぶんの変調 (offset +0.1 = 1.0 plain) を積み、書いた値 / amount を返す。
+    fn modulate(h: &mut ClapAudioHalf) -> (Written, Written) {
+        h.pending_param_events.clear();
+        h.pending_param_mods.clear();
+        for id in [1, 2] {
+            h.push_mod_event(&TimedParamEvent::global(0, id, 0.1, ParamEventKind::Mod));
+        }
+        (
+            h.pending_param_events.iter().map(|e| (e.param_id, e.value)).collect(),
+            h.pending_param_mods.iter().map(|e| (e.param_id, e.amount)).collect(),
+        )
+    }
+
+    /// r.md #140: プラグインの窓でノブを掴んでいる間は変調を書かず、離した後はユーザーの値を基準に再開する。
+    #[test]
+    fn plugin_window_gesture_pauses_modulation_and_rebases() {
+        let mut h = mod_half();
+        let (values, mods) = modulate(&mut h);
+        assert_eq!(values, vec![(1, 3.0)], "掴む前: 非 modulatable は基準値 2 + 変調 1 の絶対値");
+        assert_eq!(mods, vec![(2, 1.0)], "掴む前: modulatable は param_mod");
+
+        // ユーザーが窓で両方のノブを掴んで 7 へ動かした (プラグインの出力 event)。
+        h.collected_out_param_touches.extend([1, 2]);
+        h.collected_out_param_values.extend([(1, 7.0), (2, 7.0)]);
+        h.track_plugin_param_edits();
+        let (values, mods) = modulate(&mut h);
+        assert!(values.is_empty(), "掴んでいる間は絶対値で上書きしない: {values:?}");
+        assert_eq!(mods, vec![(2, 0.0)], "掴んでいる間の modulatable は変調 0 (手の値をそのまま鳴らす)");
+
+        // 離した。
+        h.collected_out_param_touches.clear();
+        h.collected_out_param_values.clear();
+        h.collected_out_param_releases.extend([1, 2]);
+        h.track_plugin_param_edits();
+        let (values, mods) = modulate(&mut h);
+        assert_eq!(values, vec![(1, 8.0)], "離した後: 新しい基準値 7 + 変調 1");
+        assert_eq!(mods, vec![(2, 1.0)], "離した後: modulatable の変調が戻る");
+    }
+
+    /// クリック 1 回 (begin / 値 / end が同じ buffer) でも掴みっぱなしにならず、値は基準値に入る。
+    #[test]
+    fn gesture_within_one_buffer_does_not_stick() {
+        let mut h = mod_half();
+        h.collected_out_param_touches.push(1);
+        h.collected_out_param_values.push((1, 5.0));
+        h.collected_out_param_releases.push(1);
+        h.track_plugin_param_edits();
+        let (values, _) = modulate(&mut h);
+        assert_eq!(values, vec![(1, 6.0)]);
+    }
 
     fn ctx() -> TransportContext {
         TransportContext {

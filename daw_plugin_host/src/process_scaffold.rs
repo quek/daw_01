@@ -201,6 +201,63 @@ pub fn advance_param_base(cache: &mut HashMap<u32, f64>, ev: &TimedParamEvent) {
     }
 }
 
+/// 同時に掴める param 数の上限。人の手で同時に触るのは普通 1 つ (2 本指の XY パッドでも 2 つ)。
+const GESTURE_HOLD_CAP: usize = 16;
+
+/// r.md #140: プラグインの窓で**ユーザーが今つまんでいる** param の集合 (Bitwig 型の変調の一時停止)。
+///
+/// gesture 中 (CLAP `gesture_begin`〜`gesture_end` / VST3 `beginEdit`〜`endEdit`) は、その param への変調を
+/// 書かない — 書くと手で動かした値が毎刻み「古い基準値 + 変調」で上書きされ、ノブが動かない。基準値の側は
+/// ユーザーの値で更新するので、離した後は新しい基準値の周りで変調が再開する。
+///
+/// 書き手は gesture を受け取るスレッド (VST3 は UI thread、CLAP は process() の出力 event を読む RT
+/// thread)、読み手は RT thread。固定長の atomic 配列なので確保もロックも無い。slot は `param_id + 1`
+/// (0 = 空き)。満杯で入らなかった gesture は変調が止まらないだけ (従来どおり)。
+pub struct GestureHold {
+    slots: [std::sync::atomic::AtomicU64; GESTURE_HOLD_CAP],
+}
+
+impl Default for GestureHold {
+    fn default() -> Self {
+        Self { slots: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)) }
+    }
+}
+
+impl GestureHold {
+    pub fn begin(&self, param_id: u32) {
+        use std::sync::atomic::Ordering;
+        let key = u64::from(param_id) + 1;
+        if self.slots.iter().any(|s| s.load(Ordering::Acquire) == key) {
+            return;
+        }
+        for s in &self.slots {
+            if s.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return;
+            }
+        }
+    }
+
+    pub fn end(&self, param_id: u32) {
+        use std::sync::atomic::Ordering;
+        let key = u64::from(param_id) + 1;
+        for s in &self.slots {
+            let _ = s.compare_exchange(key, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    pub fn is_held(&self, param_id: u32) -> bool {
+        let key = u64::from(param_id) + 1;
+        self.slots.iter().any(|s| s.load(std::sync::atomic::Ordering::Acquire) == key)
+    }
+
+    /// 閉じられなかった gesture を捨てる (activate し直したとき)。
+    pub fn clear(&self) {
+        for s in &self.slots {
+            s.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 /// Mod offset を絶対値へ畳む: `clamp(base + offset_scaled, min, max)`。
 /// CLAP 非 modulatable param は plain 単位 (`offset·(max−min)`)、VST3 は
 /// normalized (`min=0, max=1, offset_scaled == offset`)。

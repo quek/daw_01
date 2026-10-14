@@ -199,6 +199,8 @@ impl AudioProcessorHalf for Vst3AudioHalf {
             process_scaffold::advance_param_base(&mut self.param_mod_base, ev);
             match ev.kind {
                 ParamEventKind::Value => self.folded_param_events.push(*ev),
+                // r.md #140: ユーザーが窓で掴んでいる間は畳んだ値を書かない (手の値が届く)。
+                ParamEventKind::Mod if self.gui_param_edits.gestures.is_held(ev.param_id) => {}
                 ParamEventKind::Mod => {
                     let base = self.param_mod_base.get(&ev.param_id).copied().unwrap_or(0.0);
                     // VST3 params are normalized 0..=1 ⇒ offset_scaled == offset.
@@ -389,6 +391,7 @@ impl AudioProcessorHalf for Vst3AudioHalf {
     fn on_activate(&mut self, sample_rate: f64, max_frames: u32) {
         let mf = max_frames as usize;
         self.sample_rate = sample_rate;
+        self.gui_param_edits.gestures.clear();
         (self.input_buffers, self.input_ptrs) = alloc_planar(self.input_channels as usize, mf);
         (self.output_buffers, self.output_ptrs) = alloc_planar(self.output_channels as usize, mf);
         (self.aux_input_buffers, self.aux_input_ptrs) =
