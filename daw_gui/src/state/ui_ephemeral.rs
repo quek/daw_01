@@ -195,6 +195,10 @@ pub struct UiEphemeral {
     /// (`action_open_export_mp4_dialog`)。 None = まだ window 未生成 / 非対応。
     #[cfg(windows)]
     pub main_window_hwnd: Option<isize>,
+    /// r.md #141: アレンジのクリップを窓の外へ運んだときに OS のファイルドラッグで渡す素材ファイル。
+    /// `AppData::request_os_file_drag` が積み、runner がフレームの後に取り出して
+    /// [`crate::os_file_drag::run`] する (空 = 予約なし)。
+    pub pending_os_file_drag: Vec<PathBuf>,
     /// video export の保存先選択 dialog (background thread) が開いている間 true。
     /// 二重起動防止。 `FileDialogResult { kind: ExportMp4 }` 受信でクリアする。
     pub export_dialog_open: bool,

@@ -80,6 +80,8 @@ pub mod tracks;
 pub mod transport;
 /// 取り込み / 生成したメディアの置き場の解決と、未保存の文書の置き場の持ち主 (`crate::unsaved_place`)。
 pub mod unsaved_storage;
+/// r.md #141: クリップを OS のファイルドラッグで外へ渡すときの素材ファイルの解決。
+pub mod os_file_drag;
 /// r.md #130: グローバルトランスポーズ (基準値 / 追従 / 演奏プレビューの鍵盤 / ヘッダの印)。
 pub mod transpose;
 pub mod view_model;

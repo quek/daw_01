@@ -30,6 +30,7 @@ use winit::window::{WindowAttributes, WindowId};
 use crate::app::{AppData, AppEvent, ClipKey};
 use crate::launcher_time::RowTimeline;
 
+mod os_file_drag;
 mod preview_events;
 use crate::view::shortcuts::daw_shortcut_map;
 use daw_ui_platform::WinitWindow;
@@ -110,6 +111,7 @@ pub fn run(init: RunnerInit) -> Result<RunnerOutcome, winit::error::EventLoopErr
         diag_window_max_dt: std::time::Duration::ZERO,
         fps_window_start: Instant::now(),
         fps_window_frames: 0,
+        own_dragged_files: Vec::new(),
     };
     event_loop.run_app(&mut runner)?;
     // `state` は `run_app` から戻っても runner が保持したまま (winit は
@@ -769,6 +771,9 @@ struct Runner {
     /// per-frame dt ではなく本数 ÷ 経過時間で出す (`render_frame` のコメント参照)。
     fps_window_start: Instant,
     fps_window_frames: u32,
+    /// r.md #141: 直近の OS ファイルドラッグで出したファイル。自窓に戻ってきた file イベントを
+    /// 捨てるのに使い、次の本物のマウスボタン入力で空にする (`runner/os_file_drag.rs`)。
+    own_dragged_files: Vec<std::path::PathBuf>,
 }
 
 impl Runner {
@@ -972,6 +977,9 @@ impl ApplicationHandler<AppEvent> for Runner {
             self.handle_preview_window_event(event);
             return;
         }
+        if self.is_own_dragged_file_event(&event) {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 tracing::info!("window close requested");
@@ -1007,6 +1015,7 @@ impl ApplicationHandler<AppEvent> for Runner {
                 self.dispatch_platform_event(PlatformEvent::PointerLeft);
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                self.own_dragged_files.clear();
                 self.sync_pointer_from_os();
                 self.dispatch_platform_event(PlatformEvent::PointerInput {
                     button: map_button(button),
@@ -1085,6 +1094,8 @@ impl ApplicationHandler<AppEvent> for Runner {
             }
             WindowEvent::RedrawRequested => {
                 let request_more = self.render_frame(event_loop);
+                // r.md #141: このフレームでアレンジ widget が OS ファイルドラッグを予約していれば行う。
+                self.run_pending_os_file_drag();
                 if request_more
                     && let Some(rs) = self.state.as_ref()
                 {

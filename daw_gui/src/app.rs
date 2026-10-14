@@ -256,6 +256,7 @@ impl AppData {
                 save_as_dialog_open: false,
                 #[cfg(windows)]
                 main_window_hwnd: None,
+                pending_os_file_drag: Vec::new(),
             },
             // r.md #49: 起動直後は「アクティブ」から始める。winit は起動時の
             // `Focused(true)` を必ずしも送らないので、false 始まりだと最初の
