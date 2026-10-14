@@ -393,13 +393,13 @@ mod gate {
     /// 待ちを諦めると戻る) ので、器の referent (`RenderCtx::referents`) が呼び側のスレッドのスタックに無いことを
     /// debug build で見て、居ればスタックに居る物を全部名指しして止める (module doc の「窓」の規則 — 手の列挙で
     /// 済ませない)。
-    pub(super) fn in_flight(ctx: &RenderCtx<'_>) -> PoolRun {
+    pub(super) fn in_flight(_ctx: &RenderCtx<'_>) -> PoolRun {
         #[cfg(debug_assertions)]
         {
             let (mut low, mut high) = (0usize, 0usize);
             // SAFETY: 呼ぶスレッド自身のスタックの範囲を読むだけ (確保も待ちもしない)。
             unsafe { GetCurrentThreadStackLimits(&raw mut low, &raw mut high) };
-            let referents = ctx.referents();
+            let referents = _ctx.referents();
             let mut on_stack = referents.map(|_| "");
             let mut n = 0;
             for (name, at) in referents {
