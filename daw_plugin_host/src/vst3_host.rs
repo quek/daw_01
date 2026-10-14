@@ -309,6 +309,8 @@ impl IComponentHandlerTrait for Vst3ComponentHandler {
         // 更新する (= `A` キーで automation lane を作る起点)。 callback は
         // main/GUI thread から呼ばれ、 evt_tx (channel) 送信のみなので
         // audio thread とは無関係 (ロックなし)。
+        // r.md #140: 掴んでいる間はこの param の変調を止める (audio thread が読む)。
+        self.gui_param_edits.gestures.begin(id);
         (self.callbacks.on_param_gesture_begin)(id);
         kResultOk
     }
@@ -328,6 +330,8 @@ impl IComponentHandlerTrait for Vst3ComponentHandler {
     }
 
     unsafe fn endEdit(&self, id: ParamID) -> tresult {
+        // 最後の performEdit は既に queue にあるので、次の process() で基準値に入ってから変調が再開する。
+        self.gui_param_edits.gestures.end(id);
         (self.callbacks.on_param_gesture_end)(id);
         kResultOk
     }

@@ -256,6 +256,8 @@ pub struct GuiParamEditQueue {
     /// Raised by `push` when the ring was full; surfaced off-RT by
     /// `take_overflowed` (a best-effort diagnostic, `Relaxed` suffices).
     overflowed: AtomicBool,
+    /// r.md #140: `beginEdit`〜`endEdit` の間の param。RT 側はこの間の変調を畳まない。
+    pub gestures: crate::process_scaffold::GestureHold,
 }
 
 // SAFETY: shared across the producer (UI thread) and consumer (audio thread)
@@ -272,6 +274,7 @@ impl GuiParamEditQueue {
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
             overflowed: AtomicBool::new(false),
+            gestures: Default::default(),
         }
     }
 
