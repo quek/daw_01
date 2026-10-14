@@ -289,11 +289,22 @@ pub(crate) fn cell_rect(rects: &LauncherRects, row_top: f32, row_h: f32, col: us
 /// r.md #125: **名前帯 (ラベルと同じ行) に置く** — 上下中央だと波形 / ノートの真ん中に
 /// 記号が乗って中身が読めない。帯の高さは [`clip_content_inset_top`] (アレンジのクリップの
 /// ラベル帯と同じ SSoT) で、その中に収めて縦中央。行が低いときはセル高で頭打ち。
+/// r.md #143: 記号は名前帯の高さいっぱい (`LAUNCH_BTN_W` で頭打ち)。
 #[must_use]
 pub(crate) fn launch_button_rect(cell: Rect, style: &ArrangementStyle) -> Rect {
     let band = clip_content_inset_top(style).min(cell.h);
     let s = LAUNCH_BTN_W.min(band).min(cell.h - 2.0).min(cell.w - 2.0).max(4.0);
     Rect { x: cell.x + 1.0, y: cell.y + (band - s) * 0.5, w: s, h: s }
+}
+
+/// セルの ▶ を **押せる範囲** (r.md #143): セル左端の `LAUNCH_HIT_W` 幅 × セルの縦いっぱい。記号
+/// ([`launch_button_rect`]) より広く取り、小さな記号を狙わなくても撃てるようにする (Bitwig のスロットと同じ)。
+/// 押下 / ダブルクリック / hover の判定はすべてこの 1 本を通す。幅はセルの半分で頭打ち (狭い列で本体を潰さない)。
+#[must_use]
+pub(crate) fn launch_hit_rect(cell: Rect, style: &ArrangementStyle) -> Rect {
+    let btn = launch_button_rect(cell, style);
+    let w = LAUNCH_HIT_W.min(cell.w * 0.5).max(btn.x + btn.w - cell.x);
+    Rect { x: cell.x, y: cell.y, w, h: cell.h }
 }
 
 /// シーン見出しの ▶。見出しは 1 行なので **上下中央** (セルの ▶ が名前帯へ寄ったのとは別 —

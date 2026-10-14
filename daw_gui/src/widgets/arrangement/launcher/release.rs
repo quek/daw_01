@@ -77,10 +77,10 @@ fn double_click(
         return;
     };
     // ▶ (発火ボタン) の上は「撃つ」だけの場所。**press と同じ 1 本の分割規則**
-    // (`launch_button_rect`) を通す — 通さないと、クリップを撃ち直す 2 連打が
+    // (`launch_hit_rect`) を通す — 通さないと、クリップを撃ち直す 2 連打が
     // そのまま `OpenCellEditor` になり、空セルの ■ を 2 度叩いて行を止める操作が
     // `CreateCell` になる (止める / 撃ち直すつもりの操作が曲の中身を変える)。
-    if layout::launch_button_rect(rect, f.style).contains(cx, cy) {
+    if layout::launch_hit_rect(rect, f.style).contains(cx, cy) {
         return;
     }
     // セルを所有できない行 (マスター行 / グループ行) には作らない・開かない。

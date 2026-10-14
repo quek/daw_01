@@ -918,6 +918,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             }));
         }
     }
+    // r.md #146: 全ソロ解除 (カーソル位置に依らない)。
+    if ui.take_shortcut("daw.clear_all_solo") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::ClearAllSolo)));
+    }
 
     // ----- Mute (Q) -----
     // 「選択中のものがあればそれらを、 無ければマウスカーソル直下のものを」 mute toggle。

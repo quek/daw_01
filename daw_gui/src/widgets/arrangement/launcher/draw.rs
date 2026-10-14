@@ -646,6 +646,7 @@ fn draw_empty_cell(
         fb.hovers_cell_launch(key),
         fb.is_held(LauncherButton::Cell(key)),
     );
+    push_launch_hover_wash(hctx, fb, key, r, f.style, btn_ind);
     push_chip(hctx, btn, btn_ind);
     let s = (btn.w * 0.6).max(3.0);
     let inner = Rect { x: btn.x + (btn.w - s) * 0.5, y: btn.y + (btn.h - s) * 0.5, w: s, h: s };
@@ -735,6 +736,7 @@ fn draw_filled_cell(
         fb.hovers_cell_launch(key),
         fb.is_held(LauncherButton::Cell(key)) || blink_queued,
     );
+    push_launch_hover_wash(hctx, fb, key, r, f.style, ind);
     push_launch_glyph(hctx, btn, ind, cell.follow);
     // 残り拍 (発火まで)。セル右端に置く = ラベルの右、進捗バーの上。
     if let Some(q) = d.queued {
@@ -964,6 +966,7 @@ fn draw_group_cell(
         fb.hovers_cell_launch(key),
         fb.is_held(LauncherButton::Cell(key)),
     );
+    push_launch_hover_wash(hctx, fb, key, r, f.style, ind);
     push_launch_glyph(hctx, btn, ind, false);
     let label = Rect {
         x: btn.x + btn.w + 2.0,
@@ -1013,6 +1016,21 @@ fn push_chip(hctx: &mut HeavyCtx<'_, '_, AppData>, btn: Rect, ind: Indicator) {
 
 /// ▶ (発火)。`striped` でボタン矩形に斜線を重ねる = フォローアクションが設定されている印
 /// (Live と同じ視覚言語)。
+/// r.md #143: セルの ▶ の押せる範囲 ([`layout::launch_hit_rect`]) に乗っている間、その範囲を薄く起こす
+/// (記号より広い範囲が押せることを見せる)。色は記号のインク (背景に対してコントラストが保証された色) を薄めたもの。
+fn push_launch_hover_wash(
+    hctx: &mut HeavyCtx<'_, '_, AppData>,
+    fb: LauncherFeedback,
+    key: LauncherCellKey,
+    cell: Rect,
+    style: &ArrangementStyle,
+    ind: Indicator,
+) {
+    if fb.hovers_cell_launch(key) {
+        push_rounded(hctx, layout::launch_hit_rect(cell, style), ind.ink.with_alpha(0.16), Color::TRANSPARENT, CELL_RADIUS);
+    }
+}
+
 fn push_launch_glyph(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     btn: Rect,

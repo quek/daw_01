@@ -9,7 +9,7 @@
 
 use common::model::{AutomationTarget, SendMode, TrackBuiltinParam};
 use daw_ui_core::{
-    Edit, KnobStyle, LevelMeterStyle, MeterBallistic, MeterScale, SCROLLBAR_W,
+    DragInfo, DragKind, Edit, KnobStyle, LevelMeterStyle, MeterBallistic, MeterScale, SCROLLBAR_W,
     ScrubableNumberStyle, ToggleButtonStyle, Ui,
 };
 
@@ -180,7 +180,6 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // rect にポインタ当たり判定をして hover track を求める (arrangement の
     // `arrange_hovered_track` と同 idiom)。 layout を持つこの draw が唯一の算出点
     // (SSoT)。
-    let pointer = ui.pointer();
     // hover 用 (r.md #124: 別 widget のドラッグ中は出さない)。
     let ptr = ui.hover_pos();
     let mut hovered_strip: Option<u32> = None;
@@ -200,18 +199,23 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let strips: Vec<_> =
         mix.iter().filter(|e| !app.is_hidden_under_collapsed_group(e.track_id)).collect();
 
-    // r.md #13: strip の名前バンドを押すとトラックを選択する。 arrangement と同じ
+    // r.md #13: strip の名前バンドをクリックするとトラックを選択する。 arrangement と同じ
     // `selection.selected_track_ids` (SSoT) を読み書きするので、 mixer ↔ arrangement
     // の選択は自動で双方向連動する。 range-select (Shift) の並びは mixer の可視 strip
-    // 順 (左→右、 master は除く)。 press 時に modifier を読む
-    // ので release-frame の modifier race が無い (arrangement の press_modifiers と同狙い)。
+    // 順 (左→右、 master は除く)。 r.md #145: 名前バンドは並べ替えのドラッグの取っ手も兼ねるので、
+    // 選択は arrangement のヘッダと同じく **動かさずに離したとき** に確定する (press で選ぶと、 複数選択を
+    // 掴んだ瞬間に単一選択へ潰れて選択ごと運べない)。 修飾は press 時の snapshot (`start_modifiers`)。
     let visible_order: Vec<u32> = strips.iter().map(|e| e.track_id).collect();
-    let select_press = std::cell::Cell::new(None::<u32>);
+    // (掴んだ track, ドラッグ情報) と、 そのフレームの横スクロール量。
+    let reorder = std::cell::Cell::new(None::<(u32, DragInfo)>);
+    let scroll_off = std::cell::Cell::new(0.0_f32);
 
     // r.md #137: Sends band の行数は **全 strip 共通** (曲で一番 send が多い
     // トラックに合わせる)。 開いた分は `root` が下ペインを広げて吸収するので、
     // 本数の違いでも開閉でも fader / メーターの高さと位置は変わらない。
     let sends_rows = sends_rows(app);
+    // 名前バンドの y は strip 上端ではなく Comp / EQ 帯と Sends 帯の下 (= 名前ラベルの位置。 `draw_strip` と同じ積み方)。
+    let name_band_y = strip_y + strip_sections::head_height(app) + sends_band_height(sends_rows);
     // live 値 (再生中はレーン値) の文脈は **1 フレームに 1 回**だけ組み、全 strip へ借用で配る
     // (strip ごとに組むと行数 × トラック数の O(N²) になる)。
     let scope = app.live_param_scope();
@@ -231,8 +235,19 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let strip_h = area.h - if content_w > area.w { SCROLLBAR_W } else { 0.0 };
     let scroll_rect = Rect { x: scroll_x, y: strip_y, w: scroll_w, h: area.h };
     ui.scroll_area("mixer_strips", scroll_rect, (content_w, area.h), |ui, offset| {
+        scroll_off.set(offset.0);
         for (i, entry) in strips.iter().enumerate() {
             let x = scroll_x - offset.0 + (i as f32) * pitch;
+            // 名前バンド (選択のクリック / 並べ替えのドラッグ)。 group strip は左端の折り畳み disclosure を避けて
+            // 帯を右にずらす (disclosure クリックが選択を巻き込まないように)。 ドラッグは画面外へスクロールした
+            // strip でも続くよう、 可視判定の前に毎フレーム呼ぶ。
+            let band_x0 = if entry.is_group { x + DISCLOSURE_ZONE_W } else { x };
+            let name_band = Rect { x: band_x0, y: name_band_y, w: x + STRIP_WIDTH - band_x0, h: NAME_BAND_H };
+            let in_view = ptr.is_some_and(|(px, py)| scroll_rect.contains(px, py));
+            let drag_rect = if in_view { name_band } else { Rect { w: 0.0, h: 0.0, ..name_band } };
+            if let Some(info) = ui.take_drag_in_rect(("mixer_strip_reorder", entry.track_id), drag_rect) {
+                reorder.set(Some((entry.track_id, info)));
+            }
             if x + STRIP_WIDTH < scroll_x || x > scroll_x + scroll_w {
                 continue;
             }
@@ -244,36 +259,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             {
                 hovered_strip = Some(entry.track_id);
             }
-            // 名前バンド上の press でトラック選択 (r.md #13)。 group strip は左端の
-            // 折り畳み disclosure を避けて帯を右にずらす (disclosure クリックが選択を
-            // 巻き込まないように)。
-            let band_x0 = if entry.is_group { x + DISCLOSURE_ZONE_W } else { x };
-            let name_band = Rect { x: band_x0, y: strip_y, w: x + STRIP_WIDTH - band_x0, h: NAME_BAND_H };
-            if pointer.primary_just_pressed
-                && let Some((px, py)) = ptr
-                && scroll_rect.contains(px, py)
-                && name_band.contains(px, py)
-            {
-                select_press.set(Some(entry.track_id));
-            }
             draw_track_strip(app, ui, entry, strip_rect, sends_rows, &scope);
         }
     });
 
-    // press したトラックがあれば modifier-aware に選択を更新する (r.md #13)。
-    // arrangement のヘッダ選択と同じ意味論: Single / Ctrl=Toggle / Shift=Range。
-    // r.md #43: 解決ロジックは `AppData::apply_select_tracks` の 1 実装に集約した
-    // (旧実装はここと arrangement/run.rs に別々の範囲計算を持ち、 anchor の SSoT も
-    // 割れていた — mixer は cursor = 選択末尾を基点にしていたので、 Shift+click を
-    // 繰り返すと基点が歩いて範囲を伸縮できなかった)。 view が渡すのは mixer の
-    // 可視 strip 順 (`visible_order`) だけ。
-    if let Some(tid) = select_press.get() {
-        let modifier =
-            SelectModifier::from_modifiers(pointer.modifiers.shift, pointer.modifiers.ctrl);
-        let order = visible_order.clone();
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.apply_select_tracks(tid, modifier, &order);
-        }));
+    if let Some((grabbed, info)) = reorder.get() {
+        // 並べ替えの gap は strip 列の左端からの x で決める (横スクロール込み)。
+        let content_x = info.current.0 - scroll_x + scroll_off.get();
+        let gap = reorder_gap(content_x, pitch, strips.len());
+        let line_x = scroll_x - scroll_off.get() + (gap as f32) * pitch - STRIP_GAP * 0.5;
+        let below = strips.get(gap).map(|e| e.track_id);
+        let line = Rect { x: line_x - 1.5, y: strip_y, w: 3.0, h: strip_h };
+        handle_name_band_drag(app, ui, grabbed, info, visible_order, below, line, scroll_rect);
     }
 
     // 算出した hover track を AppData に反映 (変化時のみ Edit、
@@ -283,6 +280,88 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             app.cur.peph.mixer_hovered_track = hovered_strip;
         }));
     }
+}
+
+/// r.md #145: 並べ替えのドラッグをクリック (選択) と分ける横移動量 (px)。
+const REORDER_DRAG_THRESHOLD_PX: f32 = 8.0;
+
+/// 名前バンドのドラッグ 1 本の結果を反映する (r.md #145)。動かさずに離した = クリック → modifier-aware に選択を
+/// 更新する (r.md #13。arrangement のヘッダ選択と同じ意味論: Single / Ctrl=Toggle / Shift=Range、解決は
+/// `AppData::apply_select_tracks` の 1 実装 — r.md #43)。動かした = 並べ替え: ドラッグ中は落とし先の縦線 (`line`)
+/// を出し、離したら `SetTrackParent` を発行する (確定と規則は arrangement のヘッダ drop と同じ `Song::move_tracks`)。
+#[allow(clippy::too_many_arguments)]
+fn handle_name_band_drag(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    grabbed: u32,
+    info: DragInfo,
+    visible_order: Vec<u32>,
+    below: Option<u32>,
+    line: Rect,
+    scroll_rect: Rect,
+) {
+    let released = info.kind == DragKind::Released;
+    if info.delta.0.abs() < REORDER_DRAG_THRESHOLD_PX {
+        if released && !ui.has_open_popups() {
+            let m = info.start_modifiers;
+            let modifier = SelectModifier::from_modifiers(m.shift, m.ctrl);
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                app.apply_select_tracks(grabbed, modifier, &visible_order);
+            }));
+        }
+        return;
+    }
+    if !released {
+        ui.push_rect(RectCommand {
+            rect: line,
+            fill: app.theme.core.accent,
+            border: Color::TRANSPARENT,
+            border_width: 0.0,
+            radius: [1.5; 4],
+            clip_rect: Some(scroll_rect),
+        });
+        return;
+    }
+    if let Some((track_ids, parent_id, anchor_after)) = mixer_drop(app, grabbed, below) {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::SetTrackParent { track_ids, parent_id, anchor_after });
+        }));
+    }
+}
+
+/// 並べ替えの落とし先 = strip 間の gap index (`0..=n`)。 `content_x` は strip 列の左端からの x。
+/// strip の中央より左なら その strip の前、 右なら後ろ。
+fn reorder_gap(content_x: f32, pitch: f32, n: usize) -> usize {
+    if content_x <= 0.0 {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let g = ((content_x + pitch * 0.5) / pitch).floor() as usize;
+    g.min(n)
+}
+
+/// ミキサーの drop を `SetTrackParent` の `(track_ids, parent_id, anchor_after)` に直す。
+/// 運ぶのは掴んだ strip が選択に入っていれば選択全部 (曲の並び順)、 でなければ掴んだ 1 本。
+/// 親は右隣 (`below`) の strip と同じ (= その strip の直前に兄弟として入る。 末尾は top-level)。運ぶトラック
+/// 自身が親になるなら、 運ばない祖先へ繰り上げる。 子孫は `Song::move_tracks` が親ごと運ぶ。
+fn mixer_drop(app: &AppData, grabbed: u32, below: Option<u32>) -> Option<(Vec<u32>, Option<u32>, Option<u32>)> {
+    let song = app.cur.song_doc.song();
+    let selected = &app.cur.selection.selected_track_ids;
+    let source: Vec<u32> = if selected.contains(&grabbed) {
+        song.tracks.iter().map(|t| t.id).filter(|id| selected.contains(id)).collect()
+    } else {
+        vec![grabbed]
+    };
+    if below.is_some_and(|b| source.contains(&b)) {
+        return None;
+    }
+    let mut parent = below.and_then(|b| song.track_by_id(b)).and_then(|t| t.parent_group_id);
+    while let Some(p) = parent.filter(|p| source.contains(p)) {
+        parent = song.track_by_id(p).and_then(|t| t.parent_group_id);
+    }
+    let ins = below.and_then(|b| song.tracks.iter().position(|t| t.id == b)).unwrap_or(song.tracks.len());
+    let anchor_after = song.tracks[..ins].iter().rev().find(|t| !source.contains(&t.id)).map(|t| t.id);
+    Some((source, parent, anchor_after))
 }
 
 /// track strip。 fader / pan / mute / solo + Sends セクションを描画する。
@@ -348,6 +427,8 @@ fn dim_if_disabled(app: &AppData, ui: &mut Ui<'_, AppData>, track_id: u32, rect:
         radius: [4.0; 4],
         clip_rect: None,
     });
+    // r.md #142: 暗くするだけでは無効と読めないので斜線を重ねる (アレンジの行と同じ)。
+    ui.push_lines(crate::widgets::disabled_hatch(rect, &app.theme.core));
 }
 
 #[allow(clippy::too_many_arguments)]

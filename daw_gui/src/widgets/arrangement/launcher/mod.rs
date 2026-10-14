@@ -104,7 +104,10 @@ pub(super) const MIN_BOTH_PANE_W: f32 =
     STOP_COL_W + MIN_COL_W + RETURN_COL_W + PANE_SPLITTER_HANDLE;
 
 /// セル左端の ▶ (発火ボタン) の一辺 (px)。行が低いときは行高で頭打ちにする。
-pub(super) const LAUNCH_BTN_W: f32 = 14.0;
+pub(super) const LAUNCH_BTN_W: f32 = 16.0;
+
+/// r.md #143: セルの ▶ を押せる範囲の幅 (px、縦はセルいっぱい)。[`layout::launch_hit_rect`]。
+pub(super) const LAUNCH_HIT_W: f32 = 20.0;
 
 /// セル / シーン見出しの角丸 (px)。
 pub(super) const CELL_RADIUS: f32 = 3.0;

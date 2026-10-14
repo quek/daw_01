@@ -15,6 +15,26 @@ pub mod ruler_ops;
 pub mod select_modifier;
 pub mod time_grid;
 
+/// r.md #142: 無効トラックの面 (アレンジの行 / ヘッダ / ランチャーのセル / ミキサーの strip) に重ねる斜線。
+/// `row_dim_ink` で沈めた上に重ね、「暗いだけ」で読み違えないようにする。色は `text_dim` を薄めたもの
+/// (テーマの極性に従う = 暗いテーマでは明るい線、明るいテーマでは暗い線)。斜線の位相は画面座標に揃うので、
+/// 行の帯をヘッダ / レーン / セルに分けて描いても線が途切れずにつながる。
+#[must_use]
+pub fn disabled_hatch(rect: daw_ui_renderer::Rect, p: &daw_ui_core::theme::Palette) -> daw_ui_renderer::LineBatch {
+    const SPACING_PX: f32 = 8.0;
+    let color = p.text_dim.with_alpha(0.22);
+    let bottom = rect.y + rect.h;
+    // x + y = k の平行線。k を SPACING_PX の倍数に揃える (画面座標で位相を固定)。
+    let mut k = ((rect.x + rect.y) / SPACING_PX).floor() * SPACING_PX;
+    let hi = rect.x + rect.w + bottom;
+    let mut segments = Vec::new();
+    while rect.w > 1.0 && rect.h > 1.0 && k <= hi {
+        segments.push(daw_ui_renderer::LineSegment { a: [k - rect.y, rect.y], b: [k - bottom, bottom], color });
+        k += SPACING_PX;
+    }
+    daw_ui_renderer::LineBatch { segments: segments.into(), line_width_px: 1.5, clip_rect: Some(rect) }
+}
+
 /// slice 境界の縦線を出す最小間隔 (px)。 これより密なスライスは線だけで領域が
 /// 埋まって波形もスライス配置も読めなくなるので間引く。
 ///

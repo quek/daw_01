@@ -141,13 +141,13 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
     // で pass 1 を抜ける) ので運ぶ中身は無いが、**本体ぜんぶをボタンにすると子が鳴る列を
     // 掴もうとしただけで再生が始まる** (空セル / シーン見出しで潰したのと同じ症状)。
     if key.is_empty() {
-        return Some(if layout::launch_button_rect(rect, f.style).contains(x, y) {
+        return Some(if layout::launch_hit_rect(rect, f.style).contains(x, y) {
             Zone::CellLaunch(key)
         } else {
             Zone::CellBody(key)
         });
     }
-    if layout::launch_button_rect(rect, f.style).contains(x, y) {
+    if layout::launch_hit_rect(rect, f.style).contains(x, y) {
         Some(Zone::CellLaunch(key))
     } else {
         Some(Zone::CellBody(key))

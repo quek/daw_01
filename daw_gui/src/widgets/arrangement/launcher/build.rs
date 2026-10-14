@@ -77,9 +77,11 @@ pub(crate) fn build(
                     name: crate::widgets::arrangement::view_build::clip_display_label(
                         &sc.clip, song,
                     ),
-                    color: track_color::to_renderer(track_color::effective_clip_color(
-                        mt, &sc.clip,
-                    )),
+                    // r.md #142: 無効トラックのセルもアレンジのクリップと同じく灰色 (同じ関数)。
+                    color: crate::widgets::arrangement::view_build::clip_color_for(
+                        track_color::to_renderer(track_color::effective_clip_color(mt, &sc.clip)),
+                        !t.disabled,
+                    ),
                     muted: sc.clip.muted,
                     linked: is_shared(refcounts, sc.clip.content_id),
                     in_active_group: active_groups.contains(&sc.clip.content_id),

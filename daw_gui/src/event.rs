@@ -1028,6 +1028,8 @@ pub enum AppEvent {
     ResetTrackClipColors { track: u32 },
     ToggleTrackMute(u32),
     ToggleTrackSolo(u32),
+    /// r.md #146: 全トラックのソロを解除する (Shift+S)。Undo 対象。
+    ClearAllSolo,
     /// Mixer 帯の組み込み Comp / EQ セクションの開閉 (**全 ch 一括**、`docs/plan_channel_strip.md` §4)。
     /// 見方の都合なので `ProjectView` (session-only) に持ち、dirty を立てず Undo にも
     /// 積まない (`collapsed_groups` と同じ扱い)。
@@ -1907,6 +1909,7 @@ impl AppEvent {
             E::SetTrackPan { .. } => "パン変更",
             E::ToggleTrackMute(..) => "ミュート切替",
             E::ToggleTrackSolo(..) => "ソロ切替",
+            E::ClearAllSolo => "全ソロ解除",
             E::SetMasterGain(..) => "マスターゲイン変更",
             E::AddSend { .. } => "センド追加",
             E::RemoveSend { .. } => "センド削除",

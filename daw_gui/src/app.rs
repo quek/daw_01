@@ -1299,6 +1299,7 @@ impl AppData {
             AppEvent::ToggleTrackSolo(track) => {
                 self.toggle_track_solo(track);
             }
+            AppEvent::ClearAllSolo => self.clear_all_solo(),
             AppEvent::ToggleTrackArmed(track) => {
                 self.toggle_track_armed(track);
             }

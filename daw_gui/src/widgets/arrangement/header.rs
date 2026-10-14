@@ -122,6 +122,8 @@ pub(super) struct HeaderClicks {
     /// 左端の色ストライプの click → その track の color picker (anchor = ストライプ rect)。
     /// inspector の色スウォッチ / Parallel chain の帯と同じ操作。
     pub color_strip: Option<(u32, Rect)>,
+    /// r.md #139: 最後の行より下 (トラックの無い所) の click → トラック選択を外す。
+    pub clicked_empty: bool,
 }
 
 /// header 行の描画 + click 検出。 `response.track_header_rects` を積む。
@@ -514,6 +516,19 @@ fn draw_rows_inner(
                 radius: [0.0; 4],
                 clip_rect: Some(row),
             });
+            // r.md #142: トラック名を灰色に寄せる (名前の上に行の地の色を半分重ねる) + 行全体に斜線。
+            let bg = if f.selected_tracks.contains(&t.id) { style.track_selected_bg } else { style.header_bg };
+            let wash = bg.with_alpha(0.55);
+            ui.push_rect(RectCommand {
+                rect: name_rect_visible,
+                fill: wash,
+                border: Color::TRANSPARENT,
+                border_width: 0.0,
+                radius: [0.0; 4],
+                clip_rect: Some(row),
+            });
+            let hatch = crate::widgets::disabled_hatch(row.intersect(header_pane), ui.palette());
+            ui.push_lines(hatch);
         }
 
         // Response.track_header_rects に積む
@@ -542,6 +557,22 @@ fn draw_rows_inner(
         if ui.primary_click(WidgetId::ROOT.child((b"arr_track_row", t.id)), inside).clicked {
             clicks.clicked_track = Some(t.id);
         }
+    }
+
+    // r.md #139: 最後の行 (展開中のレーン込み) より下の空き部分の click でトラック選択を外す。
+    // `tops` の末尾 = 全行の下端 (master 行は先頭に prepend 済み)。
+    let content_bottom = f.tops.last().copied().unwrap_or(header_pane.y).max(header_pane.y);
+    let empty = Rect {
+        x: header_pane.x,
+        y: content_bottom,
+        w: header_pane.w,
+        h: (header_pane.y + header_pane.h - content_bottom).max(0.0),
+    };
+    let inside_empty = empty.h > 0.0
+        && !ui.has_open_popups()
+        && pointer.pos.is_some_and(|(rx, ry)| empty.contains(rx, ry));
+    if ui.primary_click(WidgetId::ROOT.child(b"arr_track_header_empty"), inside_empty).clicked {
+        clicks.clicked_empty = true;
     }
 }
 
@@ -607,7 +638,11 @@ pub(super) fn commit_clicks(
     clicks: HeaderClicks,
     response: &mut ArrangementResponse,
 ) {
-    let HeaderClicks { mut clicked_track, disclosure, color_strip } = clicks;
+    let HeaderClicks { mut clicked_track, disclosure, color_strip, clicked_empty } = clicks;
+    if clicked_empty && ui.dragging_kind().is_none() {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| app.set_track_selection(Vec::new())));
+        response.selection_changed = true;
+    }
     // 色ストライプの click → color picker (disclosure と重なる帯は disclosure が優先)。 この
     // frame はトラック選択を走らせない (disclosure と同じ「priority の高い操作」 の形)。
     if disclosure.is_none()

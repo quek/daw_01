@@ -384,17 +384,54 @@ impl Song {
             return Err(DependencyCycle);
         }
         let before: Vec<(u32, Option<u32>)> = self.tracks.iter().map(|t| (t.id, t.parent_group_id)).collect();
-        let mut moved: Vec<crate::model::Track> = Vec::with_capacity(track_ids.len());
-        for id in track_ids {
-            if let Some(pos) = self.tracks.iter().position(|t| t.id == *id) {
-                moved.push(self.tracks.remove(pos));
+        // r.md #144: 動かすトラックの子孫は親ごと付いて行く (並びは親の直後に元の相対順で、親子関係はそのまま)。
+        // 選択に祖先と子孫が両方入っていれば子孫は祖先の塊の一部として運ぶ (親を付け替えない)。
+        let parent_of: std::collections::HashMap<u32, Option<u32>> =
+            self.tracks.iter().map(|t| (t.id, t.parent_group_id)).collect();
+        let ancestor_in = |id: u32, set: &[u32]| {
+            let mut cur = parent_of.get(&id).copied().flatten();
+            while let Some(p) = cur {
+                if set.contains(&p) {
+                    return Some(p);
+                }
+                cur = parent_of.get(&p).copied().flatten();
+            }
+            None
+        };
+        let roots: Vec<u32> = track_ids
+            .iter()
+            .copied()
+            .filter(|&id| parent_of.contains_key(&id) && ancestor_in(id, track_ids).is_none())
+            .collect();
+        let carried: Vec<u32> = self
+            .tracks
+            .iter()
+            .map(|t| t.id)
+            .filter(|&id| roots.contains(&id) || ancestor_in(id, &roots).is_some())
+            .collect();
+        // 運ぶ塊の内側を落とし先にしても位置が定まらない (自分の中へは置けない)。
+        if anchor_after.is_some_and(|a| carried.contains(&a)) {
+            return Ok(false);
+        }
+        let mut moved: Vec<crate::model::Track> = Vec::with_capacity(carried.len());
+        for &root in &roots {
+            let block: Vec<u32> = carried
+                .iter()
+                .copied()
+                .filter(|&id| id == root || ancestor_in(id, &[root]).is_some())
+                .collect();
+            for id in block {
+                if let Some(pos) = self.tracks.iter().position(|t| t.id == id) {
+                    let mut t = self.tracks.remove(pos);
+                    if id == root {
+                        t.parent_group_id = parent;
+                    }
+                    moved.push(t);
+                }
             }
         }
         if moved.is_empty() {
             return Ok(false);
-        }
-        for t in &mut moved {
-            t.parent_group_id = parent;
         }
         let at = anchor_after.map_or(0, |after| {
             self.tracks.iter().position(|t| t.id == after).map_or(self.tracks.len(), |i| i + 1)
@@ -576,5 +613,20 @@ mod tests {
         let mut s = song(vec![sc_plugin(21, TapSource::Track(1), true)]);
         assert_eq!(s.move_tracks(&[2], Some(1), None), Ok(true), "親が変わらない並べ替え");
         assert_eq!(s.move_tracks(&[3], Some(1), Some(2)), Ok(true), "循環に無関係な付け替え");
+    }
+
+    /// r.md #144: group を動かすと子孫が親の直後に元の順で付いて行き、親子関係は変わらない。
+    #[test]
+    fn move_tracks_carries_descendants() {
+        let ids = |s: &Song| s.tracks.iter().map(|t| (t.id, t.parent_group_id)).collect::<Vec<_>>();
+        // G(1) ← A(2)、B(3) は独立。G を B の後ろへ。
+        let mut s = song(vec![]);
+        assert_eq!(s.move_tracks(&[1], None, Some(3)), Ok(true));
+        assert_eq!(ids(&s), [(3, None), (1, None), (2, Some(1))]);
+        // 祖先と子孫を両方選んでも子孫は塊の一部 (親を付け替えない)。
+        assert_eq!(s.move_tracks(&[1, 2], None, None), Ok(true));
+        assert_eq!(ids(&s), [(1, None), (2, Some(1)), (3, None)]);
+        // 自分の子の後ろへは置けない。
+        assert_eq!(s.move_tracks(&[1], None, Some(2)), Ok(false));
     }
 }

@@ -605,12 +605,11 @@ fn draw_knob<M: ?Sized + 'static>(
     // arc は「起点値の角度」から value_angle までを円周 (radius = r) 上に描画。
     // 下の 60° (5時 → 7時 経由 6時) は 300° sweep 範囲外なので、 面の色で塗って
     // リングを物理的に切る (下の「0.」 を参照)。
+    // ドラッグ中も円面は hover と同じ中立色 (accent で塗ると値弧と同色の塊になり汚く見える。
+    // r.md #150)。操作中であることは値弧と指針の動きで分かる。
     let base = p.control;
     let hover_c = p.control_hover;
-    let press_c = p.accent;
-    let bg_fill = if dragging {
-        press_c
-    } else if ui.hovers(rect) {
+    let bg_fill = if dragging || ui.hovers(rect) {
         base.lerp(hover_c, 0.85)
     } else {
         base

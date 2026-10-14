@@ -544,22 +544,32 @@ fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
     needs_history: false,
 };
 
-/// RGB スプリット（色収差）。★ 音反応の花形。R を +amount、B を −amount（px）水平にずらす。
+/// RGB スプリット（色収差）。★ 音反応の花形。R を +amount、B を −amount（px）、`angle` の向きにずらす
+/// (0° = 右、90° = 下。r.md #149。既定 0° は従来の水平と同じ)。
 const RGB_SPLIT: VideoFxDef = VideoFxDef {
     id: "builtin.video.rgb_split",
     name: "RGB Split",
     category: VideoFxCategory::Distort,
-    params: &[VideoFxParam {
-        id: 0,
-        key: "amount",
-        name: "Amount",
-        kind: ParamKind::Scalar { min: 0.0, max: 60.0, default: 8.0, unit: Unit::Px },
-    }],
+    params: &[
+        VideoFxParam {
+            id: 0,
+            key: "amount",
+            name: "Amount",
+            kind: ParamKind::Scalar { min: 0.0, max: 60.0, default: 8.0, unit: Unit::Px },
+        },
+        VideoFxParam {
+            id: 1,
+            key: "angle",
+            name: "Angle",
+            kind: ParamKind::Scalar { min: -180.0, max: 180.0, default: 0.0, unit: Unit::Deg },
+        },
+    ],
     passes: &[VideoFxPass {
         kind: PassKind::Simple,
         wgsl: r#"
 fn effect(uv: vec2<f32>, src: vec4<f32>) -> vec4<f32> {
-    let off = vec2<f32>(P.amount * P.texel.x, 0.0);
+    let a = radians(P.angle);
+    let off = vec2<f32>(cos(a), sin(a)) * P.amount * P.texel;
     let r = sample(uv + off).r;
     let b = sample(uv - off).b;
     return vec4<f32>(r, src.g, b, src.a);

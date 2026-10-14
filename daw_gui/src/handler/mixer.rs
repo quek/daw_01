@@ -619,6 +619,26 @@ impl AppData {
         self.send_audio(msg);
     }
 
+    /// r.md #146: ソロ中のトラックを全部解除する。1 本もソロでなければ何もしない (undo を積まない)。
+    pub(crate) fn clear_all_solo(&mut self) {
+        if !self.cur.song_doc.song().tracks.iter().any(|t| t.solo) {
+            return;
+        }
+        let Some(cleared) = self.edit_song(|song| {
+            let mut ids = Vec::new();
+            for t in song.tracks.iter_mut().filter(|t| t.solo) {
+                t.solo = false;
+                ids.push(t.id);
+            }
+            ids
+        }) else {
+            return;
+        };
+        for track in cleared {
+            self.send_audio(AudioCommand::SetTrackSolo { project: self.pk(), track, solo: false });
+        }
+    }
+
     pub(crate) fn toggle_track_armed(&mut self, track_id: u32) {
         // r.md #131: 無効なトラックは録音待機にできない (外すのは可 — 無効化は待機を解除済みのはず)。
         let song = self.cur.song_doc.song();

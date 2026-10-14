@@ -30,7 +30,11 @@ pub(super) fn draw(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
                     if top + row.height < pane.y || top > pane.y + pane.h {
                         continue;
                     }
-                    push_filled_rect(hctx, Rect { x: pane.x, y: top, w: pane.w, h: row.height }, ink);
+                    let r = Rect { x: pane.x, y: top, w: pane.w, h: row.height };
+                    push_filled_rect(hctx, r, ink);
+                    // r.md #142: 暗くするだけでは無効と読めないので斜線を重ねる。
+                    let hatch = crate::widgets::disabled_hatch(r.intersect(pane), hctx.palette());
+                    hctx.push_lines(hatch);
                 }
             });
         }
