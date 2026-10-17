@@ -28,7 +28,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     // 2c. `docs/plan_project_tabs.md` §5.6: タブ帯の上に留まる / Ctrl+Tab → 運んでいる
     //     クリップ / トラックを別タブへの持ち込み (drag payload) に昇格して切り替える。
     xfer::promote(app, ui, &f);
-    // 2d. r.md #141: クリップを daw_01 の窓の外 (プラグインのエディタ窓 / Explorer) へ運んだ →
+    // 2d. r.md #141: クリップ / セッションビューのセルを daw_01 の窓の外 (プラグインのエディタ窓 / Explorer) へ運んだ →
     //     移動を取り消して OS のファイルドラッグに切り替える (素材ファイルを渡す)。
     xfer::promote_to_os_file_drag(app, ui, &f);
     // 3. drag 継続 + 端オートスクロール + per-frame live 発火。

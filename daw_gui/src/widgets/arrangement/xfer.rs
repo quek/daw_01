@@ -275,25 +275,48 @@ fn track_payload(app: &AppData, ids: &[u32]) -> Option<ProjectTransferPayload> {
     Some(ProjectTransferPayload { envelope, grab_beat_offset: 0.0, grab_track_offset: 0 })
 }
 
-// r.md #141: クリップの Move ドラッグで **カーソルが daw_01 の窓の外** (別プロセスの窓 —
-// daw_plugin_host のプラグインのエディタ窓 / Explorer など) に出たら、移動を取り消して
-// OS のファイルドラッグに切り替える。渡すのは素材ファイルそのもの (Explorer から落とすのと同じ)。
+// r.md #141: クリップの Move ドラッグ (アレンジ) / セルのドラッグ (セッションビュー) で
+// **カーソルが daw_01 の窓の外** (別プロセスの窓 — daw_plugin_host のプラグインのエディタ窓 /
+// Explorer など) に出たら、移動を取り消して OS のファイルドラッグに切り替える。
+// 渡すのは素材ファイルそのもの (Explorer から落とすのと同じ)。
 //
 // エディタ窓は daw_01 の窓に重なって出るので、winit の座標 (マウスを capture しているので
 // 窓の外でも届く) では判定できない。OS にカーソルの下の窓の持ち主を聞く
 // ([`crate::os_file_drag::cursor_over_foreign_window`])。
+//
+// どちらの session も press の時点で張られるので、クリックのぶれ (各 session の短クリック判定と
+// 同じ閾値) の内側では切り替えない — エディタ窓の縁のそばを押しただけで素材が渡らないように。
 
 /// [`promote`] の後・`drag::advance` の前に呼ぶ。切り替えたフレームは session が消えて
 /// いるので、以降の continuation / release は何もしない (= クリップは元の位置に残る)。
 pub(super) fn promote_to_os_file_drag(app: &AppData, ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
+    let pos = f.pointer.pos;
+    let beyond = |anchor: (f32, f32), last: (f32, f32), slop: f32| {
+        let (x, y) = pos.unwrap_or(last);
+        (x - anchor.0).abs() + (y - anchor.1).abs() >= slop
+    };
     let keys: Vec<ClipKey> = {
         let st: &mut ArrangementState = ui.widget_state(f.wid);
-        match st.clip_drag.as_ref() {
-            Some(d) if d.kind == ClipDragKind::Move => d.anchors.iter().map(|a| a.key).collect(),
+        // 優先の規則は [`promotable`] と同じ (クリップの Move → セル)。
+        match (st.clip_drag.as_ref(), st.launcher.cell_drag.as_ref()) {
+            (Some(d), _) if d.kind == ClipDragKind::Move => {
+                if !beyond(d.anchor_mouse, d.last_mouse, super::geometry::CLIP_CLICK_DRAG_SLOP_PX) {
+                    return;
+                }
+                d.anchors.iter().map(|a| a.key).collect()
+            }
+            // セルのクリップも同じ id 空間 (`Track::clip_by_id` がセルも引く)。
+            (_, Some(d)) => {
+                if !beyond(d.anchor_mouse, d.last_mouse, super::launcher::CELL_DRAG_SLOP_PX) {
+                    return;
+                }
+                d.cells.iter().filter_map(|c| c.clip_key()).collect()
+            }
             _ => return,
         }
     };
-    if !crate::os_file_drag::cursor_over_foreign_window() {
+    // オートメーションのセルだけ → 渡すものが無いので OS に聞くまでもない。
+    if keys.is_empty() || !crate::os_file_drag::cursor_over_foreign_window() {
         return;
     }
     // 素材ファイルを持たないクリップ (MIDI / 映像 ...) だけなら窓の中のドラッグを続ける。
@@ -303,8 +326,9 @@ pub(super) fn promote_to_os_file_drag(app: &AppData, ui: &mut Ui<'_, AppData>, f
     {
         let st: &mut ArrangementState = ui.widget_state(f.wid);
         st.clip_drag = None;
+        st.launcher.cell_drag = None;
         st.tab_hover = None;
     }
-    tracing::info!(clips = keys.len(), "arrangement clip drag promoted to OS file drag");
+    tracing::info!(clips = keys.len(), "arrangement / launcher clip drag promoted to OS file drag");
     ui.push_edit(Edit::mutate(move |app: &mut AppData| app.request_os_file_drag(&keys)));
 }
