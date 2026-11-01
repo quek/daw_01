@@ -118,12 +118,17 @@ pub enum PluginCategory {
 }
 
 impl PluginCategory {
+    /// DB entry の行き先カテゴリ。映像 device かは **port 構成が SSoT** ([`PortConfig::is_video`]) —
+    /// feature tag では判定しない (字幕は `video-effect` を名乗らず `video-overlay` なので、
+    /// tag で見ると FX に落ちて `v ` で絞れなかった)。映像は audio/note の前に判定 (排他)。
+    pub fn of_entry(e: &common::plugin_db::PluginEntry) -> Self {
+        if port_config_of(e).is_video() { Self::Video } else { Self::from_features(&e.features) }
+    }
+
+    /// audio / note 系 plugin の行き先を `features` から導出する (映像は [`Self::of_entry`] が先に拾う)。
     pub fn from_features(features: &[String]) -> Self {
         let has = |k: &str| features.iter().any(|f| f == k);
-        if has("video-effect") {
-            // 映像効果は audio/note の前に判定 (排他)。
-            Self::Video
-        } else if has("note-effect") {
+        if has("note-effect") {
             Self::MidiFx
         } else if has("instrument") {
             Self::Instrument
@@ -230,7 +235,7 @@ impl PluginPickEntry {
             vendor: e.vendor.clone(),
             features: e.features.clone(),
             format_label: e.format.as_str().to_string(),
-            category: PluginCategory::from_features(&e.features),
+            category: PluginCategory::of_entry(e),
         }
     }
 }

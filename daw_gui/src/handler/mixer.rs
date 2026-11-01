@@ -768,13 +768,6 @@ impl AppData {
 
 }
 
-/// r.md #101: プラグインピッカーのクエリ先頭の種別接頭辞を剥がす。
-/// `v ` = 映像効果 / `i ` = 楽器 / `f ` = FX / `m ` = MIDI FX (大文字小文字を区別しない、
-/// 接頭辞の後ろは空でもよい = 種別だけで絞る)。 接頭辞が無ければ `(None, 全文)`。
-/// 「v」 だけ (空白なし) は接頭辞ではなく通常の検索語 (`vocoder` の途中入力)。
-/// 戻りの文字列は前後空白を除いてある (呼び側の `trim()` をここに吸収)。
-/// rescan の probe が読んだ port 構成 (note in/out・audio in/out) を DB の entry に書く。映像 port は内蔵映像効果
-/// だけが持つので probe の対象外 (書かない)。
 /// probe subprocess が持ち帰った capability を DB entry へ写す。
 /// video 系は外部 plugin では常に false なので probe 結果で上書きしない (builtin 専用)。
 fn apply_probe(
@@ -788,6 +781,11 @@ fn apply_probe(
     entry.has_embedded_gui = probe.has_embedded_gui;
 }
 
+/// r.md #101: プラグインピッカーのクエリ先頭の種別接頭辞を剥がす。
+/// `v ` = 映像 / `i ` = 楽器 / `f ` = FX / `m ` = MIDI FX (大文字小文字を区別しない、
+/// 接頭辞の後ろは空でもよい = 種別だけで絞る)。 接頭辞が無ければ `(None, 全文)`。
+/// 「v」 だけ (空白なし) は接頭辞ではなく通常の検索語 (`vocoder` の途中入力)。
+/// 戻りの文字列は前後空白を除いてある (呼び側の `trim()` をここに吸収)。
 pub(crate) fn split_picker_query(query: &str) -> (Option<PluginCategory>, &str) {
     let query = query.trim_start();
     let mut chars = query.chars();

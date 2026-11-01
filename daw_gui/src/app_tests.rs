@@ -1006,9 +1006,6 @@ mod plugin_category_tests {
             // 未分類 (主カテゴリ無し / 空) は FX チェーンへ倒す。
             (&[], PluginCategory::Fx),
             (&["reverb"], PluginCategory::Fx),
-            // video-effect は最優先で映像カテゴリへ (排他)。
-            (&["video-effect", "video-color"], PluginCategory::Video),
-            (&["video-effect"], PluginCategory::Video),
         ];
         for (features, expected) in cases {
             assert_eq!(
@@ -1016,6 +1013,20 @@ mod plugin_category_tests {
                 *expected,
                 "features = {features:?}",
             );
+        }
+    }
+
+    /// 映像 port を持つ内蔵 device は feature tag に依らず全部「映像」(`v ` で絞れる)。
+    /// 字幕は `video-effect` を名乗らないので、tag で判定していた頃は FX に落ちていた。
+    #[test]
+    fn builtin_video_port_devices_are_video_category() {
+        let video: Vec<_> = common::plugin_db::builtin_descriptors()
+            .into_iter()
+            .filter(|e| e.has_video_input || e.has_video_output)
+            .collect();
+        assert!(video.iter().any(|e| e.id == common::plugin_db::SUBTITLE_ID));
+        for e in &video {
+            assert_eq!(PluginCategory::of_entry(e), PluginCategory::Video, "{}", e.id);
         }
     }
 }
