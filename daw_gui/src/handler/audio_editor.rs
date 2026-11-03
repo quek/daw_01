@@ -17,6 +17,8 @@ impl AppData {
         if !self.is_audio_clip(target) {
             return;
         }
+        // 同じタブを取り合う Automation Editor とは排他。
+        self.close_automation_editor();
         // 別 clip を開くときは前 clip の event 選択 (クリップ内 index) が stale に
         // なるので clear する (同 clip の再 open は選択を保持)。 = close / undo と同方針。
         if self.cur.peph.audio_editor_clip != Some(target) {

@@ -34,6 +34,10 @@ impl AppData {
                 let n = self.paste_points_at(points, lane, at);
                 self.report_paste(n, "オートメーションポイント", origin, None);
             }
+            PasteContent::AutomationPointsIntoClip { points, clip, at } => {
+                let n = self.paste_points_into_clip(points, clip, at);
+                self.report_paste(n, "オートメーションポイント", origin, None);
+            }
             PasteContent::AutomationClips { clips, lane, at } => {
                 let n = self.paste_automation_clips_at(clips, lane, at);
                 self.report_paste(n, "オートメーションクリップ", origin, None);

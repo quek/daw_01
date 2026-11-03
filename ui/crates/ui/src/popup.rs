@@ -39,6 +39,10 @@ pub struct PopupOpenState {
     pub modal: bool,
     /// popup を開く前に focus を持っていた widget。close で戻す。
     pub prev_focus: Option<WidgetId>,
+    /// `context_menu_at` / `context_menu_for` が開いた popup か。これらは毎フレーム呼ばれる
+    /// 約束なので、呼ばれなかったフレームの末尾で閉じる ([`Ui::close_stale_context_menus`])。
+    /// 残すと、描かれない popup が `has_open_popups()` を true のままにして背景の操作を止める。
+    pub context_menu: bool,
     /// M14 Phase 94 (daw_01 #065): 「真のモーダル」かどうか。`true` の間、panel (popup body)
     /// **以外**の全 widget への pointer / keyboard 入力を遮断する (= 背景 widget を inert に
     /// する)。`open_popup` 経由の menu / dropdown / context_menu は `false` (= 従来どおり
@@ -228,6 +232,25 @@ pub fn popup_rect_clamped_at(
 }
 
 impl<M: ?Sized + 'static> Ui<'_, M> {
+    /// この context menu が今フレームも呼ばれたことを記録する (開いているときだけ)。
+    pub(crate) fn mark_context_menu_seen(&mut self, id: impl std::hash::Hash) {
+        let wid = WidgetId::ROOT.child((b"popup", &id));
+        if let Some(state) = self.open_popups.get_mut(&wid) {
+            state.context_menu = true;
+            self.context_menus_seen.push(wid);
+        }
+    }
+
+    /// 今フレーム呼ばれなかった context menu を閉じる (build closure を走らせたあとに 1 度)。
+    ///
+    /// id が rect 由来だと rect が動くだけで、持ち主の描画が止まれば id に関係なく、
+    /// 誰も `popup_layer` を呼ばなくなる。閉じる口の `close_popup` / outside click 判定は
+    /// どちらも持ち主が呼ぶので、ここで拾わないと永久に残る。
+    pub(crate) fn close_stale_context_menus(&mut self) {
+        let seen = std::mem::take(&mut self.context_menus_seen);
+        self.open_popups.retain(|wid, s| !s.context_menu || seen.contains(wid));
+    }
+
     /// popup body の縦スクロールを 1 フレーム分処理し、 scrollbar を描く。
     ///
     /// `viewport` は popup 自身の rect (= [`list_popup_rect_below_or_above`] 等が返した

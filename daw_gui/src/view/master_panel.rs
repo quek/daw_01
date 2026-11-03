@@ -84,9 +84,7 @@ pub fn panel_width(app: &AppData) -> f32 {
 /// 右クリックメニューの安定 id (パネル内 5 か所)。
 ///
 /// `context_menu_for` は popup id を **rect 座標から** 作るので、パネル幅や
-/// セクション高が変わると id が変わり、開いていた popup が `open_popups` に
-/// 取り残される (見えないのに click / drag を食う領域が残り、
-/// `has_open_popups()` が永久に true になって他 view のガードまで壊す)。
+/// セクション高が変わると id が変わり、開いていたメニューが閉じてしまう。
 /// 座標に依らない id を自分で与えて `context_menu_at` を使う。
 const MENU_IDS: [&str; 5] = [
     "master_panel_menu_level",

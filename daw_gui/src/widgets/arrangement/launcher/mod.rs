@@ -291,7 +291,8 @@ pub enum LauncherIntent {
     /// 空セルのダブルクリック → 空クリップを作る。
     /// `scene_index` がプレースホルダ列を指していたら `Song::ensure_scene_at` で実体化する。
     CreateCell { row: ArrangementRowKey, scene_index: u32 },
-    /// クリップのあるセルのダブルクリック → ピアノロール / オーディオエディタを開く。
+    /// クリップのあるセルのダブルクリック → ピアノロール / オーディオエディタ /
+    /// Automation Editor を開く。
     OpenCellEditor(LauncherCellKey),
     /// セルを別の行 / 列へ運んだ。
     MoveCells { moves: Vec<LauncherCellMove>, mode: ClipCopyMode },

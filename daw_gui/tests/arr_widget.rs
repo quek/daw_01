@@ -1805,6 +1805,40 @@ fn alt_double_click_off_the_line_still_adds_an_unsnapped_point() {
     );
 }
 
+/// オートメーションクリップの **名前帯** のダブルクリックで Automation Editor が開く。
+/// 本体のダブルクリックは今までどおり点の追加で、エディタは開かない。
+#[test]
+fn 名前帯のダブルクリックで_automation_editor_が開き本体では点を足す() {
+    let (mut app, _a, _p) = app_with_lane(HEADER_W);
+    let key = common::model::AutomationClipKey { track: 1, lane: 1, clip: 1 };
+    let clip_rect = lane_clip_rect(&mut app);
+    let dots = |app: &AppData| {
+        app.cur.song_doc
+            .song()
+            .clip_contents
+            .get(&AUTOMATION_CONTENT_ID)
+            .and_then(ClipContent::automation_points)
+            .map_or(0, <[_]>::len)
+    };
+    let double = |app: &mut AppData, x: f32, y: f32| {
+        let mut host = UiHost::no_redraw();
+        for p in [press(x, y, no_mods()), release(x, y, no_mods()), press(x, y, no_mods()), release(x, y, no_mods())] {
+            drive(&mut host, app, p);
+        }
+    };
+    let x = clip_rect.x + clip_rect.w * 0.9;
+    let before = dots(&app);
+
+    double(&mut app, x, clip_rect.y + clip_rect.h - 3.0);
+    assert_eq!(dots(&app), before + 1, "本体は点の追加");
+    assert_eq!(app.automation_editor_target(), None, "本体では開かない");
+
+    double(&mut app, x, clip_rect.y + 3.0);
+    assert_eq!(app.automation_editor_target(), Some(key), "名前帯で開く");
+    assert_eq!(app.cur.view.bottom_panel, Some(1));
+    assert_eq!(dots(&app), before + 1, "名前帯では点を足さない");
+}
+
 /// r.md #73 (E): 点の無修飾クリックでクリップ選択が消えない。
 /// 選択集合は面を跨いで共存でき、Delete / Copy / Cut の宛先は last-wins が解決する。
 #[test]
@@ -2397,6 +2431,51 @@ fn セルのダブルクリックは編集面を開く意図を出す() {
             .iter()
             .any(|i| matches!(i, LauncherIntent::OpenCellEditor(c) if c.clip_id == 9)),
         "セルのダブルクリックで OpenCellEditor: {:?}",
+        r.launcher.intents
+    );
+}
+
+/// レーン行のセルのダブルクリックも同じ `OpenCellEditor` の意図を出す
+/// (handler が Automation Editor を開くところは `automation_editor.rs` が見る)。
+#[test]
+fn レーン行のセルのダブルクリックは編集面を開く意図を出す() {
+    use daw_gui::widgets::arrangement::LauncherIntent;
+    let (mut app, _a, _p) = app_with_launcher(HEADER_W, 240.0);
+    add_midi_track_with_clip(&mut app, 1, 1, 0.0, 4.0);
+    add_expanded_automation_lane(&mut app, 1, 1);
+    app.edit_song(|song| {
+        let scene_id = song.ensure_scene_at(0);
+        let lane = song.automation_lane_by_key_mut(1, 1).expect("lane");
+        lane.session_clips.push(common::model::SessionAutomationClip {
+            scene_id,
+            clip: AutomationClip {
+                id: 9,
+                start_beat: 0.0,
+                length_beats: 4.0,
+                content_id: AUTOMATION_CONTENT_ID,
+                ..AutomationClip::default()
+            },
+            launch: common::model::LaunchSettings::default(),
+        });
+    });
+    let mut host = UiHost::no_redraw();
+    let r0 = drive_response(&mut host, &mut app, PointerFrame::default());
+    let (_, rect) = r0
+        .launcher
+        .cell_rects
+        .iter()
+        .copied()
+        .find(|(k, _)| k.automation_clip_key().is_some_and(|c| c.clip == 9))
+        .expect("レーン行のセルの rect が返る");
+    let (x, y) = (rect.x + rect.w * 0.7, rect.y + rect.h * 0.5);
+    let mut last = None;
+    for p in [press(x, y, no_mods()), release(x, y, no_mods()), press(x, y, no_mods()), release(x, y, no_mods())] {
+        last = Some(drive_response(&mut host, &mut app, p));
+    }
+    let r = last.expect("4 フレーム走らせた");
+    assert!(
+        r.launcher.intents.iter().any(|i| matches!(i, LauncherIntent::OpenCellEditor(c) if c.clip_id == 9)),
+        "レーン行のセルでも OpenCellEditor: {:?}",
         r.launcher.intents
     );
 }

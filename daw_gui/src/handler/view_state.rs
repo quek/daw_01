@@ -49,6 +49,20 @@ impl AppData {
             .map(|(k, v)| (*k, *v))
             .collect();
         audio_editor_views.sort_by_key(|(k, _)| (k.track_id, k.clip_id));
+        let mut automation_editor_views: Vec<(
+            common::model::AutomationClipKey,
+            common::model::AudioEditorViewState,
+        )> = self
+            .cur.view.automation_editor_views
+            .iter()
+            .filter(|(k, _)| {
+                self.cur.song_doc.song()
+                    .automation_lane_by_key(k.track, k.lane)
+                    .is_some_and(|l| l.clip_by_id(k.clip).is_some())
+            })
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        automation_editor_views.sort_by_key(|(k, _)| (k.track, k.lane, k.clip));
         // Fit / `Z` 縦ズームが張った lane 行高。**現存するレーンの分だけ**書き出し
         // (消えたレーンの orphan を溜めない)、キー順で並べて save 差分を安定させる。
         let mut lane_row_overrides: Vec<(common::model::AutomationLaneKey, u16)> = self
@@ -123,6 +137,7 @@ impl AppData {
             bottom_panel: self.cur.view.bottom_panel,
             piano_roll_views,
             audio_editor_views,
+            automation_editor_views,
             plugin_editor_windows,
             // r.md #87: ランチャー帯の見せ方 / 幅 / 列幅 / 横スクロール。
             // 「見方の都合」なので保存はするが dirty は立てない。
@@ -157,6 +172,7 @@ impl AppData {
     ) {
         self.cur.view.piano_roll_views.clear();
         self.cur.view.audio_editor_views.clear();
+        self.cur.view.automation_editor_views.clear();
         // r.md #65: 別プロジェクトの窓位置が漏れないよう per-clip view と同様に先にクリア。
         self.cur.view.plugin_editor_windows.clear();
         // r.md #129 (Q18): 開いている Par も同じ (`view = None` の旧ファイルでも前プロジェクトを持ち越さない)。
@@ -242,6 +258,12 @@ impl AppData {
             }
             av.len_beats = av.len_beats.max(0.0);
             self.cur.view.audio_editor_views.insert(k, av);
+        }
+        // 値域は描画側がクリップ長で clamp する。ここは壊れた値だけ落とす。
+        for (k, v) in v.automation_editor_views {
+            if v.start_beat.is_finite() && v.len_beats.is_finite() && v.len_beats > 0.0 {
+                self.cur.view.automation_editor_views.insert(k, v);
+            }
         }
         // r.md #65: エディタ窓のジオメトリ。現存しない device の stale entry は捨てる。
         // 位置 (`x`/`y`) は **clamp しない** — マルチモニタでは負値が正当で、

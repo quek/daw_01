@@ -64,7 +64,7 @@ use clip_drag::{AutomationDragAnchor, ClipDragAnchor, ClipDragSession};
 // のように修飾して呼ぶ (同名の自由関数が draw / geometry と衝突しやすい)。
 // session 型だけは他の drag session と同じ名前で書けるよう名指しで import する
 // (`ArrangementState` のフィールド / `LiveSessions` / `Overlays` が並べて持つため)。
-mod curve;
+pub(crate) mod curve;
 use curve::AutomationSegmentBendSession;
 mod draw;
 use draw::*;

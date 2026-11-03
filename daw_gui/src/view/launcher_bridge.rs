@@ -153,7 +153,7 @@ fn convert(intent: &LauncherIntent) -> Option<LauncherEvent> {
             row: row_of(*row),
             scene_index: *scene_index as usize,
         },
-        // 開くのは既存のクリップ編集面 (ピアノロール / オーディオエディタ)。
+        // 開くのは既存のクリップ編集面 (ピアノロール / オーディオエディタ / Automation Editor)。
         // どちらを開くかは content 種別で決まるので、判定は handler 側 1 箇所
         // (アレンジのクリップのダブルクリックと同じ式) に置く。
         LauncherIntent::OpenCellEditor(cell) => LauncherEvent::OpenCellEditor(cell_of(*cell)?),

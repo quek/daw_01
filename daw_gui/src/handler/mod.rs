@@ -4,7 +4,9 @@
 pub mod activity;
 pub mod audio_editor;
 pub mod automation;
+pub mod automation_editor;
 pub mod automation_lanes;
+pub mod automation_points_clipboard;
 pub mod bounce;
 /// r.md #129: `Q` の宛先 (Mixer 帯 / マスターパネルの hover → device / Limiter)。
 pub mod bypass_target;

@@ -399,7 +399,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     //       下り (b<a) で bend=+0.5 → k≈1.414 → `u^k < u` → 直線より a 寄り = 画面上。
     for (point_key, rect) in &resp.automation_point_rects {
         let key = *point_key;
-        ui.context_menu_for(*rect, &["階段", "直線", "曲線", "S 字"], move |idx, ui| {
+        ui.context_menu_for(*rect, &CURVE_MENU_ITEMS, move |idx, ui| {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 apply_curve_menu_choice(app, key, idx);
             }));
@@ -412,7 +412,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 値の表示/解釈は `automation_value` (人間可読単位 SSoT) を 1 経路で使う。
 
     // (a) 編集中 point の inline 数値入力欄 (点をダブルクリックで開始)。
-    if let Some(edit_key) = app.cur.peph.editing_automation_point {
+    // Automation Editor で開いているクリップの点は向こうが入力欄を出す。
+    if let Some(edit_key) = app.cur.peph.editing_automation_point
+        && !app.automation_editor_owns_point(edit_key)
+    {
         let point_rect = resp
             .automation_point_rects
             .iter()
@@ -423,62 +426,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                     && k.point_idx == edit_key.point_idx
             })
             .map(|(_, r)| *r);
-        let lane_target = app
-            .cur.song_doc.song()
-            .automation_lane_by_key(edit_key.track_id, edit_key.lane_id)
-            .map(|l| l.target.clone());
-        if let (Some(rect), Some(target)) = (point_rect, lane_target) {
-            let plugin_range = app.plugin_param_range(&target);
-            let desc = crate::automation_value::automation_value_display(&target, plugin_range);
-            let cur = app.automation_point_value(&edit_key).unwrap_or(0.0);
-            let prefill = desc.format_number(cur);
-            // 点 dot (8px) より広い入力欄を、 点の少し上に center 配置。
-            let field_w = 60.0_f32;
-            let input_rect = Rect {
-                x: rect.x + rect.w * 0.5 - field_w * 0.5,
-                y: (rect.y - 22.0).max(area.y),
-                w: field_w,
-                h: 18.0,
-            };
-            let edit_resp = ui.text_input_at_focused(
-                (
-                    "automation_point_value",
-                    edit_key.track_id,
-                    edit_key.lane_id,
-                    edit_key.clip_id,
-                    edit_key.point_idx,
-                ),
-                input_rect,
-                &prefill,
-                &ui.text_input_style(),
-                |_new| Edit::mutate(|_| {}),
-            );
-            if edit_resp.committed || edit_resp.blurred {
-                // Enter / 外クリックで確定。 数値が読めれば plain で上書き、 読めなければ
-                // 値は変えずに編集終了。
-                let text = edit_resp.committed_text.unwrap_or_default();
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    if let Some(plain) = desc.parse_to_plain(&text) {
-                        app.handle_event(AppEvent::SetAutomationPointValue {
-                            key: edit_key,
-                            value: plain,
-                        });
-                    } else {
-                        app.cur.peph.editing_automation_point = None;
-                    }
-                }));
-            } else if !edit_resp.focused {
-                // Esc / focus 喪失 (commit でない) → キャンセル。
-                ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                    app.cur.peph.editing_automation_point = None;
-                }));
-            }
-        } else {
-            // 点が画面外 / 削除済 → 編集状態を破棄。
-            ui.push_edit(Edit::mutate(|app: &mut AppData| {
-                app.cur.peph.editing_automation_point = None;
-            }));
-        }
+        crate::view::automation_value_input::draw_value_input(app, ui, edit_key, point_rect, area.y);
     }
 
     // (b) 各 lane のデフォルト値を BPM 風 scrubable_number で編集 (旧スライダー帯を置換、
@@ -532,7 +480,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 let target = target_for_change.clone();
                 Edit::mutate(move |app: &mut AppData| {
                     let plain = (desc.from_display)(display_v.clamp(desc.range.0, desc.range.1));
-                    let norm = common::automation::plain_to_norm(&target, plain);
+                    let norm =
+                        common::automation::plain_to_norm_ranged(&target, plain, app.plugin_param_range(&target));
                     app.handle_event(AppEvent::SetLaneDefault {
                         track_id: lk.track,
                         lane_id: lk.lane,
@@ -561,37 +510,13 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
             .automation_lane_by_key(drag.key.clip.track, drag.key.clip.lane)
             .map(|l| l.target.clone())
     {
-        let plugin_range = app.plugin_param_range(&target);
-        let desc = crate::automation_value::automation_value_display(&target, plugin_range);
-        let plain = common::automation::norm_to_plain(&target, drag.value_norm);
-        let text = desc.format_with_unit(plain);
-        let (cx, cy) = drag.cursor;
-        let pad = 4.0_f32;
-        #[allow(clippy::cast_precision_loss)]
-        let w = (text.chars().count() as f32) * 7.0 + pad * 2.0;
-        let label_rect = Rect {
-            x: cx + 10.0,
-            y: (cy - 20.0).max(area.y),
-            w,
-            h: 16.0,
-        };
-        // 読み値は不透明に近いクローム面 (`panel`) のチップに載せる = 背景は
-        // パレット自身の面なので、 文字は極性固定インクでなく `text` でよい。
-        ui.push_rect(RectCommand {
-            rect: label_rect,
-            fill: p.panel.with_alpha(0.92),
-            border: p.border,
-            border_width: 1.0,
-            radius: [3.0; 4],
-            clip_rect: None,
-        });
-        ui.label_at(
-            "automation_point_drag_readout",
-            &text,
-            label_rect.x + pad,
-            label_rect.y + 2.0,
-            11.0,
-            p.text,
+        crate::view::automation_value_input::draw_drag_readout(
+            app,
+            ui,
+            &target,
+            drag.value_norm,
+            drag.cursor,
+            area.y,
         );
     }
 
@@ -935,7 +860,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
 /// 「曲線」を選んだ瞬間に線が下へ沈む (#73 の元の症状)。 画面上は常に上へ膨らませる。
 /// 検算: 上り (b>a) で bend=-0.5 → k=2^-0.5≈0.707 → `u^k > u` → 直線より b 寄り = 画面上。
 ///       下り (b<a) で bend=+0.5 → k≈1.414 → `u^k < u` → 直線より a 寄り = 画面上。
-fn apply_curve_menu_choice(
+pub(crate) fn apply_curve_menu_choice(
     app: &mut AppData,
     key: crate::widgets::arrangement::AutomationPointKey,
     idx: usize,
@@ -944,11 +869,12 @@ fn apply_curve_menu_choice(
     if point_idx == 0 {
         return;
     }
+    // マスター行のレーンも引けるよう `automation_lane_by_key` を通す
+    // (`track_by_id` では引けず、マスター行の点ではメニューが無反応だった)。
     let resolved = app
         .cur.song_doc
         .song()
-        .track_by_id(key.clip.track)
-        .and_then(|t| t.lane_by_id(key.clip.lane))
+        .automation_lane_by_key(key.clip.track, key.clip.lane)
         .and_then(|l| l.clip_by_id(key.clip.clip))
         .and_then(|c| app.cur.song_doc.song().clip_contents.get(&c.content_id))
         .and_then(|cc| cc.automation_points())
@@ -975,6 +901,10 @@ fn apply_curve_menu_choice(
         next,
     });
 }
+
+/// 点の右クリックメニュー。index の意味は [`apply_curve_menu_choice`] が持つ
+/// (レーンと Automation Editor で同じ 4 択)。
+pub(crate) const CURVE_MENU_ITEMS: [&str; 4] = ["階段", "直線", "曲線", "S 字"];
 
 fn render_clip_create_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
     let Some((track, beat, pos)) = app.cur.peph.clip_create_menu else {

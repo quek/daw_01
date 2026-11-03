@@ -98,6 +98,7 @@ static MOUSE_GESTURES: &[MouseGestureDef] = &[
     MouseGestureDef { category: MouseCategory::PianoRoll, gesture: "ドラッグ (端)", description: "ノートの長さを変更" },
     MouseGestureDef { category: MouseCategory::PianoRoll, gesture: "ドラッグ (下部レーン)", description: "ベロシティを変更" },
     // オートメーション
+    MouseGestureDef { category: MouseCategory::Automation, gesture: "ダブルクリック (クリップの名前帯 / セル)", description: "Automation Editor で開く" },
     MouseGestureDef { category: MouseCategory::Automation, gesture: "ダブルクリック (空き)", description: "ポイントを追加" },
     MouseGestureDef { category: MouseCategory::Automation, gesture: "ダブルクリック (点)", description: "値を入力" },
     MouseGestureDef { category: MouseCategory::Automation, gesture: "ドラッグ (点)", description: "ポイントを移動" },

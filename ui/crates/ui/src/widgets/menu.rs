@@ -926,6 +926,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             );
             self.open_popup(menu_id, anchor, true);
         }
+        self.mark_context_menu_seen(menu_id);
 
         // popup_rect は state.anchor から取得 (open 時の固定座標、毎フレーム同じ)
         let mut clicked_idx: Option<usize> = None;
@@ -938,6 +939,16 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             on_select(idx, self);
             self.close_popup(menu_id);
         }
+    }
+
+    /// `context_menu_at(id, ..)` のメニューが開いているか。
+    pub fn is_context_menu_open(&self, id: impl std::hash::Hash) -> bool {
+        self.is_popup_open(("context_menu_at", &id))
+    }
+
+    /// `context_menu_at(id, ..)` のメニューを閉じる (Esc の振り分けなど、持ち主の外から閉じる口)。
+    pub fn close_context_menu(&mut self, id: impl std::hash::Hash) {
+        self.close_popup(("context_menu_at", &id));
     }
 }
 
@@ -1697,6 +1708,34 @@ mod tests {
             texts.contains(&"Alpha") && texts.contains(&"Beta"),
             "open_at=Some で items が popup に描画される: {texts:?}"
         );
+    }
+
+    /// 持ち主が呼ばなくなった (描画が止まった / rect 由来の id が変わった) メニューは閉じる。
+    /// 残すと描かれない popup が `has_open_popups()` を true にして、背景の操作を止め続ける。
+    /// 毎フレーム呼ばれている間は閉じない。
+    #[test]
+    fn 呼ばれなくなったcontext_menuは閉じる() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 400, height: 300 };
+        let items = ["Alpha", "Beta"];
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.context_menu_at("ctx", Some((50.0, 60.0)), &items, |_idx, _ui| {});
+        });
+        let mut open = false;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            ui.context_menu_at("ctx", None, &items, |_idx, _ui| {});
+            open = ui.is_context_menu_open("ctx");
+        });
+        assert!(open, "呼ばれ続けている間は開いたまま");
+
+        // 呼ばない 1 フレーム。そのフレームの間はまだ開いていて、末尾で閉じる。
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), _ui| {});
+        let mut any_open = true;
+        host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+            any_open = ui.has_open_popups();
+        });
+        assert!(!any_open, "呼ばれなかったフレームの末尾で閉じる");
     }
 
     /// `open_at = None` のまま (一度も開いていない) なら popup は出ない。

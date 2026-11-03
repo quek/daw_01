@@ -895,6 +895,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             seen_widgets: &mut seen_widgets,
             current_clip: None,
             open_popups: &mut self.open_popups,
+            context_menus_seen: Vec::new(),
             popup_primitives: Vec::new(),
             drawing_in_popup: false,
             current_popup: None,
@@ -929,6 +930,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             _m: PhantomData,
         };
         f(model, &mut ui);
+        ui.close_stale_context_menus();
 
         // M8 Phase 30: Tab / arrow focus traversal。
         // pending_shortcuts に "tab_next" 等が残っていれば (= widget が consume 済でなければ)、
@@ -1099,7 +1101,9 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// `push_rect / push_text / push_lines` で自動 inject される。`None` = 全画面。
     pub(crate) current_clip: Option<Rect>,
     /// M7 Phase 25: popup の open / close 状態 (UiHost が所有、Ui が借りる)。
-    open_popups: &'a mut HashMap<WidgetId, PopupOpenState>,
+    pub(crate) open_popups: &'a mut HashMap<WidgetId, PopupOpenState>,
+    /// このフレームに呼ばれた、開いている context menu ([`Self::close_stale_context_menus`])。
+    pub(crate) context_menus_seen: Vec<WidgetId>,
     /// M7 Phase 25: popup_layer 内で push される rect の deferred buffer。
     /// frame 末尾で base scene に append → z-order 最前面。
     /// drawing_in_popup 中の primitive 列 (`Primitive::Rect/Glyph/Line` の混在)。
@@ -1415,6 +1419,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 anchor,
                 modal,
                 prev_focus,
+                context_menu: false,
                 capture_input,
                 capture_keyboard,
                 dismiss_on_outside_click: true,

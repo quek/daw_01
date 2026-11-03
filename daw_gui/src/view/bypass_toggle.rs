@@ -16,12 +16,15 @@ use crate::state::ModRackHover;
 /// 下の clip / note の mute へは落とさない。
 ///
 /// `mixer_active` = Mixer タブが選ばれていて pointer が下部パネル内、
-/// `is_pianoroll_active` = Piano Roll タブが選ばれていて pointer が下部パネル内。
+/// `is_pianoroll_active` = Piano Roll タブが選ばれていて pointer が下部パネル内、
+/// `editor_lane` = pointer が Automation Editor の上にあるときの、編集しているレーン
+/// (レーンの上の `Q` と同じくそのレーンをバイパス切替)。
 pub(super) fn dispatch(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
     mixer_active: bool,
     is_pianoroll_active: bool,
+    editor_lane: Option<common::model::AutomationLaneKey>,
 ) {
     if !ui.take_shortcut("daw.toggle_mute") {
         return;
@@ -30,7 +33,7 @@ pub(super) fn dispatch(
         Some(target) => app.bypass_toggle_event(target),
         None => match hovered_track_to_disable(app, mixer_active, is_pianoroll_active) {
             Some(event) => event,
-            None => return dispatch_toggle_mute(app, ui, is_pianoroll_active),
+            None => return dispatch_toggle_mute(app, ui, is_pianoroll_active, editor_lane),
         },
     };
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -58,7 +61,12 @@ fn hovered_track_to_disable(app: &AppData, mixer_active: bool, is_pianoroll_acti
 /// Q の対象を文脈で決めて mute / bypass を切り替える (`dispatch_shortcuts` の Q 節、 マスター
 /// パネル / Mixer 帯を先取りした後)。 優先順: 変調ラック (r.md #115) → インスペクタの
 /// 行 → オートメーションレーン → ノート → クリップ / 時間範囲。
-fn dispatch_toggle_mute(app: &AppData, ui: &mut Ui<'_, AppData>, is_pianoroll_active: bool) {
+fn dispatch_toggle_mute(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    is_pianoroll_active: bool,
+    editor_lane: Option<common::model::AutomationLaneKey>,
+) {
     // r.md #105: `Q` が bypass 切替する device = **カーソル直下のチェーン行だけ** (S キーの
     // ソロと同じ「カーソルがある行」規則)。 device の選択集合は使わない — チェーン行の
     // 選択は画面上で見分けにくく、 選択優先にすると「別の行を指して押したのに前に click
@@ -86,7 +94,7 @@ fn dispatch_toggle_mute(app: &AppData, ui: &mut Ui<'_, AppData>, is_pianoroll_ac
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(event);
         }));
-    } else if let Some(lane) = app.cur.peph.arrange_hovered_automation_lane {
+    } else if let Some(lane) = editor_lane.or(app.cur.peph.arrange_hovered_automation_lane) {
         // ポインタ下のオートメーションレーン (本体 / ヘッダ) をバイパス切替。
         // ヘッダにボタンは無く、これが唯一の到達手段。
         let enabled = app

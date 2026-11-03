@@ -59,7 +59,9 @@ impl AppData {
         // 面は範囲のレーン種別が持つ (`time_selection_surface`)。
         let time_face = self.time_selection_surface();
         let notes = time_face == Some(S::Notes) && !self.selected_note_ids().is_empty();
-        let points = !self.cur.selection.selected_automation_points.is_empty();
+        // **見えている点だけ。** タブを隠したセルの点や消えたクリップの点を面として生かすと、
+        // 見えないものを Delete / Cut が消す (下の `cells` と同じ理由で実在も見る)。
+        let points = self.selected_automation_points_displayed();
         let auto_clips = !self.cur.selection.selected_automation_clips.is_empty();
         // 範囲面 (アレンジャーのトラック行 / オートメーションレーン行)。
         let time_range = time_face == Some(S::TimeRange);

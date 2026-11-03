@@ -6,7 +6,7 @@
 //! 以前は view が `paste_*_at` / `cut_tracks` を直接呼んでいて、undo 履歴に操作名が付かず、
 //! 直前の event の undo step に吸収されることがあった。
 
-use common::model::{AudioEvent, AutomationLaneKey, MediaManifest, Note};
+use common::model::{AudioEvent, AutomationClipKey, AutomationLaneKey, MediaManifest, Note};
 
 use crate::clipboard::{AutomationClipCopy, ClipCopy, CopiedPoint, DeviceCopy, LauncherCellCopy, TracksCopy};
 use crate::state::LauncherFocus;
@@ -42,6 +42,8 @@ pub enum PasteContent {
     /// オーディオエディタの `at` 拍 (クリップ内)。
     AudioEvents { events: Vec<AudioEvent>, at: f64 },
     AutomationPoints { points: Vec<CopiedPoint>, lane: AutomationLaneKey, at: f64 },
+    /// Automation Editor で開いているクリップの `at` 拍 (窓ローカル)。
+    AutomationPointsIntoClip { points: Vec<CopiedPoint>, clip: AutomationClipKey, at: f64 },
     AutomationClips { clips: Vec<AutomationClipCopy>, lane: AutomationLaneKey, at: f64 },
     /// いまインスペクタに出ているチェーン。
     Devices { devices: Vec<DeviceCopy>, dest_track: u32 },
@@ -77,7 +79,8 @@ impl ClipboardEvent {
             Self::Paste { content, .. } => match content {
                 PasteContent::Notes { .. } => "ノート貼り付け",
                 PasteContent::AudioEvents { .. } => "オーディオイベント貼り付け",
-                PasteContent::AutomationPoints { .. } => "ポイント貼り付け",
+                PasteContent::AutomationPoints { .. }
+                | PasteContent::AutomationPointsIntoClip { .. } => "ポイント貼り付け",
                 PasteContent::AutomationClips { .. } => "オートメーションクリップ貼り付け",
                 PasteContent::Devices { .. } => "デバイス貼り付け",
                 PasteContent::Clips { .. } => "クリップ貼り付け",

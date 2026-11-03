@@ -84,7 +84,7 @@ impl AppData {
         let song = self.cur.song_doc.song();
         match cell {
             LauncherCellKey::Track(k) => track_cell_payload(song, k),
-            LauncherCellKey::Lane(k) => lane_cell_payload(song, k),
+            LauncherCellKey::Lane(k) => lane_cell_payload(song, k, self.lane_plugin_range(k.track, k.lane)),
         }
     }
 
@@ -113,6 +113,16 @@ impl AppData {
         let imported = self.media_for_import(media);
         let media = &imported;
         let mut made: Vec<LauncherCellKey> = Vec::new();
+        // 点の norm を plain へ戻す写像。編集の closure の中からは引けないので先に集める。
+        let lane_ranges: std::collections::HashMap<common::model::AutomationLaneKey, (f64, f64)> = rows
+            .iter()
+            .filter_map(|row| {
+                let LauncherRow::Lane(k) = row else {
+                    return None;
+                };
+                Some((*k, self.lane_plugin_range(k.track, k.lane)?))
+            })
+            .collect();
         self.edit_song_checked(|song| {
             // 別プロジェクトからなら媒体を先に取り込む (content の source_id を張り替える)。
             let media_remap = if same_project {
@@ -147,7 +157,13 @@ impl AppData {
                     continue;
                 }
                 let scene_id = song.ensure_scene_at(dest.scene_index + cc.scene_offset as usize);
-                if let Some(key) = paste_one(song, row, scene_id, cc, same_project, &mut remap, &media_remap) {
+                let ctx = PasteCtx {
+                    same_project,
+                    remap: &mut remap,
+                    media_remap: &media_remap,
+                    lane_ranges: &lane_ranges,
+                };
+                if let Some(key) = paste_one(song, row, scene_id, cc, ctx) {
                     made.push(key);
                 }
             }
@@ -162,6 +178,15 @@ impl AppData {
     }
 }
 
+/// [`paste_one`] が貼り付け全体で共有する入力。
+struct PasteCtx<'a> {
+    same_project: bool,
+    remap: &'a mut std::collections::HashMap<common::model::ContentId, common::model::ContentId>,
+    media_remap: &'a common::model::MediaRemap,
+    /// 値域を持つプラグインのレーンの実値域。
+    lane_ranges: &'a std::collections::HashMap<common::model::AutomationLaneKey, (f64, f64)>,
+}
+
 /// セル 1 つを貼る。行の種別と payload の種別が食い違うときは置かない
 /// (MIDI セルをオートメーションレーン行へ貼っても意味が無い)。
 fn paste_one(
@@ -169,10 +194,9 @@ fn paste_one(
     row: LauncherRow,
     scene_id: u32,
     cc: &LauncherCellCopy,
-    same_project: bool,
-    remap: &mut std::collections::HashMap<common::model::ContentId, common::model::ContentId>,
-    media_remap: &common::model::MediaRemap,
+    ctx: PasteCtx<'_>,
 ) -> Option<LauncherCellKey> {
+    let PasteCtx { same_project, remap, media_remap, lane_ranges } = ctx;
     match (&cc.cell, row) {
         (LauncherCellPayload::Track(c), LauncherRow::Track(track_id)) => {
             // 同一プロジェクトで content が現存すればリンク共有、それ以外は
@@ -219,6 +243,7 @@ fn paste_one(
         }
         (LauncherCellPayload::Lane(a), LauncherRow::Lane(lk)) => {
             let target = song.automation_lane_by_key(lk.track, lk.lane)?.target.clone();
+            let range = lane_ranges.get(&lk).copied();
             // v29: 新規 content の点にも安定 id を採番する (1 始まりの連番 =
             // per-content allocator と同じ、`paste_automation_clips_at` と同型)。
             let mut points: Vec<common::model::AutomationPoint> = a
@@ -228,7 +253,7 @@ fn paste_one(
                 .map(|(i, p)| common::model::AutomationPoint {
                     id: i as u32 + 1,
                     time_beat: p.time_beat.max(0.0),
-                    value: common::automation::norm_to_plain(&target, p.value_norm),
+                    value: common::automation::norm_to_plain_ranged(&target, p.value_norm, range),
                     curve: p.curve,
                 })
                 .collect();
@@ -296,10 +321,11 @@ fn track_cell_payload(song: &common::model::Song, k: ClipKey) -> Option<Launcher
 fn lane_cell_payload(
     song: &common::model::Song,
     k: AutomationClipKey,
+    range: Option<(f64, f64)>,
 ) -> Option<LauncherCellPayload> {
     let lane = song.automation_lane_by_key(k.track, k.lane)?;
     let c = lane.session_clips.iter().find(|c| c.clip.id == k.clip)?;
-    let points = automation_points_of(song, &lane.target, c.clip.content_id, c.clip.content_offset_beats);
+    let points = automation_points_of(song, &lane.target, range, c.clip.content_id, c.clip.content_offset_beats);
     Some(LauncherCellPayload::Lane(AutomationClipCopy {
         start_beat: 0.0,
         length_beats: c.clip.length_beats,
@@ -310,10 +336,11 @@ fn lane_cell_payload(
     }))
 }
 
-/// content の curve を clipboard の点列へ落とす。
-fn automation_points_of(
+/// content の curve を clipboard の点列へ落とす (窓ローカル拍 + normalized 値)。
+pub(crate) fn automation_points_of(
     song: &common::model::Song,
     target: &common::model::AutomationTarget,
+    range: Option<(f64, f64)>,
     content_id: common::model::ContentId,
     window_offset: f64,
 ) -> Vec<crate::clipboard::CopiedPoint> {
@@ -324,7 +351,7 @@ fn automation_points_of(
         .iter()
         .map(|p| crate::clipboard::CopiedPoint {
             time_beat: p.time_beat - window_offset,
-            value_norm: common::automation::plain_to_norm(target, p.value),
+            value_norm: common::automation::plain_to_norm_ranged(target, p.value, range),
             curve: p.curve,
         })
         .collect()

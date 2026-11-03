@@ -231,18 +231,16 @@ impl AppData {
     /// アレンジのクリップと同じ `ClipKey` 空間に居るので、編集面は追加実装なしで
     /// そのまま開く (`Song::clip_by_key` が `session_clips` も引く)。
     ///
-    /// オートメーションレーン行のセルは編集面を持たない (曲線はレーン上で直接
-    /// 編集する) ので、選択だけして終わる。
+    /// オートメーションレーン行のセルは Automation Editor。セルはレーンに描かれないので、
+    /// ここが点に触る唯一の入口になる。
     pub fn open_cell_editor(&mut self, cell: LauncherCellKey) {
         self.select_launcher_cell(cell, SelectModifier::Single);
-        let LauncherCellKey::Track(key) = cell else {
-            return;
-        };
-        if self.is_audio_clip(key) {
-            self.handle_event(AppEvent::OpenAudioEditor(key));
-        } else {
-            self.handle_event(AppEvent::CloseAudioEditor);
-            self.handle_event(AppEvent::SelectBottomPanel(1));
+        match cell {
+            LauncherCellKey::Lane(key) => self.open_automation_editor(key),
+            LauncherCellKey::Track(key) if self.is_audio_clip(key) => {
+                self.handle_event(AppEvent::OpenAudioEditor(key));
+            }
+            LauncherCellKey::Track(_) => self.show_piano_roll(),
         }
     }
 

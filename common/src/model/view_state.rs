@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AudioEditorViewState, AutomationLaneKey, ClipKey, EditorWindowGeometry, FollowMode,
-    LauncherLayout, LoopRegion, PianoRollViewState,
+    AudioEditorViewState, AutomationClipKey, AutomationLaneKey, ClipKey, EditorWindowGeometry,
+    FollowMode, LauncherLayout, LoopRegion, PianoRollViewState,
 };
 
 /// プロジェクトに同梱する GUI 表示状態のスナップショット。
@@ -89,6 +89,10 @@ pub struct ViewState {
     pub piano_roll_views: Vec<(ClipKey, PianoRollViewState)>,
     #[serde(default)]
     pub audio_editor_views: Vec<(ClipKey, AudioEditorViewState)>,
+    /// Automation Editor のズーム / スクロール。`start_beat` はクリップの窓ローカル拍
+    /// (窓の左端 = 0)。entry が無いクリップは全体表示。
+    #[serde(default)]
+    pub automation_editor_views: Vec<(AutomationClipKey, AudioEditorViewState)>,
     // ---- プラグインエディタ窓のジオメトリ (r.md #65) ----
     /// device_id → 最後に観測したエディタ窓の位置 / client サイズ。
     /// save 時に **現存する device の分だけ**を device_id 昇順で書き出す

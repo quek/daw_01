@@ -202,6 +202,7 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     master_panel::draw(app, ui, master_rect);
 
     status_bar::draw(app, ui, status_rect);
+    crate::view::automation_editor::clear_stale_target(app, ui);
 
     // resource monitor (r.md #3): 詳細パネル (non-modal overlay)。 開いている時だけ
     // 描画する。 modal より前に呼ぶので、 modal が出れば自然に隠れる (意図どおり)。
@@ -499,6 +500,27 @@ fn play_from_cursor_event(app: &AppData, alt: bool, is_pianoroll_active: bool) -
     })
 }
 
+/// Automation Editor の上の `f`: アレンジのクリップは song 拍へ seek、セルはそのセルを途中から撃つ
+/// ([`play_from_cursor_event`] のピアノロールと同じ分け方)。本体の外なら何もしない。
+fn play_from_automation_editor_event(
+    app: &AppData,
+    key: common::model::AutomationClipKey,
+) -> Option<AppEvent> {
+    let (_, beat) = app.automation_editor_hover()?;
+    if app.automation_editor_is_cell(key) {
+        return Some(AppEvent::Launcher(LauncherEvent::PlayFromCellBeat {
+            cell: LauncherCellKey::Lane(key),
+            phase_beats: beat,
+        }));
+    }
+    let clip_start = app
+        .cur.song_doc.song()
+        .automation_lane_by_key(key.track, key.lane)?
+        .clip_by_id(key.clip)?
+        .start_beat;
+    Some(AppEvent::PlayFromCursor { beat: clip_start + beat })
+}
+
 /// `ShortcutMap` ルックアップで判定済みの shortcut name を pull して AppEvent / undo
 /// 要求に変換する。`Ui::take_shortcut` は 1 度だけ消費するので、各 name について
 /// この関数で一括処理する。`app` は immut で受けて、コピーや状態判定のみで使う
@@ -534,7 +556,13 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         .pointer()
         .pos
         .is_some_and(|(px, py)| bottom_rect.contains(px, py));
-    let is_pianoroll_active = app.cur.view.bottom_panel == Some(1) && pointer_in_bottom;
+    // タブ 1 が Automation Editor なら Piano Roll の文脈ではない (ノートに効くキーを渡さない)。
+    // スナップ / グリッドのキーはアレンジ側へ落ちる (この面はアレンジのスナップを使う)。
+    let automation_editor_active = (app.cur.view.bottom_panel == Some(1) && pointer_in_bottom)
+        .then(|| app.automation_editor_target())
+        .flatten();
+    let is_pianoroll_active =
+        app.cur.view.bottom_panel == Some(1) && pointer_in_bottom && automation_editor_active.is_none();
     let surface = app.edit_surface(is_pianoroll_active);
     // `Z` 段階ズーム / `R` loop の対象面 (通常 clip / automation clip) は
     // copy / cut / delete と同じ `edit_surface` arbiter で解決する (last-selection-wins)。
@@ -751,7 +779,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // f キー: カーソル位置から再生 (アレンジ / アレンジのクリップは seek、ランチャーの
     // セルはそのセルを途中から撃つ)。解決は `play_from_cursor_event`。
     if ui.take_shortcut("daw.play_from_cursor")
-        && let Some(ev) = play_from_cursor_event(app, ui.pointer().modifiers.alt, is_pianoroll_active)
+        && let Some(ev) = automation_editor_active.map_or_else(
+            || play_from_cursor_event(app, ui.pointer().modifiers.alt, is_pianoroll_active),
+            |key| play_from_automation_editor_event(app, key),
+        )
     {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| app.handle_event(ev)));
     }
@@ -830,8 +861,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         let is_launcher_active = !is_pianoroll_active
             && app.cur.peph.launcher_grid_rect.w > 0.0
             && ui.pointer().pos.is_some_and(|(px, py)| launcher_pane.contains(px, py));
+        let fit_automation_editor = automation_editor_active.is_some();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if is_pianoroll_active {
+            if fit_automation_editor {
+                app.fit_automation_editor();
+            } else if is_pianoroll_active {
                 app.handle_event(AppEvent::FitPianoRollToClip);
             } else if is_launcher_active {
                 // `delete_current_surface` と同じく handler を直接呼ぶ (handle_event の
@@ -847,8 +881,9 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // (= pointer が piano roll 上) のときは clip ズーム概念が無いので発火しない。
     // text_input focus 中は gui_01 が単キーを抑制する。
     if ui.take_shortcut("daw.zoom_selected_clip") {
+        let in_clip_editor = is_pianoroll_active || automation_editor_active.is_some();
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            if !is_pianoroll_active {
+            if !in_clip_editor {
                 app.handle_event(AppEvent::ZoomArrangeToSelectedClip {
                     automation: zoom_automation,
                 });
@@ -899,7 +934,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     //   いずれも選択トラックではなく「カーソルがあるトラック」を solo する。
     // text_input focus 中は gui_01 が単キーを抑制するので rename / 歌詞編集中は発火しない。
     if ui.take_shortcut("daw.toggle_track_solo") {
-        let target_track_id = if is_pianoroll_active {
+        let target_track_id = if let Some(key) = automation_editor_active {
+            // 編集しているレーンのトラック (マスター行はソロが無い)。
+            (key.track != common::model::MASTER_TRACK_ID).then_some(key.track)
+        } else if is_pianoroll_active {
             if app.cur.peph.audio_editor_clip.is_some() {
                 None
             } else {
@@ -943,7 +981,7 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // タイブレーカ) なら選択 device。 どちらでもなければ clip / note へ落とす。
     // 宛先の解決と発行は `view::bypass_toggle` が持つ。
     let mixer_active = app.cur.view.bottom_panel == Some(0) && pointer_in_bottom;
-    bypass_toggle::dispatch(app, ui, mixer_active, is_pianoroll_active);
+    bypass_toggle::dispatch(app, ui, mixer_active, is_pianoroll_active, automation_editor_active.map(|k| k.lane_key()));
 
     // ----- r.md #87: ランチャーのキー操作 (Tab / 矢印 / Enter) -----
     // **note nudge より先に**呼ぶ (矢印の取り合いをここで決める)。 対象面が
@@ -968,7 +1006,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
         // 直近確定面 (= セル面) を見る。 これを先に通すと、 セルを開いて piano roll に
         // ポインタを置いた `Ctrl+A` が帯に奪われ、 全セルが選択されて piano roll に
         // 全クリップのノートが並ぶ (実機で報告)。
-        if is_pianoroll_active && app.cur.peph.audio_editor_clip.is_some() {
+        if automation_editor_active.is_some() {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.select_all_automation_editor_points();
+            }));
+        } else if is_pianoroll_active && app.cur.peph.audio_editor_clip.is_some() {
             let indices = app.all_audio_event_indices();
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
                 app.handle_event(AppEvent::SetAudioEditorEventSelection(indices.clone()));
@@ -1039,7 +1081,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     }
 
     // ----- D / Alt+D: 編集面ごとの複製 (規則は `clipboard_ops` が持つ) -------
-    clipboard_ops::dispatch_duplicate(app, ui, is_pianoroll_active);
+    // Automation Editor の上ではアレンジの範囲へ流さない (見えていない面が複製される)。
+    if automation_editor_active.is_none() {
+        clipboard_ops::dispatch_duplicate(app, ui, is_pianoroll_active);
+    }
 
     // ----- Clip rename (F2) -------------------------------------------------
     // 選択中 clip を inline rename (右クリックメニュー "Rename" と同経路)。
@@ -1079,7 +1124,10 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
 
     // ----- Split (E / Alt+E / Shift+E) / Glue (J) -----------------------------
     // ビューで意味が分かれる (ピアノロール = ノート / それ以外 = クリップ)。 振り分けは `split_keys`。
-    split_keys::dispatch(app, ui, is_pianoroll_active);
+    // 分割 / 結合も同じ (ノートでもクリップでもない面なので何もしない)。
+    if automation_editor_active.is_none() {
+        split_keys::dispatch(app, ui, is_pianoroll_active);
+    }
 
     // ----- Help -----
     if ui.take_shortcut("daw.toggle_help") {
@@ -1135,6 +1183,11 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     }
     // modal が開いている間は escape を消費しない (modal 側で close する)。
     // 優先度: track rename → clip rename → Audio Editor close → CloseHelp。
+    dispatch_escape_key(app, ui);
+}
+
+/// `Esc` の振り分け (`dispatch_shortcuts` の末尾を切り出したもの)。
+fn dispatch_escape_key(app: &AppData, ui: &mut Ui<'_, AppData>) {
     // rename (track header / clip rect の inline text_input) と Audio Editor
     // (bottom panel) は同時には開かないので順番でも実用 OK。
     // plugin picker / send picker が開いている間は escape を消費しない
@@ -1148,8 +1201,13 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // widget に委ねる (widget が `take_shortcut("escape")` で歌詞編集を cancel する)。
     // 条件は piano_roll widget が実際に走る状況 (Piano Roll タブ + Audio Editor 非表示) に
     // 一致させる (`app.cur.peph.piano_roll_lyric_editing` 単独だと stale-true で誤委譲しうる)。
-    let pianoroll_lyric_editing =
-        app.cur.view.bottom_panel == Some(1) && app.cur.peph.audio_editor_clip.is_none() && app.cur.peph.piano_roll_lyric_editing;
+    // タブ 1 が見えていないエディタは閉じない (見えないものを閉じて Esc を食うと、
+    // 仮想鍵盤や選択解除が 1 回遅れる)。
+    let tab1_shown = app.cur.view.bottom_panel == Some(1);
+    let pianoroll_lyric_editing = tab1_shown
+        && app.cur.peph.audio_editor_clip.is_none()
+        && app.automation_editor_target().is_none()
+        && app.cur.peph.piano_roll_lyric_editing;
     if !app.ui_ephemeral.is_plugin_picker_open
         && !app.ui_ephemeral.is_font_picker_open
         && app.cur.peph.send_picker.is_none()
@@ -1168,9 +1226,20 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CancelRenameClip)
             }));
-        } else if app.cur.peph.audio_editor_clip.is_some() {
+        } else if app.cur.peph.editing_automation_point.is_some() {
+            // 点の数値入力のキャンセルだけ (rename の取り消しと同じ扱い)。エディタは閉じない。
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.cur.peph.editing_automation_point = None;
+            }));
+        } else if ui.is_context_menu_open(crate::view::automation_editor::POINT_MENU_ID) {
+            ui.close_context_menu(crate::view::automation_editor::POINT_MENU_ID);
+        } else if tab1_shown && app.cur.peph.audio_editor_clip.is_some() {
             ui.push_edit(Edit::mutate(|app: &mut AppData| {
                 app.handle_event(AppEvent::CloseAudioEditor)
+            }));
+        } else if tab1_shown && app.automation_editor_target().is_some() {
+            ui.push_edit(Edit::mutate(|app: &mut AppData| {
+                app.close_automation_editor();
             }));
         } else if app.cur.peph.armed_mod_source.is_some() {
             // r.md #78: 変調ソースの待受 (◉) を Esc で取り消す。 待受中は

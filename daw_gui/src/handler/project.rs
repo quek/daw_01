@@ -88,6 +88,9 @@ impl AppData {
         // `audio_editor_clip` は positional `ClipKey` なので、開いたままだと
         // 新 project の track[i].clip[j] を編集対象にしてしまう。
         self.cur.peph.audio_editor_clip = None;
+        self.cur.peph.automation_editor_clip = None;
+        self.cur.peph.automation_editor_hover_beat = None;
+        self.cur.peph.editing_automation_point = None;
         self.cur.peph.armed_mod_source = None;
         self.cur.peph.expanded_mod_sources.clear();
         // `A` キー / MIDI Learn の的も前の曲の id (device / track / 変調) を指す。残すと新しい曲の

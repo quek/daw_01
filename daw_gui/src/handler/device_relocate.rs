@@ -101,6 +101,20 @@ impl AppData {
                 p.track_id = to.track;
                 p.lane_id = to.lane;
             }
+            // Automation Editor の対象と per-clip の表示状態も同じ鍵を持つ。
+            if let Some(k) = self.cur.peph.automation_editor_clip.as_mut()
+                && k.lane_key() == from
+            {
+                k.track = to.track;
+                k.lane = to.lane;
+            }
+            let views = &mut self.cur.view.automation_editor_views;
+            let moved: Vec<_> = views.keys().filter(|k| k.lane_key() == from).copied().collect();
+            for k in moved {
+                if let Some(v) = views.remove(&k) {
+                    views.insert(common::model::AutomationClipKey { track: to.track, lane: to.lane, clip: k.clip }, v);
+                }
+            }
         }
         if !outcome.lane_remap.is_empty() {
             // 「いまポインタがどこを指しているか」 の観測値は写像せず捨てる

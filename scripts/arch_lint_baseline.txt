@@ -222,7 +222,6 @@ FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_midi          
 FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::begin_rescan                           | 8/15 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_positions                     | 8/14 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_clips_at                    | 8/8  | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_points_at                   | 8/7  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::delete_selected_notes                  | 8/6  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::resize_notes                           | 8/6  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_velocities                    | 8/6  | edit_song 多重ループ。未起票
@@ -236,7 +235,6 @@ FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_automation_clips_
 FN-NESTING | daw_gui/src/handler/automation.rs::AppData::quantize_selected_automation_points | 7/10 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/mixer.rs::AppData::ensure_voicevox_engine                 | 7/10 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/project.rs::AppData::action_save_as                       | 7/9  | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/automation.rs::AppData::copy_automation_clips_clip        | 7/8  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/clip_events.rs::AppData::set_notes_muted                  | 7/8  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/project.rs::AppData::begin_asset_decode                   | 7/8  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::quantize_selected_notes                | 7/4  | edit_song 多重ループ。未起票

@@ -194,11 +194,15 @@ pub(crate) fn paste_from_clipboard(
             };
             at.map(|at| PasteContent::AudioEvents { events: crate::clipboard::sanitize_audio_events(events), at })
         }
-        P::AutomationPoints(points) => lane_at.map(|(lane, at)| PasteContent::AutomationPoints {
-            points: crate::clipboard::sanitize_points(points),
-            lane,
-            at,
-        }),
+        // Automation Editor の上ならそのクリップへ (セルはレーンの時間軸に居ないので
+        // レーン + 拍では指せない)。
+        P::AutomationPoints(points) => {
+            let points = crate::clipboard::sanitize_points(points);
+            match app.automation_editor_hover() {
+                Some((clip, at)) => Some(PasteContent::AutomationPointsIntoClip { points, clip, at }),
+                None => lane_at.map(|(lane, at)| PasteContent::AutomationPoints { points, lane, at }),
+            }
+        }
         P::Clips(clips) => {
             let track_at = if !is_pianoroll_active && peph.arrange_hovered_automation_lane.is_none() {
                 peph.arrange_hovered_track.zip(peph.arrangement_hover_beat)

@@ -17,15 +17,12 @@ use std::sync::Arc;
 
 
 use daw_ui_core::{
-    ChannelLayout, DragKind, Edit, SampleSlices, Ui, ViewportState1D, WaveformInk,
+    ChannelLayout, DragKind, Edit, SampleSlices, Ui, WaveformInk,
     WaveformRenderMode, WaveformSegment, WaveformSource, WaveformStyle, WaveformView, WidgetId,
 };
 use daw_ui_renderer::{LineBatch, LineSegment, Rect};
 
-use common::time::{TimeDisplay, TimeMapping};
-
 use crate::app::{AppData, AppEvent, AudioEventTrimSide, MIN_AUDIO_EDITOR_VIEW_LEN_BEATS};
-use crate::widgets::time_grid::{TimeGridExt, TimeRulerStyle};
 
 /// common な mono / stereo source 用の borrowed-plane スタック配列サイズ。
 /// channel 数がこれ以下なら event ループ内の毎フレーム `Vec` 確保を消せる。
@@ -256,99 +253,17 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         w: (area.w - pad * 2.0).max(0.0),
         h: ruler_h,
     };
-    if ruler_rect.w > 0.0 && view_len_beats > 0.0 {
-        let mapping = TimeMapping {
-            sample_rate: app.ipc.sample_rate as f64,
-            tempo_bpm: app.cur.song_doc.song().bpm as f64,
-            time_sig: app.cur.song_doc.song().time_sig,
-            display: TimeDisplay::BarBeat,
-        };
-        let spb = mapping.samples_per_beat();
-        let viewport = ViewportState1D {
-            view_start: clip.content_to_song_beat(view_start_beat) * spb,
-            view_len: view_len_beats * spb,
-        };
-        ui.time_ruler(
-            "audio_editor_ruler",
-            ruler_rect,
-            mapping,
-            viewport,
-            TimeRulerStyle::from_palette(p),
-        );
-
-        // ----- 既存 loop region overlay (ruler 上に半透明バンド) -----
-        // arrangement view と同色の cyan、 view 範囲との交差のみ描画。
-        if let Some((lstart, lend)) = app.cur.transport.loop_region.range() {
-            let view_start_song = clip.content_to_song_beat(view_start_beat);
-            let view_end_song = view_start_song + view_len_beats;
-            let visible_start = lstart.max(view_start_song);
-            let visible_end = lend.min(view_end_song);
-            if visible_end > visible_start && view_len_beats > 0.0 {
-                let nstart = ((visible_start - view_start_song) / view_len_beats) as f32;
-                let nend = ((visible_end - view_start_song) / view_len_beats) as f32;
-                let band = Rect {
-                    x: ruler_rect.x + nstart * ruler_rect.w,
-                    y: ruler_rect.y,
-                    w: ((nend - nstart) * ruler_rect.w).max(1.0),
-                    h: ruler_rect.h,
-                };
-                ui.push_rect(daw_ui_renderer::RectCommand {
-                    rect: band,
-                    fill: p.loop_band.with_alpha(0.18),
-                    border: p.loop_band.with_alpha(0.55),
-                    border_width: 1.0,
-                    radius: [0.0; 4],
-                    clip_rect: Some(ruler_rect),
-                });
-            }
-        }
-    }
-
-    // ----- Ruler interaction (arrangement と同じ操作感) -----------------
-    // gui_01 #024 の arrangement widget 内蔵動作を Audio Editor 用に
-    // 外部実装。 plain (= Shift 非保持) press / drag = 連続 SetPlayheadBeat、
-    // Shift+drag = release 時に SetLoopRange。 anchor / current の x 座標を
-    // view_start_beat + view_norm * view_len_beats で song-absolute beat
-    // に換算してから AppEvent に渡す。
-    if ruler_rect.w > 0.0
-        && view_len_beats > 0.0
-        && let Some(drag) =
-            ui.take_drag_in_rect(("audio_editor_ruler_drag", clip.id), ruler_rect)
-    {
-        let to_song_beat = |x_px: f32| -> f64 {
-            let local_x = (x_px - ruler_rect.x).clamp(0.0, ruler_rect.w);
-            let view_norm = (local_x / ruler_rect.w) as f64;
-            clip.content_to_song_beat(view_start_beat + view_norm * view_len_beats).max(0.0)
-        };
-        let cur_beat = to_song_beat(drag.current.0);
-        if drag.start_modifiers.shift {
-            // Shift+drag: release frame に commit (= drag 中は preview なし、
-            // 軽量実装。 必要なら将来 preview 追加可能)。
-            if drag.kind == DragKind::Released {
-                let anchor_beat = to_song_beat(drag.anchor.0);
-                let (start, end) = if anchor_beat <= cur_beat {
-                    (anchor_beat, cur_beat)
-                } else {
-                    (cur_beat, anchor_beat)
-                };
-                if (end - start).abs() > 1e-6 {
-                    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                        app.handle_event(AppEvent::SetLoopRange { start, end });
-                    }));
-                }
-            }
-        } else {
-            // 素 drag / 単発 click: Started + Continuing で連続 seek
-            // (= Stop 中も Play 中も即座にプレイカーソル移動 + IPC SeekTo)。
-            // arrangement / piano_roll と同形で `AppData::seek_playhead_to` に集約。
-            // seek_playhead_to は「停止で戻るホーム」も更新する。
-            if drag.kind != DragKind::Released {
-                ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                    app.seek_playhead_to(cur_beat);
-                }));
-            }
-        }
-    }
+    crate::view::clip_ruler::draw(
+        app,
+        ui,
+        ("audio_editor", clip.id),
+        ruler_rect,
+        crate::view::clip_ruler::RulerView {
+            start_song: clip.content_to_song_beat(view_start_beat),
+            len_beats: view_len_beats,
+        },
+        true,
+    );
 
     // ----- Waveform area --------------------------------------------
     let wf_area = Rect {

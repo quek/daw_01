@@ -989,7 +989,7 @@ pub(super) fn commit_releases(
             if let Some((hit_key, _)) =
                 clip_hit(visible_tracks, press_tops, view, lanes, cx, cy, style.resize_handle_px)
             {
-                ui.push_edit({ let v_key = hit_key; Edit::mutate(move |app: &mut AppData| { if let Some(target) = live_clip_key(app, v_key) { app.handle_event(AppEvent::SelectClip { target, additive: false }); if app.is_audio_clip(target) { app.handle_event(AppEvent::OpenAudioEditor(target)); } else { app.handle_event(AppEvent::CloseAudioEditor); app.handle_event(AppEvent::SelectBottomPanel(1)); } } }) });
+                ui.push_edit({ let v_key = hit_key; Edit::mutate(move |app: &mut AppData| { if let Some(target) = live_clip_key(app, v_key) { app.handle_event(AppEvent::SelectClip { target, additive: false }); if app.is_audio_clip(target) { app.handle_event(AppEvent::OpenAudioEditor(target)); } else { app.show_piano_roll(); } } }) });
             } else if let Some((pt_key, _)) = automation_point_at(
                 visible_tracks,
                 press_tops,
@@ -1030,19 +1030,33 @@ pub(super) fn commit_releases(
                 if let Some((clip_key, time_local, value_norm)) =
                     automation_clip_at(track_id, lane, body_rect, view, style, cx, cy)
                 {
-                    // (2) lane body 内 clip 内 → AddAutomationPoint
                     let clip_ref = lane.clips.iter().find(|c| c.id == clip_key.clip);
                     let clip_start = clip_ref.map_or(0.0, |c| c.start_beat);
                     let clip_len = clip_ref.map_or(0.0, |c| c.len_beats);
-                    let raw_abs = clip_start + time_local;
-                    let snapped_abs = view.snap.snap_beat(
-                        raw_abs,
-                        pointer.modifiers.alt,
-                        zoom_x_px_per_beat,
-                    );
-                    let snapped_local =
-                        (snapped_abs - clip_start).clamp(0.0, clip_len.max(0.0));
-                    ui.push_edit({ let v_clip = clip_key; let v_tb = snapped_local; let v_vn = value_norm; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::AddAutomationPoint { track_id: v_clip.track, lane_id: v_clip.lane, clip_id: v_clip.clip, time_beat: v_tb, value_norm: v_vn }); }) });
+                    // 名前帯のダブルクリック → Automation Editor で開く (トラック行の
+                    // クリップと同じく、編集面へ入る操作)。掴む場所の規約は press と同じ 1 本。
+                    // Alt 付きは従来どおりスナップ無しの点の追加 (レーンが低くて全体が帯でも
+                    // レーン上で点を足せる)。
+                    let clip_rect = draw::automation_clip_rect(body_rect, view, clip_start, clip_len, style);
+                    if !pointer.modifiers.alt
+                        && press_lanes::automation_clip_in_header(clip_rect, cy, style)
+                    {
+                        let key = widget_to_model_clip_key(clip_key);
+                        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                            app.open_automation_editor(key);
+                        }));
+                    } else {
+                        // (2) lane body 内 clip 内 → AddAutomationPoint
+                        let raw_abs = clip_start + time_local;
+                        let snapped_abs = view.snap.snap_beat(
+                            raw_abs,
+                            pointer.modifiers.alt,
+                            zoom_x_px_per_beat,
+                        );
+                        let snapped_local =
+                            (snapped_abs - clip_start).clamp(0.0, clip_len.max(0.0));
+                        ui.push_edit({ let v_clip = clip_key; let v_tb = snapped_local; let v_vn = value_norm; Edit::mutate(move |app: &mut AppData| { app.handle_event(AppEvent::AddAutomationPoint { track_id: v_clip.track, lane_id: v_clip.lane, clip_id: v_clip.clip, time_beat: v_tb, value_norm: v_vn }); }) });
+                    }
                 } else if cx >= body_rect.x && cx < body_rect.x + body_rect.w {
                     // (3) lane body 内 clip ギャップ → CreateAutomationClip。
                     // beat-domain で「cursor の絶対 beat が既存 clip と重なるか」 を判定し、
@@ -1087,7 +1101,7 @@ pub(super) fn commit_releases(
                         pointer.modifiers.alt,
                         zoom_x_px_per_beat,
                     );
-                    ui.push_edit({ let v_track = t.id; let v_start = (beat).max(0.0); Edit::mutate(move |app: &mut AppData| { if let Some(t_idx) = app.cur.song_doc.song().tracks.iter().position(|t| t.id == v_track) { app.handle_event(AppEvent::CreateClip { track: t_idx as u32, start_beat: v_start }); app.handle_event(AppEvent::SelectBottomPanel(1)); } }) });
+                    ui.push_edit({ let v_track = t.id; let v_start = (beat).max(0.0); Edit::mutate(move |app: &mut AppData| { if let Some(t_idx) = app.cur.song_doc.song().tracks.iter().position(|t| t.id == v_track) { app.handle_event(AppEvent::CreateClip { track: t_idx as u32, start_beat: v_start }); app.show_piano_roll(); } }) });
                 }
             }
         }

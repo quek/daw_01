@@ -287,6 +287,12 @@ pub struct ProjectView {
     /// clip 長で clamp する。 `ViewState.audio_editor_views` として永続化される。
     pub audio_editor_views:
         std::collections::HashMap<common::model::ClipKey, common::model::AudioEditorViewState>,
+    /// Automation Editor の表示状態 (クリップごと)。`start_beat` は窓ローカル拍。entry が
+    /// 無いクリップは全体表示なので、開くだけでは entry を作らない。
+    pub automation_editor_views: std::collections::HashMap<
+        common::model::AutomationClipKey,
+        common::model::AudioEditorViewState,
+    >,
     pub arrange_zoom_x: f32,
     pub arrange_scroll_beat: f32,
     /// 再生中プレイヘッド追従スクロールの方式 (Off / Scroll / Page、 `Alt+F` で循環)。
@@ -577,6 +583,13 @@ pub struct ProjectEphemeral {
     /// 表示される。 audio clip ダブルクリックで `Some` 化、 Esc / Audio
     /// Editor close で `None` に戻る。
     pub audio_editor_clip: Option<ClipKey>,
+    /// `Some(target)` で Automation Editor が開いている (Piano Roll タブの中身を置き換える。
+    /// Audio Editor とは排他)。 読むときは実在を確かめる
+    /// [`AppData::automation_editor_target`] を通す。
+    pub automation_editor_clip: Option<common::model::AutomationClipKey>,
+    /// Automation Editor の本体上のポインタ位置 (窓ローカル拍、スナップ済み)。貼り付けの基準。
+    /// 本体の外では `None`。
+    pub automation_editor_hover_beat: Option<f64>,
     /// ピアノロールの**対象 (target) クリップ**の focus ヒント。
     ///
     /// 選択そのものではない (選択の SSoT は `SelectionState::time` 1 本) —
@@ -929,6 +942,7 @@ impl ProjectState {
                 bottom_panel: Some(0),
                 audio_editor_vertical_gain: 1.0,
                 audio_editor_views: std::collections::HashMap::new(),
+                automation_editor_views: std::collections::HashMap::new(),
                 arrange_zoom_x: ARRANGE_PX_PER_BEAT,
                 arrange_scroll_beat: 0.0,
                 arrange_follow: common::model::FollowMode::default(),
@@ -994,6 +1008,8 @@ impl ProjectState {
                 piano_roll_lyric_editing: false,
                 pianoroll_viewport: None,
                 audio_editor_clip: None,
+                automation_editor_clip: None,
+                automation_editor_hover_beat: None,
                 pianoroll_focus_clip: None,
                 audio_editor_hover_beat_in_clip: None,
                 audio_editor_zoom_x: 0.0,

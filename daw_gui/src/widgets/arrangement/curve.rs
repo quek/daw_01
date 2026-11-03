@@ -21,7 +21,7 @@ use common::model::AutomationCurve;
 
 /// 1 レーンぶんの「値 ↔ 画面 y」写像。clip 描画域 (縦 padding 適用済) を含む。
 #[derive(Clone, Copy)]
-pub(super) struct LaneValueMap<'a> {
+pub(crate) struct LaneValueMap<'a> {
     pub target: &'a common::model::AutomationTarget,
     pub plugin_range: Option<(f64, f64)>,
     /// clip 描画域の上端 y と高さ (= lane body から縦 padding を引いたもの)。
@@ -46,30 +46,30 @@ impl<'a> LaneValueMap<'a> {
 
     /// norm (0..=1) → screen y。 y は下向きなので `1 - norm` で反転する。
     #[must_use]
-    pub(super) fn norm_to_y(self, norm: f32) -> f32 {
+    pub(crate) fn norm_to_y(self, norm: f32) -> f32 {
         self.clip_y + (1.0 - norm.clamp(0.0, 1.0)) * self.clip_h
     }
 
     /// plain → screen y (`norm_to_y(to_norm(plain))`)。点 dot / 曲線の共通経路。
     #[must_use]
-    pub(super) fn plain_to_y(self, plain: f64) -> f32 {
+    pub(crate) fn plain_to_y(self, plain: f64) -> f32 {
         self.norm_to_y(self.to_norm(plain))
     }
 
     #[must_use]
-    pub(super) fn to_plain(self, norm: f32) -> f64 {
+    pub(crate) fn to_plain(self, norm: f32) -> f64 {
         norm_to_plain_ranged(self.target, norm, self.plugin_range)
     }
 
     #[must_use]
-    pub(super) fn to_norm(self, plain: f64) -> f32 {
+    pub(crate) fn to_norm(self, plain: f64) -> f32 {
         plain_to_norm_ranged(self.target, plain, self.plugin_range)
     }
 
     /// この lane で「線を掴んで曲げる」直接操作が成立するか
     /// (= `norm_mapping_is_invertible`)。Mute lane だけが false。
     #[must_use]
-    pub(super) fn is_bendable(self) -> bool {
+    pub(crate) fn is_bendable(self) -> bool {
         norm_mapping_is_invertible(self.target)
     }
 }
@@ -105,7 +105,7 @@ pub(super) fn segment_is_straight_on_screen(
 /// 区間の任意進捗 `u` における **norm 値**。曲線の唯一の評価入口。
 /// 描画 / hit-test / 逆算がすべてこれを通る。
 #[must_use]
-pub(super) fn eval_norm(
+pub(crate) fn eval_norm(
     map: LaneValueMap<'_>,
     a_plain: f64,
     b_plain: f64,
@@ -132,7 +132,7 @@ fn sample_count(dx_px: f32, max_segment_px: f32) -> usize {
 /// - それ以外は uniform sampling (`sample_count`)。旧実装の adaptive de Casteljau
 ///   は「y が制御点の 1 次式」を前提にしていて、非 affine / 飽和する写像に持ち込めない
 ///   ので廃止した。
-pub(super) fn flatten_segment(
+pub(crate) fn flatten_segment(
     map: LaneValueMap<'_>,
     prev: (f32, f64),
     next: (f32, f64),
@@ -475,7 +475,7 @@ pub(super) struct AutomationSegmentBendSession {
 /// `w < u0` → `k > 1` → `bend > 0`。同じ画面ジェスチャが区間の向きに応じて逆符号の
 /// progress 値を生む = 業界標準の挙動そのもの (定数 `dir` を掛ける小細工は要らない)。
 #[must_use]
-pub(super) fn solve_bend(
+pub(crate) fn solve_bend(
     map: LaneValueMap<'_>,
     a_plain: f64,
     b_plain: f64,

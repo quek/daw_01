@@ -285,7 +285,8 @@ pub enum LauncherEvent {
     /// 設定できない)。修飾キーの意味はセル / クリップと同じ規約。
     SelectScene { scene_id: u32, modifier: SelectModifier },
     /// セルのダブルクリック = 選択してからそのセルの編集面を開く
-    /// (MIDI ならピアノロール / オーディオならオーディオエディタ)。
+    /// (MIDI ならピアノロール / オーディオならオーディオエディタ / レーン行なら
+    /// Automation Editor)。
     /// アレンジのクリップのダブルクリックと**同じ到達先**。
     OpenCellEditor(LauncherCellKey),
     /// キーボード操作の起点を置く (セル click / 矢印移動の着地点)。

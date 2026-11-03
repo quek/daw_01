@@ -4,6 +4,9 @@ pub mod about;
 pub mod arrangement_view;
 pub mod color_picker_overlay;
 pub mod audio_editor;
+pub mod automation_editor;
+pub(crate) mod automation_value_input;
+pub(crate) mod clip_ruler;
 pub mod bottom_panel;
 /// `Q` (カーソル直下のものを無効化 / 有効化) の宛先解決と発行 (root.rs から分離)。
 pub mod bypass_toggle;
