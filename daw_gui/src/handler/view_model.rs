@@ -678,8 +678,8 @@ impl AppData {
     //
     // 置き換えは「候補を並べる」のをやめること。 変調先の指定は ◉ (arm) の
     // ワンショット 1 本に統一し、 daw_gui が描くツマミは per-control ドラッグ、
-    // プラグイン自身の窓の中のツマミは `PluginParamTouched` が拾う
-    // (`handler/ipc.rs`)。 どちらも `connect_armed_mod_source_to` に集まる。
+    // プラグイン自身の窓の中のツマミは `plugin_window_gesture_begin` が拾う
+    // (`handler/param_gesture.rs`)。 どちらも `connect_armed_mod_source_to` に集まる。
 
     /// Audio event field の inspector 表示用ライト read snapshot。
     /// 選択 clip (`selected_clip`) が `ClipContent::Audio` で、 窓に見えている event がある場合に

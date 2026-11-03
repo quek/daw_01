@@ -336,7 +336,7 @@ impl AppData {
     /// 防ぐ)。 待受中でなければ何もしない。
     ///
     /// 入口は `AppEvent::ConnectArmedModSource` 1 本で、発行元は 2 つ (**到達範囲が違う**):
-    /// - `handler/ipc.rs` の `PluginParamTouched` … プラグイン自身の窓の中の
+    /// - `handler/param_gesture.rs` の `plugin_window_gesture_begin` … プラグイン自身の窓の中の
     ///   ツマミ (daw_gui が overlay を描けない唯一の領域)。
     /// - `view/scrub_gesture.rs` の depth ドラッグ終端 … daw_gui が描いているツマミ
     ///   (ドラッグ量がそのまま depth になるので、 ここでは解除だけ担う)。

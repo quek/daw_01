@@ -16,20 +16,33 @@ use std::path::PathBuf;
 /// 実ボタンを見るのは、headless (`--script`) や widget テストが合成したドラッグで本物の
 /// `DoDragDrop` が走らないため — 走るとボタンが離れているので即座に、カーソルの下にある
 /// ユーザーの窓へ勝手に drop してしまう。
-#[cfg(windows)]
 pub fn cursor_over_foreign_window() -> bool {
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::System::Threading::GetCurrentProcessId;
+    primary_button_down() && foreign_window_under_cursor()
+}
+
+/// 実際のマウスの主ボタンが押されているか。
+#[cfg(windows)]
+pub fn primary_button_down() -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GA_ROOT, GetAncestor, GetCursorPos, GetSystemMetrics, GetWindowThreadProcessId, SM_SWAPBUTTON,
-        WindowFromPoint,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
     // GetAsyncKeyState は **物理** ボタンを見るので、左右入れ替え設定なら右を見る (MS docs)。
     let primary = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 { VK_RBUTTON } else { VK_LBUTTON };
-    if unsafe { GetAsyncKeyState(i32::from(primary.0)) } >= 0 {
-        return false;
-    }
+    unsafe { GetAsyncKeyState(i32::from(primary.0)) < 0 }
+}
+
+#[cfg(not(windows))]
+pub fn primary_button_down() -> bool {
+    false
+}
+
+/// カーソルの下が **自分以外のプロセスの窓** か。
+#[cfg(windows)]
+fn foreign_window_under_cursor() -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GA_ROOT, GetAncestor, GetCursorPos, GetWindowThreadProcessId, WindowFromPoint,
+    };
     let mut pt = POINT::default();
     if unsafe { GetCursorPos(&raw mut pt) }.is_err() {
         return false;
@@ -46,7 +59,7 @@ pub fn cursor_over_foreign_window() -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn cursor_over_foreign_window() -> bool {
+fn foreign_window_under_cursor() -> bool {
     false
 }
 

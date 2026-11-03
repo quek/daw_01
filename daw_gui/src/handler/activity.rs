@@ -112,6 +112,8 @@ impl AppData {
         };
         // Song が変わったら (= automation 録音が点を打った等) 無条件に再描画。
         mix(self.cur.song_doc.edit_epoch());
+        // 補った plugin の gesture は Tick で閉じる (本物と違い、閉じたことを知らせる event が無い)。
+        mix(self.cur.pipc.inferred_plugin_gestures.len() as u64);
         // playhead は拍の 1/1000 まで見る (ズーム最大でも 1px 未満)。
         mix(quantize(self.cur.transport.playhead_beat.unwrap_or(f32::NAN), 1000.0));
         mix(quantize(self.cur.view.arrange_scroll_beat, 1000.0));

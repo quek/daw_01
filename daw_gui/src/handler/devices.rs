@@ -96,6 +96,8 @@ impl AppData {
         // The plugin-host process tore the editor window down (user clicked
         // the window's ✕, or the plugin self-closed). Drop our open-state.
         self.cur.pipc.open_plugin_guis.remove(&device_id);
+        // 窓と一緒にノブも消えたので、掴んだままなら End はもう来ない (Ctrl+Shift+W はキーで閉じられる)。
+        self.forget_plugin_window_gestures_of(device_id);
         // r.md #65: エディタの open / close は **2 プロセスに跨って往復する**ので、
         // 片側のログだけでは「誰が閉じて誰が開き直したか」が決まらない。
         // 頻度は人の操作と同じなので info で常設する。
@@ -466,6 +468,8 @@ impl AppData {
         self.cur.pipc
             .plugin_param_values
             .retain(|k, _| k.device_id != device_id);
+        self.cur.pipc.plugins_with_gestures.remove(&device_id);
+        self.forget_plugin_window_gestures_of(device_id);
     }
 
     /// plugin host が報告した device の processing latency を engine へ中継する。

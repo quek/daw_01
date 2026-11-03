@@ -8,7 +8,6 @@
 //! 一手に担う (意味は旧 bridge + handle_event arm と同一)。
 
 use crate::app_types::*;
-use crate::event::AppEvent;
 use crate::state::*;
 use common::protocol::{AudioCommand, AudioEvent, ChildKind, DeviceAddr, PluginCommand, PluginEvent};
 
@@ -347,31 +346,10 @@ impl AppData {
                 param_id,
                 ..
             } => {
-                let Some((track, _index)) = find_device_by_id(self.cur.song_doc.song(), device_id)
-                else {
-                    return; // 削除済み device の stale event
-                };
-                let target = common::model::AutomationTarget::PluginParam {
-                    device_id,
-                    param_id,
-                    legacy_device_index: None,
-                };
-                // Phase 4 Step C-3: ParamGestureBegin として同経路で active /
-                // latched に反映する (= mixer knob と同 idiom)。 host から来る `display_name` は
-                // placeholder (= "Param N") なので使わない — 名前は handler が
-                // `automation_target_label` で作る (r.md #129 §7.6)。 寿命は描画と無関係に
-                // plugin 窓の End が閉じる (`ParamSurface::PluginWindow` は sweep されない)。
-                self.handle_event(AppEvent::ParamGestureBegin {
-                    surface: crate::state::ParamSurface::PluginWindow,
-                    track_id: track,
-                    target: target.clone(),
-                });
-                // r.md #78: modulation source が待受中 (◉) なら、 **プラグイン
-                // 自身の窓の中で触った param** をそのソースの変調先にする。
-                // daw_gui はプラグインの窓の中に overlay を描けないので、 arm +
-                // ドラッグが届かないのはここだけ。 touch 通知がその唯一の到達手段。
-                // ユーザー操作なので操作名の付く event で繋ぐ (この IPC event の名前で積まない)。
-                self.handle_event(AppEvent::ConnectArmedModSource { track_id: track, target });
+                self.cur.pipc.plugins_with_gestures.insert(device_id);
+                // 補った gesture が開いていれば本物へ引き継ぐ (期限で本物を閉じない)。
+                self.cur.pipc.inferred_plugin_gestures.remove(&DeviceParamKey { device_id, param_id });
+                self.plugin_window_gesture_begin(device_id, param_id);
             }
             PluginEvent::PluginParamValueChanged {
                 device: DeviceAddr { device_id, .. },
@@ -380,27 +358,14 @@ impl AppData {
             } => {
                 // Phase 4 Step C-3: plugin GUI knob の最新値を
                 // `(device_id, param_id)` cache に保存。
-                self.cur.pipc
-                    .plugin_param_values
-                    .insert(DeviceParamKey { device_id, param_id }, value);
+                let key = DeviceParamKey { device_id, param_id };
+                let previous = self.cur.pipc.plugin_param_values.insert(key, value);
+                if previous != Some(value) && crate::os_file_drag::cursor_over_foreign_window() {
+                    self.infer_plugin_window_gesture(key);
+                }
             }
             PluginEvent::PluginParamGestureEnd { device: DeviceAddr { device_id, .. }, param_id } => {
-                let Some((track, _index)) = find_device_by_id(self.cur.song_doc.song(), device_id)
-                else {
-                    return;
-                };
-                // Phase 4 Step C-3: plugin GUI knob release。 mixer の
-                // ParamGestureEnd と同経路に流す。
-                let target = common::model::AutomationTarget::PluginParam {
-                    device_id,
-                    param_id,
-                    legacy_device_index: None,
-                };
-                self.handle_event(AppEvent::ParamGestureEnd {
-                    surface: crate::state::ParamSurface::PluginWindow,
-                    track_id: track,
-                    target,
-                });
+                self.plugin_window_gesture_end(device_id, param_id);
             }
             PluginEvent::VoicevoxSynthStatus {
                 device: DeviceAddr { device_id, .. },

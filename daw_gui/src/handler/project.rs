@@ -114,6 +114,8 @@ impl AppData {
         // -- 子プロセスに関する帳簿 (すべて device_id keyed) ----------------
         // teardown_all_loaded_plugins が消し損ねる分をここで確実に落とす。
         self.cur.pipc.plugin_param_values.clear();
+        self.cur.pipc.plugins_with_gestures.clear();
+        self.forget_all_plugin_window_gestures();
         self.cur.pipc.ara_doc_cache.clear();
         self.cur.pipc.ara_pcm_materialized.clear();
         self.cur.pipc.gui_open_requests.clear();
@@ -1057,6 +1059,8 @@ impl AppData {
         self.cur.pipc.plugin_params.clear();
         self.cur.pipc.plugin_key_names.clear();
         self.cur.pipc.plugin_param_values.clear();
+        self.cur.pipc.plugins_with_gestures.clear();
+        self.forget_all_plugin_window_gestures();
         self.cur.pipc.pending_plugin_loads.clear();
         self.cur.pipc.pending_added_plugin_finalize.clear();
         self.cur.pipc.gui_open_requests.clear();

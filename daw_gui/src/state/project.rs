@@ -51,6 +51,11 @@ pub struct ProjectIpc {
     /// `AutomationPoint` を生成する。 session-only / Undo 対象外。 device が
     /// 消える経路 (unload / 削除 / project 切替) で当該 entry を落とす。
     pub plugin_param_values: std::collections::HashMap<DeviceParamKey, f64>,
+    /// 窓の操作で本物の gesture (CLAP `GESTURE_BEGIN` / VST3 `beginEdit`) を出したことのある device。
+    /// これらには gesture を補わない (`AppData::infer_plugin_window_gesture`)。session-only。
+    pub plugins_with_gestures: std::collections::HashSet<u64>,
+    /// 補って開いている gesture。主ボタンを離すと `on_tick` が閉じる。
+    pub inferred_plugin_gestures: std::collections::HashSet<DeviceParamKey>,
     /// Phase 2 (`docs/plan_automation.md` §7.5): plugin parameter
     /// 一覧キャッシュ。 plugin host が `PluginParamList` IPC で送って
     /// くるたびに上書き。 安定 `device_id` で identify、 Parameter
@@ -882,6 +887,8 @@ impl ProjectState {
                 ara_doc_cache: std::collections::HashMap::new(),
                 ara_pcm_materialized: std::collections::HashMap::new(),
                 plugin_param_values: std::collections::HashMap::new(),
+                plugins_with_gestures: std::collections::HashSet::new(),
+                inferred_plugin_gestures: std::collections::HashSet::new(),
                 plugin_params: PluginParamTable::default(),
                 plugin_key_names: std::collections::HashMap::new(),
                 loaded_devices: std::collections::HashMap::new(),

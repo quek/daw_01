@@ -46,6 +46,10 @@ impl AppData {
         self.expire_nudge_audition(false);
         // Global Sampler / MIDI Capture: 試聴の期限と古いノートの回収。
         self.sampler_housekeeping();
+        // 値だけを出すプラグインに補った gesture は、離した通知が来ないのでボタンを離したら閉じる。
+        if !self.cur.pipc.inferred_plugin_gestures.is_empty() && !crate::os_file_drag::primary_button_down() {
+            self.close_inferred_plugin_gestures();
+        }
 
         // パニックの遅延 reinit を発火する。 master の declick フェード
         // アウトが終わった頃 (`PANIC_REINIT_DELAY` 経過) に `ReinitAllPlugins` を

@@ -889,6 +889,7 @@ impl AppData {
             app.close_recording_session();
             app.silence_monitor_notes();
             app.cur.recording.active_param_gestures.clear();
+            app.cur.pipc.inferred_plugin_gestures.clear();
             app.sync_param_gesture_bracket();
             app.cur.recording.latched_param_gestures.clear();
         });
