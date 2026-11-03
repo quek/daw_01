@@ -354,8 +354,8 @@ mod tests {
     #[test]
     fn flatten_curve_empty_for_single_point() {
         let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        assert!(flatten_curve(&[], rect, 2.0).is_empty());
-        assert!(flatten_curve(&[(0.5, 0.5)], rect, 2.0).is_empty());
+        assert_eq!(flatten_curve(&[], rect, 2.0), []);
+        assert_eq!(flatten_curve(&[(0.5, 0.5)], rect, 2.0), []);
     }
 
     /// 当たり円 (半径 = `node_radius_px` × 2 = 10px) が重なる 2 点。rect 幅 256 で x = 128 / 144 px、y = 50 px。

@@ -1164,7 +1164,7 @@ mod tests {
 
     #[test]
     fn greedy_thin_scale_empty_and_single_and_anchor_clamp() {
-        assert!(greedy_thin_scale(&[], 0, 11.0).is_empty());
+        assert_eq!(greedy_thin_scale(&[], 0, 11.0), Vec::<bool>::new());
         assert_eq!(greedy_thin_scale(&[7.0], 0, 11.0), vec![true]);
         // anchor が範囲外でも clamp して anchor 採用。
         assert_eq!(greedy_thin_scale(&[7.0], 5, 11.0), vec![true]);

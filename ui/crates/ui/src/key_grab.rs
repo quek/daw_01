@@ -122,7 +122,7 @@ mod tests {
         let g = grab_z();
         let ctrl = Modifiers { ctrl: true, ..Modifiers::default() };
         let mut events = vec![ev(PhysicalKey::Char('Z'), ElementState::Pressed)];
-        assert!(g.take_from(&mut events, ctrl, false).is_empty());
+        assert_eq!(g.take_from(&mut events, ctrl, false), []);
         assert_eq!(events.len(), 1, "Ctrl+Z は shortcut 層へ残す");
 
         let shift = Modifiers { shift: true, ..Modifiers::default() };
@@ -164,7 +164,7 @@ mod tests {
     fn 宣言が空なら何もしない() {
         let g = KeyGrab::default();
         let mut events = vec![ev(PhysicalKey::Char('Z'), ElementState::Pressed)];
-        assert!(g.take_from(&mut events, Modifiers::default(), false).is_empty());
+        assert_eq!(g.take_from(&mut events, Modifiers::default(), false), []);
         assert_eq!(events.len(), 1);
     }
 }

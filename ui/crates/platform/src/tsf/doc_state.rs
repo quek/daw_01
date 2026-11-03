@@ -313,7 +313,7 @@ mod tests {
         assert!(!d.active());
         assert_eq!(d.end_acp(), 0);
         assert_eq!(d.selection_acp(), (0, 0, false));
-        assert!(d.text_utf16_range(0, -1).is_empty());
+        assert_eq!(d.text_utf16_range(0, -1), []);
     }
 
     #[test]
