@@ -5,16 +5,17 @@ use crate::model::{Clip, LoopRegion, Song};
 
 /// Every clip that contributes to the song's playable envelope: finite,
 /// positive-length, finite-start clips across all tracks. Single source of
-/// truth for the clip filter shared by [`song_bounds_samples`],
-/// [`latest_clip_start_beat`], and [`content_end_beat`] — a change to the
-/// filtering rule (e.g. excluding muted tracks) lives here, not in three
-/// copies. Non-finite (NaN / ±Inf) or non-positive geometry is skipped: it
-/// slips past a plain `<= 0.0` guard and would saturate the u64 sample cast /
-/// overflow `start + length` in the sample-domain caller.
+/// truth for the clip filter shared by [`song_bounds_samples`] and
+/// [`content_bounds_beats`] — a change to the filtering rule (e.g. excluding
+/// muted tracks) lives here, not in several copies. Non-finite (NaN / ±Inf) or
+/// non-positive geometry is skipped: it slips past a plain `<= 0.0` guard and
+/// would saturate the u64 sample cast. `start + length` is checked as a sum
+/// because two finite values can still overflow to infinity.
 fn playable_clips(song: &Song) -> impl Iterator<Item = &Clip> {
-    song.tracks.iter().flat_map(|t| t.clips.iter()).filter(|c| {
-        c.length_beats.is_finite() && c.length_beats > 0.0 && c.start_beat.is_finite()
-    })
+    song.tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| c.length_beats > 0.0 && (c.start_beat + c.length_beats).is_finite())
 }
 
 /// Returns `(earliest_clip_start_samples, latest_clip_end_samples)` across
@@ -71,14 +72,20 @@ pub fn content_bounds_beats(song: &Song) -> Option<(f64, f64)> {
     bounds
 }
 
+/// 曲の長さの上限 [拍]。壊れた / 細工された project の巨大な値で、曲末まで回るループや表の確保が
+/// 終わらなくなるのを防ぐ (1M 拍 ≒ 200 BPM で約 83 時間で、現実の曲の遥か上)。
+pub const MAX_SONG_BEATS: f64 = 1_000_000.0;
+
 /// 曲末 [拍]。曲全体を指す処理 (書き出しの全曲 / テンポ表 / 変調表 …) はこれを読む。
 ///
-/// `Song::length_beats` はクリップを置いても伸びない (import と時間の挿入 / 削除だけが更新する) ので、
-/// 単独で曲末として読むと、それより後ろのクリップが欠ける。クリップ終端と大きい方を取る。
+/// `Song::length_beats` はクリップを置いても伸びない (MIDI の取り込み / サンプラー / 時間の挿入・削除だけが
+/// 更新する) ので、単独で曲末として読むと、それより後ろのクリップが欠ける。クリップ終端と大きい方を取る。
+/// 値は有限で `0.0..=MAX_SONG_BEATS` に収まる。全クリップを舐めるので RT からは呼ばない。
 #[must_use]
 pub fn song_end_beat(song: &Song) -> f64 {
     let content_end = content_bounds_beats(song).map_or(0.0, |(_, end)| end);
-    song.length_beats.max(content_end)
+    let length = if song.length_beats.is_finite() { song.length_beats } else { 0.0 };
+    length.max(content_end).clamp(0.0, MAX_SONG_BEATS)
 }
 
 /// True when `playhead` has advanced past the last clip's end (or there is
@@ -314,6 +321,18 @@ mod tests {
             ..Song::default()
         };
         assert_eq!(song_bounds_samples(Some(&song), 48000), Some((0, 192_000)));
+    }
+
+    #[test]
+    fn song_end_beat_is_bounded_for_corrupt_values() {
+        // 有限どうしの和が無限へ溢れるクリップは無視する。
+        let overflow = Song { length_beats: 8.0, ..song_with_clip(120.0, f64::MAX, f64::MAX) };
+        assert_eq!(song_end_beat(&overflow), 8.0);
+        // 巨大だが有限のクリップは上限で止める。
+        assert_eq!(song_end_beat(&song_with_clip(120.0, 1e15, 4.0)), MAX_SONG_BEATS);
+        // 無限の曲長は無いものとして扱う。
+        let infinite = Song { length_beats: f64::INFINITY, ..song_with_clip(120.0, 4.0, 4.0) };
+        assert_eq!(song_end_beat(&infinite), 8.0);
     }
 
     #[test]

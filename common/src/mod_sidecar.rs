@@ -129,7 +129,7 @@ impl ModEnvSidecar {
         // ヘッダの数だけ信じて `with_capacity` すると、壊れた / 悪意ある
         // sidecar の 4G 行で OOM する。ソース数に上限は置かず (曲の変調ソース数で決まる)、
         // ヘッダが宣言した本体の長さを checked 算術で求めて実ファイル長で先に弾く
-        // (`tempo_map.rs` の `MAX_TABLE_BEATS` と同じ理由)。
+        // (`timing.rs` の `MAX_SONG_BEATS` と同じ理由)。
         let need = n_buffers
             .checked_mul(n_sources)
             .and_then(|cells| cells.checked_add(n_sources))

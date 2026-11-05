@@ -764,9 +764,11 @@ pub fn has_song_tempo_automation(song: &Song) -> bool {
 /// 呼ばない — ループ回数が target_beat に比例する)。
 #[must_use]
 pub fn beats_to_samples(song: &Song, sample_rate: u32, target_beat: f64) -> u64 {
-    if target_beat <= 0.0 || sample_rate == 0 {
+    if target_beat.is_nan() || target_beat <= 0.0 || sample_rate == 0 {
         return 0;
     }
+    // 壊れた値で下の積分が終わらなくならないように、曲の長さの上限で止める。
+    let target_beat = target_beat.min(crate::timing::MAX_SONG_BEATS);
     let sr = f64::from(sample_rate);
     // テンポカーブが無ければ線形 (積分と厳密に一致する閉形式)。
     let curve = SongTempoCurve::of(song);

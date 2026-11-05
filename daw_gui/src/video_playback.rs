@@ -101,13 +101,23 @@ impl VideoPlaybackEngine {
     ///
     /// Muted events are dropped from the result entirely.
     pub fn active_sources_at(song: &Song, rows: &RowTimeline<'_>) -> Vec<ActiveVideoFrame> {
+        Self::active_sources_with_tempo(song, song_tempo_map_if_automated(song).as_ref(), rows)
+    }
+
+    /// [`Self::active_sources_at`] の、テンポ表を求め済みの形。表の構築は曲の長さに比例するので、描画と書き出しは
+    /// フレームごとに作らず、持っている表を渡す。`tempo_map` はテンポカーブのある曲だけ `Some`。
+    ///
+    /// A4 (r.md #8): tempo automation がある曲は映像 source 時間 (秒) を tempo
+    /// 積分で求める (= 映像が音とズレない)。 constant 曲は従来の高速 60/bpm 経路。
+    pub fn active_sources_with_tempo(
+        song: &Song,
+        tempo_map: Option<&TempoMap>,
+        rows: &RowTimeline<'_>,
+    ) -> Vec<ActiveVideoFrame> {
         let bpm = song.bpm as f64;
         if bpm <= 0.0 {
             return Vec::new();
         }
-        // A4 (r.md #8): tempo automation がある曲は映像 source 時間 (秒) を tempo
-        // 積分で求める (= 映像が音とズレない)。 constant 曲は従来の高速 60/bpm 経路。
-        let tempo_map = song_tempo_map_if_automated(song);
         let mut out: Vec<ActiveVideoFrame> = Vec::new();
         // `song.tracks[0]` is the top of the arrangement, so iterating
         // `.rev()` yields bottom-most → topmost. Each video track gets
@@ -142,7 +152,7 @@ impl VideoPlaybackEngine {
                     track.id,
                     clip,
                     &scan,
-                    tempo_map.as_ref(),
+                    tempo_map,
                     bpm,
                     z_index,
                     &mut out,

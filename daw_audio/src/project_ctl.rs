@@ -519,8 +519,15 @@ impl ProjectCtl {
         let mod_plan = song.as_ref().and_then(|sg| self.publisher.mod_plans.build(sg, sample_rate));
         // 位相表は曲長ぶんの刻みループなので **必ず off-thread**。構築中は旧表 +
         // 閉形式シードで凌ぎ、完成したら housekeeping が次の便で載せる。
-        if let (Some(d), Some(sg)) = (mod_plan.as_ref(), song.as_ref()) {
-            phase_tables.request(self.shared.key, Arc::clone(&d.plan), sg, sample_rate);
+        // 積分が要らない曲は曲末も求めない (既存曲のコストはゼロ)。長さはこの便のテンポ表で引く (IPC スレッドで積分しない)。
+        if let (Some(plan), Some(sg)) = (self.publisher.mod_plans.latest().cloned(), song.as_ref())
+            && plan.needs_integration()
+        {
+            let end_beat = common::timing::song_end_beat(sg);
+            let length_secs = self.publisher.song_derived(Some(sg), sample_rate).tempo_map.beat_to_seconds(end_beat);
+            if self.publisher.mod_plans.table_needs_growth(length_secs, mod_plan.is_some()) {
+                phase_tables.request(self.shared.key, plan, sg, sample_rate, length_secs);
+            }
         }
         // follower の対応表は plan か schedule を載せる便に必ず同梱する (最新の組から作る)。
         let follower_maps = (schedule.is_some() || mod_plan.is_some()).then(|| {

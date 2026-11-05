@@ -32,8 +32,8 @@ pub const MOD_TICK_FRAMES: u32 = 64;
 /// breakpoint からの前進が曲頭からの通しと **厳密に一致**する (近似ではない)。
 pub const MOD_PHASE_BREAKPOINT_TICKS: i64 = 512;
 
-/// 表を張る最大長 (秒)。`tempo_map.rs` の `MAX_TABLE_BEATS` と同じ理由の hard cap —
-/// 破損 / 悪意ある project の巨大な `length_beats` で `Vec::with_capacity` が
+/// 表を張る最大長 (秒)。`timing.rs` の `MAX_SONG_BEATS` と同じ理由の hard cap —
+/// 破損 / 悪意ある project の巨大な曲末で `Vec::with_capacity` が
 /// OOM / panic するのを防ぐ。超える曲では表を張らず [`ModTier::Audio`] に倒す。
 pub const MOD_PHASE_TABLE_MAX_SECS: f64 = 24.0 * 3600.0;
 

@@ -15,11 +15,6 @@ use crate::model::Song;
 /// breakpoints (~75 KB) while resolving typical tempo ramps smoothly.
 const STEP_BEATS: f64 = 1.0 / 16.0;
 
-/// `from_song` が table を張る最大拍数。 破損 / 悪意ある project の巨大 or 非有限
-/// `length_beats` で `steps` が overflow → `Vec::with_capacity` が OOM/panic する
-/// のを防ぐ hard cap (r.md #8 L9)。 1M beat ≒ 200 BPM で ~83 時間 = 現実の曲の遥か上。
-const MAX_TABLE_BEATS: f64 = 1_000_000.0;
-
 /// この曲がテンポカーブを持つか (= [`song_beat_to_seconds`] が [`TempoMap`] の
 /// 構築に落ちるか)。 呼び出し側が `TempoMap` を世代キャッシュする判断に使う。
 #[must_use]
@@ -46,7 +41,7 @@ pub struct TempoMap {
     /// Cumulative elapsed seconds at breakpoint `i` (= beat `i * STEP_BEATS`).
     /// `secs[0] == 0.0`, strictly increasing (bpm is clamped ≥ 1).
     secs: Vec<f64>,
-    /// bpm at/after the table end, used to extrapolate beyond `length_beats`.
+    /// bpm at/after the table end, used to extrapolate beyond it.
     tail_bpm: f64,
 }
 
@@ -55,12 +50,17 @@ impl TempoMap {
     /// Constant-bpm songs reduce to a uniform `60/bpm` per beat (= linear).
     #[must_use]
     pub fn from_song(song: &Song) -> Self {
-        let song_end = crate::timing::song_end_beat(song);
-        let end_beat = if song_end.is_finite() {
-            song_end.clamp(1.0, MAX_TABLE_BEATS)
-        } else {
-            1.0
-        };
+        // 表は曲末とテンポカーブの終端の遠い方まで張る (カーブが曲末より先へ伸びていると、範囲の書き出しや
+        // ループがそこを読む)。上限は破損した project で `steps` が溢れて確保が OOM / panic するのを防ぐ (r.md #8 L9)。
+        let curve_end = crate::automation::song_tempo_lane(song)
+            .into_iter()
+            .flat_map(|lane| lane.clips.iter())
+            .map(|c| c.start_beat + c.length_beats)
+            .filter(|end| end.is_finite())
+            .fold(0.0, f64::max);
+        let end_beat = crate::timing::song_end_beat(song)
+            .max(curve_end)
+            .clamp(1.0, crate::timing::MAX_SONG_BEATS);
         let steps = (end_beat / STEP_BEATS).ceil() as usize;
         let mut secs = Vec::with_capacity(steps + 1);
         secs.push(0.0);
@@ -206,6 +206,25 @@ mod tests {
         assert!((b - 4.0).abs() < 0.05, "round trip beat {b}");
         // 中間 (beat 2) も単調。
         assert!(m.beat_to_seconds(2.0) > 0.0 && m.beat_to_seconds(2.0) < m.beat_to_seconds(4.0));
+    }
+
+    /// 表はクリップの終端と、曲末より先へ伸びたテンポカーブの終端まで積分する (音声の書き出しと同じ尺になる)。
+    /// 許容差は 10 ms: 2 つの積分は刻みと公式が違い、このランプの 200 拍で約 4 ms 離れる
+    /// (表がカーブの途中で切れて外挿に落ちると 14 秒離れる)。
+    #[test]
+    fn table_covers_clips_and_tempo_curve_beyond_length_beats() {
+        let mut song = ramp_song(120.0, 60.0, 200.0);
+        song.length_beats = 64.0;
+        song.tracks.push(crate::model::Track {
+            clips: vec![crate::model::Clip { start_beat: 96.0, length_beats: 4.0, ..Default::default() }],
+            ..Default::default()
+        });
+        let map = TempoMap::from_song(&song);
+        for beat in [64.0, 100.0, 200.0] {
+            let table = map.beat_to_samples(beat, 48_000) as f64;
+            let integrated = crate::automation::beats_to_samples(&song, 48_000, beat) as f64;
+            assert!((table - integrated).abs() < 480.0, "beat {beat}: table {table} / integrated {integrated}");
+        }
     }
 
     #[test]

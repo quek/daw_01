@@ -472,7 +472,7 @@ pub enum AudioCommand {
     /// replies with `AudioEvent::ExportWavComplete`.
     ///
     /// `range` (r.md #54 で **拍** へ統一):
-    /// - `None` — full-song export (frame 0 → `length_beats` + tail).
+    /// - `None` — full-song export (frame 0 → `timing::song_end_beat` + tail).
     /// - `Some((start_beat, end_beat))` — render only that window
     ///   (cold start at `start_beat`; matches pressing Play there).
     ///

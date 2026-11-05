@@ -881,8 +881,8 @@ impl AppData {
                     notes_total += ptrack.notes.len();
                 }
             }
-            // 取り込みが曲の長さを超えたら伸ばす (伸ばさないと「全曲」書き出しが
-            // 既定 64 拍で切れる)。縮めることはしない。
+            // 取り込みが曲の長さを超えたら伸ばす (後でクリップを消しても曲長は保つ)。
+            // 縮めることはしない。
             song.length_beats = song.length_beats.max(song_end);
         });
         if applied.is_none() {

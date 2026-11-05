@@ -52,6 +52,8 @@ pub struct ModPlanPublisher {
     /// 直近に計画を作った song と sample rate。同じ song (同じ `Arc`) の再配送は作るまでもなく同じ計画なので作らない
     /// (`Weak` なので中身は延命しないが、確保は残るのでアドレスが別の song に再利用されることもない)。
     built_from: Option<(std::sync::Weak<Song>, u32)>,
+    /// 直近に要求した位相表の長さ [秒] ([`Self::table_needs_growth`])。
+    table_length_secs: f64,
 }
 
 impl ModPlanPublisher {
@@ -88,6 +90,18 @@ impl ModPlanPublisher {
     #[must_use]
     pub fn latest(&self) -> Option<&Arc<ModPlan>> {
         self.last.as_ref()
+    }
+
+    /// 位相表を `length_secs` まで張り直すべきか。plan が同じでも、クリップを曲末より後ろへ置くと表が足りなくなる。
+    /// 足りないまま曲末の先へシークすると閉形式シードへ落ち、書き出し (毎回その時点の曲末まで張る) と位相が食い違う。
+    /// 短くなったときは張り直さない (余った表は読まれないだけで、クリップを動かすたびに張らずに済む)。
+    /// `plan_changed` のときは表が別物になるので常に張り直す。
+    pub fn table_needs_growth(&mut self, length_secs: f64, plan_changed: bool) -> bool {
+        let needed = plan_changed || length_secs > self.table_length_secs;
+        if needed {
+            self.table_length_secs = length_secs;
+        }
+        needed
     }
 }
 
@@ -137,14 +151,17 @@ impl ModPhaseTableBuilder {
     ///
     /// 積分が要らない plan (= rate を変調していない曲) では何もしない —
     /// **既存曲のコストはゼロ**。
-    pub fn request(&self, project: ProjectKey, plan: Arc<ModPlan>, song: &Arc<Song>, sample_rate: u32) {
+    pub fn request(
+        &self,
+        project: ProjectKey,
+        plan: Arc<ModPlan>,
+        song: &Arc<Song>,
+        sample_rate: u32,
+        length_secs: f64,
+    ) {
         if !plan.needs_integration() {
             return;
         }
-        let sr = f64::from(sample_rate.max(1));
-        #[allow(clippy::cast_precision_loss)]
-        let length_secs =
-            common::automation::beats_to_samples(song, sample_rate, common::timing::song_end_beat(song)) as f64 / sr;
         let (lock, cv) = &*self.request;
         if let Ok(mut queue) = lock.lock() {
             // 同じ project の古い要求は捨てる (最新だけ残す)。

@@ -1411,15 +1411,10 @@ impl AppData {
             }
             AppEvent::SetExportRangeEnd(beat) => {
                 if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut() {
-                    let max = common::timing::song_end_beat(self.cur.song_doc.song())
-                        .max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
-                    p.end_beat = beat.clamp(p.start_beat + MIN_EXPORT_RANGE_BEATS, max);
-                }
-            }
-            AppEvent::ResetExportRange => {
-                if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut() {
-                    p.start_beat = 0.0;
-                    p.end_beat = common::timing::song_end_beat(self.cur.song_doc.song()).max(MIN_EXPORT_RANGE_BEATS);
+                    // 曲末では止めない: ループ / セクション / 選択は曲末より後ろにも置けるので (r.md #32)、
+                    // ここで止めるとそれらの範囲に触れただけで縮む。
+                    let min = p.start_beat + MIN_EXPORT_RANGE_BEATS;
+                    p.end_beat = beat.clamp(min, common::timing::MAX_SONG_BEATS.max(min));
                 }
             }
             // r.md #54: 範囲プリセット。対象が無いときは何も変えず理由を出す
@@ -1427,13 +1422,9 @@ impl AppData {
             AppEvent::SetExportRangeSource(source) => {
                 match self.export_range_from_source(source) {
                     Some((start, end)) => {
-                        let len = common::timing::song_end_beat(self.cur.song_doc.song());
                         if let Some(p) = self.ui_ephemeral.export_range_picker.as_mut() {
                             p.start_beat = start.max(0.0);
                             p.end_beat = end.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
-                            // 曲末より後ろは掴めない (end 側の clamp と同じ規則)。
-                            let max = len.max(p.start_beat + MIN_EXPORT_RANGE_BEATS);
-                            p.end_beat = p.end_beat.min(max);
                         }
                     }
                     None => {

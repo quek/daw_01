@@ -44,7 +44,7 @@ const BTN_W: f32 = 110.0;
 
 /// start / end 拍フィールドの scrubable_number スタイル。 sensitivity 0.25 =
 /// `1 px drag で 0.25 拍`。 clamp は handler 側 SSoT なので widget range は緩く
-/// 0..=大きな上限 (実 song 長は handler が clamp する)。
+/// 0..=大きな上限 (範囲の検証は handler が行う)。
 ///
 /// パレット既定 ([`ScrubableNumberStyle::from_palette`]) から、 この modal 固有の
 /// 4 点だけ倒す: hover は窪みでなく control 面、 scrub 中は bright accent より沈む

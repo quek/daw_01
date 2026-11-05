@@ -14,8 +14,8 @@
 //! 1. Allocates its own `scratch` / `master_l` / `master_r` (heap is fine
 //!    here; this thread is RT-irrelevant once the realtime callback is
 //!    parked).
-//! 2. Walks the song from frame 0 to `length_beats * samples_per_beat`,
-//!    calling the live/export 共通の [`render_master_buffer`] every buffer
+//! 2. Walks the requested window (full export: frame 0 to the song end,
+//!    `common::timing::song_end_beat`), calling the live/export 共通の [`render_master_buffer`] every buffer
 //!    and writing the master bus into `hound::WavWriter`. master fx chain と
 //!    master gain もその中で適用される (§5 — 旧実装は export だけ両方を
 //!    素通りしていて、master に挿した limiter / master volume が WAV に
@@ -44,7 +44,7 @@ use crate::engine::{EngineShared, PluginRefs, ProjectShared, WorkerRig};
 use crate::graph::{Schedule, compile_schedule, render_master_buffer};
 use crate::mixer::TrackScratch;
 
-/// Hard ceiling on the rendered tail (10 s past `length_beats`). Stops
+/// Hard ceiling on the rendered tail (10 s past the write window). Stops
 /// runaway plugins (long reverbs / oscillators with no auto-stop) from
 /// inflating the WAV indefinitely.
 const TAIL_MAX_SECONDS: u64 = 10;
@@ -350,8 +350,8 @@ impl RenderWindow {
             anyhow::bail!("song.bpm must be positive (got {})", song.bpm);
         }
         // A2 (r.md #8): tempo automation を持つ曲も再生と同じ尺で焼くため、 song body の
-        // sample 長は SongTempo カーブを積分して求める (constant-bpm なら従来の線形
-        // `length_beats * 60*SR/bpm` と一致)。
+        // sample 長は SongTempo カーブを積分して求める (constant-bpm なら線形
+        // `曲末の拍 * 60*SR/bpm` と一致)。
         let song_length_samples = common::automation::beats_to_samples(
             song,
             sample_rate,

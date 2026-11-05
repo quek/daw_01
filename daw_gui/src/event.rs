@@ -1236,11 +1236,9 @@ pub enum AppEvent {
     /// レンジピッカーの開始拍を更新 (scrubable_number から)。 end 未満 / 0 以上に
     /// clamp。
     SetExportRangeStart(f64),
-    /// レンジピッカーの終了拍を更新 (scrubable_number から)。 start 超 / song 長
-    /// 以下に clamp。
+    /// レンジピッカーの終了拍を更新 (scrubable_number から)。 start 超に clamp
+    /// (曲末より後ろも選べる)。
     SetExportRangeEnd(f64),
-    /// レンジピッカーを「全曲」 (start=0, end=length_beats) に戻す。
-    ResetExportRange,
     /// r.md #54: レンジピッカーの範囲を、ワンクリックプリセット
     /// (ループ範囲 / 選択範囲 / セクション / 曲全体) で置き換える。
     SetExportRangeSource(crate::app_types::ExportRangeSource),

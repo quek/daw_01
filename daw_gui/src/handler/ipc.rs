@@ -49,8 +49,7 @@ impl AppData {
                 self.cur.transport.export_progress_at = None;
                 self.cur.transport.export_stage = None;
                 if let Some(mp4_path) = self.cur.transport.pending_video_export.take() {
-                    // 音声と同じ拍範囲で video を render する (= 全曲
-                    // なら None)。 取り出して消費。
+                    // 音声と同じ拍範囲で video を render する。 取り出して消費。
                     let range_beats = self.cur.transport.pending_video_export_range.take();
                     // picker で選んだ出力解像度 / fps の per-export
                     // override。 None (= 旧経路) なら action_export_mp4 が

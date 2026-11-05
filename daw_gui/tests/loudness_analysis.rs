@@ -295,6 +295,39 @@ fn 曲長を超える範囲は確定で切られない() {
     assert_eq!(app.cur.loudness.phase, LoudnessPhase::AwaitingReinit { range: Some((0.0, end)) });
 }
 
+/// `length_beats` より後ろのクリップも「曲全体」と既定の範囲に入る。曲末より後ろのループは縮まない。
+#[test]
+fn 範囲は曲長より後ろのクリップとループまで届く() {
+    use common::model::{Clip, Track};
+    use daw_gui::app_types::ExportRangeSource;
+
+    let (mut app, mut audio_rx, _plugin_rx) = build_app();
+    let clip_end = app.cur.song_doc.song().length_beats + 100.0;
+    app.edit_song(|song| {
+        song.tracks.push(Track {
+            clips: vec![Clip { start_beat: clip_end - 4.0, length_beats: 4.0, ..Clip::default() }],
+            ..Track::default()
+        });
+    });
+
+    app.handle_event(AppEvent::AnalyzeLoudness);
+    let p = app.ui_ephemeral.export_range_picker.unwrap();
+    assert_eq!((p.start_beat, p.end_beat), (0.0, clip_end), "既定の範囲");
+    app.handle_event(AppEvent::SetExportRangeSource(ExportRangeSource::Whole));
+    let p = app.ui_ephemeral.export_range_picker.unwrap();
+    assert_eq!((p.start_beat, p.end_beat), (0.0, clip_end), "曲全体");
+
+    // ループは曲末より後ろへ置ける。プリセットで選んでも、終了欄に触れても縮まない。
+    let loop_end = clip_end + 32.0;
+    app.handle_event(AppEvent::SetLoopRange { start: clip_end, end: loop_end });
+    drain(&mut audio_rx);
+    app.handle_event(AppEvent::SetExportRangeSource(ExportRangeSource::Loop));
+    let p = app.ui_ephemeral.export_range_picker.unwrap();
+    assert_eq!((p.start_beat, p.end_beat), (clip_end, loop_end), "ループ");
+    app.handle_event(AppEvent::SetExportRangeEnd(loop_end + 1.0));
+    assert_eq!(app.ui_ephemeral.export_range_picker.unwrap().end_beat, loop_end + 1.0, "終了欄");
+}
+
 /// 範囲プリセットはループ / 曲全体を拍で書き換える。対象が無いものは値を変えない。
 #[test]
 fn 範囲プリセットが拍範囲を差し替える() {

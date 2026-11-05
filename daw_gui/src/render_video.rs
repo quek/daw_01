@@ -337,6 +337,8 @@ pub fn render_mp4_cancellable(
     // (audio export・preview と同一)。 constant-bpm 換算のままだと SongTempo curve の
     // ある曲で映像が tempo 積分済みの audio から drift する (A/V desync)。
     let tempo_map = TempoMap::from_song(cfg.song);
+    // 映像 source 時間の写像はテンポカーブのある曲だけ表で引く (無い曲は定数 BPM の経路で、プレビューと同じ)。
+    let source_tempo = common::tempo_map::has_tempo_automation(cfg.song).then_some(&tempo_map);
     let start_secs = tempo_map.beat_to_seconds(start_beat);
     let window_seconds = tempo_map.beat_to_seconds(end_beat) - start_secs;
     let total_frames = (window_seconds * f64::from(framerate)).ceil() as u64;
@@ -427,6 +429,7 @@ pub fn render_mp4_cancellable(
             &mut video_textures,
             &image_textures,
             &rows,
+            source_tempo,
             start_secs + frame_seconds,
             mod_plane_buf.as_ref(),
             out_w,
@@ -554,6 +557,7 @@ fn build_frame_scene(
     video_textures: &mut HashMap<VideoSourceId, (TextureHandle, u32, u32)>,
     image_textures: &HashMap<ImageSourceId, (TextureHandle, u32, u32)>,
     rows: &RowTimeline<'_>,
+    source_tempo: Option<&TempoMap>,
     playhead_secs: f64,
     mod_plane: common::mod_plane::ModPlaneRef<'_>,
     out_w: u32,
@@ -574,7 +578,7 @@ fn build_frame_scene(
     let mut buckets: HashMap<u32, Vec<CompositeItem>> = HashMap::new();
 
     // 動画フレーム (in-process libav software decode → BGRA texture) → owning track bucket。
-    let video_layers = VideoPlaybackEngine::active_sources_at(song, rows);
+    let video_layers = VideoPlaybackEngine::active_sources_with_tempo(song, source_tempo, rows);
     for layer in video_layers {
         let Some(path) =
             resolve_video_source_path(song, layer.video_source_id, project_dir)
@@ -723,7 +727,7 @@ fn build_frame_scene(
 ///
 /// これが r.md #32 の要点: ループ範囲は `length_beats` を超えられ (loop_end >
 /// length_beats)、content 自体も `length_beats` 超に置ける。audio 書き出し
-/// (`AppData::export_beats_to_frames`) は `length_beats` で clamp せず raw な拍
+/// (`daw_audio` の `RenderWindow::resolve`) は `length_beats` で clamp せず raw な拍
 /// 範囲を frame へ換算するので、ここで video だけ `length_beats` に clamp すると
 /// **映像だけが短く切れて A/V 長が食い違う**。実例: loop `[8, 260]`・length
 /// `64`・BPM 140 の曲で、旧実装は end を 64 に clamp して窓 `[8, 64]` = 56 拍 =

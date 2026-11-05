@@ -1848,7 +1848,10 @@ impl Runner {
         // publish されていない行は `RowTimeline` が `Song.launcher` へ倒す。
         let running = state.app.launcher_running_rows();
         let rows = RowTimeline::with_running(0.0, playhead_beat, &running);
-        let active = crate::video_playback::VideoPlaybackEngine::active_sources_at(song, &rows);
+        let active = {
+            let tempo = state.app.tempo_map_cached();
+            crate::video_playback::VideoPlaybackEngine::active_sources_with_tempo(song, tempo.as_ref(), &rows)
+        };
         let project_dir = state
             .app
             .cur.song_doc.file_path
@@ -1993,7 +1996,7 @@ impl Runner {
         // preview/export 一致のため wall-clock でなく song 時間。 tempo automation
         // がある曲は積分写像 (constant-bpm 線形だと export = TempoMap 積分と
         // 効果進行がズレる。 映像 source 時間の A4 と同じ扱い)。
-        let fx_secs = common::tempo_map::song_beat_to_seconds(song, playhead_beat);
+        let fx_secs = state.app.song_beat_to_seconds(playhead_beat);
         preview.fx_engine.set_time(fx_secs as f32);
         preview.set_track_composites(composites);
         // マスター映像チェーン（master_fx_chain の映像 device）を解決して渡す。

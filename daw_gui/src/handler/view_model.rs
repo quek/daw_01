@@ -943,7 +943,7 @@ impl AppData {
 
     /// `song_epoch` 世代キャッシュの [`common::tempo_map::TempoMap`]。テンポカーブが
     /// 無い曲は `None` (= 呼び側は `song.bpm` の定数換算を使う)。
-    fn tempo_map_cached(&self) -> std::cell::Ref<'_, Option<common::tempo_map::TempoMap>> {
+    pub(crate) fn tempo_map_cached(&self) -> std::cell::Ref<'_, Option<common::tempo_map::TempoMap>> {
         let song = self.cur.song_doc.song();
         let epoch = self.cur.song_doc.edit_epoch();
         {
