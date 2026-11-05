@@ -1326,7 +1326,7 @@ impl ProjectRt {
         // Playhead advance + auto-stop / loop wrap.
         if playing {
             let mut new_ph = playhead + n as u64;
-            let song_bounds = self.song_bounds.at(song_ref, sample_rate, &self.tempo_map);
+            let song_bounds = self.song_bounds.samples;
             let active_end = if looping {
                 effective_loop_bounds(song_ref, loop_region, sample_rate, &self.tempo_map, song_bounds).map(|(_, e)| e)
             } else {

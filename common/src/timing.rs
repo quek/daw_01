@@ -24,9 +24,9 @@ fn playable_clips(song: &Song) -> impl Iterator<Item = &Clip> {
 /// playable: no song, no non-empty clip, `bpm <= 0`, or all clips have zero
 /// length.
 ///
-/// The `None` case means "do not loop, do not play": downstream code should
-/// treat it as end-of-song. The bounds are the outer envelope of all
-/// material; playhead iterates over this span once per loop cycle.
+/// `None` は鳴らすものが無い状態で、曲末には達しない ([`ended_at`] は false)。
+/// The bounds are the outer envelope of all material; playhead iterates over
+/// this span once per loop cycle.
 ///
 /// `tempo` は `song` から作った表。テンポカーブのある曲は、engine が sample を拍へ戻すときと同じ表で換算する。
 pub fn song_bounds_samples(song: Option<&Song>, sample_rate: u32, tempo: &TempoMap) -> Option<(u64, u64)> {
@@ -103,10 +103,10 @@ pub fn ended_at(bounds: Option<(u64, u64)>, playhead: u64) -> bool {
     bounds.is_some_and(|(_, end)| playhead >= end)
 }
 
-/// 曲の範囲 ([`song_bounds_samples`]) を求めたときの sample rate とその値 (song と同じ便で RT へ届ける)。
+/// 曲の範囲 (song と同じ便で RT へ届ける)。全クリップを舐めるのは [`Self::of`] (off-thread) だけで、RT は読むだけ。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SongBounds {
-    pub sample_rate: u32,
+    /// [`song_bounds_samples`] の値。engine が描く rate (session の rate、起動時に決まる) で求める。
     pub samples: Option<(u64, u64)>,
     /// 最後のクリップの終端 [拍] (`samples` が `None` なら `None`)。
     pub end_beat: Option<f64>,
@@ -117,7 +117,7 @@ impl SongBounds {
     pub fn of(song: Option<&Song>, sample_rate: u32, tempo: &TempoMap) -> Self {
         let samples = song_bounds_samples(song, sample_rate, tempo);
         let end_beat = samples.and(song).and_then(content_bounds_beats).map(|(_, end)| end);
-        Self { sample_rate, samples, end_beat }
+        Self { samples, end_beat }
     }
 
     /// 鳴っている拍 `beat` で見た `(ループの端に達したか, 曲末に達したか)`。テンポが動く曲の判定に使う。
@@ -130,15 +130,6 @@ impl SongBounds {
             None => song_ended,
         });
         (loop_end_reached, song_ended)
-    }
-
-    /// `sample_rate` での曲の範囲。求めたときと rate が違えば (device の rate が session と食い違う間) その rate で
-    /// 求め直して持ち替える — 次の buffer からは求め直さない。`song` と `tempo` は求めたときと同じ snapshot。
-    pub fn at(&mut self, song: Option<&Song>, sample_rate: u32, tempo: &TempoMap) -> Option<(u64, u64)> {
-        if self.sample_rate != sample_rate {
-            *self = Self::of(song, sample_rate, tempo);
-        }
-        self.samples
     }
 }
 
