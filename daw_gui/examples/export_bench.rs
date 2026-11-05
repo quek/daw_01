@@ -43,7 +43,7 @@ fn main() {
     let out = std::env::temp_dir().join("daw01_export_bench.mp4");
     // Synthetic PCM Float32 WAV (same format the audio engine produces) so the
     // bench exercises the full video + audio mux path, not just video.
-    let secs = song.length_beats / song.bpm as f64 * 60.0;
+    let secs = common::timing::song_end_beat(&song) / song.bpm as f64 * 60.0;
     let sr = 48_000u32;
     let wav_path = std::env::temp_dir().join("daw01_export_bench_audio.wav");
     {
@@ -72,7 +72,7 @@ fn main() {
         song.video_resolution.0,
         song.video_resolution.1,
         song.video_framerate,
-        song.length_beats,
+        common::timing::song_end_beat(&song),
         song.bpm,
         out.display()
     );

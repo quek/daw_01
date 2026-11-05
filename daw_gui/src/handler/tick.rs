@@ -331,7 +331,7 @@ impl AppData {
         let clip_len = if next_clip_start.is_finite() {
             (next_clip_start - clip_start).max(0.0)
         } else {
-            (self.cur.song_doc.song().length_beats - clip_start).max(4.0)
+            (common::timing::song_end_beat(self.cur.song_doc.song()) - clip_start).max(4.0)
         };
         // content と clip / レーンは 1 回の編集で積む (store が無ければ content を採番しない)。
         let mut content_id = None;

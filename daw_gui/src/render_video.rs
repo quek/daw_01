@@ -331,7 +331,8 @@ pub fn render_mp4_cancellable(
     // trimmed to the same window starting at its own sample 0, so A/V stay
     // aligned. 窓解決は `resolve_render_window` に一本化 (length_beats で clamp
     // しないのが要点 — r.md #32、下記関数の doc 参照)。
-    let (start_beat, end_beat) = resolve_render_window(cfg.range_beats, cfg.song.length_beats);
+    let (start_beat, end_beat) =
+        resolve_render_window(cfg.range_beats, common::timing::song_end_beat(cfg.song));
     // M2 (r.md #8): frame↔beat は tempo automation を積分する `TempoMap` で写像する
     // (audio export・preview と同一)。 constant-bpm 換算のままだと SongTempo curve の
     // ある曲で映像が tempo 積分済みの audio から drift する (A/V desync)。
@@ -729,8 +730,8 @@ fn build_frame_scene(
 /// 24.0s の映像しか出さず、audio は raw `[8, 260]` = 252 拍 = 108s だった
 /// (content は beat 260 まで在るのに映像が 24s で凍結)。
 ///
-/// `None` は全曲 = `[0, length_beats)` (レンジピッカーで「全曲」を選んだとき)。
-fn resolve_render_window(range_beats: Option<(f64, f64)>, length_beats: f64) -> (f64, f64) {
+/// `None` は全曲 = `[0, song_end_beat)` (`common::timing::song_end_beat`)。
+fn resolve_render_window(range_beats: Option<(f64, f64)>, song_end_beat: f64) -> (f64, f64) {
     // 負値・NaN/Inf を 0 に潰す (GUI も検証済みだが防御)。`f64::max` は
     // 非 NaN 側を返すので NaN.max(0.0) == 0.0。
     let sane = |b: f64| if b.is_finite() { b.max(0.0) } else { 0.0 };
@@ -739,7 +740,7 @@ fn resolve_render_window(range_beats: Option<(f64, f64)>, length_beats: f64) -> 
             let (s, e) = (sane(s), sane(e));
             (s.min(e), s.max(e))
         }
-        None => (0.0, sane(length_beats)),
+        None => (0.0, sane(song_end_beat)),
     }
 }
 

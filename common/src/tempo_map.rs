@@ -55,8 +55,9 @@ impl TempoMap {
     /// Constant-bpm songs reduce to a uniform `60/bpm` per beat (= linear).
     #[must_use]
     pub fn from_song(song: &Song) -> Self {
-        let end_beat = if song.length_beats.is_finite() {
-            song.length_beats.clamp(1.0, MAX_TABLE_BEATS)
+        let song_end = crate::timing::song_end_beat(song);
+        let end_beat = if song_end.is_finite() {
+            song_end.clamp(1.0, MAX_TABLE_BEATS)
         } else {
             1.0
         };

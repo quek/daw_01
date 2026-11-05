@@ -71,6 +71,16 @@ pub fn content_bounds_beats(song: &Song) -> Option<(f64, f64)> {
     bounds
 }
 
+/// 曲末 [拍]。曲全体を指す処理 (書き出しの全曲 / テンポ表 / 変調表 …) はこれを読む。
+///
+/// `Song::length_beats` はクリップを置いても伸びない (import と時間の挿入 / 削除だけが更新する) ので、
+/// 単独で曲末として読むと、それより後ろのクリップが欠ける。クリップ終端と大きい方を取る。
+#[must_use]
+pub fn song_end_beat(song: &Song) -> f64 {
+    let content_end = content_bounds_beats(song).map_or(0.0, |(_, end)| end);
+    song.length_beats.max(content_end)
+}
+
 /// True when `playhead` has advanced past the last clip's end (or there is
 /// nothing playable across the whole song).
 pub fn song_ended(song: Option<&Song>, sample_rate: u32, playhead: u64) -> bool {

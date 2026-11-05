@@ -352,8 +352,11 @@ impl RenderWindow {
         // A2 (r.md #8): tempo automation を持つ曲も再生と同じ尺で焼くため、 song body の
         // sample 長は SongTempo カーブを積分して求める (constant-bpm なら従来の線形
         // `length_beats * 60*SR/bpm` と一致)。
-        let song_length_samples =
-            common::automation::beats_to_samples(song, sample_rate, song.length_beats);
+        let song_length_samples = common::automation::beats_to_samples(
+            song,
+            sample_rate,
+            common::timing::song_end_beat(song),
+        );
         let to_frames = |beat: f64| {
             common::automation::beats_to_samples(song, sample_rate, beat.max(0.0))
         };
@@ -448,7 +451,7 @@ pub fn run_loudness_analysis(
     let song = Arc::new(song);
     let win = RenderWindow::resolve(&song, sample_rate, span, false)?;
     let (range_start_beat, range_end_beat) = match span {
-        RenderSpan::Full => (0.0, song.length_beats),
+        RenderSpan::Full => (0.0, common::timing::song_end_beat(&song)),
         RenderSpan::RangeCold { start_beat, end_beat }
         | RenderSpan::RangeWarm { start_beat, end_beat } => (start_beat, end_beat),
     };
@@ -824,9 +827,10 @@ fn render_loop(
         common::automation::beats_to_samples(song, sample_rate, beat) as f64 / f64::from(sample_rate.max(1))
     }));
     {
-        let length_secs = common::automation::beats_to_samples(song, sample_rate, song.length_beats)
-            as f64
-            / f64::from(sample_rate.max(1));
+        let length_secs =
+            common::automation::beats_to_samples(song, sample_rate, common::timing::song_end_beat(song))
+                as f64
+                / f64::from(sample_rate.max(1));
         let table = std::sync::Arc::new(common::mod_graph::ModPhaseTable::build(
             &plan,
             song,
@@ -1170,6 +1174,16 @@ mod tests {
         assert_eq!((w.write_start, w.write_end, w.walk_start), (0, 384_000, 0));
         // 走査は write_end + TAIL_MAX_SECONDS。
         assert_eq!(w.total_samples, 384_000 + 48_000 * TAIL_MAX_SECONDS);
+    }
+
+    #[test]
+    fn 全曲は_length_beats_より後ろのクリップまで書く() {
+        let mut s = song(16.0);
+        let mut track = common::model::Track::default();
+        track.clips.push(common::model::Clip { start_beat: 40.0, length_beats: 8.0, ..Default::default() });
+        s.tracks.push(track);
+        let w = RenderWindow::resolve(&s, 48_000, RenderSpan::Full, true).unwrap();
+        assert_eq!(w.write_end, 48 * 24_000);
     }
 
     #[test]

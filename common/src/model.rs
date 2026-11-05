@@ -544,6 +544,7 @@ pub struct MediaPools {
 pub struct Song {
     pub bpm: f32,
     pub time_sig: (u8, u8),
+    /// 曲長の下限。クリップを置いても伸びないので、曲末として読むなら [`crate::timing::song_end_beat`]。
     pub length_beats: f64,
     #[serde(default)]
     pub tracks: Vec<Track>,

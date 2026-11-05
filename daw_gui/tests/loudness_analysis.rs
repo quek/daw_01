@@ -282,6 +282,19 @@ fn 前セッションの後着完了を新しい解析の結果にしない() {
     );
 }
 
+/// 曲長 (`length_beats`) より後ろまでのループ範囲を、切らずにそのまま確定する。
+#[test]
+fn 曲長を超える範囲は確定で切られない() {
+    let (mut app, mut audio_rx, _plugin_rx) = build_app();
+    let end = app.cur.song_doc.song().length_beats + 200.0;
+    app.handle_event(AppEvent::SetLoopRange { start: 0.0, end });
+    drain(&mut audio_rx);
+
+    app.handle_event(AppEvent::AnalyzeLoudness);
+    app.handle_event(AppEvent::ConfirmExportRange);
+    assert_eq!(app.cur.loudness.phase, LoudnessPhase::AwaitingReinit { range: Some((0.0, end)) });
+}
+
 /// 範囲プリセットはループ / 曲全体を拍で書き換える。対象が無いものは値を変えない。
 #[test]
 fn 範囲プリセットが拍範囲を差し替える() {

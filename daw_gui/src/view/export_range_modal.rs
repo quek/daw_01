@@ -100,8 +100,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     let kind = picker.kind;
     let start_beat = picker.start_beat;
     let end_beat = picker.end_beat;
-    // dblclick リセット時の default: 開始=曲頭(0)、 終了=曲末(length_beats)。
-    let song_len = app.cur.song_doc.song().length_beats;
+    // dblclick リセット時の default: 開始=曲頭(0)、 終了=曲末。
+    let song_len = common::timing::song_end_beat(app.cur.song_doc.song());
     // Mp4 のときだけ出力解像度 / fps の dropdown を出す。 値は picker が
     // 保持する per-export override (open 時に Song から seed 済み)。
     let is_mp4 = matches!(kind, ExportRangeKind::Mp4);

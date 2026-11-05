@@ -109,9 +109,9 @@ fn tempo_breakpoints(song: &Song) -> Vec<(u32, f32)> {
         return vec![(0, song.bpm)];
     }
     let mut out: Vec<(u32, f32)> = Vec::new();
-    // 曲本体 [0, length_beats) を走査 (end_beat は半開区間で除外 = automation clip
+    // 曲本体 [0, 曲末) を走査 (end_beat は半開区間で除外 = automation clip
     // [..,end) の外に出て default へ revert する spurious な末尾 event を避ける)。
-    let end_beat = song.length_beats.max(1.0);
+    let end_beat = common::timing::song_end_beat(song).max(1.0);
     const STEP_BEATS: f64 = 0.125; // 1/8 note
     let mut beat = 0.0_f64;
     let mut prev_bpm = f32::NAN;

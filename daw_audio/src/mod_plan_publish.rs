@@ -144,7 +144,7 @@ impl ModPhaseTableBuilder {
         let sr = f64::from(sample_rate.max(1));
         #[allow(clippy::cast_precision_loss)]
         let length_secs =
-            common::automation::beats_to_samples(song, sample_rate, song.length_beats) as f64 / sr;
+            common::automation::beats_to_samples(song, sample_rate, common::timing::song_end_beat(song)) as f64 / sr;
         let (lock, cv) = &*self.request;
         if let Ok(mut queue) = lock.lock() {
             // 同じ project の古い要求は捨てる (最新だけ残す)。

@@ -28,7 +28,7 @@ impl AppData {
     }
 
     /// レンジピッカーを開くときの既定範囲 (拍)。 ループ範囲が設定されていれば
-    /// それを既定にし、 無ければ全曲 (0..length_beats) にフォールバックする。
+    /// それを既定にし、 無ければ全曲 (0..曲末) にフォールバックする。
     /// ループ範囲は session state (`transport.loop_region`) が所有する SSoT で、
     /// transport の再生ループと同じ値を使う (= 「ループしている区間をそのまま
     /// 書き出す」 という DAW で一般的な既定)。 ON/OFF は見ない (帯が引いてあれば
@@ -38,7 +38,7 @@ impl AppData {
             .cur.transport
             .loop_region
             .range()
-            .unwrap_or((0.0, self.cur.song_doc.song().length_beats));
+            .unwrap_or((0.0, common::timing::song_end_beat(self.cur.song_doc.song())));
         let start = start.max(0.0);
         (start, end.max(start + MIN_EXPORT_RANGE_BEATS))
     }
@@ -77,17 +77,13 @@ impl AppData {
     }
 
     /// レンジピッカー確定。 選んだ拍範囲を kind に応じて変換し、 元の
-    /// export action を起動する。 「全曲」 (start=0, end=length) のときは範囲なし
-    /// (`None`) として従来どおり全曲を書き出す。
+    /// export action を起動する。 画面に出ている範囲をそのまま渡す
+    /// (「曲末以降は全曲」 と読み替えると、 その範囲より短く切れる)。
     pub(crate) fn confirm_export_range(&mut self) {
         let Some(picker) = self.ui_ephemeral.export_range_picker.take() else {
             return;
         };
-        // start=0 かつ end>=length は全曲とみなす (= None)。 浮動小数の比較は緩く。
-        let is_full = picker.start_beat <= f64::EPSILON
-            && picker.end_beat >= self.cur.song_doc.song().length_beats - f64::EPSILON;
-        let range_beats: Option<(f64, f64)> =
-            if is_full { None } else { Some((picker.start_beat, picker.end_beat)) };
+        let range_beats = Some((picker.start_beat, picker.end_beat));
         match picker.kind {
             ExportRangeKind::Wav => {
                 let dialog = rfd::FileDialog::new().add_filter("WAV", &["wav"]);
@@ -148,7 +144,7 @@ impl AppData {
                     .or_else(|| song.sections.first())
                     .map(|s| (s.start_beat, s.end_beat()))
             }
-            ExportRangeSource::Whole => Some((0.0, song.length_beats)),
+            ExportRangeSource::Whole => Some((0.0, common::timing::song_end_beat(song))),
         }
         .filter(|(s, e)| e > s)
     }
