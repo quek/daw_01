@@ -43,6 +43,10 @@ pub struct TempoMap {
     secs: Vec<f64>,
     /// bpm at/after the table end, used to extrapolate beyond it.
     tail_bpm: f64,
+    /// 曲がテンポカーブを持つか ([`Self::is_automated`])。
+    automated: bool,
+    /// テンポが動く曲か ([`Self::varies`])。
+    varies: bool,
 }
 
 impl TempoMap {
@@ -77,7 +81,25 @@ impl TempoMap {
             beat += STEP_BEATS;
         }
         let tail_bpm = f64::from(curve.at(end_beat));
-        Self { secs, tail_bpm }
+        let automated = curve.is_automated();
+        let modulated = song
+            .song_mod_routings
+            .iter()
+            .any(|r| r.enabled && r.target == crate::model::AutomationTarget::SongTempo);
+        Self { secs, tail_bpm, automated, varies: automated || modulated }
+    }
+
+    /// 元の曲がテンポカーブを持つか。RT が `song_lanes` を探さずに判定するための値。
+    #[must_use]
+    pub fn is_automated(&self) -> bool {
+        self.automated
+    }
+
+    /// 元の曲のテンポが動くか (テンポカーブかテンポ宛の変調がある)。動く曲では、表の拍と鳴っている拍が
+    /// 一致するとは限らない (表は変調を含まず、1/16 拍より細かい段差も丸める)。
+    #[must_use]
+    pub fn varies(&self) -> bool {
+        self.varies
     }
 
     fn last_beat(&self) -> f64 {
@@ -91,8 +113,10 @@ impl TempoMap {
             return 0.0;
         }
         let idx_f = beat / STEP_BEATS;
+        // 巨大な拍では `as usize` が usize::MAX に飽和する。`i + 1` と書くと溢れて panic する
+        // (`secs` は必ず 1 要素以上ある)。
         let i = idx_f.floor() as usize;
-        if i + 1 < self.secs.len() {
+        if i < self.secs.len() - 1 {
             let frac = idx_f - i as f64;
             self.secs[i] + (self.secs[i + 1] - self.secs[i]) * frac
         } else {
@@ -225,6 +249,31 @@ mod tests {
             let integrated = crate::automation::beats_to_samples(&song, 48_000, beat) as f64;
             assert!((table - integrated).abs() < 480.0, "beat {beat}: table {table} / integrated {integrated}");
         }
+    }
+
+    #[test]
+    fn huge_beats_saturate_without_panicking() {
+        let m = TempoMap::from_song(&const_song(120.0, 4.0));
+        assert_eq!(m.beat_to_samples(f64::MAX, 48_000), u64::MAX);
+        assert_eq!(m.beat_to_samples(f64::INFINITY, 48_000), u64::MAX);
+    }
+
+    #[test]
+    fn varies_covers_curve_and_tempo_modulation() {
+        assert!(!TempoMap::from_song(&const_song(120.0, 4.0)).varies());
+        assert!(TempoMap::from_song(&ramp_song(120.0, 60.0, 4.0)).varies());
+
+        let mut modulated = const_song(120.0, 4.0);
+        modulated.song_mod_routings.push(crate::model::ModRouting {
+            id: 1,
+            target: AutomationTarget::SongTempo,
+            source_id: 1,
+            depth: 0.2,
+            polarity: crate::model::Polarity::Unipolar,
+            enabled: true,
+        });
+        let map = TempoMap::from_song(&modulated);
+        assert!(map.varies() && !map.is_automated());
     }
 
     #[test]

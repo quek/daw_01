@@ -941,6 +941,16 @@ impl AppData {
         }
     }
 
+    /// song beat → engine の再生位置 (sample)。engine がこの sample を拍へ戻すときと同じテンポ表で換算する
+    /// (別の積分を通すと、クリックした拍から数 ms ずれた位置へ着地する)。カーブが無い曲は閉形式。
+    pub(crate) fn beat_to_engine_samples(&self, beat: f64) -> u64 {
+        let sr = self.ipc.sample_rate;
+        match self.tempo_map_cached().as_ref() {
+            Some(m) => m.beat_to_samples(beat, sr),
+            None => common::automation::beats_to_samples(self.cur.song_doc.song(), sr, beat),
+        }
+    }
+
     /// `song_epoch` 世代キャッシュの [`common::tempo_map::TempoMap`]。テンポカーブが
     /// 無い曲は `None` (= 呼び側は `song.bpm` の定数換算を使う)。
     pub(crate) fn tempo_map_cached(&self) -> std::cell::Ref<'_, Option<common::tempo_map::TempoMap>> {

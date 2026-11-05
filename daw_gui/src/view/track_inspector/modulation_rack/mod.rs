@@ -113,41 +113,20 @@ struct ModBodyCtx<'a> {
 /// (`daw_audio/src/engine.rs`)、 export も同じ組
 /// (`samples_to_beats` → `playhead / sample_rate`)。 GUI だけが秒を
 /// `beat * 60 / bpm` で自作していて、 テンポカーブのある曲では 3 経路の値が割れていた
-/// (r.md #88-7)。 ここで beat をサンプル位置へ写して秒を出せば、 GUI の `(beat, secs)` も
+/// (r.md #88-7)。 ここで engine と同じテンポ表から秒を引けば、 GUI の `(beat, secs)` も
 /// 同じ tempo map の 1 点になる。
-///
-/// **beat と秒は必ず同時に寄せる**。 秒だけを直すと、 定数 bpm での往復相殺
-/// (`playhead_to_beat` は定数 bpm 換算なので `beat * 60 / bpm == playhead / sr`) で
-/// たまたま合っていた再生中の一致まで壊れる。 テンポカーブが無い曲では
-/// `beats_to_samples` が閉形式に落ちるので、 既存曲のプレビューは 1 サンプルも動かない。
 fn mod_preview_pos(app: &AppData) -> (f64, f64) {
     let beat = f64::from(app.cur.transport.playhead_beat.unwrap_or(0.0));
     (beat, song_secs_at_beat(app, beat))
 }
 
-/// `beat` を engine / export と同じ写像で song 秒へ落とす。
-///
-/// テンポカーブのある曲では `beats_to_samples` が 1/64 拍刻みの積分 = **O(拍)** で、
-/// 描画は毎フレーム走る。 拍は 1 フレームの間に何度も同じ値で問われる (transport 位置 +
-/// `build_plan` の anchor) ので、 **直近 1 件だけ memo** する。 曲を編集したら
-/// `edit_epoch` が変わるので、 テンポカーブを引き直したときは自動で無効になる。
+/// `beat` を engine と同じテンポ表で song 秒へ落とす。描画は毎フレーム走るので、編集世代ごとに
+/// キャッシュした表を引く ([`AppData::song_beat_to_seconds`])。
 fn song_secs_at_beat(app: &AppData, beat: f64) -> f64 {
-    let sr = app.ipc.sample_rate;
-    if sr == 0 || !beat.is_finite() {
+    if !beat.is_finite() {
         return 0.0;
     }
-    let epoch = app.cur.song_doc.edit_epoch();
-    if let Some((e, b, secs)) = app.cur.peph.preview_secs_memo.get()
-        && e == epoch
-        && b.to_bits() == beat.to_bits()
-    {
-        return secs;
-    }
-    let samples = common::automation::beats_to_samples(app.cur.song_doc.song(), sr, beat);
-    #[allow(clippy::cast_precision_loss)]
-    let secs = samples as f64 / f64::from(sr);
-    app.cur.peph.preview_secs_memo.set(Some((epoch, beat, secs)));
-    secs
+    app.song_beat_to_seconds(beat)
 }
 
 /// モジュレーションラックを **スクロール viewport の top-down

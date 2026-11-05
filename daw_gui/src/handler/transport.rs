@@ -94,11 +94,7 @@ impl AppData {
         };
         if start != playhead {
             self.cur.transport.playhead_beat = Some(start);
-            let samples = common::automation::beats_to_samples(
-                self.cur.song_doc.song(),
-                self.ipc.sample_rate,
-                f64::from(start),
-            );
+            let samples = self.beat_to_engine_samples(f64::from(start));
             self.send_audio(AudioCommand::SeekTo { project: self.pk(), samples });
         }
         if let Some(preroll_samples) = record {
@@ -155,12 +151,10 @@ impl AppData {
         // 未 flush だと engine の再生グリッドが旧 tempo のままで seek 位置がずれる。
         // epoch 未変化なら no-op。
         self.flush_song_sync();
-        // r.md #54: 定数 BPM の線形換算をやめ、engine の sample↔beat 対応と同じ
-        // `beats_to_samples` (SongTempo カーブの積分) を通す。定数換算のままだと
-        // テンポオートメーションのある曲で「クリックした小節と実際に鳴り始める
-        // 位置」がずれ、ラウドネス解析の「最大値の位置へ飛ぶ」も外れる。
-        let samples =
-            common::automation::beats_to_samples(self.cur.song_doc.song(), self.ipc.sample_rate, beat);
+        // r.md #54: 定数 BPM の線形換算のままだと、テンポオートメーションのある曲で
+        // 「クリックした小節と実際に鳴り始める位置」がずれ、ラウドネス解析の
+        // 「最大値の位置へ飛ぶ」も外れる。
+        let samples = self.beat_to_engine_samples(beat);
         self.send_audio(AudioCommand::SeekTo { project: self.pk(), samples });
     }
 

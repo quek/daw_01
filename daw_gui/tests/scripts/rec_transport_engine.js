@@ -16,7 +16,7 @@
 //      再生が始まった)。
 //  5. パンチアウト (StopRecording) は transport を止めない。
 //
-// 起動時の default song はクリップが無い = `song_ended` が常に false なので、
+// 起動時の default song はクリップが無い = 曲末の判定が常に false なので、
 // 曲末 auto-stop に邪魔されずに transport の素の挙動だけを見られる。
 
 function fmt(label, s) {

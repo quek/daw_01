@@ -127,7 +127,7 @@ impl AppData {
             && playhead_beat.is_finite())
         .then_some(playhead_beat as f32);
         // r.md #51: 曲末の auto-stop は **engine だけ**が判定する
-        // (`daw_audio/src/engine.rs` の `song_ended`)。 GUI 側にも同じ述語を
+        // (`daw_audio/src/engine.rs` の `reached_transport_end`)。 GUI 側にも同じ述語を
         // 複製していたが、engine 側は録音中に抑止する / GUI 側は抑止しない、の
         // ように片方だけ条件が増えた瞬間に「音は止まったのに録音は続く」
         // 「録音が始まった瞬間に止まる」という食い違いになる。 GUI は Tick で

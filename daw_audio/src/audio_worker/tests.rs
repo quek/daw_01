@@ -336,7 +336,7 @@ fn bundle(song: &Arc<Song>, refs: &Arc<PluginRefs>) -> RtBundle {
     RtBundle {
         song: Some(Arc::clone(song)),
         song_index: Arc::new(SongIndex::build(song)),
-        song_bounds: SongBounds::of(Some(song), SR),
+        song_bounds: SongBounds::of(Some(song), SR, &common::tempo_map::TempoMap::from_song(song)),
         tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(song)),
         schedule: Some(
             crate::graph::compile_schedule(

@@ -533,12 +533,6 @@ pub struct ProjectEphemeral {
     /// shortcut で「対応 lane を所有 track に追加」 する source。
     /// session-only (起動 None、Undo / save 対象外)。
     pub last_touched_param: Option<TouchedParam>,
-    /// r.md #88: 変調ラックのプレビュー用 `beat → song 秒` の直近 1 件 memo
-    /// `(edit_epoch, beat, secs)`。 テンポカーブのある曲では `beats_to_samples` が
-    /// **O(拍)** の積分で、 描画は毎フレーム走る。 1 フレームの中で同じ拍が何度も
-    /// 問われる (transport 位置 + `build_plan` の anchor) ので 1 件で足りる。
-    /// `edit_epoch` を鍵に含めるので、 テンポカーブを描き替えたら自動で無効になる。
-    pub preview_secs_memo: std::cell::Cell<Option<(u64, f64, f64)>>,
     /// r.md #10: `Home` の 2 段トグル state。 直前の `Home` が「先頭 (時間的に
     /// 最初) のクリップの頭」 へ飛んだなら `true`。 次の `Home` はこれを見て
     /// 1.1.1 (beat 0) へ戻す。 **live playhead 位置で判定しない**理由: 再生中は
@@ -1001,7 +995,6 @@ impl ProjectState {
                 pianoroll_hover_pitch: None,
                 editing_automation_point: None,
                 last_touched_param: None,
-                preview_secs_memo: std::cell::Cell::new(None),
                 home_toggle_at_first: false,
                 arrange_hover_content: None,
                 arrange_hovered_automation_lane: None,

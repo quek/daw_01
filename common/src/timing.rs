@@ -1,7 +1,8 @@
-//! Sample / beat conversion helpers shared by `daw_plugin_host`
-//! (audio thread) and `daw_gui` (playhead rendering).
+//! Sample / beat conversion helpers shared by `daw_audio` (audio thread) and
+//! `daw_gui`.
 
 use crate::model::{Clip, LoopRegion, Song};
+use crate::tempo_map::TempoMap;
 
 /// Every clip that contributes to the song's playable envelope: finite,
 /// positive-length, finite-start clips across all tracks. Single source of
@@ -26,7 +27,9 @@ fn playable_clips(song: &Song) -> impl Iterator<Item = &Clip> {
 /// The `None` case means "do not loop, do not play": downstream code should
 /// treat it as end-of-song. The bounds are the outer envelope of all
 /// material; playhead iterates over this span once per loop cycle.
-pub fn song_bounds_samples(song: Option<&Song>, sample_rate: u32) -> Option<(u64, u64)> {
+///
+/// `tempo` は `song` から作った表。テンポカーブのある曲は、engine が sample を拍へ戻すときと同じ表で換算する。
+pub fn song_bounds_samples(song: Option<&Song>, sample_rate: u32, tempo: &TempoMap) -> Option<(u64, u64)> {
     let song = song?;
     if song.bpm <= 0.0 {
         return None;
@@ -35,8 +38,13 @@ pub fn song_bounds_samples(song: Option<&Song>, sample_rate: u32) -> Option<(u64
     let mut min_start: Option<u64> = None;
     let mut max_end: u64 = 0;
     for clip in playable_clips(song) {
-        let start = (clip.start_beat * samples_per_beat).max(0.0) as u64;
-        let length = (clip.length_beats * samples_per_beat) as u64;
+        let (start, length) = if tempo.is_automated() {
+            let start = tempo.beat_to_samples(clip.start_beat, sample_rate);
+            let end = tempo.beat_to_samples(clip.start_beat + clip.length_beats, sample_rate);
+            (start, end.saturating_sub(start))
+        } else {
+            ((clip.start_beat * samples_per_beat).max(0.0) as u64, (clip.length_beats * samples_per_beat) as u64)
+        };
         // A clip shorter than one sample at this rate contributes nothing.
         if length == 0 {
             continue;
@@ -88,51 +96,50 @@ pub fn song_end_beat(song: &Song) -> f64 {
     length.max(content_end).clamp(0.0, MAX_SONG_BEATS)
 }
 
-/// True when `playhead` has advanced past the last clip's end (or there is
-/// nothing playable across the whole song).
-pub fn song_ended(song: Option<&Song>, sample_rate: u32, playhead: u64) -> bool {
-    ended_at(song_bounds_samples(song, sample_rate), playhead)
-}
-
-/// [`song_ended`] の、曲の範囲 ([`song_bounds_samples`]) を求め済みの形 (RT は song と同じ便で届いた値を使い、
-/// buffer ごとに全 clip を舐めない)。
+/// `playhead` が最後のクリップの終端に達したか。曲の範囲 ([`song_bounds_samples`]) は求め済みのものを渡す
+/// (RT は song と同じ便で届いた値を使い、buffer ごとに全 clip を舐めない)。
 #[must_use]
 pub fn ended_at(bounds: Option<(u64, u64)>, playhead: u64) -> bool {
     bounds.is_some_and(|(_, end)| playhead >= end)
 }
 
 /// 曲の範囲 ([`song_bounds_samples`]) を求めたときの sample rate とその値 (song と同じ便で RT へ届ける)。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SongBounds {
     pub sample_rate: u32,
     pub samples: Option<(u64, u64)>,
+    /// 最後のクリップの終端 [拍] (`samples` が `None` なら `None`)。
+    pub end_beat: Option<f64>,
 }
 
 impl SongBounds {
     #[must_use]
-    pub fn of(song: Option<&Song>, sample_rate: u32) -> Self {
-        Self { sample_rate, samples: song_bounds_samples(song, sample_rate) }
+    pub fn of(song: Option<&Song>, sample_rate: u32, tempo: &TempoMap) -> Self {
+        let samples = song_bounds_samples(song, sample_rate, tempo);
+        let end_beat = samples.and(song).and_then(content_bounds_beats).map(|(_, end)| end);
+        Self { sample_rate, samples, end_beat }
+    }
+
+    /// 鳴っている拍 `beat` で見た `(ループの端に達したか, 曲末に達したか)`。テンポが動く曲の判定に使う。
+    /// 前者は `loop_active` (ループが効いている) のときだけ `Some`。`loop_region` に範囲が無ければ曲全体がループ区間。
+    #[must_use]
+    pub fn reached_at_beat(&self, beat: f64, loop_region: LoopRegion, loop_active: bool) -> (Option<bool>, bool) {
+        let song_ended = self.end_beat.is_some_and(|end| beat >= end);
+        let loop_end_reached = loop_active.then(|| match loop_region.range() {
+            Some((_, end)) => beat >= end,
+            None => song_ended,
+        });
+        (loop_end_reached, song_ended)
     }
 
     /// `sample_rate` での曲の範囲。求めたときと rate が違えば (device の rate が session と食い違う間) その rate で
-    /// 求め直して持ち替える — 次の buffer からは求め直さない。`song` は求めたときと同じ snapshot。
-    pub fn at(&mut self, song: Option<&Song>, sample_rate: u32) -> Option<(u64, u64)> {
+    /// 求め直して持ち替える — 次の buffer からは求め直さない。`song` と `tempo` は求めたときと同じ snapshot。
+    pub fn at(&mut self, song: Option<&Song>, sample_rate: u32, tempo: &TempoMap) -> Option<(u64, u64)> {
         if self.sample_rate != sample_rate {
-            *self = Self::of(song, sample_rate);
+            *self = Self::of(song, sample_rate, tempo);
         }
         self.samples
     }
-}
-
-/// Converts a sample-domain playhead to a beat-domain position. `None` when
-/// the song has no BPM defined.
-pub fn playhead_to_beat(song: Option<&Song>, sample_rate: u32, playhead: u64) -> Option<f64> {
-    let song = song?;
-    if song.bpm <= 0.0 {
-        return None;
-    }
-    let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song.bpm);
-    Some(playhead as f64 / samples_per_beat)
 }
 
 /// Converts a beat-domain position to `(bar, beat_in_bar)`, both **1-based**,
@@ -173,50 +180,39 @@ pub fn boundary_frame(delta_beats: f64, samples_per_beat: f64) -> f64 {
     if (x - nearest).abs() < 1e-6 { nearest } else { x.ceil() }
 }
 
-/// Converts a beat-domain position to seconds using the song's constant
-/// tempo. Inverse of the constant-`bpm` mapping `playhead_to_beat` uses, so
-/// the displayed time matches the audio engine's playback position.
-pub fn beat_to_seconds(beat: f64, bpm: f32) -> f64 {
-    if bpm <= 0.0 || !beat.is_finite() {
-        return 0.0;
-    }
-    beat * 60.0 / f64::from(bpm)
-}
-
 /// Returns the sample range the audio engine should treat as the active
 /// playback loop. Prefers the user-defined [`LoopRegion`] range when it is
-/// non-empty; otherwise falls back to the full song-content envelope from
-/// [`song_bounds_samples`].
+/// non-empty; otherwise falls back to `song_bounds`, the full song-content
+/// envelope from [`song_bounds_samples`] (RT は song と同じ便で届いた値を渡す).
 ///
 /// The loop region is **session state**, not part of `Song` (see
 /// [`LoopRegion`]): the engine receives it via `AudioCommand::SetLoop` and
-/// passes it in here. `song` still supplies the BPM for the beat → sample
-/// conversion and the content-envelope fallback.
+/// passes it in here. テンポカーブのある曲は、engine が sample を拍へ戻すときと同じ `tempo` の表で換算する
+/// (巻き戻した先の sample が指定した拍に戻る)。表の引きは alloc なしで RT から呼べる。
+#[must_use]
 pub fn effective_loop_bounds(
     song: Option<&Song>,
     loop_region: LoopRegion,
     sample_rate: u32,
-) -> Option<(u64, u64)> {
-    effective_loop_bounds_with(song, loop_region, sample_rate, || song_bounds_samples(song, sample_rate))
-}
-
-/// [`effective_loop_bounds`] の、曲の範囲を求める手段を渡す形 (RT は song と同じ便で届いた値を返す)。
-pub fn effective_loop_bounds_with(
-    song: Option<&Song>,
-    loop_region: LoopRegion,
-    sample_rate: u32,
-    song_bounds: impl FnOnce() -> Option<(u64, u64)>,
+    tempo: &TempoMap,
+    song_bounds: Option<(u64, u64)>,
 ) -> Option<(u64, u64)> {
     let song_ref = song?;
     if song_ref.bpm > 0.0 && loop_region.has_range() {
-        let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song_ref.bpm);
-        let start = (loop_region.start_beat * samples_per_beat).max(0.0) as u64;
-        let end = (loop_region.end_beat * samples_per_beat).max(0.0) as u64;
+        let (start, end) = if tempo.is_automated() {
+            (tempo.beat_to_samples(loop_region.start_beat, sample_rate), tempo.beat_to_samples(loop_region.end_beat, sample_rate))
+        } else {
+            let samples_per_beat = f64::from(sample_rate) * 60.0 / f64::from(song_ref.bpm);
+            (
+                (loop_region.start_beat * samples_per_beat).max(0.0) as u64,
+                (loop_region.end_beat * samples_per_beat).max(0.0) as u64,
+            )
+        };
         if end > start {
             return Some((start, end));
         }
     }
-    song_bounds()
+    song_bounds
 }
 
 #[cfg(test)]
@@ -245,33 +241,39 @@ mod tests {
         }
     }
 
+    /// 48 kHz での曲の範囲 (本番と同じく `song` から作った表で求める)。
+    fn bounds(song: Option<&Song>) -> Option<(u64, u64)> {
+        let default = Song::default();
+        song_bounds_samples(song, 48000, &TempoMap::from_song(song.unwrap_or(&default)))
+    }
+
     #[test]
     fn bounds_none_for_no_song() {
-        assert_eq!(song_bounds_samples(None, 48000), None);
+        assert_eq!(bounds(None), None);
     }
 
     #[test]
     fn bounds_none_for_empty_tracks() {
-        assert_eq!(song_bounds_samples(Some(&Song::default()), 48000), None);
+        assert_eq!(bounds(Some(&Song::default())), None);
     }
 
     #[test]
     fn bounds_none_for_zero_bpm() {
         let song = song_with_clip(0.0, 0.0, 4.0);
-        assert_eq!(song_bounds_samples(Some(&song), 48000), None);
+        assert_eq!(bounds(Some(&song)), None);
     }
 
     #[test]
     fn bounds_none_for_zero_length_clip() {
         let song = song_with_clip(120.0, 0.0, 0.0);
-        assert_eq!(song_bounds_samples(Some(&song), 48000), None);
+        assert_eq!(bounds(Some(&song)), None);
     }
 
     #[test]
     fn bounds_standard_clip() {
         // 120 BPM, 48 kHz: 1 beat = 24000 samples; 4 beats = 96000 samples.
         let song = song_with_clip(120.0, 0.0, 4.0);
-        assert_eq!(song_bounds_samples(Some(&song), 48000), Some((0, 96_000)));
+        assert_eq!(bounds(Some(&song)), Some((0, 96_000)));
     }
 
     #[test]
@@ -279,7 +281,7 @@ mod tests {
         // Start at beat 2 → 48000 samples in; length 4 beats → end at 144000.
         let song = song_with_clip(120.0, 2.0, 4.0);
         assert_eq!(
-            song_bounds_samples(Some(&song), 48000),
+            bounds(Some(&song)),
             Some((48_000, 144_000))
         );
     }
@@ -320,7 +322,7 @@ mod tests {
             ],
             ..Song::default()
         };
-        assert_eq!(song_bounds_samples(Some(&song), 48000), Some((0, 192_000)));
+        assert_eq!(bounds(Some(&song)), Some((0, 192_000)));
     }
 
     #[test]
@@ -336,39 +338,43 @@ mod tests {
     }
 
     #[test]
-    fn song_ended_never_triggers_with_no_song() {
-        assert!(!song_ended(None, 48000, 0));
-        assert!(!song_ended(None, 48000, u64::MAX));
-    }
-
-    #[test]
-    fn song_ended_after_final_clip_end() {
+    fn loop_bounds_without_tempo_curve_use_the_song_bpm() {
         let song = song_with_clip(120.0, 0.0, 4.0);
-        assert!(!song_ended(Some(&song), 48000, 95_999));
-        assert!(song_ended(Some(&song), 48000, 96_000));
-        assert!(song_ended(Some(&song), 48000, 96_001));
+        let tempo = TempoMap::from_song(&song);
+        let region = LoopRegion { enabled: true, start_beat: 8.0, end_beat: 24.0 };
+        assert_eq!(effective_loop_bounds(Some(&song), region, 48000, &tempo, None), Some((192_000, 576_000)));
     }
 
     #[test]
-    fn song_ended_treats_zero_length_as_not_ended() {
+    fn reached_at_beat_uses_the_loop_end_or_the_song_end() {
+        let song = song_with_clip(120.0, 0.0, 4.0);
+        let b = SongBounds::of(Some(&song), 48000, &TempoMap::from_song(&song));
+        let region = LoopRegion { enabled: true, start_beat: 1.0, end_beat: 2.0 };
+        assert_eq!(b.reached_at_beat(1.9, region, true), (Some(false), false));
+        assert_eq!(b.reached_at_beat(2.0, region, true), (Some(true), false));
+        assert_eq!(b.reached_at_beat(4.0, region, false), (None, true));
+        // 範囲が無いループは曲全体を回す。
+        assert_eq!(b.reached_at_beat(4.0, LoopRegion::default(), true), (Some(true), true));
+    }
+
+    #[test]
+    fn ended_at_never_triggers_with_no_song() {
+        assert!(!ended_at(bounds(None), 0));
+        assert!(!ended_at(bounds(None), u64::MAX));
+    }
+
+    #[test]
+    fn ended_at_after_final_clip_end() {
+        let song = song_with_clip(120.0, 0.0, 4.0);
+        assert!(!ended_at(bounds(Some(&song)), 95_999));
+        assert!(ended_at(bounds(Some(&song)), 96_000));
+        assert!(ended_at(bounds(Some(&song)), 96_001));
+    }
+
+    #[test]
+    fn ended_at_treats_zero_length_as_not_ended() {
         let song = song_with_clip(120.0, 0.0, 0.0);
-        assert!(!song_ended(Some(&song), 48000, 1_000_000));
-    }
-
-    #[test]
-    fn playhead_to_beat_basic() {
-        let song = song_with_clip(120.0, 0.0, 4.0);
-        // 120 BPM, 48 kHz: samples_per_beat = 24000.
-        assert_eq!(playhead_to_beat(Some(&song), 48000, 0), Some(0.0));
-        assert_eq!(playhead_to_beat(Some(&song), 48000, 24_000), Some(1.0));
-        assert_eq!(playhead_to_beat(Some(&song), 48000, 96_000), Some(4.0));
-    }
-
-    #[test]
-    fn playhead_to_beat_none_for_invalid_song() {
-        assert_eq!(playhead_to_beat(None, 48000, 0), None);
-        let song = song_with_clip(0.0, 0.0, 4.0);
-        assert_eq!(playhead_to_beat(Some(&song), 48000, 0), None);
+        assert!(!ended_at(bounds(Some(&song)), 1_000_000));
     }
 
     #[test]
@@ -395,17 +401,6 @@ mod tests {
     fn beat_to_bar_beat_handles_degenerate() {
         assert_eq!(beat_to_bar_beat(f64::NAN, (4, 4)), (1, 1.0));
         assert_eq!(beat_to_bar_beat(5.0, (0, 4)), (1, 1.0));
-    }
-
-    #[test]
-    fn beat_to_seconds_constant_tempo() {
-        // 120 BPM: 1 beat = 0.5 s; matches playhead_to_beat inverse.
-        assert!((beat_to_seconds(0.0, 120.0) - 0.0).abs() < 1e-9);
-        assert!((beat_to_seconds(1.0, 120.0) - 0.5).abs() < 1e-9);
-        assert!((beat_to_seconds(4.0, 120.0) - 2.0).abs() < 1e-9);
-        // 140 BPM: 32 beats → 32 * 60/140 ≈ 13.714 s.
-        assert!((beat_to_seconds(32.0, 140.0) - 13.714285714).abs() < 1e-6);
-        assert_eq!(beat_to_seconds(4.0, 0.0), 0.0);
     }
 
     fn clip(start_beat: f64, length_beats: f64) -> Clip {

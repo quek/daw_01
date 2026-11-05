@@ -260,18 +260,19 @@ impl BundlePublisher {
         match &mut self.derived {
             Some(d) if same_song(d) => {
                 if d.sample_rate != sample_rate {
-                    (d.sample_rate, d.bounds) = (sample_rate, SongBounds::of(song.map(|s| &**s), sample_rate));
+                    (d.sample_rate, d.bounds) = (sample_rate, SongBounds::of(song.map(|s| &**s), sample_rate, &d.tempo_map));
                 }
             }
             slot => {
                 let default_song = common::model::Song::default();
                 let s = song.map_or(&default_song, |s| &**s);
+                let tempo_map = Arc::new(common::tempo_map::TempoMap::from_song(s));
                 *slot = Some(SongDerived {
                     song: song.cloned(),
                     sample_rate,
                     index: Arc::new(song.map_or_else(SongIndex::default, |s| SongIndex::build(s))),
-                    bounds: SongBounds::of(song.map(|s| &**s), sample_rate),
-                    tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(s)),
+                    bounds: SongBounds::of(song.map(|s| &**s), sample_rate, &tempo_map),
+                    tempo_map,
                 });
             }
         }

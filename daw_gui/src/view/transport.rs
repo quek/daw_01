@@ -245,8 +245,8 @@ fn ts_index_to_den(idx: usize) -> u8 {
 /// (アレンジ / ピアノロールのルーラと同じ [`common::timing::beat_to_bar_beat`])、
 /// 秒は [`AppData::song_beat_to_seconds`] から導出する。 これは SongTempo automation
 /// lane があれば `TempoMap` を `song_epoch` 世代キャッシュに載せて引くだけの経路で、
-/// 無ければ定数 BPM の高速経路に落ちる。 旧実装は常に定数 BPM 換算の
-/// `timing::beat_to_seconds` だったので、 テンポカーブを引いた曲で秒表示だけが
+/// 無ければ定数 BPM の高速経路に落ちる。 旧実装は常に定数 BPM 換算だったので、
+/// テンポカーブを引いた曲で秒表示だけが
 /// 実時間とずれていた。 なお `common::tempo_map::song_beat_to_seconds` を直に呼ぶと
 /// テンポカーブのある曲で毎フレーム O(曲長) の table 構築が走る (常時描画のバーなので
 /// 曲長に比例して悪化する) ため、 必ずキャッシュ側を通す。

@@ -120,12 +120,11 @@ pub fn buffer_is_idle(
 #[must_use]
 pub fn reached_transport_end(
     keep_rolling: bool,
-    active_loop_end: Option<u64>,
-    new_playhead: u64,
+    loop_end_reached: Option<bool>,
     song_has_ended: bool,
 ) -> bool {
-    match active_loop_end {
-        Some(end) => new_playhead >= end,
+    match loop_end_reached {
+        Some(reached) => reached,
         None => !keep_rolling && song_has_ended,
     }
 }
@@ -714,7 +713,7 @@ mod idle_park_tests {
         ];
         for (keep_rolling, loop_end, playhead, ended, expect) in cases {
             assert_eq!(
-                reached_transport_end(keep_rolling, loop_end, playhead, ended),
+                reached_transport_end(keep_rolling, loop_end.map(|end: u64| playhead >= end), ended),
                 expect,
                 "keep_rolling={keep_rolling} loop_end={loop_end:?} ph={playhead} ended={ended}"
             );

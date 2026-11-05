@@ -33,7 +33,7 @@ use common::device_scope_bridge::{DeviceScopeBridgeHandle, MAX_DEVICE_SCOPES};
 use common::model::Song;
 use common::protocol::{ProjectKey, SamplerSource};
 use common::song_index::SongIndex;
-use common::timing::{SongBounds, effective_loop_bounds_with, ended_at};
+use common::timing::{SongBounds, effective_loop_bounds, ended_at};
 
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::graph::{DelayLine, DeviceScopeTap, NativeIo, Schedule, render_master_buffer};
@@ -1326,18 +1326,25 @@ impl ProjectRt {
         // Playhead advance + auto-stop / loop wrap.
         if playing {
             let mut new_ph = playhead + n as u64;
-            let song_bounds = self.song_bounds.at(song_ref, sample_rate);
+            let song_bounds = self.song_bounds.at(song_ref, sample_rate, &self.tempo_map);
             let active_end = if looping {
-                effective_loop_bounds_with(song_ref, loop_region, sample_rate, || song_bounds).map(|(_, e)| e)
+                effective_loop_bounds(song_ref, loop_region, sample_rate, &self.tempo_map, song_bounds).map(|(_, e)| e)
             } else {
                 None
+            };
+            // テンポが動く曲は**鳴っている拍**で判定する。sample の端はテンポ表で換算した値で、表は変調を含まず
+            // 1/16 拍より細かい段差も丸めるので、指定した拍から外れる。動かない曲は従来どおり sample で比べる。
+            let rendered_beat =
+                if self.tempo_map.varies() { self.mod_tick.beat_at_sample(new_ph, sample_rate) } else { None };
+            let (loop_end_reached, song_has_ended) = match rendered_beat {
+                Some(beat) => self.song_bounds.reached_at_beat(beat, loop_region, active_end.is_some()),
+                None => (active_end.map(|end| new_ph >= end), ended_at(song_bounds, new_ph)),
             };
             // r.md #87: ランチャーが鳴っている間は曲末で止めない (上の doc)。
             let reached_end = reached_transport_end(
                 recording_requested || self.launcher.any_cell_playing(),
-                active_end,
-                new_ph,
-                ended_at(song_bounds, new_ph),
+                loop_end_reached,
+                song_has_ended,
             );
             // r.md #89: `playhead_beats` は **刻みが進める** (この buffer の頭で
             // `ModTickRunner::run_buffer` が解いた値を入れてある)。ここで
@@ -1359,7 +1366,7 @@ impl ProjectRt {
             if reached_end {
                 self.queue_all_notes_off();
                 let wrap_to = if looping {
-                    effective_loop_bounds_with(song_ref, loop_region, sample_rate, || song_bounds).map(|(s, _)| s)
+                    effective_loop_bounds(song_ref, loop_region, sample_rate, &self.tempo_map, song_bounds).map(|(s, _)| s)
                 } else {
                     None
                 };
@@ -1367,7 +1374,7 @@ impl ProjectRt {
                     // 巻き戻しの起点は **この buffer の末尾** (`new_ph` = 進めた後の位置)。
                     // `playhead_beats` (buffer 頭の拍) を起点にすると跳び量が 1 buffer ぶん
                     // 多くなり、ランチャーの時計が周回ごとに 1 buffer 遅れて累積する。
-                    let prev_beats = self.tempo_map.samples_to_beat(new_ph, sample_rate);
+                    let prev_beats = rendered_beat.unwrap_or_else(|| self.tempo_map.samples_to_beat(new_ph, sample_rate));
                     new_ph = start;
                     // A10 (r.md #8): loop start の beat も tempo map で正確に
                     // 逆算 (constant-bpm 線形推定は tempo automation 中の loop
@@ -1563,7 +1570,7 @@ mod bundle_install_tests {
         RtBundle {
             song: Some(Arc::clone(song)),
             song_index: Arc::new(SongIndex::build(song)),
-            song_bounds: SongBounds::of(Some(song), 48_000),
+            song_bounds: SongBounds::of(Some(song), 48_000, &common::tempo_map::TempoMap::from_song(song)),
             tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(song)),
             input_delay_replacements: crate::project_ctl::build_input_delay_replacements(&schedule),
             schedule: Some(schedule),
@@ -1590,7 +1597,7 @@ mod bundle_install_tests {
         RtBundle {
             song: Some(Arc::clone(song)),
             song_index: Arc::new(SongIndex::build(song)),
-            song_bounds: SongBounds::of(Some(song), 48_000),
+            song_bounds: SongBounds::of(Some(song), 48_000, &common::tempo_map::TempoMap::from_song(song)),
             tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(song)),
             schedule: None,
             reset_song_scoped_state: false,
@@ -2295,7 +2302,7 @@ mod multi_project_tests {
         RtBundle {
             song: Some(Arc::clone(song)),
             song_index: Arc::new(SongIndex::build(song)),
-            song_bounds: SongBounds::of(Some(song), 48_000),
+            song_bounds: SongBounds::of(Some(song), 48_000, &common::tempo_map::TempoMap::from_song(song)),
             tempo_map: Arc::new(common::tempo_map::TempoMap::from_song(song)),
             schedule: Some(
                 crate::graph::compile_schedule(
@@ -2358,6 +2365,102 @@ mod multi_project_tests {
         assert_eq!(a.playhead.load(Ordering::Acquire), 256 * 6);
         assert_eq!(b.playhead.load(Ordering::Acquire), 256 * 5);
         assert!(r.dev.any_playing());
+    }
+
+    /// 基準の BPM が 120 で、`points` = `(拍, BPM)` のテンポカーブ (値を保持する階段) を引いた曲。
+    /// `clip_end` は最後のクリップの終端。
+    fn song_with_tempo(points: &[(f64, f64)], clip_end: f64) -> Arc<Song> {
+        use common::model::{
+            AutomationClip, AutomationContent, AutomationCurve, AutomationLane, AutomationPoint, AutomationTarget,
+            Clip, ClipContent,
+        };
+        let mut s = Song { bpm: 120.0, ..Song::default() };
+        let mut t = track(1);
+        t.clips.push(Clip { id: 1, length_beats: clip_end, ..Clip::default() });
+        s.tracks.push(t);
+        let cid = s.alloc_content_id();
+        let points = points
+            .iter()
+            .map(|&(time_beat, value)| AutomationPoint { id: 0, time_beat, value, curve: AutomationCurve::Hold })
+            .collect();
+        s.clip_contents.insert(cid, ClipContent::Automation(AutomationContent { next_point_id: 0, points }));
+        s.song_lanes.push(AutomationLane {
+            id: 1,
+            clips: vec![AutomationClip {
+                id: 1,
+                name: "t".into(),
+                start_beat: 0.0,
+                length_beats: 200.0,
+                content_id: cid,
+                content_offset_beats: 0.0,
+                color: None,
+            }],
+            ..AutomationLane::new(AutomationTarget::SongTempo, 60.0)
+        });
+        Arc::new(s)
+    }
+
+    /// テンポカーブのある曲のループは、基準の BPM ではなく指定した拍で折り返す。
+    #[test]
+    fn テンポカーブの曲のループは指定した拍で折り返す() {
+        let mut r = rig("tempo_loop");
+        let (a, mut a_tx) = open(&mut r, ProjectKey(1));
+        let mut b = bundle(&song_with_tempo(&[(0.0, 60.0)], 100.0));
+        b.loop_region = common::model::LoopRegion { enabled: true, start_beat: 1.0, end_beat: 2.0 };
+        a_tx.push(b).ok().unwrap();
+        run(&mut r, 1);
+        a.playback.store(PlaybackCommand::Play as u8, Ordering::Release);
+
+        // 基準の 120 BPM で換算すると拍 2 = 48,000 サンプルで折り返してしまう。
+        run(&mut r, 200);
+        assert_eq!(a.playhead.load(Ordering::Acquire), 51_200, "拍 2 (96,000) の手前では折り返さない");
+        run(&mut r, 174);
+        assert_eq!(a.playhead.load(Ordering::Acquire), 95_744, "折り返す直前");
+        run(&mut r, 1);
+        assert_eq!(a.playhead.load(Ordering::Acquire), 48_000, "拍 2 で拍 1 (48,000) へ戻る");
+    }
+
+    /// テンポカーブのある曲の自動停止は、基準の BPM ではなく最後のクリップの終端で起きる。
+    #[test]
+    fn テンポカーブの曲は最後のクリップの終端で止まる() {
+        let mut r = rig("tempo_end");
+        let (a, mut a_tx) = open(&mut r, ProjectKey(1));
+        a_tx.push(bundle(&song_with_tempo(&[(0.0, 60.0)], 2.0))).ok().unwrap();
+        run(&mut r, 1);
+        a.playback.store(PlaybackCommand::Play as u8, Ordering::Release);
+
+        // 基準の 120 BPM で換算すると拍 2 = 48,000 サンプルで止まってしまう。
+        run(&mut r, 200);
+        assert!(r.bridge.find_project(ProjectKey(1)).unwrap().playing(), "拍 2 (96,000) の手前では止まらない");
+        run(&mut r, 176);
+        assert!(!r.bridge.find_project(ProjectKey(1)).unwrap().playing(), "拍 2 で止まる");
+        assert_eq!(a.playhead.load(Ordering::Acquire), 96_000, "止まった位置は拍 2");
+    }
+
+    /// 1/16 拍の格子に乗らない段差ではテンポ表が約 500 サンプル (1 buffer の 2 倍) ずれる。
+    /// 折り返しは表ではなく鳴っている拍で判定するので、端を越えた最初の buffer で巻き戻る。
+    #[test]
+    fn 段差テンポの曲のループは鳴っている拍で折り返す() {
+        let mut r = rig("tempo_step");
+        let (a, mut a_tx) = open(&mut r, ProjectKey(1));
+        let mut b = bundle(&song_with_tempo(&[(0.0, 120.0), (8.3333, 60.0)], 100.0));
+        b.loop_region = common::model::LoopRegion { enabled: true, start_beat: 8.0, end_beat: 9.0 };
+        a_tx.push(b).ok().unwrap();
+        run(&mut r, 1);
+        a.playback.store(PlaybackCommand::Play as u8, Ordering::Release);
+
+        let mut last = 0.0;
+        for _ in 0..2_000 {
+            run(&mut r, 1);
+            let now = r.dev.projects[0].playhead_beats;
+            if now < last {
+                assert!(last < 9.0, "ひとつ前の buffer で端を越えていた: {last}");
+                assert!((now - 8.0).abs() < 1e-3, "拍 8 へ戻る: {now}");
+                return;
+            }
+            last = now;
+        }
+        panic!("折り返さなかった (最後の拍 {last})");
     }
 
     /// 計画書 §3.5: **出力はミックス**。1 デバイスの master は開いている全 project の
