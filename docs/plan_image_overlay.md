@@ -3,6 +3,11 @@
 ステータス: **設計完了** (2026-05-26)、着手前。 grilling session 未実施
 (= 短い「画像を動画に重ねられるようにして」 要望 + AskUserQuestion で PiP 確定)。
 
+> **2026-11-14 追記**: アニメーション GIF / APNG / WebP に対応した。本文の「静止画像のみ」
+> 「animated GIF / APNG は out-of-scope」「GPU upload は 1 枚」は当時の計画で、現状は
+> `daw_gui/src/image_frames.rs` の module doc が正本 (全フレームを decode し、イベント開始
+> からの経過秒でフレームを選ぶ)。
+
 関連: [plan_video.md](plan_video.md) (= video clip pipeline)、
 [plan_video_perf.md](plan_video_perf.md) (= zero-copy + ring buffer)、
 [plan_audio_clip.md](plan_audio_clip.md) (= clip ⊃ event 階層モデル)。

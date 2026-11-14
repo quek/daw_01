@@ -1947,7 +1947,7 @@ impl Runner {
             let Some(handle) = preview
                 .image_textures
                 .get(&frame_info.image_source_id)
-                .map(|t| t.handle_at(frame_info.anim_secs))
+                .and_then(|t| t.handle_at(frame_info.anim_secs))
             else {
                 continue; // texture not yet uploaded
             };

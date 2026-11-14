@@ -46,7 +46,7 @@ impl std::fmt::Display for ImageImportError {
         match self {
             Self::UnsupportedFormat(ext) => write!(
                 f,
-                "Unsupported image format: .{ext} (P2 supports png/jpg/jpeg/webp/bmp/tiff/tga/gif)"
+                "Unsupported image format: .{ext} (P2 supports png/jpg/jpeg/webp/bmp/tiff/tga/gif/apng)"
             ),
             Self::DecodeFailed(s) => write!(f, "Image decode failed: {s}"),
             Self::IoError(s) => write!(f, "I/O error: {s}"),
@@ -108,7 +108,7 @@ pub fn is_supported_extension(path: &Path) -> bool {
     };
     matches!(
         ext.to_ascii_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff" | "tga" | "gif"
+        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff" | "tga" | "gif" | "apng"
     )
 }
 
@@ -316,6 +316,7 @@ mod tests {
         assert!(is_supported_extension(Path::new("a.tiff")));
         assert!(is_supported_extension(Path::new("a.tga")));
         assert!(is_supported_extension(Path::new("a.gif")));
+        assert!(is_supported_extension(Path::new("a.apng")));
         assert!(!is_supported_extension(Path::new("a.mp4")));
         assert!(!is_supported_extension(Path::new("a.txt")));
         assert!(!is_supported_extension(Path::new("noext")));

@@ -655,14 +655,14 @@ impl AppData {
     }
 
     /// File menu → "Import Image..." 経路。 `rfd` の native file picker
-    /// (multi-select、 png/jpg/jpeg/webp/bmp/gif filter) を開いて、 選択
+    /// (multi-select、 png/jpg/jpeg/webp/bmp/tiff/tga/gif/apng filter) を開いて、 選択
     /// された path を `action_import_image` に転送する。 OS-neutral
     /// (= image crate のみ、 cfg(windows) 不要)。
     pub(crate) fn action_open_import_image_dialog(&mut self) {
         let dialog = rfd::FileDialog::new()
             .add_filter(
                 "Image",
-                &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "tga", "gif"],
+                &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "tga", "gif", "apng"],
             )
             .set_title("Import Image...");
         self.spawn_file_dialog(

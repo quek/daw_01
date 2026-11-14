@@ -80,36 +80,20 @@ pub struct ImagePixels {
 
 /// 画像ファイルを decode する。形式は中身から判定する (拡張子を信じない)。
 pub fn decode_image_pixels(path: &Path) -> Result<ImagePixels, String> {
-    let format = ImageReader::open(path)
+    // 既定の上限 (確保 512 MB) つきの reader。静止画はこれでそのまま読む。
+    let reader = ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
-        .map_err(|e| e.to_string())?
-        .format();
-    let animated = match format {
-        Some(ImageFormat::Gif) => {
-            let dec = image::codecs::gif::GifDecoder::new(open_buffered(path)?)
-                .map_err(|e| e.to_string())?;
-            Some(collect_frames(dec)?)
-        }
-        Some(ImageFormat::Png) => {
-            let dec = image::codecs::png::PngDecoder::new(open_buffered(path)?)
-                .map_err(|e| e.to_string())?;
-            if dec.is_apng().map_err(|e| e.to_string())? {
-                Some(collect_frames(dec.apng().map_err(|e| e.to_string())?)?)
-            } else {
-                None
-            }
-        }
-        Some(ImageFormat::WebP) => {
-            let dec = image::codecs::webp::WebPDecoder::new(open_buffered(path)?)
-                .map_err(|e| e.to_string())?;
-            if dec.has_animation() { Some(collect_frames(dec)?) } else { None }
-        }
-        _ => None,
-    };
+        .map_err(|e| e.to_string())?;
+    // アニメーションとして読めなければ静止画 (先頭フレーム) として読み直す。
+    // 16-bit の APNG のように、静止画なら読めるものを落とさない。
+    let animated = decode_animation(path, reader.format()).unwrap_or_else(|e| {
+        tracing::warn!(path = %path.display(), error = %e, "animation decode failed; reading as a still image");
+        None
+    });
     let pixels = match animated {
         Some(p) => p,
         None => {
-            let rgba = image::open(path).map_err(|e| e.to_string())?.into_rgba8();
+            let rgba = reader.decode().map_err(|e| e.to_string())?.into_rgba8();
             let (width, height) = rgba.dimensions();
             ImagePixels {
                 width,
@@ -125,8 +109,63 @@ pub fn decode_image_pixels(path: &Path) -> Result<ImagePixels, String> {
     Ok(pixels)
 }
 
+/// アニメーションなら全フレームを読む。静止画 (アニメーションでない PNG / WebP、
+/// その他の形式) は `Ok(None)`。
+fn decode_animation(
+    path: &Path,
+    format: Option<ImageFormat>,
+) -> Result<Option<ImagePixels>, String> {
+    let err = |e: image::ImageError| e.to_string();
+    match format {
+        Some(ImageFormat::Gif) => {
+            let dec = image::codecs::gif::GifDecoder::new(open_buffered(path)?).map_err(err)?;
+            collect_frames(limited(dec)?).map(Some)
+        }
+        Some(ImageFormat::Png) => {
+            // `new` + `set_limits` では png crate の内部まで上限が届かない。
+            let dec =
+                image::codecs::png::PngDecoder::with_limits(open_buffered(path)?, alloc_limits())
+                    .map_err(err)?;
+            if !dec.is_apng().map_err(err)? {
+                return Ok(None);
+            }
+            collect_frames(limited(dec)?.apng().map_err(err)?).map(Some)
+        }
+        Some(ImageFormat::WebP) => {
+            let dec = image::codecs::webp::WebPDecoder::new(open_buffered(path)?).map_err(err)?;
+            if !dec.has_animation() {
+                return Ok(None);
+            }
+            collect_frames(limited(dec)?).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn alloc_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODED_BYTES as u64);
+    limits
+}
+
 fn open_buffered(path: &Path) -> Result<BufReader<File>, String> {
     File::open(path).map(BufReader::new).map_err(|e| e.to_string())
+}
+
+/// decoder を直に作ると確保量の上限が無い (`ImageReader` は既定の上限つき)。
+/// 巨大なキャンバスを名乗る壊れた / 悪意のあるファイルで確保させないよう、
+/// 1 フレームの大きさを decode の前に見て、decoder にも同じ上限を渡す。
+///
+/// `set_limits` が確保量まで見るのは GIF と PNG だけ。WebP の decoder は寸法しか
+/// 見ないので、WebP で効くのはここの寸法検査と [`collect_frames`] の累計の上限。
+fn limited<D: image::ImageDecoder>(mut dec: D) -> Result<D, String> {
+    let (width, height) = dec.dimensions();
+    let frame_bytes = u64::from(width) * u64::from(height) * 4;
+    if frame_bytes > MAX_DECODED_BYTES as u64 {
+        return Err(format!("image too large: {width}x{height}"));
+    }
+    dec.set_limits(alloc_limits()).map_err(|e| e.to_string())?;
+    Ok(dec)
 }
 
 fn collect_frames<'a>(dec: impl AnimationDecoder<'a>) -> Result<ImagePixels, String> {
@@ -139,7 +178,16 @@ fn collect_frames<'a>(dec: impl AnimationDecoder<'a>) -> Result<ImagePixels, Str
     let mut size = (0, 0);
     let mut bytes = 0usize;
     for frame in dec.into_frames() {
-        let frame = frame.map_err(|e| e.to_string())?;
+        let frame = match frame {
+            Ok(f) => f,
+            // 末尾が切れたファイル等。読めたところまでを使う (0 枚なら呼び出し側が
+            // 静止画として読み直す)。
+            Err(e) if !frames.is_empty() => {
+                tracing::warn!(frames = frames.len(), error = %e, "animation truncated");
+                break;
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         let (numer, denom) = frame.delay().numer_denom_ms();
         let ms = f64::from(numer) / f64::from(denom.max(1));
         let ms = if ms <= MIN_DELAY_MS { FALLBACK_DELAY_MS } else { ms };
@@ -155,7 +203,8 @@ fn collect_frames<'a>(dec: impl AnimationDecoder<'a>) -> Result<ImagePixels, Str
             ));
         }
         bytes = bytes.saturating_add(buf.as_raw().len());
-        if bytes > MAX_DECODED_BYTES && !frames.is_empty() {
+        // 1 フレーム目は上の寸法検査で上限内と分かっている。
+        if bytes > MAX_DECODED_BYTES {
             tracing::warn!(
                 frames = frames.len(),
                 "animated image exceeds {MAX_DECODED_BYTES} bytes; remaining frames dropped"
@@ -192,9 +241,9 @@ pub struct ImageTextures {
 }
 
 impl ImageTextures {
-    /// イベント開始から `secs` 秒の時点で引く texture。
-    pub fn handle_at(&self, secs: f64) -> TextureHandle {
-        self.frames[self.timing.frame_at(secs).min(self.frames.len() - 1)]
+    /// イベント開始から `secs` 秒の時点で引く texture (フレームが無ければ `None`)。
+    pub fn handle_at(&self, secs: f64) -> Option<TextureHandle> {
+        self.frames.get(self.timing.frame_at(secs)).or(self.frames.last()).copied()
     }
 }
 

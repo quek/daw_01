@@ -107,6 +107,12 @@ impl AppData {
         // (`Renderer` を持つ runner に世代印で伝える。main renderer 側のサムネイル /
         // 画像テクスチャはタブごとの cache に残るので触らない)。
         self.ui_ephemeral.project_generation = self.ui_ephemeral.project_generation.wrapping_add(1);
+        // preview の画像テクスチャは上で捨てられ、CPU 側の staging は upload 済みで
+        // 残っていない。開いている preview にこのタブの画像を出すため、ディスクから
+        // 読み直す (preview を後から開いたときと同じ経路。冪等)。
+        if self.ui_prefs.preview_window_visible {
+            self.begin_asset_decode("プレビュー用の画像を読込中");
+        }
         // 積算ラウドネスは「いま聴いている曲」のもの。別の曲の値を引き継がない。
         self.reset_master_loudness();
         // picker / 範囲ダイアログ等は旧タブの track / clip id を指しているので畳む。

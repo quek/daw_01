@@ -650,7 +650,7 @@ fn build_frame_scene(
     for layer in image_layers {
         // アニメーション画像はイベント開始からの経過秒でフレームを選ぶ (preview と同じ)。
         let Some(texture) =
-            image_textures.get(&layer.image_source_id).map(|t| t.handle_at(layer.anim_secs))
+            image_textures.get(&layer.image_source_id).and_then(|t| t.handle_at(layer.anim_secs))
         else {
             continue; // not decoded / failed import
         };

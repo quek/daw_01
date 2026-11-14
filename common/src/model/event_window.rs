@@ -173,7 +173,9 @@ impl TimedEvent for ImageEvent {
     }
 
     fn take_continues_into(&self, _next: &Self) -> bool {
-        // 静止画は時間の写像を持たないので、中身が同じなら続き。
+        // 画像は take の頭を持たないので、中身が同じなら続きとして扱う。
+        // アニメーション画像 (GIF / APNG / WebP) は各イベントの頭から再生するので、
+        // 分割した後ろの片は 1 フレーム目から始まる (`image_compose` の `anim_secs`)。
         true
     }
 }
