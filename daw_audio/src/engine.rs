@@ -2198,6 +2198,7 @@ mod bundle_install_tests {
                 let io = native_io_for_buffer(
                     ProjectKey(1),
                     11,
+                    [0; common::model::MAX_DELTA_DEVICES],
                     Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
                     watch,
                 );
