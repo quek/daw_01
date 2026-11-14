@@ -51,63 +51,14 @@ GUI のイベント (クリック / ドラッグ / キー / focus / IME) が動�
 
 ### 2. 各層にトレースを仕込む
 
-#### Edit 層 (最上流、Model に到達したかが一目で見える)
+一時的な `eprintln!` を下の位置に入れる。`pointer.pos` / `pointer.modifiers.ctrl` / `state.drag_anchor.is_some()` /
+`rect.contains(..)` など、その時点の判定材料を全部出す。Edit 層から入れると、Model に届いたかが最初に分かる。
 
-```rust
-// crates/ui/src/ui.rs の UiHost::frame_with_fonts (UiHost::frame から呼ばれる) の apply ループ:
-for e in edits {
-    eprintln!("[edit] applying"); // ← 一時的に。確認後に削除
-    e.apply(model);
-}
-```
-
-または widget 内で発行直前:
-
-```rust
-if (displayed_value - value).abs() > f32::EPSILON {
-    eprintln!("[fader] emit value={} (was {})", displayed_value, value);
-    self.push_edit(on_change(displayed_value));
-}
-```
-
-#### widget 層 (state や hit-test の判定確認)
-
-```rust
-// fader.rs の press 判定箇所など
-if pointer.primary_just_pressed {
-    eprintln!(
-        "[fader] press pos={:?} thumb={:?} contains={}",
-        pointer.pos,
-        thumb_rect,
-        pointer.pos.is_some_and(|(x,y)| thumb_rect.contains(x,y)),
-    );
-}
-```
-
-`pointer.modifiers.ctrl` / `state.drag_anchor.is_some()` など、その時点の判定材料を全部出す。
-
-#### 入力取り込み層 (winit / InputAccumulator が呼ばれているか)
-
-```rust
-// crates/platform/src/winit_backend.rs の window_event 内
-WindowEvent::MouseInput { state, button, .. } => {
-    eprintln!("[winit] MouseInput {:?} {:?}", button, state);
-    ...
-}
-WindowEvent::ModifiersChanged(mods) => {
-    eprintln!("[winit] modifiers {:?}", mods.state());
-    ...
-}
-```
-
-または `InputAccumulator::ingest` で:
-
-```rust
-pub fn ingest(&mut self, ev: &AppEvent) {
-    eprintln!("[input] {:?}", ev);
-    ...
-}
-```
+| 層 | 入れる場所 |
+|---|---|
+| 3. Edit | `crates/ui/src/ui.rs` の `UiHost::frame_with_fonts` の apply ループ、または widget が `push_edit` する直前 (発行条件の値も出す) |
+| 2. widget | 該当 widget の press / hit-test の判定箇所 (例: `fader.rs` の `primary_just_pressed` の分岐) |
+| 1. 入力取り込み | `crates/platform/src/winit_backend.rs` の `window_event` (`MouseInput` / `ModifiersChanged`)、または `InputAccumulator::ingest` 冒頭 |
 
 ### 3. 再ビルドを明示
 
@@ -165,9 +116,7 @@ ui/CLAUDE.md「既知の罠」と一部重複するが、デバッグ視点で�
 - **focus の即時反映**: `set_focus` 呼び出しは `pending_focus` 経由で同フレーム内に `is_focused()` に反映される。前フレームの focused widget を見るには `UiHost::focused_widget()` 経由。
 - **Ctrl mid-drag toggle で値 jump**: drag 中に Ctrl 状態が変わったら anchor を `(現在 py, 現在 value, 現在 ctrl)` に張り直す。さもなくば cumulative-from-anchor delta が一気にスケール変わって jump する (Phase 4d)。
 
-## 参考実装 / コミット
+## 参考実装
 
-- `e649e5a` Phase 1 — fader + 入力周りバグ修正 (Alt-Tab 復帰、armed-state、edit 後の追加 redraw)
-- `b926dca` Phase 4d — fader/knob ダブルクリックリセット + Ctrl+drag (modifier 配線、mid-drag re-anchor)
 - `crates/ui/src/widgets/fader.rs::tests` — UiHost::frame 経由での挙動テストの様式
 - `crates/platform/src/winit_backend.rs` — winit Event の取り込み、modifier 処理、focus-click workaround

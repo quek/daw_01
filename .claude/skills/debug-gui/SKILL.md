@@ -60,55 +60,15 @@ GUI イベントは概ね以下の 4 層を通る。どこで消えているか�
 
 ### 2. 各層にトレースを仕込む
 
-**handler 層（最上流で一番わかりやすい）**:
+`tracing::info!` を下の位置に入れる (判定材料になる値を全部出す)。handler 層から入れると、届いたかどうかが
+最初に分かる。
 
-```rust
-// daw_gui/src/app.rs の handle_event 冒頭
-pub fn handle_event(&mut self, event: AppEvent) {
-    tracing::info!(?event, "AppEvent received");
-    // ... 既存の処理 (終了中の破棄 / タブへの振り分け / undo scope / dispatch_app_event)
-}
-```
-
-**emit 層 (view から)**:
-
-```rust
-// view 内で push_edit する直前
-hctx.push_edit(Edit::mutate(move |app: &mut AppData| {
-    tracing::info!("about to apply Foo edit");
-    app.handle_event(AppEvent::Foo);
-}));
-```
-
-**配線層 (shortcut の受け口、view)**:
-
-```rust
-// daw_gui/src/view/root.rs の dispatch_shortcuts
-if ui.take_shortcut("daw.play_toggle") {
-    tracing::info!("shortcut daw.play_toggle");
-    // 既存の push_edit
-}
-```
-
-**winit 取り込み層 (Runner)**:
-
-```rust
-// daw_gui/src/view/runner.rs の window_event の KeyboardInput アーム
-WindowEvent::KeyboardInput { event, .. } => {
-    tracing::info!(?event.physical_key, ?event.state, "raw keydown");
-    // 既存の処理 (PlatformEvent::Keyboard に変換して dispatch_platform_event へ)
-}
-```
-
-**winit 取り込み層 (一番下流)**:
-
-```rust
-// dispatch_platform_event 冒頭
-fn dispatch_platform_event(&mut self, ev: PlatformEvent) {
-    tracing::info!(?ev, "platform event");
-    // ...
-}
-```
+| 層 | 入れる場所 |
+|---|---|
+| 4. handler | `daw_gui/src/app.rs` の `AppData::handle_event` 冒頭 (`?event`) |
+| 3. emit | view で `push_edit` する直前と、`Edit::mutate` の closure の中 |
+| 2. 配線 | `daw_gui/src/view/root.rs` の `dispatch_shortcuts` で `ui.take_shortcut(name)` が true になった所 |
+| 1. winit 取り込み | `daw_gui/src/view/runner.rs` の `window_event` の `KeyboardInput` アーム (`physical_key` / `state`) と、`dispatch_platform_event` 冒頭 |
 
 キー → shortcut 名 → `AppEvent` の配線 (2〜4 層) は、アプリを起動しなくても headless のテストで確かめられる。
 `daw_gui/src/view/root/undo_event_tests.rs` の `press()` が型 (`UiHost::no_redraw()` に本番の
@@ -116,17 +76,9 @@ fn dispatch_platform_event(&mut self, ev: PlatformEvent) {
 `AppData` に適用する。`dispatch_shortcuts` は private なので `view/root/` の子 module に置く)。
 起動して確かめるのは 1 層 (OS / winit / 窓のフォーカス) を疑うときと、最後の確認だけにする。
 
-### 3. **再ビルドを明示**（必須）
+### 3. 再ビルド
 
-```bash
-make build       # 実行 3 exe (daw_gui / daw_audio / daw_plugin_host) を生成
-```
-
-`cargo clippy` / `cargo check` / `cargo test` だけでは **exe が更新されない**。
-古いバイナリで検証すると「直したはずなのに動かない」で時間を溶かす。
-（このプロジェクトで 2 回繰り返している。[feedback_build_after_clippy.md] 参照）
-
-子プロセス側 (daw_audio / daw_plugin_host) も `make build` が同時に生成する。
+`make build` で 3 exe を作り直す (clippy / check / test では exe が更新されない。CLAUDE.md「ビルドと検証の区別」)。
 
 ### 4. 実行してキー操作 → ログを確認
 
@@ -179,15 +131,5 @@ tracing::debug!(?event, "AppEvent received");
   ホイール回転量の合計 (pixels)。1 line ≈ 40px (LINE_HEIGHT_PX)
 - **PointerFrame.modifiers**: 現在の修飾キーは `pointer.modifiers` で取れる。frame をまたいで
   保持される
-- **ダブルクリック**: `ui.take_double_click_in_rect(rect)` (2 回目の release で成立) /
-  `ui.take_double_click_press_in_rect(rect)` (2 回目の press で成立。放さず drag する起点) を使う。
-  閾値は `UiHost::set_double_click_threshold` (既定 400ms / 5px)
-- **背景スレッドからの wake**: `AppData` の handler が起こす thread は `self.ipc.event_proxy`
-  (`Arc<dyn BackgroundDispatcher>`、`daw_gui/src/dispatcher.rs`) の `send(AppEvent::X)` を使い、
-  送信失敗 (event loop が閉じた) は黙って捨てられる。`main.rs` が起こす常駐 thread (IPC bridge /
-  playhead poll / autosave) は `EventLoopProxy::send_event` を直接呼び、`Err` で loop を抜ける
-
-## 参考コミット
-
-- `8050184` GUI を Vizia から ../gui_01 (daw-ui) に置き換え (本ワークフローのリライト元)
-- `4312dab` hjkl カーソル + ノート入力・編集（旧 Vizia 時代に本ワークフローで bug を切り分けた）
+- ダブルクリックの取り方と、背景スレッドからの wake は ui/CLAUDE.md「daw_01 側からの使い方」。handler が起こす
+  thread の `event_proxy.send` は、送信失敗 (event loop が閉じた) を黙って捨てる
