@@ -31,6 +31,32 @@ fn is_zero_beats(v: &f64) -> bool {
     *v == 0.0
 }
 
+/// 映像 / アニメーション画像 event の再生速度 ([`VideoEvent::speed`] / [`ImageEvent::speed`]) の
+/// 有効範囲。 伸縮 ([`VideoEvent::apply_time_stretch`]) と再生側の読み出し
+/// ([`event_speed_or_unity`]) が同じ範囲を見る。
+pub const EVENT_SPEED_MIN: f64 = 1.0 / 1024.0;
+pub const EVENT_SPEED_MAX: f64 = 1024.0;
+
+/// serde の既定: 等速 (速度を持たない旧プロジェクトはこれで開く)。
+fn unity_speed() -> f64 {
+    1.0
+}
+
+/// `skip_serializing_if` 用: 等速ちょうどか (伸縮していない event は速度を書かない)。
+fn is_unity_speed(v: &f64) -> bool {
+    *v == 1.0
+}
+
+/// 保存値の速度を再生に使える値にする: 非有限 / 0 以下は等速、それ以外は有効範囲へ収める。
+#[must_use]
+pub fn event_speed_or_unity(speed: f64) -> f64 {
+    if speed.is_finite() && speed > 0.0 {
+        speed.clamp(EVENT_SPEED_MIN, EVENT_SPEED_MAX)
+    } else {
+        1.0
+    }
+}
+
 /// A clip is a free-time container of notes positioned along the song
 /// timeline. `start_beat` and `length_beats` define where the clip lives;
 /// the actual notes are stored in `Song.clip_contents` keyed by
@@ -997,15 +1023,13 @@ pub struct VideoEvent {
     /// Duration of the event in clip-local beats = **how long the event is
     /// visible**, not a time-stretch factor.
     ///
-    /// r.md #68: the source advances at **1:1 real time** —
-    /// `source_micros = source_start_micros + elapsed_real_micros`, clamped to
+    /// r.md #68: the source advances in **real time × [`Self::speed`]** —
+    /// `source_micros = source_start_micros + elapsed_real_micros * speed`, clamped to
     /// `source_end_micros` (`daw_gui::video_playback::active_video_frames` /
-    /// `render_video`). Lengthening the event therefore does *not* slow the
-    /// footage down; it freezes on the last frame once the source range is
-    /// exhausted, and shortening it simply cuts playback early. (The doc here
-    /// used to claim the source range is mapped onto `event_length_beats` at
-    /// project tempo, which no implementation has ever done — it misled the
-    /// #68 diagnosis into predicting that trimming a video clip stretches it.)
+    /// `render_video`). Lengthening the event by a plain trim therefore does *not*
+    /// slow the footage down; it freezes on the last frame once the source range is
+    /// exhausted, and shortening it simply cuts playback early. Only the clip
+    /// time-stretch (Shift + edge drag, [`Self::apply_time_stretch`]) changes the speed.
     pub event_length_beats: f64,
     /// Source-relative start position in microseconds (libav
     /// `AV_TIME_BASE` units). Disjoint from `AudioEvent`'s
@@ -1016,10 +1040,18 @@ pub struct VideoEvent {
 
     /// v42 (r.md #132 残件): 見えている先頭が **take** (= 分割する前の 1 つの event) の頭から
     /// 何拍後か。 source の時刻は take の頭からの実時間で進む
-    /// (`source_micros = source_start_micros + 実時間(take の頭 → 今)`) ので、分割の片は
+    /// (`source_micros = source_start_micros + 実時間(take の頭 → 今) × speed`) ので、分割の片は
     /// source の範囲を配り直さずにこれだけを進める ([`AudioEvent::take_head_beats`] と同じ窓モデル)。
     #[serde(default, skip_serializing_if = "is_zero_beats")]
     pub take_head_beats: f64,
+    /// r.md #152: **再生速度** (source の進みが実時間の何倍か)。 `1.0` = 等速、`0.5` = 半分の速さ。
+    /// クリップの time-stretch (Shift + 端 drag) が書く — 長さを `k` 倍にすると速度は `1/k` 倍に
+    /// なり、同じ source の範囲が新しい長さに収まる ([`Self::apply_time_stretch`])。 audio の伸縮率が
+    /// 「source 窓 ÷ take の長さ」から決まるのに対し、映像は event が source より長くてよい
+    /// (尻で止まる) ので、率を値として持つ。 読み出しは [`Self::playback_speed`] を通す。
+    /// 速度を持たない旧プロジェクトは `1.0` で開く。
+    #[serde(default = "unity_speed", skip_serializing_if = "is_unity_speed")]
+    pub speed: f64,
 
     /// When `true` the event renders as a solid clear color (= black
     /// frame, no `VideoSource` decode). Useful for "blank" placeholders
@@ -1045,6 +1077,7 @@ impl Default for VideoEvent {
             source_start_micros: 0,
             source_end_micros: 0,
             take_head_beats: 0.0,
+            speed: 1.0,
             muted: false,
             fade_in_beats: 0.0,
             fade_out_beats: 0.0,
@@ -1142,6 +1175,12 @@ pub struct ImageEvent {
     /// drag-trim (an animated GIF / APNG / WebP loops from the event
     /// start for as long as the event lasts).
     pub event_length_beats: f64,
+    /// r.md #152: アニメーション画像 (GIF / APNG / WebP) の **再生速度** (`1.0` = 等速)。
+    /// クリップの time-stretch (Shift + 端 drag) が書く ([`Self::apply_time_stretch`]、
+    /// [`VideoEvent::speed`] と同じ意味)。 静止画では何にも効かない。 読み出しは
+    /// [`Self::playback_speed`] を通す。 速度を持たない旧プロジェクトは `1.0` で開く。
+    #[serde(default = "unity_speed", skip_serializing_if = "is_unity_speed")]
+    pub speed: f64,
 
     /// PiP rect in normalized preview-window coordinates. `(0.0, 0.0)`
     /// is the top-left corner of the preview window, `(1.0, 1.0)` is
@@ -1199,6 +1238,7 @@ impl Default for ImageEvent {
             source_id: 0,
             event_start_in_clip_beats: 0.0,
             event_length_beats: 0.0,
+            speed: 1.0,
             // PiP rect defaults to "full screen" so a freshly-dropped
             // image immediately shows something visible; the user can
             // shrink/move it in the inspector or preview drag handle.

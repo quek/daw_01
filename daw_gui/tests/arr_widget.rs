@@ -553,7 +553,7 @@ fn assert_close(got: (f32, f32), want: (f32, f32), what: &str) {
 ///
 /// 修正前はドラッグゴーストが「drag 後の矩形 × drag 前のクリップ長」 でノートを描いて
 /// いたため、 4 拍 → 8 拍に伸ばすとノート間隔もノート長もちょうど 2 倍になった
-/// (= `stretch_remap` と pixel 一致する time-stretch の絵)。
+/// (= time-stretch と pixel 一致する絵)。
 #[test]
 fn right_edge_trim_does_not_stretch_midi_notes() {
     let (mut app, _a, _p) = build_app();
@@ -766,6 +766,116 @@ fn video_clip_thumbnails_tile_across_the_visible_range() {
         assert!(left <= 0.0, "{what}: 左端まで届く: got {left}");
         assert!(right >= LANES_RIGHT, "{what}: 右端まで届く: got {right}");
     }
+}
+
+/// 左端を trim したクリップ (窓が content の途中から始まる) の Shift + 右端ドラッグでも、
+/// ゴーストと確定結果が一致する。 伸縮は content の拍の軸と窓の起点を同じ倍率にするので、
+/// ゴーストの窓の起点も倍率ぶん動く (トリムの「起点は Δstart だけ進む」とは別の規則)。
+#[test]
+fn shift_stretch_of_a_left_trimmed_clip_previews_the_commit() {
+    let (mut app, _a, _p) = build_app();
+    // clip [2,6) の窓は content 1 拍目から。 ノートは content 拍 2..3 (= 曲の 3..4 拍)。
+    add_midi_track_with_note(&mut app, 1, 10, 2.0, 4.0, 2.0, 1.0);
+    app.edit_song(|song| song.tracks[0].clips[0].content_offset_beats = 1.0);
+    let y = track0_y();
+    let shift = modifiers(false, true, false);
+    let mut host = UiHost::no_redraw();
+
+    let before = note_rects(&drive_scene(&mut host, &mut app, PointerFrame::default()), y);
+    assert_close(before[0], (192.0, 64.0), "ドラッグ前");
+
+    // 4 拍 → 8 拍 (factor 2、pivot = 左端 = 拍 2)。 ノート (曲の 3..4 拍) は 4..6 拍へ。
+    drive(&mut host, &mut app, press(384.0, y, shift));
+    let during = note_rects(&drive_scene(&mut host, &mut app, hold(640.0, y, shift)), y);
+    drive(&mut host, &mut app, release(640.0, y, shift));
+    let after = note_rects(&drive_scene(&mut host, &mut app, PointerFrame::default()), y);
+    assert_eq!(after.len(), 1, "確定後はノート 1 本: got {after:?}");
+    assert_close(after[0], (256.0, 128.0), "確定後 (左端から 2 倍の距離)");
+    assert!(
+        during.iter().any(|r| (r.0 - after[0].0).abs() < 1.5 && (r.1 - after[0].1).abs() < 1.5),
+        "ゴーストに確定結果と同じ絵が含まれる: during={during:?} after={after:?}"
+    );
+}
+
+/// r.md #152: 動画クリップの Shift + 左端ドラッグ (time-stretch) では、ゴーストのサムネイルが
+/// 確定後と同じ位相で並ぶ。 伸縮は event を新しい左端へ写すので、タイルの並びは掴んだ端に
+/// 付いてくる (トリムなら中身は動かず、タイルは元の位相のまま)。
+#[test]
+fn shift_left_edge_stretch_of_a_video_clip_previews_the_committed_thumbnails() {
+    use std::num::NonZeroU32;
+    use std::path::PathBuf;
+
+    use common::model::{VideoContent, VideoEvent, VideoSource, VideoSourcePath};
+    use daw_ui_renderer::TextureHandle;
+
+    let (mut app, _a, _p) = build_app();
+    app.edit_song(|song| {
+        song.tracks.clear();
+        song.media.video_sources.insert(
+            1,
+            VideoSource {
+                path: VideoSourcePath::Absolute(PathBuf::from("dummy.mp4")),
+                width: 1920,
+                height: 1080,
+                framerate: 30.0,
+                duration_micros: 2_000_000,
+                codec: "h264".to_string(),
+                audio_source_id: None,
+            },
+        );
+        let cid: ContentId = song.alloc_content_id();
+        song.clip_contents.insert(
+            cid,
+            ClipContent::Video(VideoContent {
+                events: vec![VideoEvent {
+                    source_id: 1,
+                    event_length_beats: 4.0,
+                    source_end_micros: 2_000_000,
+                    ..VideoEvent::default()
+                }],
+            }),
+        );
+        song.tracks.push(track_with(|t| {
+            t.id = 1;
+            t.clips = vec![Clip { id: 10, content_id: cid, start_beat: 2.0, length_beats: 4.0, ..Clip::default() }];
+        }));
+    });
+    app.cur.peph
+        .video_texture_cache
+        .insert(1, TextureHandle::from_raw(NonZeroU32::new(9).unwrap()));
+
+    let tile_xs = |scene: &Scene| -> Vec<f32> {
+        scene
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                Primitive::Texture(q) => Some(q.rect.x),
+                _ => None,
+            })
+            .collect()
+    };
+    let y = track0_y();
+    let shift = modifiers(false, true, false);
+    let mut host = UiHost::no_redraw();
+    let before = tile_xs(&drive_scene(&mut host, &mut app, PointerFrame::default()));
+    assert!(before.iter().any(|x| (x - 128.0).abs() < 0.5), "ドラッグ前は clip の左端 (拍 2) が位相: {before:?}");
+
+    // 左端 (x=128) を +2 拍 (128px) 右へ → clip [4,6) (右端固定、長さ半分 = 2 倍速)。
+    drive(&mut host, &mut app, press(128.0, y, shift));
+    let during = tile_xs(&drive_scene(&mut host, &mut app, hold(256.0, y, shift)));
+    drive(&mut host, &mut app, release(256.0, y, shift));
+    let after = tile_xs(&drive_scene(&mut host, &mut app, PointerFrame::default()));
+
+    assert!(after.iter().any(|x| (x - 256.0).abs() < 0.5), "確定後は新しい左端 (拍 4) が位相: {after:?}");
+    for x in &after {
+        assert!(
+            during.iter().any(|d| (d - x).abs() < 0.5),
+            "確定後のタイル x={x} がゴーストにも在る: during={during:?}"
+        );
+    }
+    let song = app.cur.song_doc.song();
+    let events = song.clip_contents[&song.tracks[0].clips[0].content_id].video_events().expect("video");
+    assert!((events[0].speed - 2.0).abs() < 1e-9, "長さ半分 = 2 倍速 (got {})", events[0].speed);
 }
 
 /// r.md #71 (ユーザー報告そのもの): 「Break を 2 まで D&D しても元に戻ってしまいます。

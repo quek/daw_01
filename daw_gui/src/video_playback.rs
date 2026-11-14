@@ -244,7 +244,7 @@ fn push_clip_video_frames(
             continue;
         }
         // source の時刻は **take の頭** (= 分割する前の event の頭、`VideoEvent::take_head_beats`) からの
-        // 実時間で進む。 分割の片は take の頭を共有するので、片を並べると分割前と同じ frame を映す。
+        // 実時間 (× `VideoEvent::speed`) で進む。 分割の片は take の頭を共有するので、片を並べると分割前と同じ frame を映す。
         let take_start_in_clip = event.event_start_in_clip_beats - event.take_head_beats;
         let event_progress_beats = clip_local - take_start_in_clip;
         let event_progress_secs = match (tempo_map, row_secs) {
@@ -261,7 +261,9 @@ fn push_clip_video_frames(
             }
             _ => event_progress_beats * 60.0 / bpm,
         };
-        let event_progress_micros = (event_progress_secs * 1_000_000.0).round() as u64;
+        // r.md #152: source は実時間 × 速度で進む (time-stretch した event は速度が 1 でない)。
+        let event_progress_micros =
+            (event_progress_secs * event.playback_speed() * 1_000_000.0).round() as u64;
         let source_micros = event
             .source_start_micros
             .saturating_add(event_progress_micros)

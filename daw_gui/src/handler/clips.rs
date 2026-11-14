@@ -100,9 +100,15 @@ impl AppData {
     /// audio は source 窓 (`source_start/end_frames`) を **固定**して event 長のみ
     /// 変え (engine が `stretch_ratio = native/event 長` で warp 再生)、 Raw は
     /// pitch 保持の `Stretch` (granular) へ昇格 (= ピッチ保持が既定)。 MIDI は
-    /// note の `start_beat` / `duration_beats` を比例 scale。 共有 content は fork
+    /// note の `start_beat` / `duration_beats` を比例 scale。 映像 / アニメーション画像は
+    /// source の範囲を固定して再生速度を `1 / 倍率` にする (r.md #152)。 共有 content は fork
     /// してから伸縮し linked siblings (= 別 length) を巻き込まない。 pivot は
     /// 固定端 (右端 drag = 左端固定 / 左端 drag = 右端固定)。
+    ///
+    /// 伸縮は **content の拍の軸と窓の起点を同じ倍率にする** ことで行う
+    /// (`ClipContent::apply_time_stretch`)。 以前は固定端まわりに event を 1 つずつ写して
+    /// 窓より前を 0 に切り詰めていたので、左端を trim したクリップでは隠れている中身が窓の頭へ
+    /// 集まり、見えている中身が跳んでいた。
     pub(crate) fn stretch_clip_content(
         &mut self,
         target: ClipKey,
@@ -115,9 +121,8 @@ impl AppData {
         if prev_len <= 1e-9 || new_len <= 1e-9 {
             return;
         }
-        // r.md #44: content 内の位置は **窓の起点** (`content_offset_beats`) 基準で
-        // 出し入れする。 `resize_clip` が先に offset を更新済みなので、ここで読む
-        // `new_off` が新しい窓の起点、`prev_off` が伸縮前の起点。
+        // `resize_clip` が先に offset を trim の規則で進めてある (`new_off`)。 伸縮前の起点が
+        // `prev_off`。
         let new_off = self
             .cur.song_doc
             .song()
@@ -142,43 +147,22 @@ impl AppData {
             content_id
         };
 
+        let factor = new_len / prev_len;
         self.edit_song(|song| {
-            match song.clip_contents.get_mut(&content_id) {
-                Some(ClipContent::Audio(audio)) => {
-                    for e in &mut audio.events {
-                        let (s, l) = stretch_remap(
-                            prev_start,
-                            prev_len,
-                            new_start,
-                            new_len,
-                            e.event_start_in_clip_beats - prev_off,
-                            e.event_length_beats,
-                        );
-                        // 窓 + take の軸 (隠れている頭と尻、warp marker の拍) を同じ倍率で伸縮し、
-                        // Raw はピッチ保持の Stretch へ昇格 (source 窓は固定 = stretch の本質)。
-                        e.apply_time_stretch(new_off + s, l, new_len / prev_len);
-                    }
-                }
-                Some(ClipContent::Midi(midi)) => {
-                    for n in &mut midi.notes {
-                        let (s, l) = stretch_remap(
-                            prev_start,
-                            prev_len,
-                            new_start,
-                            new_len,
-                            n.start_beat - prev_off,
-                            n.duration_beats,
-                        );
-                        n.start_beat = new_off + s;
-                        n.duration_beats = l;
-                    }
-                }
-                other => {
-                    // overlay / automation は stretch 概念なし → 長さ追従のみ。
-                    if let Some(content) = other {
-                        content.ensure_event_covers_clip(new_off + new_len);
-                    }
-                }
+            let Some(content) = song.clip_contents.get_mut(&content_id) else {
+                return;
+            };
+            // content の拍の軸ごと伸縮し、窓の起点も同じ倍率にする (`ClipContent::apply_time_stretch`)。
+            // 字幕 / automation は stretch 概念なし → 長さ追従のみ (起点は `resize_clip` が進めたまま)。
+            let window_start = if content.apply_time_stretch(factor) { prev_off * factor } else { new_off };
+            // overlay clip (image / video / text) の「clip 長 = 表示長」を保つ (trim と同じ
+            // extend-only。 写像の丸めで末尾に隙間が残らないようにもする)。
+            content.ensure_event_covers_clip(window_start + new_len);
+            if let Some(clip) = song
+                .track_by_id_mut(target.track_id)
+                .and_then(|t| t.clip_by_id_mut(target.clip_id))
+            {
+                clip.content_offset_beats = window_start;
             }
         });
     }

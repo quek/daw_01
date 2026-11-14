@@ -268,39 +268,6 @@ mod follow_scroll_tests {
 }
 
 #[cfg(test)]
-mod stretch_remap_tests {
-    use crate::app_types::stretch_remap;
-
-    #[test]
-    fn right_edge_stretch_scales_from_left() {
-        // clip [0,4] を右端 drag で [0,8] (2x)。 左端固定。
-        // spanning event (0,4) → (0,8)。
-        let (s, l) = stretch_remap(0.0, 4.0, 0.0, 8.0, 0.0, 4.0);
-        assert!((s - 0.0).abs() < 1e-9 && (l - 8.0).abs() < 1e-9, "got ({s},{l})");
-        // 中間 event (2,1) → start 4 (= 2*2)、 len 2。
-        let (s, l) = stretch_remap(0.0, 4.0, 0.0, 8.0, 2.0, 1.0);
-        assert!((s - 4.0).abs() < 1e-9 && (l - 2.0).abs() < 1e-9, "got ({s},{l})");
-    }
-
-    #[test]
-    fn left_edge_stretch_scales_from_right() {
-        // clip [0,4] を左端 drag で [2,2] (start +2, len 0.5x)。 右端固定。
-        // spanning event (0,4) は新 clip-local [0,2] を覆う。
-        let (s, l) = stretch_remap(0.0, 4.0, 2.0, 2.0, 0.0, 4.0);
-        assert!((s - 0.0).abs() < 1e-9 && (l - 2.0).abs() < 1e-9, "got ({s},{l})");
-        // 元 clip 末尾 (4) にあった点は新 clip 末尾 (local 2) へ。
-        let (s, _l) = stretch_remap(0.0, 4.0, 2.0, 2.0, 4.0, 0.0);
-        assert!((s - 2.0).abs() < 1e-9, "got {s}");
-    }
-
-    #[test]
-    fn degenerate_prev_len_is_identity() {
-        let (s, l) = stretch_remap(0.0, 0.0, 0.0, 4.0, 1.5, 2.0);
-        assert!((s - 1.5).abs() < 1e-9 && (l - 2.0).abs() < 1e-9);
-    }
-}
-
-#[cfg(test)]
 mod add_track_insert_index_tests {
     use crate::app_types::{add_track_insert_index, track_with};
     use common::model::Track;

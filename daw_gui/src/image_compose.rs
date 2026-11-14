@@ -57,7 +57,7 @@ pub struct ActiveImageFrame {
     /// 無し)。 適用は `group_compose::flip_uv` (preview / export 共通)。
     pub flip_h: bool,
     pub flip_v: bool,
-    /// イベント開始からの経過秒 (テンポ自動化があれば積分した実時間)。アニメーション
+    /// イベント開始からの経過秒 (テンポ自動化があれば積分した実時間) × `ImageEvent::speed`。アニメーション
     /// 画像 (GIF / APNG / WebP) のフレーム選択に使う
     /// (`image_frames::ImageTextures::handle_at`)。静止画では無視される。
     pub anim_secs: f64,
@@ -178,12 +178,13 @@ pub fn active_image_sources_at(
                 // テンポ自動化があれば song-absolute 拍で積分、無ければ 60/bpm。
                 let event_start_song = scan.song_origin()
                     + clip.content_to_song_beat(event.event_start_in_clip_beats);
+                // r.md #152: time-stretch した event は速度が 1 でない (ループは続く)。
                 let anim_secs = elapsed_secs(
                     tempo_map,
                     event_start_song,
                     scan.song_beat,
                     (clip_local - event.event_start_in_clip_beats) * 60.0 / bpm,
-                );
+                ) * event.playback_speed();
                 out.push(ActiveImageFrame {
                     image_source_id: event.source_id,
                     owning_track_id: track.id,

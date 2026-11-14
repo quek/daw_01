@@ -1278,6 +1278,69 @@ mod tests {
         }
     }
 
+    /// r.md #152: 映像 / アニメーション画像の再生速度は保存 → 読み込みで保たれる。 伸縮していない
+    /// event は速度を書かない (速度を持たない旧 file と同じ形) ので、旧 file は等速で開き、開いて
+    /// 保存し直しても中身が変わらない。
+    #[test]
+    fn 伸縮した映像と画像の速度は保存され等速は書かれない() {
+        use crate::model::{ImageContent, ImageEvent, VideoContent, VideoEvent};
+        let dir = tempdir().unwrap();
+        let song_with = |video_speed: f64, image_speed: f64| {
+            let mut song = Song::default();
+            let video = song.alloc_content(
+                ClipContent::Video(VideoContent {
+                    events: vec![VideoEvent {
+                        event_length_beats: 4.0,
+                        source_end_micros: 2_000_000,
+                        speed: video_speed,
+                        ..VideoEvent::default()
+                    }],
+                }),
+                String::new(),
+            );
+            let image = song.alloc_content(
+                ClipContent::Image(ImageContent {
+                    events: vec![ImageEvent { event_length_beats: 4.0, speed: image_speed, ..ImageEvent::default() }],
+                }),
+                String::new(),
+            );
+            let clips = [video, image].into_iter().enumerate().map(|(i, content_id)| Clip {
+                id: i as u32 + 1,
+                start_beat: 8.0 * i as f64,
+                length_beats: 4.0,
+                content_id,
+                ..Clip::default()
+            });
+            song.tracks = vec![Track { id: 1, clips: clips.collect(), next_clip_id: 3, ..Track::default() }];
+            song
+        };
+        let speeds = |song: &Song| -> Vec<f64> {
+            song.tracks[0]
+                .clips
+                .iter()
+                .map(|c| match &song.clip_contents[&c.content_id] {
+                    ClipContent::Video(v) => v.events[0].speed,
+                    ClipContent::Image(i) => i.events[0].speed,
+                    other => panic!("想定外の content: {other:?}"),
+                })
+                .collect()
+        };
+
+        let stretched = song_with(0.5, 2.5);
+        let path = dir.path().join("stretched.daw");
+        save(&path, &stretched).unwrap();
+        assert_eq!(speeds(&load_project(&path).unwrap().song), vec![0.5, 2.5]);
+
+        let unity = song_with(1.0, 1.0);
+        let raw = serde_json::to_value(&unity).unwrap().to_string();
+        assert!(!raw.contains("\"speed\""), "等速の event は speed を書かない");
+        let path = dir.path().join("unity.daw");
+        save(&path, &unity).unwrap();
+        let loaded = load_project(&path).unwrap().song;
+        assert_eq!(speeds(&loaded), vec![1.0, 1.0], "speed の無い file は等速で開く");
+        assert_eq!(loaded.clip_contents, unity.clip_contents, "開いても event は変わらない");
+    }
+
     /// r.md #132 残件 (v42): v41 以前の ARA アーカイブ (位置由来の persistent id で書かれている) は、開くと
     /// 旧 id → 今の安定 id の読み替え表を device に持つ。 旧版はクリップごとに modification を持っていたので、
     /// 1 つのトラックで content を共有する 2 本目のクリップは content を分けて編集を分けたまま開く。 表は保存して

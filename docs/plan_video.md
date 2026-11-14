@@ -41,7 +41,8 @@
 - Video processor / per-clip FX
 - 色補正 / LUT / トランジション effect
 - Text overlay / title generator
-- Time-stretch video
+- Time-stretch video (r.md #152 で実装済み: Shift + 端ドラッグが `VideoEvent::speed` を変える。
+  正本は同 field の doc)
 - 明示的な Hardware decode tuning (= WMF は default で DXVA / D3D11 / NVDEC を
   driver 対応範囲で自動使用するので、 MVP は WMF の自動選択に任せる。
   fallback / preset 切替 UI は post-MVP)

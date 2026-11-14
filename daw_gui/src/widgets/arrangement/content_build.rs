@@ -5,52 +5,81 @@
 //! は `ClipView` が持ち、 画面 x への換算は [`geometry::content_map`] 1 本が行う。
 //!
 //! ドラッグゴースト用の中身 ([`build_stretch_ghost_content`]) も同じ builder を通す。
-//! Shift + 端 drag (= time-stretch) では **確定処理と同じ [`crate::app_types::stretch_remap`]**
-//! で event / note を写像してから span を引き直すので、 プレビューと確定結果が
-//! Slice のスライス配置や `Raw → Stretch` 昇格まで含めて一致する。
+//! Shift + 端 drag (= time-stretch) では **確定処理と同じ
+//! [`ClipContent::apply_time_stretch`]** を content の複製に掛けてから span を引き直すので、
+//! プレビューと確定結果が Slice のスライス配置や `Raw → Stretch` 昇格まで含めて一致する。
+//! 伸縮は content の拍の軸と窓の起点を同じ倍率にするので、ゴーストの窓の起点
+//! ([`resize_ghost_offset`]) とサムネイルの位相 ([`ghost_thumbnail`]) もここが出す。
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 use common::audio_render::{TempoMap, WaveSpan, event_wave_spans};
 use common::model::{Clip, ClipContent};
 
 use crate::app::AppData;
-use crate::app_types::stretch_remap;
 
 use super::draw::{AudioEventDraw, ClipContentDraw, MidiNoteDraw};
 use super::geometry::resize_preview_start_len;
-use super::{ArrangementTrack, ClipDragKind, ClipDragSession, ClipKey, MASTER_TRACK_ID};
+use super::{
+    ArrangementTrack, ClipDragAnchor, ClipDragKind, ClipDragSession, ClipKey, ClipThumbnail,
+    ClipView, MASTER_TRACK_ID,
+};
 
-/// time-stretch プレビューの写像パラメータ (`stretch_clip_content` の引数と同じ形)。
+/// time-stretch プレビューの写像パラメータ。
 #[derive(Clone, Copy, Debug)]
 pub(super) struct StretchPreview {
-    prev_start: f64,
-    prev_len: f64,
+    /// 伸縮後の clip の開始拍。
     new_start: f64,
-    new_len: f64,
+    /// 倍率 (= 新しい長さ ÷ 元の長さ)。
+    factor: f64,
 }
 
-impl StretchPreview {
-    /// clip 窓の起点 (`content_offset_beats`) の変化ぶん。 `resize_clip` が
-    /// `content_offset_beats += Δstart` を行うのと同じ量。
-    fn offset_delta(self) -> f64 {
-        self.new_start - self.prev_start
-    }
+/// この drag が time-stretch (Shift + 端 drag) なら、その倍率 (= 新しい長さ ÷ 元の長さ)。
+///
+/// Shift が効くのは端 drag だけ (`release.rs` は Resize の arm でしか `stretch: nd.last_shift`
+/// を送らない。 Move の Shift は clone 種別の修飾)。 退化した長さでは確定処理
+/// (`stretch_clip_content`) も伸縮しないので `None`。
+fn stretch_factor(nd: &ClipDragSession, anchor: &ClipDragAnchor, new_len: f64) -> Option<f64> {
+    (nd.last_shift
+        && matches!(nd.kind, ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight)
+        && anchor.len_beats > 1e-9
+        && new_len > 1e-9)
+        .then(|| new_len / anchor.len_beats)
+}
 
-    /// content-local (start, len) → 伸縮後の content-local (start, len)。
-    /// `stretch_clip_content` が model へ書き戻すのと同じ式。
-    fn remap(self, prev_off: f64, start: f64, len: f64) -> (f64, f64) {
-        let (s, l) = stretch_remap(
-            self.prev_start,
-            self.prev_len,
-            self.new_start,
-            self.new_len,
-            start - prev_off,
-            len,
-        );
-        (prev_off + self.offset_delta() + s, l)
+/// 端 drag のゴーストの **窓の起点** (`content_offset_beats`) を確定後と一致させる。
+///
+/// - トリム: `resize_clip` が `content_offset_beats += Δstart` を行う (content 原点は不動)。
+/// - time-stretch: content の拍の軸ごと伸縮するので、起点も同じ倍率になる
+///   (`stretch_clip_content`)。
+pub(super) fn resize_ghost_offset(
+    nd: &ClipDragSession,
+    anchor: &ClipDragAnchor,
+    src_offset: f64,
+    (new_start, new_len): (f64, f64),
+) -> f64 {
+    match stretch_factor(nd, anchor, new_len) {
+        Some(factor) => src_offset * factor,
+        None => src_offset + (new_start - anchor.start_beat),
     }
+}
+
+/// r.md #152: ゴーストに載せる video / image clip のサムネイル。
+///
+/// サムネイルは「それが表す event の content-local 開始拍」を位相に敷き詰める
+/// ([`super::thumbnail::thumbnail_tiling`])。 time-stretch は event の開始拍も倍率ぶん写すので、
+/// 同じ倍率を掛けて確定後の位相にする。 トリム / 移動では中身が動かないので元のまま返す。
+pub(super) fn ghost_thumbnail(
+    nd: &ClipDragSession,
+    anchor: &ClipDragAnchor,
+    src: Option<&ClipView>,
+    new_len: f64,
+) -> Option<ClipThumbnail> {
+    let mut thumb = src?.thumbnail?;
+    if let Some(factor) = stretch_factor(nd, anchor, new_len) {
+        thumb.start_in_content_beats *= factor;
+    }
+    Some(thumb)
 }
 
 /// visible clip すべての中身 (base 描画用)。
@@ -87,7 +116,7 @@ pub(super) fn build_clip_content(
 /// **確定後の中身そのもの** を描く。 トリム / 移動では確定後の中身は base と
 /// **完全に同一** (中身は 1px も動かない) なので、ここは空を返し、描画側は
 /// `clip_content` をそのまま使う (= 毎フレームの span 再計算を増やさない)。
-/// time-stretch のときだけ、確定処理と同じ `stretch_remap` で写像した内容を返す。
+/// time-stretch のときだけ、確定処理と同じ `ClipContent::apply_time_stretch` を掛けた内容を返す。
 pub(super) fn build_stretch_ghost_content(
     app: &AppData,
     tempo_map: &TempoMap,
@@ -100,19 +129,24 @@ pub(super) fn build_stretch_ghost_content(
     let Some(&(ref nd, beat_delta, _)) = drag else {
         return map;
     };
-    // Shift が効くのは端 drag だけ (`release.rs` は Resize の arm でしか
-    // `stretch: nd.last_shift` を送らない)。 Move の Shift は clone 種別の修飾。
-    if !nd.last_shift || !matches!(nd.kind, ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight)
-    {
-        return map;
-    }
     let mut spans: Vec<WaveSpan> = Vec::new();
     for a in &nd.anchors {
-        // **base と定義域を揃える**。 ゴーストの content 原点は描画側が
-        // `visible_tracks` から引いた `ClipView::content_offset_beats` で決まるので、
-        // ここだけ model から直接引いて中身を出すと、 drag 中に track がスクロールで
-        // 見えなくなった瞬間に「中身はあるのに原点が 0 扱い」 になり、 伸縮した中身が
-        // ゴースト枠に対して `content_offset_beats` ぶんずれる。
+        // ゴースト矩形 / release commit と **同じ** `resize_preview_start_len`。
+        // 別々に写経すると、伸縮した中身とゴースト枠が食い違う。
+        let (new_start, new_len) = resize_preview_start_len(
+            a.start_beat,
+            a.len_beats,
+            nd.kind,
+            beat_delta,
+            min_len,
+        );
+        let Some(factor) = stretch_factor(nd, a, new_len) else {
+            continue;
+        };
+        // **base と定義域を揃える**。 ゴーストの窓の起点は描画側が `visible_tracks` から引いた
+        // `ClipView::content_offset_beats` で決まるので、 ここだけ model から直接引いて中身を
+        // 出すと、 drag 中に track がスクロールで見えなくなった瞬間に「中身はあるのに起点が
+        // 0 扱い」 になり、 伸縮した中身がゴースト枠に対してずれる。
         if !visible_tracks.iter().any(|t| {
             t.id == a.key.track_id && t.clips.iter().any(|c| c.id == a.key.clip_id)
         }) {
@@ -130,21 +164,7 @@ pub(super) fn build_stretch_ghost_content(
         let Some(mc) = mt.clips.iter().find(|mc| mc.id == a.key.clip_id) else {
             continue;
         };
-        // ゴースト矩形 / release commit と **同じ** `resize_preview_start_len`。
-        // 別々に写経すると、伸縮した中身とゴースト枠が食い違う。
-        let (new_start, new_len) = resize_preview_start_len(
-            a.start_beat,
-            a.len_beats,
-            nd.kind,
-            beat_delta,
-            min_len,
-        );
-        let stretch = StretchPreview {
-            prev_start: a.start_beat,
-            prev_len: a.len_beats,
-            new_start,
-            new_len,
-        };
+        let stretch = StretchPreview { new_start, factor };
         if let Some(content) = build_one(app, tempo_map, mc, Some(stretch), &mut spans) {
             map.insert(a.key, content);
         }
@@ -162,10 +182,22 @@ pub(super) fn build_one(
     stretch: Option<StretchPreview>,
     spans: &mut Vec<WaveSpan>,
 ) -> Option<ClipContentDraw> {
-    let content = app.cur.song_doc.song().clip_contents.get(&mc.content_id)?;
-    // content 原点は trim でも stretch でも不変 (`resize_clip` / `stretch_clip_content` が
-    // start と offset を同量動かす)。 span の tempo 評価位置はここを基準に出す。
-    let content_origin = mc.content_origin_beat();
+    let base = app.cur.song_doc.song().clip_contents.get(&mc.content_id)?;
+    // stretch preview のときだけ、確定 (`stretch_clip_content`) と同じ 1 本を複製に掛ける
+    // (take の軸の伸縮と Raw→Stretch の昇格まで揃えないと、 span の張る範囲が確定後と食い違う)。
+    // base は借用のまま。
+    let stretched = stretch.map(|st| {
+        let mut c = base.clone();
+        c.apply_time_stretch(st.factor);
+        c
+    });
+    let content = stretched.as_ref().unwrap_or(base);
+    // content 原点 (content-local 拍 0 の song 拍)。 span の tempo 評価位置はここを基準に出す。
+    // trim では不変、 stretch では窓の起点が倍率ぶん動く (`resize_ghost_offset` と同じ量)。
+    let content_origin = stretch.map_or_else(
+        || mc.content_origin_beat(),
+        |st| st.new_start - mc.content_offset_beats * st.factor,
+    );
     match content {
         ClipContent::Audio(_) => {
             // r.md #41: clip 内の **全** audio event を、 engine と同じ時間写像
@@ -179,24 +211,8 @@ pub(super) fn build_one(
                     // decode 待ち / missing source は skip (他 event は描く)。
                     continue;
                 };
-                // stretch preview のときだけ event を写像した複製を作る (base は借用のまま)。
-                let ev: Cow<'_, _> = match stretch {
-                    None => Cow::Borrowed(ev),
-                    Some(st) => {
-                        let mut e = ev.clone();
-                        let (s, l) = st.remap(
-                            mc.content_offset_beats,
-                            e.event_start_in_clip_beats,
-                            e.event_length_beats,
-                        );
-                        // 確定 (`stretch_clip_content`) と同じ 1 本 (take の軸の伸縮と Raw→Stretch の
-                        // 昇格まで揃えないと、 span の張る範囲が確定後と食い違う)。
-                        e.apply_time_stretch(s, l, st.new_len / st.prev_len);
-                        Cow::Owned(e)
-                    }
-                };
                 event_wave_spans(
-                    &ev,
+                    ev,
                     buffer.sample_rate,
                     tempo_map,
                     // event の song 位置は content 原点基準 (tempo 曲線の評価位置)。
@@ -233,17 +249,11 @@ pub(super) fn build_one(
             }
             let nd: Vec<MidiNoteDraw> = notes
                 .iter()
-                .map(|n| {
-                    let (start_beat, duration_beats) = stretch.map_or(
-                        (n.start_beat, n.duration_beats),
-                        |st| st.remap(mc.content_offset_beats, n.start_beat, n.duration_beats),
-                    );
-                    MidiNoteDraw {
-                        pitch: n.pitch,
-                        start_beat,
-                        duration_beats,
-                        velocity: n.velocity,
-                    }
+                .map(|n| MidiNoteDraw {
+                    pitch: n.pitch,
+                    start_beat: n.start_beat,
+                    duration_beats: n.duration_beats,
+                    velocity: n.velocity,
                 })
                 .collect();
             Some(ClipContentDraw::Midi { notes: nd })

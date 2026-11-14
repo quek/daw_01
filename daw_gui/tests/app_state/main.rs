@@ -26,6 +26,7 @@ mod group_track_lifecycle;
 mod history_plugin_state;
 mod linked_clip_bounds;
 mod make_unique;
+mod media_stretch;
 mod modulation_arm;
 mod modulation_bypass;
 mod modulation_follower_edit;

@@ -353,7 +353,7 @@ pub(super) enum ClipContentDraw {
     /// r.md #68: `len_beats` (= clip の長さ) は持たない。 ノートの x 写像に clip 長を
     /// 使っていたのが「トリムなのに中身がストレッチ表示される」 の主因だった
     /// (ゴーストは drag 後の矩形 × drag 前の長さで描いていたので、 ちょうど
-    /// `stretch_remap` と pixel 一致する time-stretch の絵になっていた)。
+    /// time-stretch と pixel 一致する絵になっていた)。
     Midi { notes: Vec<MidiNoteDraw> },
 }
 
@@ -1248,7 +1248,7 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
     // r.md #24: ゴーストに描く中身 (波形 / MIDI)。 base 描画と同じ map。
     clip_content: &std::collections::HashMap<ClipKey, ClipContentDraw>,
     // r.md #68: Shift + 端 drag (= time-stretch) のときだけ入る「伸縮済みの中身」。
-    // caller (`run.rs`) が commit と同じ `stretch_remap` で content を写像し、 audio は
+    // caller が commit と同じ `ClipContent::apply_time_stretch` で content を伸縮し、 audio は
     // engine と同じ `event_wave_spans` で span を引き直しているので、 プレビューと確定結果が
     // Slice / Raw→Stretch 昇格まで含めて一致する。 トリム / 移動では確定後の中身が base と
     // 同一なので空で、 ゴーストも `clip_content` をそのまま描く (= 中身は 1px も動かない)。
@@ -1319,7 +1319,7 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
         // r.md #68: ゴーストの **content 原点** を確定後と一致させる。
         // - Move: 窓ごと動く = offset 据え置き (原点も同じだけ動く)。
         // - ResizeLeft / ResizeRight: `resize_clip` が `content_offset_beats += Δstart` を
-        //   行うので原点は不動 (`stretch_clip_content` も offset を同量進めるので stretch でも同じ)。
+        //   行うので原点は不動 (time-stretch は起点も倍率ぶん動く。 `resize_ghost_offset`)。
         // これで「トリムしても中身は 1px も動かない」 が式として成り立ち、 中身は
         // ゴースト矩形で切り抜かれるだけになる。
         let src_offset = src.map_or(0.0, |(_, c)| c.content_offset_beats);
@@ -1330,7 +1330,7 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
         let preview_offset = match nd.kind {
             ClipDragKind::Move => src_offset + anchor_lead,
             ClipDragKind::ResizeLeft | ClipDragKind::ResizeRight => {
-                src_offset + (start - a.start_beat)
+                content_build::resize_ghost_offset(nd, a, src_offset, (start, len))
             }
         };
         let preview_clip = ClipView {
@@ -1344,8 +1344,8 @@ pub(super) fn draw_drag_preview<M: ?Sized + 'static>(
             share_group_color: None,
             // fade envelope は transient な preview では出さない (元 clip 側で描画済)。
             fades: Vec::new(),
-            // video / image / text clip の thumbnail はコピーにも見せる (それが中身なので)。
-            thumbnail: src.and_then(|(_, c)| c.thumbnail),
+            // video / image clip の thumbnail はコピーにも見せる (time-stretch なら確定後の位相で)。
+            thumbnail: content_build::ghost_thumbnail(nd, a, src.map(|(_, c)| c), len),
             in_active_group: false,
             // drag ghost は半透明プレビューなので mute ハッチは出さない (元 clip 側で描画済)。
             muted: false,

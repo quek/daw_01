@@ -152,7 +152,7 @@ pub(super) fn dispatch(
     let tempo_map = common::audio_render::TempoMap::from_song(app.cur.song_doc.song());
     let clip_content = content_build::build_clip_content(app, &tempo_map, &f.visible_tracks);
     // r.md #68: Shift + 端 drag (= time-stretch) のときだけ、 ゴーストの中身を
-    // commit と同じ `stretch_remap` + `event_wave_spans` で組み直す (Slice 配置 /
+    // commit と同じ `ClipContent::apply_time_stretch` + `event_wave_spans` で組み直す (Slice 配置 /
     // Raw→Stretch 昇格まで含めてプレビュー = 確定結果)。 トリム / 移動では確定後の
     // 中身が base と同一なので空 = 描画側が `clip_content` をそのまま使う。
     let stretch_ghost_content = content_build::build_stretch_ghost_content(

@@ -13,7 +13,7 @@
 //! [`join_pieces`] は [`event_piece`] の逆で、同じ event から切り出した隣り合う片を元の 1 つに戻す
 //! (Glue)。 片のあとで一方だけを編集した (fade を掛け直した / 別の素材に変えた) 片はつながない。
 
-use super::{AudioEvent, EventFade, ImageEvent, TextEvent, VideoEvent};
+use super::{AudioEvent, ClipContent, EventFade, ImageEvent, TextEvent, VideoEvent};
 
 /// 拍の同一視許容量 ([`super::split_boundaries`] と同じ)。
 const EPS: f64 = 1e-9;
@@ -162,6 +162,95 @@ impl TimedEvent for VideoEvent {
 
     fn take_continues_into(&self, next: &Self) -> bool {
         (next.take_head_beats - (self.take_head_beats + self.event_length_beats)).abs() <= EPS
+    }
+}
+
+/// 伸縮の倍率 `factor` (= 新しい長さ ÷ 元の長さ) を掛けた後の再生速度。 退化した倍率では変えない。
+fn stretched_speed(speed: f64, factor: f64) -> f64 {
+    if factor.is_finite() && factor > 0.0 {
+        super::event_speed_or_unity(super::event_speed_or_unity(speed) / factor)
+    } else {
+        speed
+    }
+}
+
+impl ClipContent {
+    /// クリップの time-stretch (Shift + 端 drag) を content 全体に掛ける: **content の拍の軸を
+    /// `factor` 倍する** (event / note の開始拍と長さ)。 audio / 映像 / 画像は source の範囲を固定した
+    /// まま時間写像を伸縮する (各 event の `apply_time_stretch`)。 伸縮の概念を持たない字幕 /
+    /// automation は触らず `false` を返す。
+    ///
+    /// 呼び側はクリップの窓の起点 (`Clip::content_offset_beats`) も同じ `factor` 倍にする。 軸ごと
+    /// 伸縮するので、窓より前に隠れている中身 (左端を trim したクリップ) も比例して写り、固定端
+    /// (右端 drag なら左端) の song 上の位置は動かない。
+    pub fn apply_time_stretch(&mut self, factor: f64) -> bool {
+        if !factor.is_finite() || factor <= 0.0 {
+            return false;
+        }
+        match self {
+            ClipContent::Audio(audio) => {
+                for e in &mut audio.events {
+                    e.apply_time_stretch(e.event_start_in_clip_beats * factor, e.event_length_beats * factor, factor);
+                }
+            }
+            ClipContent::Midi(midi) => {
+                for n in &mut midi.notes {
+                    n.start_beat *= factor;
+                    n.duration_beats *= factor;
+                }
+            }
+            ClipContent::Video(video) => {
+                for e in &mut video.events {
+                    e.apply_time_stretch(e.event_start_in_clip_beats * factor, e.event_length_beats * factor, factor);
+                }
+            }
+            ClipContent::Image(image) => {
+                for e in &mut image.events {
+                    e.apply_time_stretch(e.event_start_in_clip_beats * factor, e.event_length_beats * factor, factor);
+                }
+            }
+            ClipContent::Text(_) | ClipContent::Automation(_) => return false,
+        }
+        true
+    }
+}
+
+impl VideoEvent {
+    /// 再生に使う速度 (非有限 / 0 以下の保存値は等速として読む)。
+    #[must_use]
+    pub fn playback_speed(&self) -> f64 {
+        super::event_speed_or_unity(self.speed)
+    }
+
+    /// クリップの time-stretch (Shift + 端 drag) を 1 event に掛ける ([`AudioEvent::apply_time_stretch`]
+    /// の映像版): 見えている窓を `start` / `len` (content-local 拍) にし、take の頭までの拍を同じ
+    /// 倍率 `factor` で伸縮して、速度を `1 / factor` 倍にする。 **source の範囲は固定** なので、
+    /// 伸ばす前に各拍で映っていた frame が、伸ばした後の対応する拍で映る。 確定
+    /// (`stretch_clip_content`) とゴーストが同じこれを通る。
+    pub fn apply_time_stretch(&mut self, start: f64, len: f64, factor: f64) {
+        self.event_start_in_clip_beats = start;
+        self.event_length_beats = len;
+        if factor.is_finite() && factor > 0.0 {
+            self.take_head_beats *= factor;
+        }
+        self.speed = stretched_speed(self.speed, factor);
+    }
+}
+
+impl ImageEvent {
+    /// 再生に使う速度 (非有限 / 0 以下の保存値は等速として読む)。
+    #[must_use]
+    pub fn playback_speed(&self) -> f64 {
+        super::event_speed_or_unity(self.speed)
+    }
+
+    /// クリップの time-stretch (Shift + 端 drag) を 1 event に掛ける: 見えている窓を `start` / `len`
+    /// にし、アニメーションの速度を `1 / factor` 倍にする (1 周の拍数が `factor` 倍になる)。
+    /// 静止画は窓が変わるだけ。
+    pub fn apply_time_stretch(&mut self, start: f64, len: f64, factor: f64) {
+        self.event_start_in_clip_beats = start;
+        self.event_length_beats = len;
+        self.speed = stretched_speed(self.speed, factor);
     }
 }
 

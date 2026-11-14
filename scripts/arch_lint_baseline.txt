@@ -186,7 +186,6 @@ FN-NESTING | daw_gui/src/widgets/piano_roll/run.rs::piano_roll                  
 FN-NESTING | daw_gui/src/widgets/arrangement/view_build.rs::build_arrangement_lanes_from_slice | 8/33 | #77 の対象外。未起票
 FN-NESTING | daw_gui/src/widgets/arrangement/geometry.rs::collect_points_in_rect      | 8/8    | #77 の対象外。未起票
 FN-NESTING | daw_gui/src/widgets/piano_roll/draw.rs::draw_grid_background             | 7/52   | #77 と同型の分割が未着手
-FN-NESTING | daw_gui/src/widgets/arrangement/content_build.rs::build_one              | 7/20   | #77 の対象外。未起票
 FN-NESTING | daw_gui/src/widgets/arrangement/mod.rs::fold_arrangement_clip_hash       | 7/8    | #77 の対象外。未起票
 
 # 2. view の巨大 draw。1 関数が 1 画面ぶんの UI を組み立てるので、
@@ -225,7 +224,6 @@ FN-NESTING | daw_gui/src/handler/automation.rs::AppData::paste_clips_at         
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::delete_selected_notes                  | 8/6  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::resize_notes                           | 8/6  | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/notes.rs::AppData::set_note_velocities                    | 8/6  | edit_song 多重ループ。未起票
-FN-NESTING | daw_gui/src/handler/clips.rs::AppData::stretch_clip_content                   | 7/24 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/voicevox.rs::AppData::normalize_lipsync_clips_on_load     | 7/17 | edit_song 多重ループ。未起票
 FN-NESTING | daw_gui/src/handler/media.rs::AppData::action_import_image                    | 7/16 | edit_song 多重ループ。未起票
 # `project.rs::reconcile_plugins_with_song` (7/15) は #71 で **解消**。 §A で slot

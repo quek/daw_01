@@ -1818,33 +1818,6 @@ pub(crate) fn resolve_media_drop_target(target: ImportTrackTarget, n_tracks: usi
     }
 }
 
-/// time-stretch で clip-local の (start, len) を新 clip 長へ写像する
-/// ピュア関数。 固定端 pivot (右端 drag = 左端固定 / 左端 drag = 右端固定) で
-/// 絶対 beat 上を `factor = new_len/prev_len` で scale し、 新 clip-local へ戻す。
-/// `prev_len <= 0` は identity (退化保護)。 audio event / MIDI note 共通。
-pub(crate) fn stretch_remap(
-    prev_start: f64,
-    prev_len: f64,
-    new_start: f64,
-    new_len: f64,
-    local_start: f64,
-    local_len: f64,
-) -> (f64, f64) {
-    if prev_len <= 1e-9 {
-        return (local_start, local_len);
-    }
-    let factor = new_len / prev_len;
-    // start が動いた = 左端 drag (右端固定)、 不動 = 右端 drag (左端固定)。
-    let pivot_abs = if (new_start - prev_start).abs() > 1e-9 {
-        prev_start + prev_len
-    } else {
-        prev_start
-    };
-    let old_abs = prev_start + local_start;
-    let new_abs = pivot_abs + (old_abs - pivot_abs) * factor;
-    ((new_abs - new_start).max(0.0), (local_len * factor).max(0.0))
-}
-
 /// 新規 track の挿入 index を決めるピュアロジック。 選択中の track が
 /// 1 つ以上あれば「最上段 (= `tracks` 内 index 最小) の選択の **直上**」、無ければ末尾。
 /// 複数選択でも一番上を基準にすることで選択のかたまりを割らない。

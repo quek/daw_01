@@ -6,7 +6,8 @@
 > **2026-11-14 追記**: アニメーション GIF / APNG / WebP に対応した。本文の「静止画像のみ」
 > 「animated GIF / APNG は out-of-scope」「GPU upload は 1 枚」は当時の計画で、現状は
 > `daw_gui/src/image_frames.rs` の module doc が正本 (全フレームを decode し、イベント開始
-> からの経過秒でフレームを選ぶ)。
+> からの経過秒でフレームを選ぶ)。クリップの time-stretch (Shift + 端ドラッグ) は
+> `ImageEvent::speed` を変える (r.md #152、正本は同 field の doc)。
 
 関連: [plan_video.md](plan_video.md) (= video clip pipeline)、
 [plan_video_perf.md](plan_video_perf.md) (= zero-copy + ring buffer)、
