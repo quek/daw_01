@@ -141,6 +141,25 @@ pub(super) fn daw_set_sc_listen(_this: &JsValue, args: &[JsValue], ctx: &mut Con
     Ok(JsValue::undefined())
 }
 
+/// `daw.setDeviceMix(deviceId, mix)` → `DeviceEvent::SetDeviceMix` (Rack の行の Mix ノブと同じ口、r.md #151)。
+pub(super) fn daw_set_device_mix(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let device_id = u64::try_from_js(args.get_or_undefined(0), ctx)?;
+    let mix = f64::try_from_js(args.get_or_undefined(1), ctx)? as f32;
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::Device(DeviceEvent::SetDeviceMix { device_id, mix }));
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.toggleDeviceDelta(deviceId)` → `DeviceEvent::ToggleDeviceDelta` (Mix ノブの Alt+クリックと同じ口)。
+pub(super) fn daw_toggle_device_delta(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let device_id = u64::try_from_js(args.get_or_undefined(0), ctx)?;
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::Device(DeviceEvent::ToggleDeviceDelta { device_id }));
+    });
+    Ok(JsValue::undefined())
+}
+
 /// `daw.masterPeakDbfs(ms)` → これから `ms` ミリ秒の間に master が出したサンプルピーク (dBFS)。
 /// 無音なら `null`。GUI のマスターメーターと同じリング (`ScopeBridge`) を読み、待つ間も IPC を
 /// 捌く (`sleepMs` と同じ)。書き出しではなく **再生中の音** を測る口 (SC Listen は書き出しに乗らない)。

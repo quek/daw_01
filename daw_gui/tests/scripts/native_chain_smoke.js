@@ -127,7 +127,9 @@ daw.stop();
 daw.sleepMs(300);
 
 // ---- 3. 書き出しに Listen は乗らない (WAV の突き合わせは harness) -----------------
+daw.toggleDeviceDelta(compId); // Δ も試聴 (r.md #151)。Listen と同じく書き出しに乗らない
 daw.exportWavRange(outDir + "/listen_on.wav", 0.0, CLIP_BEATS, 120000);
+daw.toggleDeviceDelta(compId);
 daw.setScListen(null);
 daw.sleepMs(100);
 daw.exportWavRange(outDir + "/listen_off.wav", 0.0, CLIP_BEATS, 120000);

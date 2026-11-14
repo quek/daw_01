@@ -538,7 +538,7 @@ fn sc_listen_replaces_the_chain_output_with_the_detection_signal_and_keeps_later
     let settings =
         CompSettings { sc_freq_hz: 1_000.0, threshold_db: -30.0, ratio: 8.0, attack_ms: 1.0, ..CompSettings::default() };
     let devices = vec![Device::Native(comp(10, settings)), Device::Native(eq_boost(11))];
-    let listen = |id| NativeIo { sc_listen: id, scopes: None };
+    let listen = |id| NativeIo { sc_listen: id, ..NativeIo::default() };
     let block = |p: &mut ChainProgram, devices: &[Device], io: NativeIo<'_>, b: usize| {
         let x = sine(n, b * n, 700.0, 0.8);
         let (mut l, mut r) = (x.clone(), x);
@@ -602,7 +602,7 @@ fn sc_listen_on_a_group_replaces_its_post_fx_point() {
         (scratch[0].track_l[..n].to_vec(), scratch[0].track_r[..n].to_vec())
     };
     let chain = vec![Device::Native(hard_comp(10)), Device::Native(eq_boost(11))];
-    let listened = render(chain.clone(), NativeIo { sc_listen: 10, scopes: None });
+    let listened = render(chain.clone(), NativeIo { sc_listen: 10, ..NativeIo::default() });
     assert_eq!(listened, render(vec![], NativeIo::default()));
     assert_ne!(render(chain, NativeIo::default()), listened);
 }
@@ -643,7 +643,7 @@ fn native_ops_and_sidechain_staging_do_not_allocate() {
     let mut watch = [0u64; MAX_DEVICE_SCOPES];
     watch[3] = 23;
     bridge.set_slot(3, ProjectKey(1), 23);
-    let io = NativeIo { sc_listen: 21, scopes: Some(DeviceScopeTap { bridge: &bridge, watch: &watch }) };
+    let io = NativeIo { sc_listen: 21, scopes: Some(DeviceScopeTap { bridge: &bridge, watch: &watch }), ..NativeIo::default() };
     let refs: PluginRefs = HashMap::new();
     let rec = HashSet::new();
     let (mut l, mut r) = (vec![0.0f32; n], vec![0.0f32; n]);

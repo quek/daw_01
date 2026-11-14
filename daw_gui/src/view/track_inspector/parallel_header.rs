@@ -1,4 +1,4 @@
-//! Parallel のヘッダ行 (`「 ▼ 名前 … [Split ▾] [out knob] [Match] [x]`) と、 r.md #112 の入力の
+//! Parallel のヘッダ行 (`「 ▼ 名前 … [Split ▾] [out knob] [Match] [Mix] [x]`) と、 r.md #112 の入力の
 //! 配り方 (`Split`) の UI — ヘッダ行の dropdown と、 その直下の param 行 (`Frequency3` なら
 //! `Low ◂[200 Hz]▸ Mid ◂[2.0 kHz]▸ High`)。 chain list 本体 (`chain_list.rs`) から Parallel 1 行ぶんの
 //! 描画を切り出したもの (サイズ budget、 不変条件 9)。
@@ -21,6 +21,7 @@ use common::model::{AutomationTarget, Device, SELECTOR_FADE_RANGE, SPLIT_FREQ_RA
 
 use super::chain_list::ROW_H;
 use super::chain_row::{CHAIN_BTN_W, CHAIN_KNOB, draw_disclosure, draw_rename_input};
+use super::mix_knob::MIX_COL_W;
 use super::{push_scrub_bracket, scrub_style, toggle_audio_style};
 
 /// dropdown の項目 (順序 = [`split_index`] / [`split_from_index`])。
@@ -309,7 +310,7 @@ pub(super) struct ParallelHead<'a> {
     pub split: Split,
 }
 
-/// Parallel ヘッダ行: 「 ▼ 名前 … [Split ▾] [out knob] [Match] [x]。 出力 trim と gain match は
+/// Parallel ヘッダ行: 「 ▼ 名前 … [Split ▾] [out knob] [Match] [Mix] [x]。 出力 trim と gain match は
 /// 終了行ではなくここ (高さを増やさない)。 Split dropdown (r.md #112) の param 行は直下。
 pub(super) fn draw_parallel_begin_row(
     app: &AppData,
@@ -336,6 +337,8 @@ pub(super) fn draw_parallel_begin_row(
             })
         },
     );
+    // Mix の列 (r.md #151。plugin / 内蔵 device の行と同じ列、ノブは chain list が描く)。
+    right -= MIX_COL_W;
     // Match トグル + 出力 trim knob (右から)。
     let match_w = 44.0;
     right -= match_w + 2.0;

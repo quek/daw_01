@@ -51,6 +51,7 @@ impl Song {
         for_each_chain_mut(&mut self.master_fx_chain, &mut fix_chain);
         let mut fix_parallel = |r: &mut Parallel| {
             r.out_gain = if r.out_gain.is_finite() { r.out_gain.clamp(0.0, MAX_TRACK_GAIN) } else { 1.0 };
+            r.mix = device_mix::sanitize(r.mix);
             // r.md #112: クロスオーバーも RT がそのまま係数に使う。
             r.split.sanitize();
             // r.md #114: Selector のアクティブ chain を実在する id に揃える。
@@ -67,6 +68,9 @@ impl Song {
         }
         for_each_native_mut(&mut self.master_fx_chain, &mut NativeDevice::sanitize);
         self.master_limiter.sanitize();
+        // r.md #151: device の Mix も RT が snapshot からそのまま使う (Parallel は上、内蔵 device は
+        // `NativeDevice::sanitize`)。
+        self.for_each_plugin_mut(&mut |p| p.mix = device_mix::sanitize(p.mix));
         // r.md #116 / #117: LFO の Shape / Jitter / Smooth / Delay / Fade In と ADSR の時定数も RT が
         // そのまま使う (GUI の編集は clamp 済だが LoadSong は素通し)。
         for m in &mut self.mod_sources {

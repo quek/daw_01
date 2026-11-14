@@ -150,6 +150,9 @@ pub enum TrackBuiltinParam {
     /// `Parallel::select_pos` (アクティブ chain の中央)。 `Split::Selector` でない Parallel に
     /// 残った lane は何にも効かない (dangling、削除で消える)。
     ParallelSelect { parallel_id: u64 },
+    /// r.md #151: device (plugin / 内蔵 / Parallel) の Mix = 原音との混ぜ具合 (`0..=1`)。住所は安定
+    /// `Device::id`。レーンは device を持つ track (master なら song lanes)。
+    DeviceMix { device_id: u64 },
 }
 
 /// v16 (`docs/plan_text_overlay.md` §2.3): text overlay の各 field

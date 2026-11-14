@@ -1,4 +1,4 @@
-//! chain list の内蔵 device の行 (`名前 + 小表示 + [SC▾] [Par] [x]`) とその直下の展開 (SC パネル /
+//! chain list の内蔵 device の行 (`名前 + 小表示 + [SC▾] [Par] [Mix] [x]`) とその直下の展開 (SC パネル /
 //! Par)、および master の末尾 (「Post-Fader」の区切り + 固定の Limiter 行)
 //! (Q3 / Q9 / Q10 / Q15、`docs/plan_rack_native_devices.md` §10.5)。
 //!
@@ -21,6 +21,7 @@ use crate::view::native_device::{
 };
 
 use super::chain_list::{ROW_GAP, ROW_H, RowCtx, draw_row_bg};
+use super::mix_knob::MIX_COL_W;
 use super::native_panel::{self, PanelCtx, layout};
 use super::plugin_row::draw_sidechain_panel;
 
@@ -59,6 +60,8 @@ pub(super) fn draw_native_row(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Row
             })
         });
     }
+    // Mix の列 (r.md #151。ノブは chain list が描く)
+    right -= MIX_COL_W;
     // [Par]
     right -= BTN_PAR_W + BTN_GAP;
     ui.button_at(wid(ParamSurface::Rack, key, "par", ()), "Par", Rect { x: right, y: by, w: BTN_PAR_W, h: btn_h }, move || {
@@ -214,6 +217,7 @@ pub(super) fn draw_master_tail(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Ro
     let btn_h = ROW_H - 4.0;
     let by = y + 2.0;
     let mut right = x + w - BTN_X_W; // × の列は空ける (組み込みと同じ見分け)
+    right -= MIX_COL_W; // Mix の列も空ける (Limiter は Mix を持たない。Par の列を上の行と揃える)
     right -= BTN_PAR_W + BTN_GAP;
     ui.button_at(wid(ParamSurface::Rack, key, "par", ()), "Par", Rect { x: right, y: by, w: BTN_PAR_W, h: btn_h }, move || {
         Edit::mutate(move |app: &mut AppData| {

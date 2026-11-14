@@ -805,6 +805,7 @@ fn 器が呼び側のスタックを指したまま_in_flight_を返すと_ス�
         native_io: crate::graph::NativeIo {
             sc_listen: 0,
             scopes: Some(crate::graph::DeviceScopeTap { bridge: &scope_bridge, watch: &scope_watch }),
+            ..Default::default()
         },
         transpose: 0,
     };

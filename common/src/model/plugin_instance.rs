@@ -14,7 +14,7 @@ use crate::plugin_format::PluginFormat;
 /// `IComponent::getState`). Paths are NOT stored — `(format, plugin_id)`
 /// is resolved through `plugin_db::PluginDatabase` at load time, keeping
 /// projects portable across machines.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginInstance {
     /// v29: Song-global の安定 device id (`Song.next_device_id` 採番、`0` =
     /// 未採番 sentinel)。IPC / automation / plugin host bookkeeping / shmem 名
@@ -104,6 +104,10 @@ pub struct PluginInstance {
     /// project に保存し undo 対象 (= 「作った中身」)。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bypassed: bool,
+    /// r.md #151: 原音との混ぜ具合 (`0.0` = 原音だけ、`1.0` = エフェクト後だけ。[`super::device_mix`])。
+    /// 音声入力を持つ device だけが意味を持つ。automation / 変調の対象 (`TrackBuiltinParam::DeviceMix`)。
+    #[serde(default = "super::device_mix::full", skip_serializing_if = "super::device_mix::is_full")]
+    pub mix: f32,
 }
 
 impl PluginInstance {
@@ -122,6 +126,7 @@ impl PluginInstance {
             ara_archive_ids: Vec::new(),
             send_all_keys_to_plugin: false,
             bypassed: false,
+            mix: 1.0,
         }
     }
 
@@ -156,6 +161,7 @@ impl PluginInstance {
             ara_archive_ids: Vec::new(),
             send_all_keys_to_plugin: false,
             bypassed: false,
+            mix: 1.0,
         }
     }
 
@@ -170,7 +176,7 @@ impl PluginInstance {
 /// `LoadSong` は plugin state / ARA アーカイブの肥大に依らず常に小さく、
 /// 16MB wire 上限に構造的に到達しない。encode / decode の field 順は一致
 /// させること (id → plugin_id → format → aux_inputs → aux_outputs →
-/// aux_output_count → ports → send_all_keys_to_plugin → bypassed → aux_input_count)。
+/// aux_output_count → ports → send_all_keys_to_plugin → bypassed → aux_input_count → mix)。
 impl bincode::Encode for PluginInstance {
     fn encode<E: bincode::enc::Encoder>(
         &self,
@@ -185,7 +191,8 @@ impl bincode::Encode for PluginInstance {
         self.ports.encode(encoder)?;
         self.send_all_keys_to_plugin.encode(encoder)?;
         self.bypassed.encode(encoder)?;
-        self.aux_input_count.encode(encoder)
+        self.aux_input_count.encode(encoder)?;
+        self.mix.encode(encoder)
     }
 }
 
@@ -207,6 +214,7 @@ impl<Ctx> bincode::Decode<Ctx> for PluginInstance {
             send_all_keys_to_plugin: bincode::Decode::decode(decoder)?,
             bypassed: bincode::Decode::decode(decoder)?,
             aux_input_count: bincode::Decode::decode(decoder)?,
+            mix: bincode::Decode::decode(decoder)?,
         })
     }
 }

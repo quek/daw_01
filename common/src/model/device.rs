@@ -38,6 +38,9 @@ pub struct Parallel {
     /// r.md #105 と同じ意味: `true` の間、Parallel 全体が素通し (中の device は dispatch されない)。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bypassed: bool,
+    /// r.md #151: Parallel 全体と Parallel 入力 (原音) の混ぜ具合 ([`PluginInstance::mix`] と同じ意味)。
+    #[serde(default = "super::device_mix::full", skip_serializing_if = "super::device_mix::is_full")]
+    pub mix: f32,
     /// 括弧行 (開始 / 終了) の色。 作った時点で周囲と別の色を自動で振る (Bitwig)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[f32; 3]>,
@@ -290,6 +293,9 @@ pub struct ParallelChain {
     pub devices: Vec<Device>,
 }
 
+/// r.md #151: 同時に Δ (差分試聴) にできる device の上限。engine は固定長の表で持つ (RT で確保しない)。
+pub const MAX_DELTA_DEVICES: usize = 16;
+
 fn default_parallel_name() -> String {
     "Parallel".to_string()
 }
@@ -306,6 +312,7 @@ impl Parallel {
             name: default_parallel_name(),
             chains: vec![ParallelChain::new("Chain 1")],
             bypassed: false,
+            mix: 1.0,
             color: None,
             out_gain: 1.0,
             gain_match: false,
@@ -453,6 +460,40 @@ impl Device {
             Device::Plugin(p) => p.bypassed,
             Device::Native(n) => n.bypassed,
             Device::Parallel(r) => r.bypassed,
+        }
+    }
+
+    /// r.md #151: 原音との混ぜ具合 (`0.0..=1.0`)。
+    pub fn mix(&self) -> f32 {
+        match self {
+            Device::Plugin(p) => p.mix,
+            Device::Native(n) => n.mix,
+            Device::Parallel(r) => r.mix,
+        }
+    }
+
+    /// [`Self::mix`] を書く (値域へ丸める。非有限値は捨てる)。戻り値 = 実際に変わったか。
+    /// GUI と engine (`song_values`) が同じ規則を通る唯一の口。
+    pub fn set_mix(&mut self, mix: f32) -> bool {
+        if !mix.is_finite() {
+            return false;
+        }
+        let mix = mix.clamp(0.0, 1.0);
+        let slot = match self {
+            Device::Plugin(p) => &mut p.mix,
+            Device::Native(n) => &mut n.mix,
+            Device::Parallel(r) => &mut r.mix,
+        };
+        std::mem::replace(slot, mix) != mix
+    }
+
+    /// r.md #151: Mix (原音との混ぜ具合) を持つ device か = 入ってくる音を加工する device。
+    /// 音声入力の無い plugin (音源 / 映像 FX / MIDI FX) は混ぜる原音が無いので持たない。
+    /// 行の Mix ノブを出すかと、engine が混ぜる段を置くかの両方がこれを引く。
+    pub fn has_mix(&self) -> bool {
+        match self {
+            Device::Plugin(p) => p.ports.has_audio_input && p.ports.has_audio_output,
+            Device::Native(_) | Device::Parallel(_) => true,
         }
     }
 
@@ -1201,6 +1242,7 @@ mod tests {
         Device::Parallel(Parallel {
             id,
             name: "Parallel".into(),
+            mix: 1.0,
             color: None,
             out_gain: 1.0,
             gain_match: false,
@@ -1356,6 +1398,7 @@ mod tests {
                 ParallelChain { id: 3, devices: vec![plug(7)], ..ParallelChain::new("b") },
             ],
             bypassed: false,
+            mix: 1.0,
             color: None,
             out_gain: 1.0,
             gain_match: false,

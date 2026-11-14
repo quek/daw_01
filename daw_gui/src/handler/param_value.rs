@@ -207,6 +207,8 @@ fn track_builtin_value(doc: &SongDoc, owner: u32, param: &common::model::TrackBu
             .map(f64::from),
         // r.md #114: アクティブ chain の中央の位置 (Selector でなければ中央 0.5)。
         B::ParallelSelect { parallel_id } => doc.parallel_by_id(*parallel_id).map(|r| f64::from(r.select_pos())),
+        // r.md #151: device の Mix (種類を問わず device id で引く)。
+        B::DeviceMix { device_id } => song.device_by_id(*device_id).map(|d| f64::from(d.mix())),
     }
 }
 
@@ -276,7 +278,10 @@ fn fallback_plain(target: &AutomationTarget) -> f64 {
         T::NativeParam { param, .. } => param.default_plain().map_or(0.0, f64::from),
         T::MasterLimiter(p) => f64::from(p.default_plain()),
         // gain は unity (0 にすると無音のレーンができる)、pan / mute は中立。
-        T::TrackBuiltin(B::Volume | B::SendGain { .. } | B::ChainGain { .. } | B::ParallelOutGain { .. }) => 1.0,
+        // Mix の既定は 1 (エフェクト後だけ = Mix が無いのと同じ音)。
+        T::TrackBuiltin(
+            B::Volume | B::SendGain { .. } | B::ChainGain { .. } | B::ParallelOutGain { .. } | B::DeviceMix { .. },
+        ) => 1.0,
         T::TrackBuiltin(B::Pan | B::ChainPan { .. } | B::Mute) => 0.0,
         T::TrackBuiltin(B::ParallelSplitFreq { edge, .. }) => {
             common::model::Split::DEFAULT_FREQUENCY3.freq(*edge).map_or(0.0, f64::from)

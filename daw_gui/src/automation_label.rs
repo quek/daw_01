@@ -33,6 +33,10 @@ pub fn automation_target_display_name(
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::ParallelSelect { parallel_id }) => {
             format!("Parallel {parallel_id} Active")
         }
+        // r.md #151: device の Mix (表示側は device 名で引き直す)。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::DeviceMix { device_id }) => {
+            format!("Device {device_id} Mix")
+        }
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::SendGain { send_id, .. }) => {
             // v29: 安定 send id (1 始まり)。 位置ベースの連番表示は S3b で
             // 「track の sends 内位置」 を引く形に戻す予定 (ここは song 非依存

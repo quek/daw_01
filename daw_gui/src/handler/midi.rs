@@ -34,7 +34,8 @@ fn learnable_binding(
             | P::ChainPan { .. }
             | P::ParallelOutGain { .. }
             | P::ParallelSplitFreq { .. }
-            | P::ParallelSelect { .. },
+            | P::ParallelSelect { .. }
+            | P::DeviceMix { .. },
         )
         | T::SongTimeSigNumerator
         | T::ImageBuiltin(_)

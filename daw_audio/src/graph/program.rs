@@ -89,6 +89,17 @@ pub enum ChainOp {
     /// bypass 中でも op は出す (実効 ON/OFF は block 頭で解決し、切り替えは crossfade)。
     /// `native_slot` = `ChainProgram::natives` の index (状態は値型の op に持てないので scratch 側)。
     Native { device_id: u64, native_slot: u32 },
+    /// r.md #151: Mix (原音との混ぜ具合) を持つ device の手前。現在のバスを原音として
+    /// `ChainProgram::mix_dry[depth]` に退避する。`depth` = 入れ子の深さ (Parallel の Mix の中に
+    /// device の Mix が入る。区間は必ず入れ子なので、退避先は深さごとに 1 組で足りる)。
+    /// 混ぜる必要が無い buffer (mix が 1 で動かず、Δ でもない) は退避もしない — ただし `has_delay`
+    /// (原音を遅らせる device) は遅延線の履歴を切らさないよう毎 buffer 退避して進める。
+    MixBegin { depth: u32, device_id: u64, has_delay: bool },
+    /// [`ChainOp::MixBegin`] と対。バス := 原音 + (エフェクト後 − 原音) × mix。Δ (差分試聴、
+    /// `NativeIo::delta`) 中は原音を引いた差分だけにする。mix が 1 で Δ でなければバスに触らない
+    /// (= この段が無いのと同じ音)。
+    /// `delay`: 原音を device の latency に揃える `(delay_lines の index, frames)`。遅延 0 は `None`。
+    MixEnd { depth: u32, device_id: u64, delay: Option<(u32, u32)> },
 }
 
 /// Parallel 1 つぶんの RT scratch。
@@ -203,6 +214,26 @@ impl ChainScratch {
     }
 }
 
+/// r.md #151: Mix の原音の退避 (入れ子の深さ 1 つぶん)。
+pub struct MixScratch {
+    pub dry_l: Vec<f32>,
+    pub dry_r: Vec<f32>,
+    /// この buffer の `MixBegin` が原音を退避したか (`MixEnd` はこれが立っているときだけ混ぜる)。
+    pub active: bool,
+}
+
+impl MixScratch {
+    pub fn new() -> Self {
+        Self { dry_l: vec![0.0; MAX_FRAMES], dry_r: vec![0.0; MAX_FRAMES], active: false }
+    }
+}
+
+impl Default for MixScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// pass 1 (`process_track_owned`) でこの track が何をするか。compile 時に配線トポロジから焼く
 /// (RT で Song を歩いて判定しない — plugin を列挙する判定は確保を伴う、r.md #129 §18-B と同じ理由)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -240,7 +271,8 @@ pub struct ChainProgram {
     /// 並列 PDC の delay line (`ChainOp::ChainEnd::delay` / `ChainOp::ParallelEnd::input_delay` の index)。
     pub delay_lines: Vec<DelayLine>,
     /// `delay_lines` と平行な stable key (= `ParallelChain::id`、素材の音だけを描く Parallel の入力は
-    /// `Parallel::id`。どちらも device id と同じ空間なので衝突しない。再 compile 跨ぎの状態移送)。
+    /// `Parallel::id`、r.md #151 の Mix の原音は `Device::id`。どれも同じ id 空間で、Mix の段は素材だけを
+    /// 描く scope には置かないので衝突しない。再 compile 跨ぎの状態移送)。
     pub delay_keys: Vec<u64>,
     /// r.md #117: plugin ごとのボイス表 (`ChainOp::Plugin::voice_slot`)。 device id で移送。
     pub voices: Vec<VoiceTable>,
@@ -249,6 +281,10 @@ pub struct ChainProgram {
     /// crossfade 中の dry 退避。op は直列なので 1 組。`natives` が空なら確保しない。
     pub native_dry_l: Vec<f32>,
     pub native_dry_r: Vec<f32>,
+    /// r.md #151: Mix の原音の退避 (`ChainOp::MixBegin::depth` ごとに 1 つ)。
+    pub mix_dry: Vec<MixScratch>,
+    /// r.md #151: Mix の per-sample ramp (automation + 変調)。op は直列なので 1 本。`mix_dry` が空なら確保しない。
+    pub mix_ramp: Vec<f32>,
     /// この track の Pre-FX / PostFx (pre-fader) の snapshot を誰かが読むか。compile 時に焼く
     /// (RT で Song を歩いて判定しない、§18-B)。PostFx は pre-fader send も含む。
     pub snapshot_pre_fx: bool,
@@ -288,6 +324,8 @@ impl ChainProgram {
             natives: Vec::new(),
             native_dry_l: Vec::new(),
             native_dry_r: Vec::new(),
+            mix_dry: Vec::new(),
+            mix_ramp: Vec::new(),
             snapshot_pre_fx: false,
             snapshot_post_fx: false,
             fader: true,
@@ -427,6 +465,8 @@ pub fn run_chain_program(
         natives,
         native_dry_l,
         native_dry_r,
+        mix_dry,
+        mix_ramp,
         listen_pending,
         ..
     } = program;
@@ -593,9 +633,61 @@ pub fn run_chain_program(
                     ctx,
                 );
             }
+            ChainOp::MixBegin { depth, device_id, has_delay } => {
+                let Some(ms) = mix_dry.get_mut(*depth as usize) else { continue };
+                ms.active = *has_delay || device_mix_moves(ctx, *device_id);
+                if ms.active {
+                    ms.dry_l[..n].copy_from_slice(&bus_l[..n]);
+                    ms.dry_r[..n].copy_from_slice(&bus_r[..n]);
+                }
+            }
+            ChainOp::MixEnd { depth, device_id, delay } => {
+                let Some(ms) = mix_dry.get_mut(*depth as usize).filter(|ms| ms.active) else { continue };
+                // 原音を device の latency に揃える。mix が 1 の間も進める (履歴を切らさない)。
+                if let Some((line_idx, frames)) = delay
+                    && let Some(line) = delay_lines.get_mut(*line_idx as usize)
+                {
+                    line.step_in_place(&mut ms.dry_l[..n], &mut ms.dry_r[..n], *frames as usize);
+                }
+                let base = device_mix_base(ctx, *device_id);
+                fill_parallel_ramp(ctx, track_id, TrackBuiltinParam::DeviceMix { device_id: *device_id }, base, mix_ramp);
+                let delta = ctx.native.is_delta(*device_id);
+                let m = n.min(mix_ramp.len());
+                apply_device_mix(&mut bus_l[..m], &mut bus_r[..m], &ms.dry_l, &ms.dry_r, &mix_ramp[..m], delta);
+            }
         }
     }
     midi_replaced
+}
+
+/// device の Mix の基準値を Song snapshot から live-read する (再 compile なしで効く)。無ければ 1。
+fn device_mix_base(ctx: &ProgramCtx<'_>, device_id: u64) -> f32 {
+    ctx.song.and_then(|s| ctx.index.device(s, device_id)).map_or(1.0, Device::mix)
+}
+
+/// この buffer で device の Mix が「1 のまま動かない」以外になりうるか: 基準値が 1 でない / Δ 試聴中 /
+/// Mix を動かす lane か変調がある。どれでもなければ `MixBegin` / `MixEnd` は何もしない。
+fn device_mix_moves(ctx: &ProgramCtx<'_>, device_id: u64) -> bool {
+    if ctx.native.is_delta(device_id) || device_mix_base(ctx, device_id) != 1.0 {
+        return true;
+    }
+    let target = AutomationTarget::TrackBuiltin(TrackBuiltinParam::DeviceMix { device_id });
+    let store = ctx.owner_store();
+    store.enabled_lane(&target).is_some() || !store.routings_for(&target).is_empty()
+}
+
+/// `MixEnd`: バス (エフェクト後) を原音と混ぜる。`delta` = 原音を引いた差分だけを残す (Δ 試聴)。
+/// mix が buffer を通して 1 で `delta` でなければ何もしない (この段が無いのと bit 単位で同じ音)。
+fn apply_device_mix(bus_l: &mut [f32], bus_r: &mut [f32], dry_l: &[f32], dry_r: &[f32], mix: &[f32], delta: bool) {
+    if !delta && mix.iter().all(|&m| m == 1.0) {
+        return;
+    }
+    let keep_dry = if delta { 0.0 } else { 1.0 };
+    for (i, &m) in mix.iter().enumerate() {
+        let m = m.clamp(0.0, 1.0);
+        bus_l[i] = dry_l[i] * keep_dry + (bus_l[i] - dry_l[i]) * m;
+        bus_r[i] = dry_r[i] * keep_dry + (bus_r[i] - dry_r[i]) * m;
+    }
 }
 
 /// `ChainEnd`: chain の出力 (`bus`) に gain / pan / mute の ramp を掛けて Parallel の和へ足す。
@@ -987,6 +1079,7 @@ mod tests {
             name: "Parallel".into(),
             chains,
             bypassed: false,
+            mix: 1.0,
             color: None,
             out_gain: 1.0,
             gain_match: false,
@@ -1025,6 +1118,19 @@ mod tests {
     ) -> ChainProgram {
         let built = build_program(&song.tracks[0].devices, 1, None, latencies, &HashSet::new(), scope, 48_000);
         let mut program = built.program;
+        run_block(&mut program, song, NativeIo::default(), frames, bus, midi);
+        program
+    }
+
+    /// 組んである program を 1 buffer 走らせる (`native` = 聴き方: Δ 試聴など)。
+    fn run_block(
+        program: &mut ChainProgram,
+        song: &Song,
+        native: NativeIo<'_>,
+        frames: u32,
+        bus: &mut (Vec<f32>, Vec<f32>),
+        midi: &mut Vec<TimedNoteEvent>,
+    ) {
         let refs: PluginRefs = std::collections::HashMap::new();
         let lanes = HashSet::new();
         let ctx = ProgramCtx {
@@ -1041,14 +1147,56 @@ mod tests {
             mod_plane: ModTickPlaneRef::default(),
             own_pre_fx: None,
             rows: TrackRows::default(),
-            native: NativeIo::default(),
+            native,
             index: &SongIndex::build(song),
             owner: ParamStoreAt::Track(0),
         };
         let mut midi_b = Vec::with_capacity(MAX_EVENTS);
         let len = program.ops.len();
-        run_chain_program(&mut program, 0..len, &mut bus.0, &mut bus.1, midi, &mut midi_b, &ctx);
-        program
+        run_chain_program(program, 0..len, &mut bus.0, &mut bus.1, midi, &mut midi_b, &ctx);
+    }
+
+    /// r.md #151: Mix は原音とエフェクト後の線形補間、Δ は「エフェクト後 − 原音」に Mix を掛けたもの。
+    /// Mix 1 (Δ なし) はこの段が無いのと bit 単位で同じ。原音は device の latency ぶん遅れて混ざる。
+    /// エフェクト = chain gain 0.5 の Parallel (中央 pan は unity なので エフェクト後 = 入力 × 0.5)。
+    #[test]
+    fn device_mix_blends_dry_and_wet_and_delta_leaves_only_the_difference() {
+        let n = 8usize;
+        let halving = |mix: f32| {
+            let mut p = parallel(10, vec![ParallelChain { gain: 0.5, ..chain(11, vec![]) }]);
+            p.as_parallel_mut().unwrap().mix = mix;
+            song_with(vec![p])
+        };
+        let out = |mix: f32, delta: bool| {
+            let song = halving(mix);
+            let mut bus = ramp(n);
+            let mut io = NativeIo::default();
+            io.delta[3] = if delta { 10 } else { 0 };
+            let built = build_program(&song.tracks[0].devices, 1, None, &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix, 48_000);
+            let mut program = built.program;
+            run_block(&mut program, &song, io, n as u32, &mut bus, &mut Vec::with_capacity(MAX_EVENTS));
+            bus.0
+        };
+        let scaled = |k: f32| ramp(n).0.iter().map(|x| x * k).collect::<Vec<_>>();
+        assert_eq!(out(1.0, false), scaled(0.5), "Mix 1 = エフェクト後だけ");
+        assert_eq!(out(0.0, false), scaled(1.0), "Mix 0 = 原音だけ");
+        assert_eq!(out(0.5, false), scaled(0.75));
+        assert_eq!(out(1.0, true), scaled(-0.5), "Δ = エフェクト後 − 原音");
+        assert_eq!(out(0.5, true), scaled(-0.25), "Δ にも Mix が掛かる");
+
+        // latency のある device: 原音は同じだけ遅れて混ざる (Parallel の中に latency 3 の plugin。
+        // dispatch 先が無いので plugin は素通し = エフェクト後は遅れない入力 × 0.5)。
+        let fx = Device::Plugin(common::model::PluginInstance {
+            id: 20,
+            ..common::model::PluginInstance::new("p".into(), common::plugin_format::PluginFormat::Clap)
+        });
+        let mut p = parallel(10, vec![ParallelChain { gain: 0.5, ..chain(11, vec![fx]) }]);
+        p.as_parallel_mut().unwrap().mix = 0.0;
+        let song = song_with(vec![p]);
+        let lat: DeviceLatencies = [(20, 3)].into();
+        let mut bus = ramp(n);
+        run_scoped(&song, RenderScope::Mix, &lat, n as u32, &mut bus, &mut Vec::with_capacity(MAX_EVENTS));
+        assert_eq!(bus.0, vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0], "原音が 3 サンプル遅れる");
     }
 
     fn ramp(n: usize) -> (Vec<f32>, Vec<f32>) {

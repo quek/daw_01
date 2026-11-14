@@ -75,6 +75,8 @@ pub fn target_range(target: &AutomationTarget, plugin_range: Option<(f64, f64)>)
             B::Volume | B::SendGain { .. } | B::ChainGain { .. } | B::ParallelOutGain { .. } => GAIN,
             B::Pan | B::ChainPan { .. } => BIPOLAR,
             B::Mute => ParamRange::Toggle,
+            // r.md #151: Mix は 0 (原音) 〜 1 (エフェクト後)。
+            B::DeviceMix { .. } => ParamRange::Linear { lo: 0.0, hi: 1.0 },
             // r.md #112: クロスオーバー周波数は対数 (値域の SSoT は `SPLIT_FREQ_RANGE`)。
             B::ParallelSplitFreq { .. } => crate::model::SPLIT_FREQ_RANGE,
             // r.md #114: Selector の位置は plain == norm (chain 数に依らず全域を等分)。
@@ -1432,6 +1434,7 @@ mod tests {
             B::ParallelSplitFreq { parallel_id: 1, edge: SplitEdge::LowMid },
             B::ParallelSplitFreq { parallel_id: 1, edge: SplitEdge::MidHigh },
             B::ParallelSelect { parallel_id: 1 },
+            B::DeviceMix { device_id: 1 },
         ]
         .into_iter()
         .map(AutomationTarget::TrackBuiltin)

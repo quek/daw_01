@@ -870,6 +870,7 @@ pub fn handle_project_command(
         | AudioCommand::SetTrackMuted { .. }
         | AudioCommand::SetTrackSolo { .. }
         | AudioCommand::SetNativeDevice { .. }
+        | AudioCommand::SetDeviceMix { .. }
         | AudioCommand::SetMasterLimiter { .. }
         | AudioCommand::SetTrackArmed { .. }
         | AudioCommand::SetSendGain { .. }
@@ -966,6 +967,13 @@ pub fn handle_project_command(
         // 一致しないので効かない。
         AudioCommand::SetScListen { device_id, .. } => {
             shared.sc_listen_device.store(device_id.unwrap_or(0), Ordering::Release);
+        }
+        // r.md #151: Δ (差分試聴) も「聴き方」。上限を超えたぶんは捨て、余りの slot は空き (0) に戻す。
+        AudioCommand::SetDeltaDevices { device_ids, .. } => {
+            let mut ids = device_ids.iter().copied().filter(|&id| id != 0);
+            for slot in &shared.delta_devices {
+                slot.store(ids.next().unwrap_or(0), Ordering::Release);
+            }
         }
         AudioCommand::SetDeviceScopes { device_ids, .. } => {
             ctl.device_scope_watch = device_scope_watch(&device_ids);

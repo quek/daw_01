@@ -102,6 +102,10 @@ impl AppData {
         // SC Listen は聴き方の都合で Song に書かない。新しい曲の device を指さないよう、LoadSong
         // より先に届く解除を送る (§10.14)。
         self.set_sc_listen(None);
+        // r.md #151: Δ (差分試聴) も同じ扱い (立っていたときだけ解除を送る)。
+        if !self.cur.peph.delta_devices.is_empty() {
+            self.set_delta_devices(Vec::new());
+        }
 
         // -- track_id / ClipKey keyed の表示設定 ----------------------------
         // ViewState を持たない旧 .daw では `restore_view_state` が早期 return
@@ -406,6 +410,7 @@ impl AppData {
             self.cur.peph.armed_mod_source = None;
         }
         self.prune_sc_listen();
+        self.prune_delta_devices();
     }
 
     // -------- File ----------------------------------------------------------

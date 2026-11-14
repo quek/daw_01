@@ -236,6 +236,9 @@ pub struct NativeDevice {
     /// ON/OFF の唯一の SSoT。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bypassed: bool,
+    /// r.md #151: 原音との混ぜ具合 ([`PluginInstance::mix`] と同じ意味)。
+    #[serde(default = "super::device_mix::full", skip_serializing_if = "super::device_mix::is_full")]
+    pub mix: f32,
     pub params: NativeParams,
     /// 外部サイドチェインの配線 (Comp / Bus Comp だけが意味を持つ。他は正規化が `None` に落とす)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,6 +254,7 @@ impl NativeDevice {
             builtin: true,
             ordinal: 1,
             bypassed: true,
+            mix: 1.0,
             params: NativeParams::default_of(kind),
             aux_input: None,
         }
@@ -264,6 +268,7 @@ impl NativeDevice {
             builtin: false,
             ordinal,
             bypassed: false,
+            mix: 1.0,
             params: NativeParams::default_of(kind),
             aux_input: None,
         }
@@ -314,6 +319,7 @@ impl NativeDevice {
     /// 値の値域回復。構造 (builtin / ordinal / aux) には触らない。
     pub fn sanitize(&mut self) {
         self.params.sanitize();
+        self.mix = super::device_mix::sanitize(self.mix);
     }
 
     /// 行 / レーンに出す名前。`ordinal <= 1` は種類名だけ、それ以外は `"{label} {ordinal}"`。

@@ -126,6 +126,10 @@ pub enum DeviceEvent {
     MasterLimiterEdit(MasterLimiterEdit),
     /// SC Listen (聴き方の都合、Song に書かない。bypass 中の Comp を有効化するのだけ Song 編集)。
     SetScListen { device_id: Option<u64> },
+    /// r.md #151: device (plugin / 内蔵 / Parallel) の Mix = 原音との混ぜ具合 (`0..=1`)。Song 編集 + 値 IPC。
+    SetDeviceMix { device_id: u64, mix: f32 },
+    /// r.md #151: Δ (差分試聴) の ON/OFF (Mix ノブを Alt+クリック)。聴き方の都合で Song に書かない。
+    ToggleDeviceDelta { device_id: u64 },
     /// Par の開閉 (見方の都合、Song に書かない)。
     ToggleRackPanel(RackPanelKey),
 }
@@ -183,6 +187,9 @@ impl DeviceEvent {
             E::MasterLimiterEdit(_) => "マスターリミッター変更",
             // Listen 自体は Song に書かない。snapshot が積まれるのは bypass 中の Comp を有効化したときだけ。
             E::SetScListen { .. } => "デバイスを有効化",
+            E::SetDeviceMix { .. } => "デバイスの Mix",
+            // Δ は Song に書かない (snapshot を積まない)。
+            E::ToggleDeviceDelta { .. } => "Δ 試聴",
             // 非編集 (GUI 窓 / 選択 / 再読込 / 開閉) は snapshot を積まないので
             // ラベルは記録されない (`AppEvent::undo_label` の既定と同じ名前)。
             E::ToggleSlotGui { .. }

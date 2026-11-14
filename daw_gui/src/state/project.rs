@@ -500,6 +500,10 @@ pub struct ProjectEphemeral {
     /// 同時に 1 つ」が型で保証される。**聴き方の都合**で Song に書かず、保存も undo もしない。
     /// 書き込みと `AudioCommand::SetScListen` の送信は `handler::sc_listen::set_sc_listen` だけ。
     pub sc_listen_device: Option<u64>,
+    /// r.md #151: Δ (差分試聴) 中の device id (ON にした順、`MAX_DELTA_DEVICES` まで)。**聴き方の都合**で
+    /// Song に書かず、保存も undo もしない。書き込みと `AudioCommand::SetDeltaDevices` の送信は
+    /// `handler::device_mix::set_delta_devices` だけ。
+    pub delta_devices: Vec<u64>,
     /// r.md #129 (§11.2): 直近 `AudioCommand::SetDeviceScopes` で engine に送った device id
     /// (差分送信用)。respawn で clear し、次のフレームで再送する。session-only。
     pub device_scopes_sent: Vec<u64>,
@@ -987,6 +991,7 @@ impl ProjectState {
                 inspector_hovered_mod: None,
                 master_panel_hovered: None,
                 sc_listen_device: None,
+                delta_devices: Vec::new(),
                 device_scopes_sent: Vec::new(),
                 param_gesture_seen: std::collections::HashSet::new(),
                 pianoroll_hover_beat: None,

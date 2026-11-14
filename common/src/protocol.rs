@@ -564,6 +564,13 @@ pub enum AudioCommand {
     /// engine は `SetScListen` と `CloseProject` 以外で値を変えない (LoadSong / project 切替でも解除しない)。
     /// Comp 以外の id は engine が無視する。
     SetScListen { project: ProjectKey, device_id: Option<u64> },
+    /// r.md #151: device (plugin / 内蔵 / Parallel) の Mix (原音との混ぜ具合 `0..=1`) の値のみ更新。
+    /// `device_id` は song 全体で一意なので track を持たない。
+    SetDeviceMix { project: ProjectKey, device_id: u64, mix: f32 },
+    /// r.md #151: Δ (差分試聴) 中の device id の全体 (空 = 解除)。**聴き方の都合**で Song には書かない
+    /// (`SetScListen` と同じ扱い: 書き出しに入らず、engine は LoadSong / project 切替でも解除しない)。
+    /// [`crate::model::MAX_DELTA_DEVICES`] 個まで (engine も切り詰める)。
+    SetDeltaDevices { project: ProjectKey, device_ids: Vec<u64> },
     /// r.md #129: スペクトラムを計算する device (EQ Par が開いているもの) の id。
     /// `MAX_DEVICE_SCOPES` 以下 (engine も切り詰め・重複除去する)。サンプルは shmem で運ぶ。
     SetDeviceScopes { project: ProjectKey, device_ids: Vec<u64> },
@@ -789,6 +796,8 @@ impl AudioCommand {
             | SetNativeDevice { project, .. }
             | SetMasterLimiter { project, .. }
             | SetScListen { project, .. }
+            | SetDeviceMix { project, .. }
+            | SetDeltaDevices { project, .. }
             | SetDeviceScopes { project, .. }
             | SetSendGain { project, .. }
             | SetSendEnabled { project, .. }

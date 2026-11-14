@@ -529,6 +529,10 @@ pub struct ProjectShared {
     /// 切替でも解除しない: respawn 後の GUI の再送を無効にしないため)。Song に無い id もそのまま
     /// 保持し、compile 後に一致する op があれば効く。
     pub sc_listen_device: AtomicU64,
+    /// r.md #151: Δ (差分試聴) 中の device id (`0` = 空き)。`sc_listen_device` と同じ扱い (IPC スレッドが
+    /// `AudioCommand::SetDeltaDevices` で書き、RT が buffer 頭で読む。Song に載せない)。slot ごとに独立に
+    /// 読むので、書き換えの途中を読んでも「1 buffer だけ古い / 新しい id が混ざる」だけで壊れない。
+    pub delta_devices: [AtomicU64; common::model::MAX_DELTA_DEVICES],
 }
 
 impl ProjectShared {
@@ -579,6 +583,7 @@ impl ProjectShared {
             loading_devices: ArcSwap::from_pointee(crate::graph::LoadingDevices::new()),
             telemetry_slot,
             sc_listen_device: AtomicU64::new(0),
+            delta_devices: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }

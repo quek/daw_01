@@ -466,6 +466,10 @@ fn draw_row(
         _ => {}
     }
     draw_parallel_band(ui, i, r, content, popup_open, p);
+    // r.md #151: Mix ノブ (plugin / 内蔵 device / Parallel ヘッダの行。行の描画は列を空けるだけ)。
+    if let Some(device_id) = r.drag_id() {
+        super::mix_knob::draw_mix_knob(app, ui, ctx.scope, device_id, content, popup_open);
+    }
     match &r.kind {
         ChainRowKind::Plugin(e) => {
             draw_plugin_row(app, ui, i, e, content, popup_open, keys_style, ctx.disabled);

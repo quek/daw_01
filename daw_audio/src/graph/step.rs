@@ -183,7 +183,7 @@ impl<'a> RenderCtx<'a> {
         let ModTickPlaneRef { ids, col_of, values, depth_ids, depth_col_of, depths, lead: _, first_sample: _, nodes: mod_nodes } =
             mod_plane;
         let FollowerDrive { spans, first_sample: _, col_of_slot, eff, n_cols: _ } = follower_drive;
-        let NativeIo { sc_listen: _, scopes } = native_io;
+        let NativeIo { sc_listen: _, scopes, delta: _ } = native_io;
         [
             ("song", at(*song)),
             ("index", at(*index)),

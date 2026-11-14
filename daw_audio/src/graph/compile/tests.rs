@@ -611,7 +611,8 @@ fn render_scope_shapes_the_master_stage_and_track_faders() {
         let s = compile_schedule(&song, &lat, &LoadingDevices::new(), 48_000, 0, scope).unwrap();
         (s.master_stage, s.master_program.ops.len(), s.master_limiter_latency, s.master_latency_samples, s.track_programs[0].fader)
     };
-    assert_eq!(shape(RenderScope::Mix), (true, 1, true, 512 + 2048 + look, true));
+    // master fx 1 つ = Mix の段 (r.md #151) で挟んだ 3 op。
+    assert_eq!(shape(RenderScope::Mix), (true, 3, true, 512 + 2048 + look, true));
     assert_eq!(shape(RenderScope::PostFx), (false, 0, false, 512, false), "PostFx 点まで (fx は数え、フェーダーは掛けない)");
     assert_eq!(shape(RenderScope::Sources), (false, 0, false, 0, false), "音声入力を持つ fx も数えない");
 }
@@ -2207,6 +2208,7 @@ fn paraout_independent_dest_pdc_fans_in_source_latency() {
 fn parallel_with_chains(id: u64, chains: Vec<(u64, Vec<Device>)>) -> Device {
     Device::Parallel(common::model::Parallel {
         id,
+        mix: 1.0,
         name: "Parallel".into(),
         chains: chains
             .into_iter()
@@ -2329,19 +2331,21 @@ fn sidechain_from_another_tracks_chain_orders_the_owner_first() {
 
 // ---- r.md #129: 内蔵 device (§15.3 T13 / T14 / T15) ----
 
+/// Mix の段 (r.md #151) を除いた op の並び。
 fn op_labels(p: &crate::graph::ChainProgram) -> Vec<String> {
     use crate::graph::ChainOp;
     p.ops
         .iter()
-        .map(|op| match op {
-            ChainOp::Plugin { device_id, .. } => format!("P{device_id}"),
+        .filter_map(|op| match op {
+            ChainOp::Plugin { device_id, .. } => Some(format!("P{device_id}")),
             ChainOp::Native { native_slot, .. } => {
-                format!("N({:?})", p.natives[*native_slot as usize].dsp.kind())
+                Some(format!("N({:?})", p.natives[*native_slot as usize].dsp.kind()))
             }
-            ChainOp::ParallelBegin { .. } => "RB".into(),
-            ChainOp::ChainBegin { .. } => "CB".into(),
-            ChainOp::ChainEnd { .. } => "CE".into(),
-            ChainOp::ParallelEnd { .. } => "RE".into(),
+            ChainOp::ParallelBegin { .. } => Some("RB".into()),
+            ChainOp::ChainBegin { .. } => Some("CB".into()),
+            ChainOp::ChainEnd { .. } => Some("CE".into()),
+            ChainOp::ParallelEnd { .. } => Some("RE".into()),
+            ChainOp::MixBegin { .. } | ChainOp::MixEnd { .. } => None,
         })
         .collect()
 }
@@ -2468,7 +2472,7 @@ fn a_return_native_comp_aligns_its_bus_input_to_the_sidechain_with_bus_sc_align(
         scratch[0].track_r[L as usize] = 1.0;
         scratch[1].track_l[0] = 1.0;
         scratch[1].track_r[0] = 1.0;
-        let io = crate::graph::NativeIo { sc_listen: if listen { 40 } else { 0 }, scopes: None };
+        let io = crate::graph::NativeIo { sc_listen: if listen { 40 } else { 0 }, ..Default::default() };
         run_post_dispatch(&mut sched, &mut scratch, &song, n, io);
         let out = &scratch[2].track_l[..n];
         (0..n).max_by(|&a, &b| out[a].abs().total_cmp(&out[b].abs())).unwrap()

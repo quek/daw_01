@@ -164,14 +164,17 @@ pub struct KnobStyle {
     /// knob が載る既定の面)。 **面が既定と違う場所** に置く caller だけ `Some` を渡す
     /// (widget は自分が何色の上に描かれているかを知り得ないため、 そこだけは caller の責務)。
     pub surface: Option<Color>,
+    /// 値弧と指針の色。 `None` で palette の `accent`。 knob が **別の状態** にあること
+    /// (試聴中など) を色で示す caller だけ `Some` を渡す。
+    pub accent: Option<Color>,
 }
 
 impl KnobStyle {
     /// 片極性: 弧は最小値 (7 時) から伸びる。 吸着なし。 送り量 / dry-wet など。
-    pub const UNIPOLAR: Self = Self { arc_origin: 0.0, detent: false, surface: None };
+    pub const UNIPOLAR: Self = Self { arc_origin: 0.0, detent: false, surface: None, accent: None };
     /// 双極性: 弧は中央 (12 時) から左右へ伸び、 中央に目印が付き、 中央 (= `default_value`)
     /// に吸着する。 pan / balance など。
-    pub const BIPOLAR: Self = Self { arc_origin: 0.5, detent: true, surface: None };
+    pub const BIPOLAR: Self = Self { arc_origin: 0.5, detent: true, surface: None, accent: None };
 }
 
 /// 零点吸着 (detent) の写像。 ドラッグ座標 (raw) と値の間に「`target` で平らな区間」を挟む
@@ -475,10 +478,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             // scene cache ごと捨てるので hash 不要だが、 これは **caller が渡す色** なので
             // 畳まないと「同じ knob を別の面へ移した」 変化が cache に映らない。
             style.surface.map(|c| (c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits())),
+            style.accent.map(|c| (c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits())),
         ));
         let surface = style.surface;
+        let accent = style.accent;
         self.with_widget_node(wid, input_hash, |ui| {
-            draw_knob(ui, rect, displayed_value, arc_origin, surface, dragging);
+            draw_knob(ui, rect, displayed_value, arc_origin, surface, accent, dragging);
         });
 
         // ---- modulation overlay (= cache node の外、 毎フレーム描画) ----
@@ -587,6 +592,8 @@ fn draw_knob<M: ?Sized + 'static>(
     arc_origin: f32,
     // この knob が載っている面の色 (`KnobStyle::surface`)。 None で palette の `panel`。
     surface: Option<Color>,
+    // 値弧の色 (`KnobStyle::accent`)。 None で palette の `accent`。
+    accent: Option<Color>,
     dragging: bool,
 ) {
     let p = ui.palette();
@@ -630,7 +637,7 @@ fn draw_knob<M: ?Sized + 'static>(
     let start_angle = value_angle(0.0);
     let end_angle = value_angle(1.0);
     let arc_radius = r;
-    let active_color = p.accent;
+    let active_color = accent.unwrap_or(p.accent);
     let inactive_color = p.inset_bg;
 
     // 0. 可動範囲 **外** の 60° (5時 → 6時 → 7時) を「この knob が載っている面」の色で塗り、

@@ -330,13 +330,37 @@ pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, ru
 /// `content_forked_from` を複製の event の `take_origins` へ移し、目次の無いアーカイブにはトラックの document の
 /// object から目次を作る (`project::migrate_forked_contents_to_take_origins` / `ara_ids::migrate_archive_contents`)。
 /// 新ファイルを旧ビルドで開くと写した元が消え、目次を旧い読み替え表と取り違えるので、版を上げて gate で弾く。
-pub const CURRENT_VERSION: u32 = 44;
+///
+/// v45 (r.md #151 / #152): device の Mix (`PluginInstance::mix` / `NativeDevice::mix` / `Parallel::mix`、
+/// [`TrackBuiltinParam::DeviceMix`]) と、映像 / アニメーション画像 event の再生速度 (`VideoEvent::speed` /
+/// `ImageEvent::speed`) を追加。旧ファイルは `serde(default)` の 1.0 (Mix 100% / 等速) で読める (migration 不要)。
+/// 新ファイルを旧ビルドで開くと Mix のレーンが unknown variant で落ち、Mix と速度は黙って捨てられる
+/// (保存し直すと消える) ので、版を上げて gate で弾く。
+pub const CURRENT_VERSION: u32 = 45;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
 /// `0` is the "未採番" sentinel — `Song::ensure_clip_contents` reassigns
 /// any zero-valued `content_id` on load.
 pub type ContentId = u32;
+
+/// r.md #151: device の Mix (原音との混ぜ具合) の serde 既定値。`1.0` (エフェクト後だけ = 従来の音) は
+/// 保存しない (旧ファイルと同じ JSON のまま = 開いただけで `*` にならない)。
+pub mod device_mix {
+    pub fn full() -> f32 {
+        1.0
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)] // serde の `skip_serializing_if` は `&T` を渡す
+    pub fn is_full(mix: &f32) -> bool {
+        *mix == 1.0
+    }
+
+    /// load の信頼境界の値域 (`Song::sanitize_ranges`): 非有限は 100%、それ以外は 0..=1。
+    pub fn sanitize(mix: f32) -> f32 {
+        if mix.is_finite() { mix.clamp(0.0, 1.0) } else { 1.0 }
+    }
+}
 
 /// Serde adapter for `Option<Arc<[u8]>>` that writes binary data as base64 in
 /// JSON (and other human-readable formats). Bincode bypasses this and uses

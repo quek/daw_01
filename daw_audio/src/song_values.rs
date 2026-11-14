@@ -40,6 +40,12 @@ pub fn apply(cmd: &AudioCommand, song: &mut Song) -> bool {
                 d.replace_values(bypassed, params);
             }
         }
+        // r.md #151: device の Mix。丸めは model の setter が SSoT (GUI と同じ規則)。
+        AudioCommand::SetDeviceMix { device_id, mix, .. } => {
+            if let Some(d) = song.device_by_id_mut(device_id) {
+                d.set_mix(mix);
+            }
+        }
         // master のフェーダー後 Limiter。**シーリングが壊れると出力が丸ごと消える**ので境界で丸める。
         AudioCommand::SetMasterLimiter { mut limiter, .. } => {
             limiter.sanitize();

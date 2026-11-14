@@ -182,6 +182,16 @@ pub struct NativeIo<'a> {
     pub sc_listen: u64,
     /// device scope (EQ Par のスペクトラム) の書き先。scope project の live 描画だけ `Some`。
     pub scopes: Option<DeviceScopeTap<'a>>,
+    /// r.md #151: Δ (差分試聴) 中の device id (`0` = 空き)。
+    pub delta: [u64; common::model::MAX_DELTA_DEVICES],
+}
+
+impl NativeIo<'_> {
+    /// `device_id` が Δ (差分試聴) 中か。
+    #[must_use]
+    pub fn is_delta(&self, device_id: u64) -> bool {
+        device_id != 0 && self.delta.contains(&device_id)
+    }
 }
 
 /// device scope の書き先と、各 slot が見る device id。

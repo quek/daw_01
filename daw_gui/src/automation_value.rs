@@ -191,6 +191,8 @@ fn display_units(target: &AutomationTarget) -> (&'static str, ScrubableNumberFor
         // r.md #114: Selector の位置 (0..=1 を全 chain で等分。 chain 数は lane から見えないので
         // 位置そのまま。 どの chain かはインスペクタの `Active` 欄が示す)。
         T::TrackBuiltin(TrackBuiltinParam::ParallelSelect { .. }) => ("", F::Decimal(2), id, id),
+        // r.md #151: device の Mix (0..=1 ↔ 0..=100 %)。
+        T::TrackBuiltin(TrackBuiltinParam::DeviceMix { .. }) => ("%", F::Integer, |v| v * 100.0, |v| v / 100.0),
         // r.md #129: 内蔵 device (§7.4)。plain = 表示単位そのもの (Hz / dB / ms / 比) なので変換は恒等。
         T::NativeParam { param, .. } => {
             let (unit, format) = native_unit_format(*param);

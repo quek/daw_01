@@ -70,6 +70,8 @@ impl AppData {
             DeviceEvent::NativeEdit { device_id, edit } => self.apply_native_edit(device_id, &edit),
             DeviceEvent::MasterLimiterEdit(edit) => self.apply_master_limiter_edit(edit),
             DeviceEvent::SetScListen { device_id } => self.request_sc_listen(device_id),
+            DeviceEvent::SetDeviceMix { device_id, mix } => self.set_device_mix(device_id, mix),
+            DeviceEvent::ToggleDeviceDelta { device_id } => self.toggle_device_delta(device_id),
             DeviceEvent::ToggleRackPanel(key) => self.toggle_rack_panel(key),
         }
     }

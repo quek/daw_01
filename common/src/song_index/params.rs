@@ -16,6 +16,8 @@ pub enum ParamSubject {
     Parallel(u64),
     Plugin(u64),
     Native(u64),
+    /// r.md #151: device (plugin / 内蔵 / Parallel) の Mix。device の param の束とは別に引く。
+    DeviceMix(u64),
     MasterLimiter,
     /// テンポ / 拍子。
     Song,
@@ -37,6 +39,7 @@ impl ParamSubject {
                 B::ParallelOutGain { parallel_id }
                 | B::ParallelSplitFreq { parallel_id, .. }
                 | B::ParallelSelect { parallel_id } => Self::Parallel(*parallel_id),
+                B::DeviceMix { device_id } => Self::DeviceMix(*device_id),
             },
             AutomationTarget::PluginParam { device_id, .. } => Self::Plugin(*device_id),
             AutomationTarget::NativeParam { device_id, .. } => Self::Native(*device_id),

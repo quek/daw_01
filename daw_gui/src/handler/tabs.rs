@@ -311,6 +311,10 @@ impl AppData {
                     // Listen は OpenProject の後・LoadSong (次の frame flush) の前に再送し、watch は
                     // 送信済みの記憶を捨てて次のフレームの差分送信に任せる。
                     app.set_sc_listen(app.cur.peph.sc_listen_device);
+                    // r.md #151: Δ (差分試聴) も session state (立っているときだけ送り直す)。
+                    if !app.cur.peph.delta_devices.is_empty() {
+                        app.set_delta_devices(app.cur.peph.delta_devices.clone());
+                    }
                     app.cur.peph.device_scopes_sent.clear();
                 }
             });

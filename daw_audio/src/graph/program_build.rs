@@ -9,7 +9,7 @@ use common::protocol::RenderScope;
 use super::compile::DeviceLatencies;
 use super::delay_line::DelayLine;
 use super::native::NativeScratch;
-use super::program::{ChainOp, ChainProgram, ChainScratch, ParallelScratch};
+use super::program::{ChainOp, ChainProgram, ChainScratch, MixScratch, ParallelScratch};
 use crate::mixer::MAX_FRAMES;
 
 /// chain の tap 点ごとの **track chain 起点からの相対 latency** (samples)。
@@ -110,6 +110,7 @@ pub fn build_program(
         chain_slots: &mut chain_slots,
         native_slots: &mut native_slots,
         sample_rate,
+        mix_depth: 0,
     };
     let mut acc = 0u32;
     let mut pass1_end: Option<usize> = None;
@@ -125,6 +126,9 @@ pub fn build_program(
     if !program.natives.is_empty() {
         program.native_dry_l = vec![0.0; MAX_FRAMES];
         program.native_dry_r = vec![0.0; MAX_FRAMES];
+    }
+    if !program.mix_dry.is_empty() {
+        program.mix_ramp = vec![1.0; MAX_FRAMES];
     }
     program.index_state_keys();
     BuiltProgram {
@@ -146,6 +150,8 @@ struct Builder<'a> {
     native_slots: &'a mut HashMap<u64, u32>,
     /// セッションのサンプルレート (Reverb / Delay の遅延メモリの確保に要る)。
     sample_rate: u32,
+    /// r.md #151: いま emit している device を包んでいる Mix の段の数 (`ChainOp::MixBegin::depth`)。
+    mix_depth: u32,
 }
 
 impl Builder<'_> {
@@ -158,8 +164,43 @@ impl Builder<'_> {
         acc
     }
 
-    /// device 1 つを emit し、その latency を返す。
+    /// device 1 つを emit し、その latency を返す。r.md #151: Mix を持つ device ([`Device::has_mix`]) は
+    /// `MixBegin` / `MixEnd` で挟む (bypass 中の plugin / Parallel は中身の無い段になる)。
+    /// トラックの fx を通さない scope では挟まない (原音と混ぜるのは加工の一部)。
     fn emit_device(&mut self, d: &Device, prefix: u32) -> u32 {
+        if !(self.scope.track_fx() && d.has_mix() && d.id() != 0) {
+            return self.emit_device_ops(d, prefix);
+        }
+        let depth = self.mix_depth;
+        let begin = self.program.ops.len();
+        self.program.ops.push(ChainOp::MixBegin { depth, device_id: d.id(), has_delay: false });
+        self.mix_depth += 1;
+        let latency = self.emit_device_ops(d, prefix);
+        self.mix_depth -= 1;
+        // op を出さなかった device。bypass 中 (plugin / Parallel) は空の段を残す — 素通しの Δ は無音
+        // (bypass 中も op を出す内蔵 device と同じ答え)。それ以外 (scope の外) は挟まない。
+        if self.program.ops.len() == begin + 1 && !d.bypassed() {
+            self.program.ops.pop();
+            return latency;
+        }
+        // 原音を device の latency に揃える (key は device id — chain / Parallel の id と同じ空間で、
+        // この scope では Parallel id の遅延線を他に置かない)。
+        let delay = (latency > 0).then(|| {
+            let line_idx = self.program.delay_lines.len() as u32;
+            self.program.delay_lines.push(DelayLine::with_capacity(latency as usize + 1));
+            self.program.delay_keys.push(d.id());
+            (line_idx, latency)
+        });
+        self.program.ops[begin] = ChainOp::MixBegin { depth, device_id: d.id(), has_delay: delay.is_some() };
+        self.program.ops.push(ChainOp::MixEnd { depth, device_id: d.id(), delay });
+        while self.program.mix_dry.len() <= depth as usize {
+            self.program.mix_dry.push(MixScratch::new());
+        }
+        latency
+    }
+
+    /// [`Self::emit_device`] の本体 (Mix の段を除いた device 自身の op)。
+    fn emit_device_ops(&mut self, d: &Device, prefix: u32) -> u32 {
         match d {
             Device::Plugin(p) => {
                 if !plugin_in_scope(p, self.scope) {
@@ -293,6 +334,7 @@ mod tests {
     fn parallel(id: u64, chains: Vec<(u64, Vec<Device>)>) -> Device {
         Device::Parallel(Parallel {
             id,
+            mix: 1.0,
             name: "Parallel".into(),
             chains: chains
                 .into_iter()
@@ -310,7 +352,12 @@ mod tests {
         })
     }
 
+    /// Mix の段 (r.md #151) を除いた op の並び (device ツリーの展開の形を見るテスト用)。
     fn op_kinds(p: &ChainProgram) -> Vec<String> {
+        all_op_kinds(p).into_iter().filter(|k| !k.starts_with('M')).collect()
+    }
+
+    fn all_op_kinds(p: &ChainProgram) -> Vec<String> {
         p.ops
             .iter()
             .map(|op| match op {
@@ -323,8 +370,48 @@ mod tests {
                 },
                 ChainOp::ParallelEnd { parallel_slot, .. } => format!("RE{parallel_slot}"),
                 ChainOp::Native { device_id, .. } => format!("N{device_id}"),
+                ChainOp::MixBegin { depth, .. } => format!("MB{depth}"),
+                ChainOp::MixEnd { depth, delay, .. } => match delay {
+                    Some((_, f)) => format!("ME{depth}d{f}"),
+                    None => format!("ME{depth}"),
+                },
             })
             .collect()
+    }
+
+    /// r.md #151: 音声を加工する device (音声入出力のある plugin / 内蔵 / Parallel) は Mix の段で挟まれ、
+    /// 入れ子は深さが 1 つずつ増える。音源 (音声入力の無い plugin) は挟まれず、bypass 中の plugin は
+    /// 中身の無い段になる (素通しの Δ = 無音)。
+    /// 原音は device の latency ぶん遅らせて揃える (device id で状態を移送)。素材だけを描く scope では挟まない。
+    #[test]
+    fn devices_that_process_audio_are_wrapped_in_mix_stages() {
+        use common::model::{NativeDevice, NativeKind};
+        use common::port_config::PortConfig;
+        let with_ports = |id: u64, ports: PortConfig| {
+            Device::Plugin(PluginInstance { id, ..PluginInstance::with_ports(format!("p{id}"), PluginFormat::Clap, ports) })
+        };
+        let fx = |id| with_ports(id, PortConfig { has_audio_input: true, has_audio_output: true, ..PortConfig::default() });
+        let synth = |id| with_ports(id, PortConfig { has_note_input: true, has_audio_output: true, ..PortConfig::default() });
+        let mut off = fx(5);
+        off.set_bypassed(true);
+        let devices = vec![
+            synth(1),
+            fx(2),
+            parallel(10, vec![(11, vec![fx(3)])]),
+            Device::Native(NativeDevice::new_builtin(NativeKind::Comp, 30)),
+            off,
+        ];
+        let lat: DeviceLatencies = [(2, 64), (3, 100)].into();
+        let b = build_program(&devices, 7, None, &lat, &HashSet::new(), RenderScope::Mix, 48_000);
+        assert_eq!(
+            all_op_kinds(&b.program),
+            vec!["P1", "MB0", "P2", "ME0d64", "MB0", "RB0", "CB0", "MB1", "P3", "ME1d100", "CE0", "RE0", "ME0d100", "MB0", "N30", "ME0", "MB0", "ME0"]
+        );
+        assert_eq!(b.latency, 164, "Mix の段は latency を足さない");
+        assert_eq!(b.program.mix_dry.len(), 2, "退避先は入れ子の深さぶん");
+        assert_eq!(b.program.delay_keys, vec![2, 3, 10]);
+        let sources = build_program(&devices, 7, None, &lat, &HashSet::new(), RenderScope::Sources, 48_000);
+        assert!(all_op_kinds(&sources.program).iter().all(|k| !k.starts_with('M')));
     }
 
     #[test]
@@ -360,7 +447,7 @@ mod tests {
             op_kinds(&b.program),
             vec!["P1", "RB0", "CB0", "P2", "CE0", "CB1", "P3", "CE1d60", "CB2", "CE2d100", "RE0"]
         );
-        assert_eq!(b.program.delay_keys, vec![12, 13]);
+        assert_eq!(b.program.delay_keys, vec![12, 13, 10], "chain 2 本の PDC + Parallel の Mix の原音 (r.md #151)");
         assert_eq!(
             b.chain_latency[&12],
             ChainLatency { parallel_input: 5, post_fx: 45, post_fader: 105 }
@@ -382,8 +469,8 @@ mod tests {
     fn paraout_split_lands_after_the_top_level_device() {
         let devices = vec![plug(1), parallel(10, vec![(11, vec![plug(2)])]), plug(3)];
         let b = build_program(&devices, 7, Some(2), &DeviceLatencies::new(), &HashSet::new(), RenderScope::Mix, 48_000);
-        // P1 RB CB P2 CE RE | P3
-        assert_eq!(b.program.pass1_end, 6);
+        // P1 MB RB CB P2 CE RE ME | P3
+        assert_eq!(b.program.pass1_end, 8);
     }
 
     /// r.md #112: `Frequency3` の Parallel は chain 1/2/3 に出力 0/1/2 (Low/Mid/High)、 4 本目は

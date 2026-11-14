@@ -184,6 +184,72 @@ fn sc_listen_lives_outside_the_song() {
     assert_eq!(app.cur.peph.sc_listen_device, None);
 }
 
+/// r.md #151: Mix は Song の値 (値 IPC 1 通 / undo / dirty)、Δ は Song の外 (dirty も undo も動かさず、
+/// device が消えたら解除)。
+#[test]
+fn device_mix_is_song_data_and_delta_lives_outside_the_song() {
+    let (mut app, mut audio_rx, _p, _d) = support::build_app();
+    let track = app.cur.song_doc.song().tracks[0].id;
+    app.handle_event(AppEvent::Device(DeviceEvent::AddNative {
+        chain: ChainRef::Track(track),
+        kind: NativeKind::Comp,
+        open_panel: false,
+    }));
+    let comp = app.cur.selection.selected_device_ids[0];
+    app.cur.song_doc.mark_saved();
+    let depth = app.cur.song_doc.undo_depth();
+    let _ = drain(&mut audio_rx);
+    let mixes = |rx: &mut UnboundedReceiver<AudioCommand>| -> Vec<(u64, f32)> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|c| match c {
+                AudioCommand::SetDeviceMix { device_id, mix, .. } => Some((device_id, mix)),
+                _ => None,
+            })
+            .collect()
+    };
+    let deltas = |rx: &mut UnboundedReceiver<AudioCommand>| -> Vec<Vec<u64>> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|c| match c {
+                AudioCommand::SetDeltaDevices { device_ids, .. } => Some(device_ids),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // 範囲外は 0..=1 に収まり、値 IPC は 1 通。同じ値は 0 通で undo も積まない。
+    app.handle_event(AppEvent::Device(DeviceEvent::SetDeviceMix { device_id: comp, mix: 0.25 }));
+    assert_eq!(mixes(&mut audio_rx), vec![(comp, 0.25)]);
+    assert!(app.cur.song_doc.is_dirty());
+    assert_eq!(app.cur.song_doc.undo_depth(), depth + 1);
+    app.handle_event(AppEvent::Device(DeviceEvent::SetDeviceMix { device_id: comp, mix: 0.25 }));
+    assert!(mixes(&mut audio_rx).is_empty());
+    assert_eq!(app.cur.song_doc.undo_depth(), depth + 1);
+    app.handle_event(AppEvent::Device(DeviceEvent::SetDeviceMix { device_id: comp, mix: 7.0 }));
+    assert_eq!(mixes(&mut audio_rx), vec![(comp, 1.0)]);
+    app.handle_event(AppEvent::Undo);
+    assert_eq!(app.cur.song_doc.song().device_by_id(comp).unwrap().mix(), 0.25);
+
+    // Δ: Song の外。
+    app.cur.song_doc.mark_saved();
+    let depth = app.cur.song_doc.undo_depth();
+    let _ = drain(&mut audio_rx);
+    let eq = builtin(&app, track, NativeKind::Eq);
+    app.handle_event(AppEvent::Device(DeviceEvent::ToggleDeviceDelta { device_id: comp }));
+    app.handle_event(AppEvent::Device(DeviceEvent::ToggleDeviceDelta { device_id: eq }));
+    assert_eq!(deltas(&mut audio_rx), vec![vec![comp], vec![comp, eq]], "複数 device で同時に ON");
+    assert!(!app.cur.song_doc.is_dirty(), "Δ は dirty にしない");
+    assert_eq!(app.cur.song_doc.undo_depth(), depth);
+    app.handle_event(AppEvent::Device(DeviceEvent::ToggleDeviceDelta { device_id: eq }));
+    assert_eq!(deltas(&mut audio_rx), vec![vec![comp]]);
+
+    // Δ 中の device を削除 → 解除 + IPC。
+    app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices { device_ids: vec![comp] }));
+    assert!(app.cur.peph.delta_devices.is_empty());
+    assert_eq!(deltas(&mut audio_rx), vec![Vec::<u64>::new()]);
+}
+
 /// ⑥ GR の表示: plane の値を正の減衰量で持ち、None の tick は前回値を保ち、減衰して消える。
 #[test]
 fn native_gain_reduction_display_follows_the_plane() {

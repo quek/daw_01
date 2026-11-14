@@ -525,6 +525,17 @@ impl AppData {
             T::TrackBuiltin(B::ParallelSelect { parallel_id }) => {
                 return Some(format!("{}: Active", doc.parallel_by_id(*parallel_id)?.name));
             }
+            // r.md #151: device の Mix = `"<device 名>: Mix"` (plugin / 内蔵 / Parallel)。
+            T::TrackBuiltin(B::DeviceMix { device_id }) => {
+                let name = if let Some(inst) = doc.plugin_by_id(*device_id) {
+                    self.device_label(inst).to_string()
+                } else if let Some(n) = doc.native_by_id(*device_id) {
+                    n.display_name().into_owned()
+                } else {
+                    doc.parallel_by_id(*device_id)?.name.clone()
+                };
+                return Some(format!("{name}: Mix"));
+            }
             T::TrackBuiltin(B::Volume | B::Pan | B::Mute | B::SendGain { .. })
             | T::MasterLimiter(_)
             | T::SongTempo

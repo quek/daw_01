@@ -33,6 +33,7 @@ impl AutomationTarget {
                 B::ParallelOutGain { parallel_id }
                 | B::ParallelSplitFreq { parallel_id, .. }
                 | B::ParallelSelect { parallel_id } => Some(*parallel_id),
+                B::DeviceMix { device_id } => Some(*device_id),
                 B::Volume | B::Pan | B::Mute | B::SendGain { .. } => None,
             },
             Self::MasterLimiter(_)
@@ -57,6 +58,7 @@ impl AutomationTarget {
                 B::ParallelOutGain { parallel_id }
                 | B::ParallelSplitFreq { parallel_id, .. }
                 | B::ParallelSelect { parallel_id } => Some(parallel_id),
+                B::DeviceMix { device_id } => Some(device_id),
                 B::Volume | B::Pan | B::Mute | B::SendGain { .. } => None,
             },
             Self::MasterLimiter(_)
@@ -163,6 +165,7 @@ impl Song {
                 B::ParallelOutGain { parallel_id }
                 | B::ParallelSplitFreq { parallel_id, .. }
                 | B::ParallelSelect { parallel_id } => self.device_owner_track(*parallel_id),
+                B::DeviceMix { device_id } => self.device_owner_track(*device_id),
                 B::Volume | B::Pan | B::Mute | B::SendGain { .. } => None,
             },
             AutomationTarget::ModSourceParam { source_id, .. } => self.mod_source_owner(*source_id),
@@ -369,6 +372,10 @@ impl PruneCtx {
                 B::ParallelOutGain { parallel_id }
                 | B::ParallelSplitFreq { parallel_id, .. }
                 | B::ParallelSelect { parallel_id } => self.node_is(*parallel_id, owner, NodeKind::Parallel),
+                // r.md #151: どの種類の device でもよい (chain は device ではない)。
+                B::DeviceMix { device_id } => {
+                    self.nodes.get(device_id).is_some_and(|(o, kind)| *o == owner && *kind != NodeKind::Chain)
+                }
                 // その store の持ち主のトラックに、その id の send がある (master の store に send は無い)。
                 B::SendGain { send_id, .. } => self.sends.get(&owner).is_some_and(|ids| ids.contains(send_id)),
                 B::Volume | B::Pan | B::Mute => true,

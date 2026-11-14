@@ -889,6 +889,11 @@ fn lane_target_display(
             label: node_label(device_param_name, || intern_label("Active")),
             color: Color::rgb(0.95, 0.65, 0.35),
         },
+        // r.md #151: device の Mix (ゲイン系と同じ色)。
+        AutomationTarget::TrackBuiltin(TrackBuiltinParam::DeviceMix { .. }) => LaneDisplay {
+            label: node_label(device_param_name, || intern_label("Mix")),
+            color: Color::rgb(0.42, 0.78, 0.95),
+        },
         AutomationTarget::TrackBuiltin(TrackBuiltinParam::Mute) => LaneDisplay {
             label: intern_label("Mute"),
             color: Color::rgb(0.92, 0.45, 0.40),

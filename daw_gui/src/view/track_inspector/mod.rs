@@ -15,6 +15,8 @@ mod device_panel;
 mod image_event_section;
 /// r.md #87: 選択中のランチャーセルのローンチ設定 (Q7 / 計画書 §3.4)。
 mod launch_section;
+/// r.md #151: Rack の行の Mix ノブ (Alt+クリックで Δ)。
+mod mix_knob;
 /// 口パク出力先トラックの「口形状 → 画像」 セクション。
 mod mouth_map_section;
 /// r.md #129: 内蔵 device の Par パネル (格子の寸法 `layout` はテストが座標を求めるのに使う)。

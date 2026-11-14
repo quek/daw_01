@@ -1,4 +1,4 @@
-//! chain list の plugin 行 (`名前 + [SC▾] [⌨] [Par|GUI] [x]`) と、 その直下の展開
+//! chain list の plugin 行 (`名前 + [SC▾] [⌨] [Par|GUI] [Mix] [x]`) と、 その直下の展開
 //! (SC パネル / param パネル)。 chain list 本体 (`chain_list.rs`) から切り出したもの
 //! (サイズ budget、 不変条件 9)。
 
@@ -11,6 +11,7 @@ use common::model::{RackPanelKey, TapPoint, TapSource};
 
 use super::chain_list::{ROW_H, RowCtx, panel_height};
 use super::device_panel;
+use super::mix_knob::MIX_COL_W;
 use super::native_row::claim_expansion_press;
 
 /// SC パネル 1 port 行の高さ。
@@ -82,6 +83,8 @@ pub(super) fn draw_plugin_row(
             })
         },
     );
+    // Mix の列 (ノブは chain list が描く。音声を通さない device でも列は空ける)。
+    right -= MIX_COL_W;
     // [Par | GUI]。r.md #131: 無効トラックでは host の instance を要る窓 / param パネルは出さない
     // (Song だけで完結する映像 FX / 声のパネルは開ける)。
     if entry.shows_button() && !(disabled && !entry.is_video && !entry.is_voicevox) {

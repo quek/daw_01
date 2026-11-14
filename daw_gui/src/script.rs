@@ -119,6 +119,8 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("masterLimiterGainReduction", native_device::daw_master_limiter_gain_reduction, 0),
     ("setDevicesBypassed", native_device::daw_set_devices_bypassed, 2),
     ("setScListen", native_device::daw_set_sc_listen, 1),
+    ("setDeviceMix", native_device::daw_set_device_mix, 2),
+    ("toggleDeviceDelta", native_device::daw_toggle_device_delta, 1),
     ("masterPeakDbfs", native_device::daw_master_peak_dbfs, 1),
 ];
 

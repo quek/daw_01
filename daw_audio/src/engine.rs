@@ -1161,6 +1161,7 @@ impl ProjectRt {
             let native_io = native_io_for_buffer(
                 self.key,
                 self.shared.sc_listen_device.load(Ordering::Acquire),
+                std::array::from_fn(|k| self.shared.delta_devices[k].load(Ordering::Acquire)),
                 ctx.device_scope,
                 &self.device_scope_watch,
             );
@@ -1437,6 +1438,7 @@ impl ProjectRt {
 fn native_io_for_buffer<'a>(
     key: ProjectKey,
     sc_listen: u64,
+    delta: [u64; common::model::MAX_DELTA_DEVICES],
     device_scope: Option<DeviceScopeCtx<'a>>,
     watch: &'a [u64; MAX_DEVICE_SCOPES],
 ) -> NativeIo<'a> {
@@ -1449,7 +1451,7 @@ fn native_io_for_buffer<'a>(
         }
         DeviceScopeTap { bridge: ds.bridge, watch }
     });
-    NativeIo { sc_listen, scopes }
+    NativeIo { sc_listen, scopes, delta }
 }
 
 mod device_rt;
@@ -2145,6 +2147,7 @@ mod bundle_install_tests {
         let io = native_io_for_buffer(
             ProjectKey(5),
             9,
+            [0; common::model::MAX_DELTA_DEVICES],
             Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
             &watch,
         );
@@ -2161,13 +2164,14 @@ mod bundle_install_tests {
         native_io_for_buffer(
             ProjectKey(5),
             0,
+            [0; common::model::MAX_DELTA_DEVICES],
             Some(DeviceScopeCtx { bridge: &scope, headers: &mut headers }),
             &watch,
         );
         scope.write_block(2, &[0.5; 3], &[0.5; 3]);
         assert_eq!(reader.read(&scope, 2, &mut frames).map(|(_, _, o)| o.frames), Some(3));
         // scope project でなければ scope を持たない。
-        assert!(native_io_for_buffer(ProjectKey(5), 0, None, &watch).scopes.is_none());
+        assert!(native_io_for_buffer(ProjectKey(5), 0, [0; common::model::MAX_DELTA_DEVICES], None, &watch).scopes.is_none());
     }
 
     /// T12: GR 面の publish と device scope の見出し同期は RT で確保しない。

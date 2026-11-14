@@ -1489,7 +1489,9 @@ fn current_version_is_pinned() {
     // (`project::migrate_forked_contents_to_take_origins` / `ara_ids::migrate_archive_contents` が v42 から移す)。
     // v44 (r.md #134 / #135): 内蔵 Reverb / Delay (`NativeKind::{Reverb,Delay}` と
     // `NativeParams` の variant)。旧ファイルには存在しないので migration は要らない。
-    assert_eq!(CURRENT_VERSION, 44);
+    // v45 (r.md #151 / #152): device の Mix と `DeviceMix` の target、映像 / 画像 event の `speed`
+    // (serde default の 1.0 で読める)。
+    assert_eq!(CURRENT_VERSION, 45);
 }
 
 #[test]
