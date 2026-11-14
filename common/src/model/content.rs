@@ -1137,9 +1137,10 @@ pub struct ImageEvent {
     pub source_id: ImageSourceId,
     /// Clip-local beat at which the event starts.
     pub event_start_in_clip_beats: f64,
-    /// Duration of the event in clip-local beats. Image is static so
-    /// the source has no inherent duration — the user freely extends
-    /// the event by drag-trim.
+    /// Duration of the event in clip-local beats. The source has no
+    /// inherent duration — the user freely extends the event by
+    /// drag-trim (an animated GIF / APNG / WebP loops from the event
+    /// start for as long as the event lasts).
     pub event_length_beats: f64,
 
     /// PiP rect in normalized preview-window coordinates. `(0.0, 0.0)`

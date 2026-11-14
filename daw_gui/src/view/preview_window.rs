@@ -51,13 +51,12 @@ pub struct PreviewWindowState {
         (TextureHandle, u32, u32),
     >,
     /// docs/plan_image_overlay.md §P3: per-`ImageSourceId` GPU textures
-    /// backing the PiP overlay path. Static — the import path uploads
-    /// each image once via `upload_image_bgra` and the handle stays
-    /// valid for the lifetime of the preview window. `(handle, width,
-    /// height)`.
+    /// backing the PiP overlay path. The import path uploads each image
+    /// once via `upload_image_bgra` (every frame of an animated image)
+    /// and the handles stay valid for the lifetime of the preview window.
     pub image_textures: std::collections::HashMap<
         common::model::ImageSourceId,
-        (TextureHandle, u32, u32),
+        crate::image_frames::ImageTextures,
     >,
     /// トラック合成画リスト。runner が毎 frame
     /// 構築し、bottom→top (track z 順) に並ぶ。各 `TrackComposite` は 1 トラックの
@@ -201,24 +200,32 @@ impl PreviewWindowState {
     }
 
     /// docs/plan_image_overlay.md §P3: upload a freshly-decoded image
-    /// into its dedicated `(ImageSourceId)` GPU texture. Idempotent —
-    /// re-uploading the same id replaces the existing texture (=
-    /// reimport-after-edit case). Returns the cached handle so the
-    /// caller can populate `AppData::image_texture_cache`.
+    /// into its dedicated `(ImageSourceId)` GPU textures (1 per frame for
+    /// an animated image). Idempotent — re-uploading the same id replaces
+    /// the existing textures (= reimport-after-edit case).
     pub fn upload_image_bgra(
         &mut self,
         source_id: common::model::ImageSourceId,
-        width: u32,
-        height: u32,
-        bgra: &[u8],
-    ) -> TextureHandle {
-        if let Some((old, _, _)) = self.image_textures.remove(&source_id) {
-            self.renderer.destroy_texture(old);
+        pixels: &crate::image_frames::ImagePixels,
+    ) {
+        if let Some(old) = self.image_textures.remove(&source_id) {
+            for h in old.frames {
+                self.renderer.destroy_texture(h);
+            }
         }
-        let handle = self.renderer.create_texture_bgra(width, height);
-        self.renderer.upload_texture_bgra(handle, bgra);
-        self.image_textures.insert(source_id, (handle, width, height));
-        handle
+        let frames = pixels
+            .frames
+            .iter()
+            .map(|bgra| {
+                let handle = self.renderer.create_texture_bgra(pixels.width, pixels.height);
+                self.renderer.upload_texture_bgra(handle, bgra);
+                handle
+            })
+            .collect();
+        self.image_textures.insert(
+            source_id,
+            crate::image_frames::ImageTextures { frames, timing: pixels.timing.clone() },
+        );
     }
 
     /// Upload a freshly-decoded BGRA frame into the `(source_id, slot_idx)`
@@ -265,8 +272,10 @@ impl PreviewWindowState {
         for (_, (h, _, _)) in self.frame_textures.drain() {
             self.renderer.destroy_texture(h);
         }
-        for (_, (h, _, _)) in self.image_textures.drain() {
-            self.renderer.destroy_texture(h);
+        for (_, textures) in self.image_textures.drain() {
+            for h in textures.frames {
+                self.renderer.destroy_texture(h);
+            }
         }
         self.track_composites.clear();
     }

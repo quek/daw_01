@@ -282,13 +282,15 @@ pub fn render_mp4_cancellable(
     // uploaded once at startup and reused for every frame the layer is
     // visible.
     let mut video_textures: HashMap<VideoSourceId, (TextureHandle, u32, u32)> = HashMap::new();
-    let mut image_textures: HashMap<ImageSourceId, (TextureHandle, u32, u32)> = HashMap::new();
+    let mut image_textures: HashMap<ImageSourceId, crate::image_frames::ImageTextures> =
+        HashMap::new();
 
     // docs/plan_image_overlay.md §P3: decode each project image once
-    // up-front (= keyed by ImageSourceId), upload to a persistent
-    // wgpu texture, then push a textured-quad per frame the image is
-    // visible. The typical MV has < 10 images, each < 4 MB at 1080p,
-    // so keeping all of them resident in GPU memory is fine.
+    // up-front (= keyed by ImageSourceId), upload to persistent
+    // wgpu textures (1 per frame for an animated image), then push a
+    // textured-quad per frame the image is visible. The typical MV has
+    // < 10 images, each < 4 MB at 1080p, so keeping all of them resident
+    // in GPU memory is fine.
     for (image_source_id, source) in &cfg.song.media.image_sources {
         let abs = match &source.path {
             common::model::ImageSourcePath::Absolute(p) => p.clone(),
@@ -304,13 +306,22 @@ pub fn render_mp4_cancellable(
                 }
             },
         };
-        match image::open(&abs) {
-            Ok(dynamic) => {
-                let rgba = dynamic.into_rgba8();
-                let (w, h) = rgba.dimensions();
-                let handle = offscreen.create_texture(w, h);
-                offscreen.upload_texture_rgba(handle, rgba.as_raw());
-                image_textures.insert(*image_source_id, (handle, w, h));
+        // decode は取り込み / preview と同じ口 (BGRA8 のフレーム列)。
+        match crate::image_frames::decode_image_pixels(&abs) {
+            Ok(pixels) => {
+                let frames = pixels
+                    .frames
+                    .iter()
+                    .map(|bgra| {
+                        let handle = offscreen.create_texture_bgra(pixels.width, pixels.height);
+                        offscreen.upload_texture_bgra(handle, bgra);
+                        handle
+                    })
+                    .collect();
+                image_textures.insert(
+                    *image_source_id,
+                    crate::image_frames::ImageTextures { frames, timing: pixels.timing },
+                );
             }
             Err(e) => tracing::warn!(
                 image_source_id,
@@ -470,8 +481,10 @@ pub fn render_mp4_cancellable(
     for (_, (handle, _, _)) in video_textures.drain() {
         offscreen.destroy_texture(handle);
     }
-    for (_, (handle, _, _)) in image_textures.drain() {
-        offscreen.destroy_texture(handle);
+    for (_, textures) in image_textures.drain() {
+        for handle in textures.frames {
+            offscreen.destroy_texture(handle);
+        }
     }
 
     if cancelled {
@@ -555,7 +568,7 @@ fn build_frame_scene(
     offscreen: &mut OffscreenRenderer,
     fx_engine: &mut crate::video_fx::VideoFxEngine,
     video_textures: &mut HashMap<VideoSourceId, (TextureHandle, u32, u32)>,
-    image_textures: &HashMap<ImageSourceId, (TextureHandle, u32, u32)>,
+    image_textures: &HashMap<ImageSourceId, crate::image_frames::ImageTextures>,
     rows: &RowTimeline<'_>,
     source_tempo: Option<&TempoMap>,
     playhead_secs: f64,
@@ -632,9 +645,13 @@ fn build_frame_scene(
     let active_groups = crate::group_compose::active_visual_groups(song, rows, mod_plane);
 
     // PiP 画像 → 親が active group ならその group bucket へ吸収、さもなくば owning track bucket。
-    let image_layers = crate::image_compose::active_image_sources_at(song, rows, mod_plane);
+    let image_layers =
+        crate::image_compose::active_image_sources_at(song, rows, mod_plane, source_tempo);
     for layer in image_layers {
-        let Some((texture, _iw, _ih)) = image_textures.get(&layer.image_source_id) else {
+        // アニメーション画像はイベント開始からの経過秒でフレームを選ぶ (preview と同じ)。
+        let Some(texture) =
+            image_textures.get(&layer.image_source_id).map(|t| t.handle_at(layer.anim_secs))
+        else {
             continue; // not decoded / failed import
         };
         let target_track = song
@@ -643,7 +660,7 @@ fn build_frame_scene(
             .filter(|g| active_groups.contains_key(g))
             .unwrap_or(layer.owning_track_id);
         buckets.entry(target_track).or_default().push(CompositeItem::Quad {
-            texture: *texture,
+            texture,
             dest: (layer.x, layer.y, layer.w, layer.h),
             alpha: layer.alpha,
             rotation_radians: layer.rotation_radians,
@@ -1031,6 +1048,87 @@ mod tests {
         assert_eq!(md.width, 1280, "output width = override, not project canvas");
         assert_eq!(md.height, 720, "output height = override, not project canvas");
         assert_eq!(md.codec, "h264");
+    }
+
+    /// アニメーション GIF (赤 0.5s → 青 0.5s) を置いた曲を書き出し、出来た mp4 を
+    /// 読み戻して「前半は赤、後半は青、2 周目でまた赤」を確かめる。decode → フレームごとの
+    /// texture → 経過秒でのフレーム選択 → 合成 → encode の全経路を通す。
+    #[test]
+    fn render_mp4_animated_gif_switches_frames() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame, Rgba, RgbaImage};
+        let dir = tempfile::tempdir().unwrap();
+        let gif = dir.path().join("anim.gif");
+        {
+            let mut enc = GifEncoder::new(std::fs::File::create(&gif).unwrap());
+            enc.set_repeat(Repeat::Infinite).unwrap();
+            for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+                let img = RgbaImage::from_pixel(32, 24, Rgba(color));
+                let delay = Delay::from_numer_denom_ms(500, 1);
+                enc.encode_frame(Frame::from_parts(img, 0, 0, delay)).unwrap();
+            }
+        }
+        // 120 BPM・4 拍 = 2 秒 (GIF 2 周)。
+        let mut song = Song {
+            bpm: 120.0,
+            length_beats: 4.0,
+            video_resolution: (320, 240),
+            video_framerate: 30.0,
+            ..Song::default()
+        };
+        let src_id = song.alloc_image_source_id();
+        song.media.image_sources.insert(
+            src_id,
+            common::model::ImageSource {
+                path: common::model::ImageSourcePath::Absolute(gif),
+                name: "anim.gif".into(),
+                width: 32,
+                height: 24,
+                format: "Gif".into(),
+            },
+        );
+        let cid = song.alloc_content(
+            common::model::ClipContent::Image(common::model::ImageContent {
+                events: vec![common::model::ImageEvent {
+                    source_id: src_id,
+                    event_length_beats: 4.0,
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                    opacity: 1.0,
+                    ..common::model::ImageEvent::default()
+                }],
+            }),
+            "anim".to_string(),
+        );
+        let track_id = song.alloc_track_id();
+        let mut track = crate::app::track_with(|t| t.id = track_id);
+        let clip_id = track.alloc_clip_id();
+        track.clips.push(common::model::Clip {
+            id: clip_id,
+            start_beat: 0.0,
+            length_beats: 4.0,
+            content_id: cid,
+            ..Default::default()
+        });
+        song.tracks.push(track);
+
+        let out_mp4 = dir.path().join("out.mp4");
+        if let Err(e) = render_mp4(&RenderConfig::new(&song, &out_mp4)) {
+            eprintln!("animated gif export: encoder unavailable ({e}); skipping");
+            return;
+        }
+        let mut dec = crate::libav_decoder::LibavVideoDecoder::new();
+        // (秒, 赤が勝つか)
+        for (secs, want_red) in [(0.25, true), (0.75, false), (1.25, true), (1.75, false)] {
+            let f = dec
+                .decode_at(1, &out_mp4, (secs * 1_000_000.0) as u64)
+                .expect("decode output");
+            let i = ((f.height / 2 * f.width + f.width / 2) * 4) as usize;
+            let (b, r) = (f.bgra[i], f.bgra[i + 2]);
+            assert_eq!(r > b, want_red, "t={secs}s center pixel r={r} b={b}");
+        }
     }
 
 

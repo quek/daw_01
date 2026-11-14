@@ -31,11 +31,11 @@ pub struct MediaState {
     /// `Renderer::create_texture_bgra` + `upload_texture_bgra` and
     /// inserts the resulting `TextureHandle` into
     /// [`Self::image_texture_cache`]. After upload the entry here is
-    /// dropped (= the texture lives in GPU memory). `(width, height,
-    /// bgra)`; bgra length is `width * height * 4`.
+    /// dropped (= the texture lives in GPU memory). Animated images carry
+    /// every frame (`ImagePixels::frames`).
     pub image_source_bgra: std::collections::HashMap<
         common::model::ImageSourceId,
-        (u32, u32, std::sync::Arc<Vec<u8>>),
+        std::sync::Arc<crate::image_frames::ImagePixels>,
     >,
     /// v13: `ImageSourceId`s queued for GPU texture upload. Drained by
     /// the runner each frame.

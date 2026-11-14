@@ -2005,10 +2005,10 @@ pub(crate) type DecodedAudio = (
     std::sync::Arc<crate::audio_source_cache::AudioSourceBuffer>,
 );
 
-/// decode 済み image staging entry (source_id, (w, h, bgra))。
+/// decode 済み image staging entry (source_id, フレーム列)。
 pub(crate) type DecodedImage = (
     common::model::ImageSourceId,
-    (u32, u32, std::sync::Arc<Vec<u8>>),
+    std::sync::Arc<crate::image_frames::ImagePixels>,
 );
 
 /// r.md #42: 動画クリップのサムネイル 1 件 (`(id, (width, height, rgba))`)。
@@ -2043,24 +2043,14 @@ pub struct AssetDecodeStaging {
     pub audio_remaining: usize,
 }
 
-/// PNG/JPEG/… を decode して BGRA8 + 寸法を返す (background thread から呼ぶ自由
-/// 関数)。 失敗 / 0 サイズは `None`。 旧 `decode_image_sources_into_cache` の
-/// image::open → RGBA → BGRA part を抽出したもの。
-pub(crate) fn decode_image_to_bgra(abs: &Path) -> Option<(u32, u32, std::sync::Arc<Vec<u8>>)> {
-    match image::open(abs) {
-        Ok(dynamic) => {
-            let rgba = dynamic.into_rgba8();
-            let (w, h) = rgba.dimensions();
-            if w == 0 || h == 0 {
-                tracing::warn!(path = %abs.display(), "asset decode (image): zero-sized");
-                return None;
-            }
-            let mut bytes = rgba.into_raw();
-            for px in bytes.as_chunks_mut::<4>().0 {
-                px.swap(0, 2); // RGBA → BGRA
-            }
-            Some((w, h, std::sync::Arc::new(bytes)))
-        }
+/// PNG/JPEG/GIF/… を BGRA8 のフレーム列に decode する (background thread から呼ぶ
+/// 自由関数)。 失敗 / 0 サイズは `None`。 decode の口は取り込みと同じ
+/// [`crate::image_frames::decode_image_pixels`]。
+pub(crate) fn decode_image_to_bgra(
+    abs: &Path,
+) -> Option<std::sync::Arc<crate::image_frames::ImagePixels>> {
+    match crate::image_frames::decode_image_pixels(abs) {
+        Ok(pixels) => Some(std::sync::Arc::new(pixels)),
         Err(e) => {
             tracing::warn!(path = %abs.display(), error = %e, "asset decode (image) failed");
             None

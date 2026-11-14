@@ -500,10 +500,7 @@ impl AppData {
                 }
             };
 
-            // 1) Register ImageSource + stage BGRA for GPU upload.
-            // bgra length matches width * height * 4 by construction of
-            // `import_one_image`; re-fetch dims from the source we just
-            // inserted so the staging matches.
+            // 1) Register ImageSource + stage the BGRA frames for GPU upload.
             let cell_idx = import_cell_index(target, cell_offset);
             let Some((image_source_id, src_w, src_h)) = self.edit_song(|song| {
                 let image_source_id = song.alloc_image_source_id();
@@ -513,10 +510,10 @@ impl AppData {
             }) else {
                 return;
             };
-            self.cur.media.image_source_bgra.insert(
-                image_source_id,
-                (src_w, src_h, std::sync::Arc::new(imported.bgra)),
-            );
+            self.cur
+                .media
+                .image_source_bgra
+                .insert(image_source_id, std::sync::Arc::new(imported.pixels));
             self.cur.media.pending_image_uploads.push(image_source_id);
 
             // 2) Build the Image clip content. Single ImageEvent

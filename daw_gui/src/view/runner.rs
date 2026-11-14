@@ -1769,10 +1769,15 @@ impl Runner {
         }
         let pending: Vec<_> = std::mem::take(&mut state.app.cur.media.pending_image_uploads);
         for image_source_id in pending {
-            let Some((w, h, bgra)) =
+            let Some(pixels) =
                 state.app.cur.media.image_source_bgra.remove(&image_source_id)
             else {
                 continue; // already uploaded (= rapid undo path)
+            };
+            // main (arrangement のサムネイル) はアニメーションでも先頭フレームだけ。
+            let (w, h) = (pixels.width, pixels.height);
+            let Some(bgra) = pixels.frames.first() else {
+                continue;
             };
             // main: arrangement クリップのサムネイル用。既に同 id の texture を持って
             // いれば作り直さない (preview を開いたときの再 staging で無駄に確保しない)。
@@ -1802,10 +1807,10 @@ impl Runner {
                     handle
                 }
             };
-            state.renderer.upload_texture_bgra(main_handle, &bgra);
-            // preview: 合成用 (開いていれば)。preview 側は自前 map が SSoT。
+            state.renderer.upload_texture_bgra(main_handle, bgra);
+            // preview: 合成用 (開いていれば)。preview 側は自前 map が SSoT。全フレームを上げる。
             if let Some(preview) = state.preview.as_mut() {
-                preview.upload_image_bgra(image_source_id, w, h, &bgra);
+                preview.upload_image_bgra(image_source_id, &pixels);
             }
         }
     }
@@ -1931,12 +1936,18 @@ impl Runner {
 
         // PiP 画像 → 親が active group ならその group bucket へ吸収、さもなくば owning
         // track の bucket。
-        let image_frames = crate::image_compose::active_image_sources_at(song, &rows, mods);
+        let image_frames = {
+            let tempo = state.app.tempo_map_cached();
+            crate::image_compose::active_image_sources_at(song, &rows, mods, tempo.as_ref())
+        };
         for frame_info in image_frames {
             // **preview 自身の** texture を引く。`image_texture_cache` は main renderer 用
             // なので、ここで使うと renderer 間で id が別名衝突する (r.md #42 レビュー指摘)。
-            let Some((handle, _, _)) =
-                preview.image_textures.get(&frame_info.image_source_id).copied()
+            // アニメーション画像はイベント開始からの経過秒でフレームを選ぶ。
+            let Some(handle) = preview
+                .image_textures
+                .get(&frame_info.image_source_id)
+                .map(|t| t.handle_at(frame_info.anim_secs))
             else {
                 continue; // texture not yet uploaded
             };

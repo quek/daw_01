@@ -632,8 +632,8 @@ impl AppData {
         for (id, buf) in audio {
             self.cur.media.audio_source_cache.insert(id, buf);
         }
-        for (id, (w, h, bytes)) in image {
-            self.cur.media.image_source_bgra.insert(id, (w, h, bytes));
+        for (id, pixels) in image {
+            self.cur.media.image_source_bgra.insert(id, pixels);
             self.cur.media.pending_image_uploads.push(id);
         }
         for (id, (w, h, rgba)) in video_thumbnail {

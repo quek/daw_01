@@ -57,6 +57,10 @@ pub struct ActiveImageFrame {
     /// 無し)。 適用は `group_compose::flip_uv` (preview / export 共通)。
     pub flip_h: bool,
     pub flip_v: bool,
+    /// イベント開始からの経過秒 (テンポ自動化があれば積分した実時間)。アニメーション
+    /// 画像 (GIF / APNG / WebP) のフレーム選択に使う
+    /// (`image_frames::ImageTextures::handle_at`)。静止画では無視される。
+    pub anim_secs: f64,
     /// Bottom-up draw order, same numbering as
     /// `video_playback::ActiveVideoFrame::z_index`. The runner sorts
     /// all (video + image) frames by `z_index` ascending before
@@ -77,10 +81,15 @@ pub struct ActiveImageFrame {
 ///
 /// Muted events and events whose fade envelope evaluates to 0 are
 /// dropped from the result entirely.
+///
+/// `tempo_map` はテンポ自動化のある曲だけ `Some` (映像の
+/// `active_sources_with_tempo` と同じ)。アニメーション画像の経過秒
+/// (`anim_secs`) をテンポ積分で求め、音とずれないようにする。
 pub fn active_image_sources_at(
     song: &Song,
     rows: &RowTimeline<'_>,
     mod_plane: common::mod_plane::ModPlaneRef<'_>,
+    tempo_map: Option<&common::tempo_map::TempoMap>,
 ) -> Vec<ActiveImageFrame> {
     let bpm = song.bpm as f64;
     if bpm <= 0.0 {
@@ -165,6 +174,16 @@ pub fn active_image_sources_at(
                 if alpha <= 0.0 {
                     continue;
                 }
+                // 経過秒の求め方は映像 (`video_playback::push_clip_video_frames`) と同じ:
+                // テンポ自動化があれば song-absolute 拍で積分、無ければ 60/bpm。
+                let event_start_song = scan.song_origin()
+                    + clip.content_to_song_beat(event.event_start_in_clip_beats);
+                let anim_secs = elapsed_secs(
+                    tempo_map,
+                    event_start_song,
+                    scan.song_beat,
+                    (clip_local - event.event_start_in_clip_beats) * 60.0 / bpm,
+                );
                 out.push(ActiveImageFrame {
                     image_source_id: event.source_id,
                     owning_track_id: track.id,
@@ -176,12 +195,27 @@ pub fn active_image_sources_at(
                     rotation_radians: rotation,
                     flip_h: event.flip_h,
                     flip_v: event.flip_v,
+                    anim_secs,
                     z_index,
                 });
             }
         }
     }
     out
+}
+
+/// song 拍 `from_beat` → `to_beat` の実時間 (秒)。テンポ表があれば積分、
+/// 無ければ定 BPM で求めた `constant_secs`。
+fn elapsed_secs(
+    tempo_map: Option<&common::tempo_map::TempoMap>,
+    from_beat: f64,
+    to_beat: f64,
+    constant_secs: f64,
+) -> f64 {
+    match tempo_map {
+        Some(m) => (m.beat_to_seconds(to_beat) - m.beat_to_seconds(from_beat)).max(0.0),
+        None => constant_secs,
+    }
 }
 
 /// Per-track index of the `ImageBuiltin` automation lanes, built once
@@ -372,7 +406,7 @@ mod tests {
     #[test]
     fn active_image_returns_single_layer_inside_event() {
         let song = make_song_with_one_image(0.1, 0.2, 0.5, 0.5, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default());
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default(), None);
         assert_eq!(frames.len(), 1);
         let f = frames[0];
         assert_eq!(f.x, 0.1);
@@ -386,14 +420,14 @@ mod tests {
     #[test]
     fn active_image_returns_empty_outside_event() {
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(16.0), common::mod_plane::ModPlaneRef::default());
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(16.0), common::mod_plane::ModPlaneRef::default(), None);
         assert!(frames.is_empty());
     }
 
     #[test]
     fn active_image_applies_opacity_multiplier() {
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 0.5, 8.0, 0.0, 0.0);
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default());
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default(), None);
         assert_eq!(frames.len(), 1);
         assert!((frames[0].alpha - 0.5).abs() < 1e-6);
     }
@@ -402,7 +436,7 @@ mod tests {
     fn active_image_applies_linear_fade_in() {
         // 4-beat fade-in, query at half-way → alpha = opacity * 0.5
         let song = make_song_with_one_image(0.0, 0.0, 1.0, 1.0, 1.0, 8.0, 4.0, 0.0);
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(2.0), common::mod_plane::ModPlaneRef::default());
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(2.0), common::mod_plane::ModPlaneRef::default(), None);
         assert_eq!(frames.len(), 1);
         assert!(
             (frames[0].alpha - 0.5).abs() < 1e-6,
@@ -420,7 +454,7 @@ mod tests {
                 events[0].muted = true;
             }
         }
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default());
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(4.0), common::mod_plane::ModPlaneRef::default(), None);
         assert!(frames.is_empty());
     }
 
@@ -473,14 +507,14 @@ mod tests {
         song.tracks[0].launcher = RowPlayback::Launcher { clip_id: cell_clip_id };
 
         // 拍 3 → 位相 3.0 → セルの event 窓 [2, 4) の中 → x = 0.9。
-        let frames = active_image_sources_at(&song, &RowTimeline::preview(3.0), common::mod_plane::ModPlaneRef::default());
+        let frames = active_image_sources_at(&song, &RowTimeline::preview(3.0), common::mod_plane::ModPlaneRef::default(), None);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].x, 0.9, "アレンジの画像 (x=0.1) ではなくセルが出る");
         // 拍 5 → 位相 1.0 → セルの event 窓の外 → 何も出ない
         // (アレンジのクリップは拍 5 を覆っているが、行はランチャー主導)。
-        assert!(active_image_sources_at(&song, &RowTimeline::preview(5.0), common::mod_plane::ModPlaneRef::default()).is_empty());
+        assert!(active_image_sources_at(&song, &RowTimeline::preview(5.0), common::mod_plane::ModPlaneRef::default(), None).is_empty());
         // 拍 7 → 位相 3.0 (ループ 2 周目) → また出る。
-        let looped = active_image_sources_at(&song, &RowTimeline::preview(7.0), common::mod_plane::ModPlaneRef::default());
+        let looped = active_image_sources_at(&song, &RowTimeline::preview(7.0), common::mod_plane::ModPlaneRef::default(), None);
         assert_eq!(looped.len(), 1);
         assert_eq!(looped[0].x, 0.9);
     }

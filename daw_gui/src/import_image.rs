@@ -6,20 +6,18 @@
 //!    content addressing.
 //! 2. Copy the file into `<project_dir>/images/<basename>_<hash>.<ext>`
 //!    (or, for unsaved projects, an `Absolute` cache path).
-//! 3. Open with `image::open` → `DynamicImage::into_rgba8()` to get a
-//!    width × height × 4-byte RGBA buffer (alpha-aware for transparent
-//!    PNGs).
-//! 4. Reorder RGBA → BGRA8 so the preview pipeline can hand the bytes
-//!    straight to `Renderer::upload_texture_bgra` (= the same path
-//!    video frames take, no shader changes needed).
-//! 5. Build an `ImageSource` referencing the on-disk image path and
-//!    return it alongside the decoded BGRA8 bytes (= caller uploads
-//!    once into a per-source GPU `TextureHandle` cached on the preview
-//!    window for the project's lifetime — static, no per-frame decode).
+//! 3. Decode with [`crate::image_frames::decode_image_pixels`] into
+//!    BGRA8 frames (one for a static image, every frame for an animated
+//!    one) so the preview pipeline can hand the bytes straight to
+//!    `Renderer::upload_texture_bgra` (= the same path video frames take).
+//! 4. Build an `ImageSource` referencing the on-disk image path and
+//!    return it alongside the decoded frames (= caller uploads them
+//!    once into per-frame GPU textures cached on the preview window for
+//!    the project's lifetime — no per-frame decode).
 //!
-//! Formats: PNG / JPEG / WebP (static) / BMP / TIFF / TGA / GIF
-//! (static). The `image` crate's default features cover all of these.
-//! Animated GIF / APNG / SVG / RAW are post-MVP.
+//! Formats: PNG / JPEG / WebP / BMP / TIFF / TGA / GIF. Animated GIF /
+//! APNG / WebP keep every frame (`crate::image_frames`). SVG / RAW are
+//! not supported.
 
 use std::fs;
 use std::path::Path;
@@ -37,7 +35,7 @@ pub enum ImageImportError {
     /// dialog selection by extension before reaching here; this is
     /// a defensive last line.
     UnsupportedFormat(String),
-    /// `image::open` failed (= corrupt file, unsupported subformat).
+    /// Decoding failed (= corrupt file, unsupported subformat).
     DecodeFailed(String),
     /// File read / copy failed.
     IoError(String),
@@ -58,18 +56,17 @@ impl std::fmt::Display for ImageImportError {
 
 impl std::error::Error for ImageImportError {}
 
-/// Successful import outcome. The `bgra` buffer is meant to be uploaded
-/// to a per-`ImageSourceId` GPU texture exactly once by the caller; the
+/// Successful import outcome. The `pixels` frames are meant to be uploaded
+/// to per-`ImageSourceId` GPU textures exactly once by the caller; the
 /// `ImageSource` is registered in `Song.image_sources` so future
 /// project loads can re-decode from disk.
 #[derive(Debug)]
 pub struct ImportedImage {
     pub source: ImageSource,
-    /// Tightly-packed BGRA8 in scanline order, length =
-    /// `source.width * source.height * 4`. Suitable for direct upload
-    /// via `Renderer::upload_texture_bgra` (= the same path video
-    /// frames take).
-    pub bgra: Vec<u8>,
+    /// Decoded BGRA8 frames (1 for a static image, all frames for an
+    /// animated GIF / APNG / WebP). Each frame is suitable for direct
+    /// upload via `Renderer::upload_texture_bgra`.
+    pub pixels: crate::image_frames::ImagePixels,
 }
 
 /// Sanitize a basename: keep ASCII alphanumerics, `_`, `-`. Anything
@@ -151,42 +148,20 @@ pub fn import_one_image(src: &Path, dest: &MediaDest) -> Result<ImportedImage> {
     fs::create_dir_all(&dir).with_context(|| format!("create dir {}", dir.display()))?;
     let cache_path = dir.join(&filename);
     // 名前が内容 hash なので既存は完成品として使う。書きかけを最終名に出さない
-    // (並行する同じ取り込みが下の `image::open` で途中の複製を掴む)。
+    // (並行する同じ取り込みが下の decode で途中の複製を掴む)。
     common::atomic_file::copy_new(src, &cache_path)
         .with_context(|| format!("copy {} → {}", src.display(), cache_path.display()))?;
 
-    // Decode via image crate. `image::open` sniffs the format from the
-    // first few bytes (= robust against renamed extensions). Errors
-    // bubble through `ImageImportError::DecodeFailed`.
-    let dynamic = image::open(&cache_path).map_err(|e| {
-        anyhow!(ImageImportError::DecodeFailed(format!(
-            "{}: {}",
-            cache_path.display(),
-            e
-        )))
+    // `decode_image_pixels` sniffs the format from the content (= robust
+    // against renamed extensions) and decodes every frame of an animated
+    // GIF / APNG / WebP (static images yield exactly one frame).
+    let pixels = crate::image_frames::decode_image_pixels(&cache_path).map_err(|e| {
+        anyhow!(ImageImportError::DecodeFailed(format!("{}: {e}", cache_path.display())))
     })?;
     let format = image::ImageFormat::from_path(&cache_path)
         .map(|f| format!("{f:?}"))
         .unwrap_or_else(|_| "Unknown".to_string());
-
-    let rgba = dynamic.into_rgba8();
-    let (w, h) = rgba.dimensions();
-    if w == 0 || h == 0 {
-        return Err(anyhow!(ImageImportError::DecodeFailed(format!(
-            "zero-sized image: {}x{}",
-            w, h
-        ))));
-    }
-
-    // RGBA → BGRA8 reorder so the buffer drops into the preview
-    // pipeline's `upload_texture_bgra` without any further conversion.
-    // `into_raw()` consumes the RgbaImage's buffer in place (= no
-    // extra allocation beyond the swap), and the result is the same
-    // length we hand back to the caller.
-    let mut bytes = rgba.into_raw();
-    for px in bytes.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
-    }
+    let (w, h) = (pixels.width, pixels.height);
 
     // 表示用に import 元ファイルの元名 (拡張子込み、 sanitize / hash 前) を
     // 保持する。 on-disk `path` は content addressing で sanitize / hash
@@ -206,7 +181,7 @@ pub fn import_one_image(src: &Path, dest: &MediaDest) -> Result<ImportedImage> {
             height: h,
             format,
         },
-        bgra: bytes,
+        pixels,
     })
 }
 
@@ -245,17 +220,17 @@ mod tests {
         assert_eq!(imported.source.width, 2);
         assert_eq!(imported.source.height, 2);
         assert_eq!(imported.source.format, "Png");
-        assert_eq!(imported.bgra.len(), 2 * 2 * 4);
+        assert_eq!(imported.pixels.frames[0].len(), 2 * 2 * 4);
 
         // BGRA layout: byte order is B, G, R, A.
         // Top-left red → (0, 0, 255, 255)
-        assert_eq!(&imported.bgra[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&imported.pixels.frames[0][0..4], &[0, 0, 255, 255]);
         // Top-right green → (0, 255, 0, 255)
-        assert_eq!(&imported.bgra[4..8], &[0, 255, 0, 255]);
+        assert_eq!(&imported.pixels.frames[0][4..8], &[0, 255, 0, 255]);
         // Bottom-left blue → (255, 0, 0, 255)
-        assert_eq!(&imported.bgra[8..12], &[255, 0, 0, 255]);
+        assert_eq!(&imported.pixels.frames[0][8..12], &[255, 0, 0, 255]);
         // Bottom-right semi-transparent yellow → (0, 255, 255, 128)
-        assert_eq!(&imported.bgra[12..16], &[0, 255, 255, 128]);
+        assert_eq!(&imported.pixels.frames[0][12..16], &[0, 255, 255, 128]);
     }
 
     #[test]
