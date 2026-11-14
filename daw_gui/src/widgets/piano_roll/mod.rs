@@ -309,7 +309,7 @@ pub struct PianoRollView {
     /// `last_note_duration_beats` (= 直近に描いた / 選択した note の長さ) を渡す = Bitwig の
     /// 「直前にドラッグした長さがそのクリップの新既定になる」 挙動を SSoT 1 本で実現する。
     /// ダブルクリック作成でボタンを放さず左右ドラッグしたときは、 ドラッグ長 (snap 済み右端 −
-    /// start) が優先され、 この既定長は使われない。 値は widget 側で `0.0625` (1/16) 下限に clamp。
+    /// start) が優先され、 この既定長は使われない。 値は widget 側で `MIN_NOTE_LEN` 下限に clamp。
     pub default_note_len_beats: f64,
     /// `start_beat` が左へスクロールできる下限 (song-absolute 拍)。daw_01 では編集対象 clip の
     /// 開始拍 (= `pianoroll_scroll_beat >= 0` を絶対拍に直したもの)。edge auto-scroll が左端で view を

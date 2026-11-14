@@ -282,10 +282,10 @@ fn ctrl_arrow_resizes_notes_as_a_set() {
         assert!((got - want).abs() < 1e-9, "両方 +0.25 拍: got {lens:?}");
     }
 
-    // 短い方 (0.75) が下限 0.0625 に当たるまでしか縮まない。
+    // 短い方 (0.75) が下限 (1/32 拍) に当たるまでしか縮まない。
     app.handle_event(AppEvent::NudgeSelectedNoteLength { step: NudgeStep::Bar, steps: -1 });
     let lens: Vec<f64> = notes_of(&app, 0).iter().map(|n| n.duration_beats).collect();
-    for (got, want) in lens.iter().zip([0.5625, 0.0625]) {
+    for (got, want) in lens.iter().zip([0.53125, 0.03125]) {
         assert!((got - want).abs() < 1e-9, "下限で delta 全体が縮む: got {lens:?}");
     }
 }

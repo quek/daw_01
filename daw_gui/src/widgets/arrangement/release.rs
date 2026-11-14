@@ -86,7 +86,7 @@ pub(super) fn commit_releases(
         // ---- clip drag release → MoveClips / ResizeClips ----
         // M9 Phase 60: anchor 0 の delta を `view.snap.snap_beat_delta` で round → 全 anchor に
         // 同 delta 適用。 Resize の min_len は snap unit に合わせる。 下限は model の
-        // `MIN_CLIP_LEN_BEATS` (= `resize_clip` の clamp と同じ 1/16。 r.md #68: overlay 側と
+        // `MIN_CLIP_LEN_BEATS` (= `resize_clip` の clamp と同じ値。 r.md #68: overlay 側と
         // 揃えないと最小長付近で preview ≠ commit)。
         // **alt は drag 中の最終 `nd.last_alt` を真値とする** — release frame の `pointer.modifiers.alt`
         // は OS event 順序 (ModifiersChanged が MouseInput(Released) より先に届く) によって false に
@@ -503,9 +503,9 @@ pub(super) fn commit_releases(
                 let min_len = if view.snap.is_active(release_alt) {
                     view.snap
                         .beat_unit(zoom_x_px_per_beat)
-                        .map_or(0.05, |u| u.max(0.05))
+                        .map_or(common::model::MIN_CLIP_LEN_BEATS, |u| u.max(common::model::MIN_CLIP_LEN_BEATS))
                 } else {
-                    0.05
+                    common::model::MIN_CLIP_LEN_BEATS
                 };
                 // #071: cross-lane drop は単一選択 drag のみ (cursor 解決)。 複数選択一括は宛先 lane が
                 // 一意でない (異種・可変高 lane) ため各 anchor は自 lane 維持の horizontal time-shift。

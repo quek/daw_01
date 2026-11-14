@@ -72,8 +72,8 @@ pub(crate) fn clamp_shared_pitch_delta(
 /// (別々に書くと overlay と確定値がずれる)。
 /// r.md #68 同件: 下限そのものも **model と共有** する (`MIN_NOTE_LEN` =
 /// `common::model::MIN_NOTE_LEN_BEATS`)。 ここが `0.05` だった頃は、 handler 側
-/// (`AppData::resize_notes` / `resize_note` / `add_note`) が `0.0625` に clamp するため、
-/// snap off (Alt) で 1/16 未満まで縮めるとゴーストより長く確定していた。
+/// (`AppData::resize_notes` / `resize_note` / `add_note`) が別の下限に clamp するため、
+/// snap off (Alt) でその下限未満まで縮めるとゴーストより長く確定していた。
 /// `ResizeLeft` では start だけ見えたとおりに確定して長さが伸ばされるので、
 /// **固定していたはずの右端が動く**。 ドラッグ作成 ([`note_create_geometry`]) も同じ値を使う。
 #[must_use]
@@ -517,7 +517,7 @@ pub(super) fn drag_preview_geometry(
 /// 飛ばない)。 そこからの移動量ぶんだけ右端が動く (cursor がそのまま右端に追従)。
 ///
 /// - `dragged == false` (即放し / jitter 以下 / warp 未着地): 長さ = `view.default_note_len_beats`
-///   (= caller の `last_note_duration_beats`)。 `0.0625` (1/16) 下限。
+///   (= caller の `last_note_duration_beats`)。 [`MIN_NOTE_LEN`] 下限。
 /// - `dragged == true` (warp 着地後に左右いずれかへ閾値ぶん drag した): 右端 pivot = `start + default`、
 ///   warp 先からの移動量 `raw_delta = (last_mouse.x − anchor_mouse.x) × beat_per_px` を pivot に足して
 ///   **絶対位置 snap** (`snap(pivot + raw_delta)`、 ui/CLAUDE.md の delta-snap NG ガイドライン /

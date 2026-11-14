@@ -428,7 +428,7 @@ pub(super) fn overlays(
     });
 
     // M9 Phase 45f: drag overlay の Resize min_len は snap unit。 下限は model の
-    // `MIN_CLIP_LEN_BEATS` (= `resize_clip` の clamp と同じ 1/16)。 r.md #68: ここが
+    // `MIN_CLIP_LEN_BEATS` (= `resize_clip` の clamp と同じ値)。 r.md #68: ここが
     // 0.05 だったので、 snap off (Alt) で 1/16 未満までゴーストが縮み、 release で
     // 1/16 に戻る = preview ≠ commit だった。
     // release 側 min_len と一貫させるため、 alt 真値は drag session の `last_alt` を使う

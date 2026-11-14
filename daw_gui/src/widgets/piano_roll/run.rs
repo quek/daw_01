@@ -1280,7 +1280,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             // (Fold mode では y_to_pitch_f が既に in-scale pitch を整数で返すので ceil は no-op)。
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let pitch = (pitch_f.ceil() as i32).clamp(0, 127) as u8;
-            // 長さは caller の既定長 (= last_note_duration_beats) に統一。下限 1/16。widget は
+            // 長さは caller の既定長 (= last_note_duration_beats) に統一。下限は `MIN_NOTE_LEN`。widget は
             // song-absolute → model は clip-local (clip_origin_beat を引く)。id は handler が採番。
             let insert_len = view.default_note_len_beats.max(MIN_NOTE_LEN);
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {

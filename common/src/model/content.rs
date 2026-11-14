@@ -8,15 +8,19 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
-/// Clip の最小長 (拍) = 1/16。端 drag の trim / stretch はこの値まで縮められる。
+/// Clip の最小長 (拍) = 1/32 拍 = 128 分音符 1 つ。端 drag の trim / stretch はこの値まで縮められる。
+///
+/// グリッドの最も細かい選択肢 ("1/128") と同じ長さ。これより大きいと、グリッドを 1/128 に
+/// しても 1 マスまで縮められない (以前は 1/16 拍 = 64 分音符で止まっていた)。
 ///
 /// r.md #68: **drag preview と commit の共通下限**。widget 側 (`arrangement` の
 /// resize preview) と handler 側 (`AppData::resize_clip`) が別々のリテラルを持って
 /// いると、最小長付近でゴーストと確定結果がずれる (snap off = Alt drag のときだけ
 /// 露呈する類のずれ)。両方ここを参照する。
-pub const MIN_CLIP_LEN_BEATS: f64 = 0.0625;
+pub const MIN_CLIP_LEN_BEATS: f64 = 1.0 / 32.0;
 
-/// Note の最小長 (拍) = 1/16。ピアノロールの端 drag / 新規ノート作成はこの値まで縮められる。
+/// Note の最小長 (拍) = 1/32 拍 = 128 分音符 1 つ。ピアノロールの端 drag / 新規ノート作成は
+/// この値まで縮められる。[`MIN_CLIP_LEN_BEATS`] と同じく、グリッドの最も細かい選択肢に合わせる。
 ///
 /// r.md #68 同件: [`MIN_CLIP_LEN_BEATS`] と同じ理由で **preview と commit の共通下限**。
 /// widget 側 (`piano_roll` の resize preview) が `0.05`、handler 側
@@ -24,7 +28,7 @@ pub const MIN_CLIP_LEN_BEATS: f64 = 0.0625;
 /// snap off (Alt) で 1/16 未満まで縮めるとゴーストより長く確定していた。
 /// `ResizeLeft` ではさらに悪く、start は見えたとおりに確定するのに長さだけ伸ばされる
 /// ので、**固定していたはずの右端が動く**。
-pub const MIN_NOTE_LEN_BEATS: f64 = 0.0625;
+pub const MIN_NOTE_LEN_BEATS: f64 = 1.0 / 32.0;
 
 /// `skip_serializing_if` 用: 既定 (張り出しなし) の拍量か。
 fn is_zero_beats(v: &f64) -> bool {

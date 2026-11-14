@@ -722,9 +722,12 @@ fn render_arrangement_heavy(
                 f.zoom_x_px_per_beat,
             );
             let min_len = if f.view.snap.is_active(acd.last_alt) {
-                f.view.snap.beat_unit(f.zoom_x_px_per_beat).map_or(0.05, |u| u.max(0.05))
+                f.view
+                    .snap
+                    .beat_unit(f.zoom_x_px_per_beat)
+                    .map_or(common::model::MIN_CLIP_LEN_BEATS, |u| u.max(common::model::MIN_CLIP_LEN_BEATS))
             } else {
-                0.05
+                common::model::MIN_CLIP_LEN_BEATS
             };
             // #071: 単一選択は cursor で cross-lane drop を preview、 複数選択は各 anchor の自 lane に
             // 留め horizontal time-shift を preview (release commit の cross-lane policy と一致)。

@@ -127,23 +127,23 @@ fn ピアノロールの_shift_e_はグリッド線ごとにノートを割り_�
     assert_eq!(notes_of(&app, A), vec![(1.5, 2.0, 60, ly("あ"))], "1 回の undo で元に戻る");
 }
 
-/// 最短ノート長 (1/16 拍) より短い片はできず、隣の片にくっつく。
+/// 最短ノート長 (1/32 拍) より短い片はできず、隣の片にくっつく。
 #[test]
 fn グリッド分割は最短ノート長より短い片を作らない() {
-    // グリッド線 (1 拍) がノートの頭から 1/32 拍の位置 → 頭の 1/32 拍は次の片へ。
-    let mut app = app_with_midi(&[(1, 0.0, 8.0)], vec![note(1, 1.0 - 1.0 / 32.0, 2.0 + 1.0 / 32.0, 60, None)]);
+    // グリッド線 (1 拍) がノートの頭から 1/64 拍の位置 → 頭の 1/64 拍は次の片へ。
+    let mut app = app_with_midi(&[(1, 0.0, 8.0)], vec![note(1, 1.0 - 1.0 / 64.0, 2.0 + 1.0 / 64.0, 60, None)]);
     app.handle_event(AppEvent::SetClipSelection(vec![A]));
     piano_grid(&mut app, GRID_1_4, true);
     app.handle_event(split(SplitSurface::Notes, SplitAt::Grid));
-    assert_eq!(notes_of(&app, A), vec![(1.0 - 1.0 / 32.0, 1.0 + 1.0 / 32.0, 60, None), (2.0, 1.0, 60, None)]);
+    assert_eq!(notes_of(&app, A), vec![(1.0 - 1.0 / 64.0, 1.0 + 1.0 / 64.0, 60, None), (2.0, 1.0, 60, None)]);
 
-    // グリッド (1/32 拍) が最短長より細かい → 1/16 拍ずつの片。 歌詞の無いノートは無いまま。
-    let mut app = app_with_midi(&[(1, 0.0, 8.0)], vec![note(1, 0.0, 0.25, 60, None)]);
+    // 最も細かいグリッド (1/128 = 1/32 拍) は最短長と同じ → 1 マスずつの片。 歌詞の無いノートは無いまま。
+    let mut app = app_with_midi(&[(1, 0.0, 8.0)], vec![note(1, 0.0, 0.125, 60, None)]);
     app.handle_event(AppEvent::SetClipSelection(vec![A]));
     piano_grid(&mut app, GRID_1_128, true);
     app.handle_event(split(SplitSurface::Notes, SplitAt::Grid));
     let spans: Vec<(f64, f64)> = notes_of(&app, A).iter().map(|n| (n.0, n.1)).collect();
-    assert_eq!(spans, vec![(0.0, 0.0625), (0.0625, 0.0625), (0.125, 0.0625), (0.1875, 0.0625)]);
+    assert_eq!(spans, vec![(0.0, 0.03125), (0.03125, 0.03125), (0.0625, 0.03125), (0.09375, 0.03125)]);
 }
 
 /// `E` の回帰: 後ろの片の歌詞は「ー」(以前は `None` = 実際には「ら」と歌われた)、
@@ -193,8 +193,8 @@ fn linked_clip_を同時に表示しても編集は_content_ごとに_1_回() {
 /// 片は全部選択される。
 #[test]
 fn アレンジの_shift_e_はクリップをグリッド線で割る() {
-    // クリップは 1/32 拍だけ小節線の手前から始まる → 先頭の 1/32 拍は次の片へくっつく。
-    let start = 1.0 - 1.0 / 32.0;
+    // クリップは 1/64 拍だけ小節線の手前から始まる → 先頭の 1/64 拍は次の片へくっつく。
+    let start = 1.0 - 1.0 / 64.0;
     let mut app = app_with_midi(&[(1, start, 4.0 - start)], vec![note(1, 0.0, 4.0 - start, 60, Some("ら"))]);
     // 両端に隣とのクロスフェードの張り出しが付いている。
     app.edit_song(|song| {
