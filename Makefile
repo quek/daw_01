@@ -312,6 +312,19 @@ test: preflight-no-app gates build test-rt
 # (env が欠けていれば落ちる。`make test` の最後は「渡された env の分だけ回し、残りを表示」)。
 # **env は make の引数で渡す** (`make test-real-vst3 DAW01_TEST_VST3_MCENTER=<path> ...`) —
 # シェルの環境変数は make に継承されない (冒頭「Windows のログオン環境の復元」)。
+#
+# プラグインが MeldaProduction の標準のインストール先に在れば、env を既定で補う (引数で渡した値が勝つ)。
+# 在るマシンでは `make test` / `make test-real-vst3` がそのまま実物の検査まで回す。無いマシンでは補わず、
+# 従来どおり「回していない」の表示 / 落ちる、になる。
+MELDA_VST3_DIR := C:/Program Files/Common Files/VST3/MeldaProduction
+ifeq ($(shell test -e "$(MELDA_VST3_DIR)/Stereo/MCenter.vst3" && echo y),y)
+DAW01_TEST_VST3_MCENTER ?= $(MELDA_VST3_DIR)/Stereo/MCenter.vst3
+export DAW01_TEST_VST3_MCENTER
+endif
+ifeq ($(shell test -e "$(MELDA_VST3_DIR)/Dynamics/MCompressor.vst3" && echo y),y)
+DAW01_TEST_VST3_MCOMPRESSOR ?= $(MELDA_VST3_DIR)/Dynamics/MCompressor.vst3
+export DAW01_TEST_VST3_MCOMPRESSOR
+endif
 test-real-vst3: preflight-no-app build
 	@$(BASH) "$(CURDIR)/scripts/test_real_vst3.sh"
 
