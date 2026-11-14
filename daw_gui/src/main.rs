@@ -194,7 +194,8 @@ fn main() -> Result<std::process::ExitCode> {
         None => common::app_dirs::AppDirs::production(),
     };
 
-    let bootstrap = bootstrap_subprocess()?;
+    // 窓の無い script 起動 (テスト) はスピーカーを鳴らさない。`--script --gui` は実機と同じ条件を見るので鳴らす。
+    let bootstrap = bootstrap_subprocess(cli.script.is_some() && !cli.gui)?;
 
     if let (Some(script_path), false) = (cli.script.as_ref(), cli.gui) {
         tracing::info!(script = %script_path.display(), "headless script mode");

@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
         Arc::clone(&scope),
         Arc::clone(&device_scope),
         session.sample_rate,
+        session.mute_output,
         cmd_rx,
         project_rx,
         project_recycle_tx,
@@ -865,6 +866,7 @@ fn start_output_stream(
     scope: Arc<ScopeBridgeHandle>,
     device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
     session_sample_rate: u32,
+    mute_output: bool,
     cmd_rx: rtrb::Consumer<EngineCommand>,
     project_rx: rtrb::Consumer<ProjectDelivery>,
     project_recycle_tx: rtrb::Producer<Box<ProjectRt>>,
@@ -920,6 +922,7 @@ fn start_output_stream(
         scope,
         device_scope,
         session_sample_rate,
+        mute_output,
         local,
     )?;
     stream.play().context("failed to start stream")?;
@@ -956,6 +959,9 @@ fn build_stream(
     scope: Arc<ScopeBridgeHandle>,
     device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
     session_sample_rate: u32,
+    // `AudioSession::mute_output`: 描いた後、デバイスへ渡す直前に無音へ差し替える
+    // (メーター / scope は描画の中で既に書かれているので、テストは値を読める)。
+    mute_output: bool,
     // `DeviceRt` is the CPAL closure's exclusive heap. It holds
     // master_l/r and the per-project scratch — pre-allocated, never
     // touched outside the audio thread.
@@ -1003,6 +1009,9 @@ fn build_stream(
                 }
                 starve.observe(data.len() / channels_usize, &metrics);
                 stage.on_callback(data);
+                if mute_output {
+                    data.fill(0.0);
+                }
             },
             |err| tracing::error!(?err, "audio stream error"),
             None,

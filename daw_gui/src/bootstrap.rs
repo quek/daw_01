@@ -539,7 +539,7 @@ fn retire_child(rt: &tokio::runtime::Handle, kind: ChildKind, mut child: Child) 
 /// 子プロセスを spawn → handshake → Session / OpenWorkerPool 配信 →
 /// pipe loop spawn まで一連の起動処理。 GUI mode と script mode の前段は
 /// 完全に同一なのでこの 1 関数でカバー。
-pub fn bootstrap_subprocess() -> Result<Bootstrap> {
+pub fn bootstrap_subprocess(mute_output: bool) -> Result<Bootstrap> {
     let job = Arc::new(JobHandle::new()?);
     let rt = Runtime::new().context("failed to create tokio runtime")?;
 
@@ -555,6 +555,7 @@ pub fn bootstrap_subprocess() -> Result<Bootstrap> {
         sample_rate: DEFAULT_SAMPLE_RATE,
         max_frames: MAX_FRAMES,
         channels: CHANNELS as u16,
+        mute_output,
     };
     let bridge = Arc::new(
         AudioBridgeHandle::create(&session.shmem_id).context("failed to create audio shmem")?,

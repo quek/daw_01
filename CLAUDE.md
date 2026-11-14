@@ -58,7 +58,8 @@ make fetch-ffmpeg   # third_party/ffmpeg 取得 (gitignore なので fresh machi
 
 `daw_gui/tests/` の一部は **daw_gui 本体を `--script` で subprocess 起動**し、daw_audio /
 daw_plugin_host まで spawn して audio device を開く。窓を出さず single-instance gate も素通り
-するので **起動したことに誰も気付けない**。実機を触っている最中に回すと、開いているプロジェクトの
+するので **起動したことに誰も気付けない** (スピーカーは鳴らない — 窓なしの `--script` は
+`AudioSession::mute_output` で無音を出す。`--script --gui` は鳴る)。実機を触っている最中に回すと、開いているプロジェクトの
 再生を壊す。
 
 - **判定基準は 1 つだけ**: `grep -l CARGO_BIN_EXE_daw_gui daw_gui/tests/*.rs` (ディレクトリ形式の target

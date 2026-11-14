@@ -204,6 +204,10 @@ pub struct AudioSession {
     pub sample_rate: u32,
     pub max_frames: u32,
     pub channels: u16,
+    /// 出力デバイスへ無音を出す (描画・メーター・scope のリングは通常どおり動く)。窓の無い検証用の起動
+    /// (`daw_gui --script`、`--gui` なし) が立てる — テストが再生しても実機のスピーカーが鳴らない。
+    /// daw_plugin_host は使わない。
+    pub mute_output: bool,
 }
 
 /// Phase 2 (`docs/plan_automation.md` §7.5): 1 parameter のメタデータ。

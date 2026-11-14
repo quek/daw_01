@@ -2404,6 +2404,7 @@ mod tests {
             sample_rate: 48_000,
             max_frames: 256,
             channels: 2,
+            mute_output: false,
         };
         (PluginHost::new(session, evt_tx, notify_tx), evt_rx)
     }
