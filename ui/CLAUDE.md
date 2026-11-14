@@ -227,4 +227,5 @@ sub-pixel quad / TSF / wgpu 29.x の offscreen・uniform / text_input のタイ�
 - フィードバック / 過去知見: daw_01 の `~/.claude/projects/F--dev-daw-01/memory/`
   （旧 gui_01 memory `F--dev-gui-01` からの移行は統合作業の follow-up）
 - skill: UI デバッグは daw_01 root の `.claude/skills/debug-ui`。実装 / レビュー / 調査は
-  root の `implement` / `review` / `research-similar-impl` を使う
+  root の `implement` / `review` / `research-similar-impl` を使う。daw_gui の view の配置・操作性は
+  [daw_gui/CLAUDE.md](../daw_gui/CLAUDE.md)

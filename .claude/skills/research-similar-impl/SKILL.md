@@ -4,9 +4,9 @@ description: |
   類似 DAW / CLAP ホスト / Rust オーディオプロジェクト（clap-host, clap-validator, clack,
   nih-plug, Meadowlark 等）、gui_01 (daw-ui)、VOICEVOX のソースコードと公式リファレンスを調査し、
   実装方針レポートを出力する。調査のみ行い、コードの編集は行わない。
-  実装方針や参考実装の調査を頼まれたとき、implement skill の調査段 (手順 2) から呼ばれるとき、
+  実装方針や参考実装の調査を頼まれたとき、implement skill から呼ばれるとき、
   または CLAP / VST3 / cpal / gui_01 / VOICEVOX API の使い方が不明なときに発動。
-  「実装して」「バグを直して」等のコード変更の指示は implement が受ける (この skill を呼ぶ条件は implement 側にある)。
+  「実装して」「バグを直して」等のコード変更の指示は implement が受ける。
 argument-hint: "[調査対象の機能名]"
 allowed-tools: Bash(git clone *), Bash(git pull *), Read, Grep, Glob, WebSearch, WebFetch, Agent
 ---

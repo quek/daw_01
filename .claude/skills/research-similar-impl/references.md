@@ -46,7 +46,8 @@ Agent に調査を依頼するときは「crates.io の `<crate> = \"X.Y.Z\"` �
 (breaking change は全 example を同じ commit で直す) ので、daw-ui の使い方の参照元として最も信頼できる。
 ただし前作はプロト品質なので、構造 (プロセス分割・
 IPC の形・イベントの流れ) の目安にとどめ、実装はベストプラクティスを調べて採る
-(`feedback_prioritize_best_practices`。implement skill の手順 2 と同じ)。
+(`feedback_prioritize_best_practices`)。前作で鵜呑みにしないもの: RT パス (`process()` 内) の
+`Vec::new` / `Box::new`、`unwrap` / `panic!`、ハードコード定数。
 
 # API リファレンス・ガイド
 
@@ -94,5 +95,16 @@ IPC の形・イベントの流れ) の目安にとどめ、実装はベスト�
 - `clap_process` のイベント配列は時刻順にソートされている必要がある
 - オーディオバッファは CLAP 側が所有する場合と、ホスト側が貸し出す場合があるため `flags` を確認
 - サブプロセスでプラグインを動かす場合、共有メモリのレイアウトとシグナリング順を厳密に設計する
+- CLAP 拡張をホスト側に足すとき:
+  - `clap-sys` に該当する `clap_plugin_*` / `clap_host_*` struct と `CLAP_EXT_*` 定数があるかを
+    `~/.cargo/registry/src/.../clap-sys-*/src/ext/` で確かめる
+  - プラグイン側拡張は `plugin.get_extension(CLAP_EXT_*)` で取る。null を返すプラグインもあるので
+    `Option<*const _>` で持ち、関数ポインタ (`Option<unsafe extern "C" fn>`) は `unwrap` せず `ok_or_else`
+  - ホスト側拡張は `Host` (`daw_plugin_host/src/clap_host.rs`) にフィールドを足して `Host::new()` で埋め、
+    `get_extension` callback で id を比べて `std::ptr::from_ref(&this.clap_gui) as *const c_void` の形で返す。
+    callback 内では `Host::from_clap(host)` で `&Host` を復元する
+  - ホスト callback (`request_resize` 等) は任意スレッドから呼ばれうる。送信端は `Send + Sync`
+  - 戻り値 bool の `false` はエラーとは限らない (VCV Rack は `show` が `false` でも動く)。GUI の呼び出し順は
+    `docs/plan_plugin_editor_topwindow.md` §9
 - gui_01 の `HeavyCtx::cached` 内の描画は viewport_key 一致時にスキップ。動的 overlay (cursor / 選択範囲) は cached の **外側** で `push_*`
 - VOICEVOX の歌唱クエリでは `key` は MIDI ノート番号（60 = C4）、`frame_length` はフレーム数（93.75Hz 基準）

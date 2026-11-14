@@ -2,7 +2,7 @@
 name: review
 description: |
   変更箇所のリアルタイム安全性・パフォーマンス・セキュリティレビューを行い、問題を修正する。
-  commit の前に回す (`/implement` の §8 から呼ぶ。明示的に `/review` でも呼べる)。
+  commit の前に回す (`/implement` の「commit まで」から呼ぶ。明示的に `/review` でも呼べる)。
 allowed-tools: Read, Grep, Glob, Edit, Bash(git diff *), Bash(git ls-files *), Bash(make clippy), Bash(make arch-lint), Bash(cargo check -p *), Bash(cargo clippy -p *), Bash(cargo test -p *), Agent
 ---
 
