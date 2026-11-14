@@ -11,6 +11,10 @@
 //! **`Instant::now` / 走行カウンタ / dispatch 順に依存させないこと** — worker pool は
 //! work-stealing なのでトラックの処理順は実行ごとに変わる。
 //!
+//! ここで言う「発火拍」は song 拍そのものではなく、**起点からの走行拍** (トランスポートの
+//! 跳びを除いた拍、`LauncherRuntime::draw_beat`)。song 拍で引くとループ再生で毎周同じ拍に
+//! 戻り、毎周同じ目が出る (r.md #155)。書き出しは跳ばないので両者は一致する。
+//!
 //! # グループ
 //!
 //! `Next` / `Previous` / `First` / `Last` / `Any` / `Other` が指す範囲は
@@ -62,6 +66,7 @@ pub fn row_seed(row_key: u64, clip_id: u32) -> u64 {
 /// - `from` = 今鳴っているセルの列 index
 /// - `scene_pos` = 列 id → `Song.scenes` の表示順 index (`Jump { scene_id }` の解決にだけ使う。同じ id が
 ///   複数あれば先頭)
+/// - `fire_beat` = 乱数を引く拍 (module doc の「発火拍」= 起点からの走行拍)
 ///
 /// RT 安全: 確保もロックも無い純関数。
 #[must_use]

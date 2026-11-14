@@ -117,7 +117,8 @@ impl LauncherRuntime {
         let n = self.fill_scene_occupancy(song);
         let seed = follow::row_seed(SCENE_SEED_SALT, self.scene.scene_id);
         let scene_pos = |id| song.index.scene_pos(id);
-        let outcome = follow::resolve(&follow, &self.occupied[..n], pos, scene_pos, seed, fire);
+        let draw = self.draw_beat(fire);
+        let outcome = follow::resolve(&follow, &self.occupied[..n], pos, scene_pos, seed, draw);
         match outcome {
             FollowOutcome::Keep => {
                 // 再武装は **初回と同じ長さ** (その列の最長セル) で張る。

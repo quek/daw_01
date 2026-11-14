@@ -277,6 +277,13 @@ pub struct LauncherRuntime {
     last_project_id: u64,
     /// 次の `update` で `Song` の [`RowPlayback`] から撃ち直す。
     reseed: bool,
+    /// 起点 (reseed) から後にトランスポートが**跳んだ量の累計** (拍)。
+    ///
+    /// フォローアクションの乱数は `song 拍 - これ` (= 跳びを除いた、起点からの走行拍) で引く
+    /// ([`Self::draw_beat`])。song 拍そのもので引くと、ループで巻き戻るたびに同じ拍で発火して
+    /// **毎周同じ目が出る** (r.md #155: `Any` が自分を引いたセル / 列は二度と動かない)。
+    /// 書き出しは跳ばないので常に 0 = 「同じ起点から同じ遷移列」(Q9) は変わらない。
+    jumped_beats: f64,
 }
 
 impl Default for LauncherRuntime {
@@ -308,6 +315,7 @@ impl LauncherRuntime {
             seeded_scene: 0,
             last_project_id: 0,
             reseed: true,
+            jumped_beats: 0.0,
         }
     }
 
@@ -379,6 +387,7 @@ impl LauncherRuntime {
         if !delta_beats.is_finite() || delta_beats == 0.0 {
             return;
         }
+        self.jumped_beats += delta_beats;
         let shift = |v: &mut f64| {
             if v.is_finite() {
                 *v += delta_beats;
@@ -405,6 +414,12 @@ impl LauncherRuntime {
     #[must_use]
     pub fn any_cell_playing(&self) -> bool {
         self.rows.iter().any(|r| matches!(r.phase, RowPhase::Cell { .. }))
+    }
+
+    /// フォローアクションの乱数を引く拍 = song 拍 `fire` から跳びを除いた走行拍
+    /// ([`Self::jumped_beats`])。行と列の抽選はどちらも必ずここを通す。
+    fn draw_beat(&self, fire: f64) -> f64 {
+        fire - self.jumped_beats
     }
 
     /// この buffer の行の供給元を解く。返り値はそのまま dispatch へ渡す。`index` は `song` と同じ snapshot の索引。
@@ -564,6 +579,8 @@ impl LauncherRuntime {
         // (§1.4) ので、前の再生で armed だった `scene.at` を残すと「どこで
         // 停止したか」で次のシーンへ移る拍が変わる = 同じ起点から始まらない。
         self.disarm_scene();
+        // 乱数の時計も起点へ戻す (同じ位置から再生し直せば同じ遷移列 = 書き出しと一致)。
+        self.jumped_beats = 0.0;
         let scene_id = song.last_launched_scene_id;
         // 列の連鎖の起点 = その列のセルが**最初に鳴り出す拍** (`launch_scene` の
         // `first` と同じ規則。`now` にすると、小節の途中から再生したとき連鎖だけ
@@ -1082,7 +1099,8 @@ impl LauncherRuntime {
         let from = song.index.scene_pos(cell.scene_id).unwrap_or(0);
         let seed = follow::row_seed(self.rows[idx].key.packed(), clip_id);
         let scene_pos = |id| song.index.scene_pos(id);
-        let outcome = follow::resolve(&cell.follow, &self.occupied[..n], from, scene_pos, seed, fire);
+        let draw = self.draw_beat(fire);
+        let outcome = follow::resolve(&cell.follow, &self.occupied[..n], from, scene_pos, seed, draw);
         match outcome {
             FollowOutcome::Keep => {
                 // 鳴り続ける (位相は動かさない)。次の発火だけ張り直す。
@@ -2574,6 +2592,63 @@ mod tests {
             rt.rows().track_row(0).tail.cell_clip_id(),
             Some(11),
             "跳び越されてフォローアクションが二度と発火しない"
+        );
+    }
+
+    /// 4 拍のループを `laps` 周させ、各周の終わりに track 1 が鳴らしているセルを返す。
+    /// buffer はループ長をちょうど割り切る (256 frame × 750 = 4 拍) — 巻き戻しの量が
+    /// 毎周ぴったり -4 拍になり、フォローアクションの発火拍が毎周同じ値へ戻る条件。
+    fn loop_walk(song: &Song, laps: usize) -> Vec<Option<u32>> {
+        const BUFFERS_PER_LAP: u32 = 750;
+        let index = SongIndex::build(song);
+        let bpf = BufferSpan::new(0.0, BPM, SR, 256).beats_per_frame;
+        let mut rt = LauncherRuntime::for_song(song);
+        rt.arm_reseed();
+        let mut out = Vec::new();
+        for _ in 0..laps {
+            for k in 0..BUFFERS_PER_LAP {
+                let beat = f64::from(k * 256) * bpf;
+                rt.update(song, &index, BufferSpan::new(beat, BPM, SR, 256), LaunchQuantize::Off, true);
+            }
+            rt.on_transport_jump(-4.0);
+            out.push(rt.rows().track_row(0).tail.cell_clip_id());
+        }
+        out
+    }
+
+    /// r.md #155: **ループ再生でも「ランダム」は周回ごとに引き直される。**
+    ///
+    /// 乱数を「発火した song 拍」だけから引くと、ループで巻き戻るたびに同じ拍で
+    /// 発火する = 毎周同じ目が出る。`Any` が自分自身を引いたセルは二度と動かない
+    /// (行によって「ずっと同じセルのまま」になる)。
+    #[test]
+    fn ループ再生でもランダムのフォローアクションは周回ごとに引き直す() {
+        let any = FollowAction { enabled: true, a: FollowActionKind::Any, ..FollowAction::default() };
+        // セル側 (行のフォローアクション)。
+        let mut song = two_rows();
+        for cell in &mut song.tracks[0].session_clips {
+            cell.launch.follow = any.clone();
+        }
+        song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
+        let walk = loop_walk(&song, 34);
+        let settled = &walk[2..];
+        assert!(
+            settled.contains(&Some(10)) && settled.contains(&Some(11)),
+            "セルの Any が同じセルに張り付いた: {walk:?}"
+        );
+
+        // 列側 (シーンのフォローアクション)。両方の列にセルを持つ track 1 で見る。
+        let mut song = two_rows();
+        for scene in &mut song.scenes {
+            scene.follow = any.clone();
+        }
+        song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
+        song.last_launched_scene_id = 1;
+        let walk = loop_walk(&song, 34);
+        let settled = &walk[2..];
+        assert!(
+            settled.contains(&Some(10)) && settled.contains(&Some(11)),
+            "列の Any が同じ列に張り付いた: {walk:?}"
         );
     }
 

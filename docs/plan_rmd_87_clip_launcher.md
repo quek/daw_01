@@ -212,6 +212,8 @@ LauncherStopped: 無音 (オートメーションはレーン既定値)
 - セル終端 (linked、`multiplier` 回ループ後) / `time_beats` (unlinked) で次の行動を決める。
 - `chance_a : (100 - chance_a)` で `a` / `b` を抽選。`Any` / `Other` の乱数と合わせて
   **`f(seed, 発火拍)` の純ハッシュ** — 既存モジュレータの決定論規約と同じ (書き出し再現性の前提)。
+  発火拍は song 拍ではなく**再生開始からの走行拍** (ループの巻き戻し / seek を除く。r.md #155 —
+  song 拍だとループ再生で毎周同じ目が出る。規則の正本は `daw_audio/src/launcher/follow.rs` の module doc)。
 - **グループ = 同じ行の中で空セルに区切られた連続した塊** (Q13、Live と同じ定義)。
   `Next` / `Previous` / `First` / `Last` / `Any` / `Other` はこの塊の中で解決し、`Next` は末尾で先頭へ巡回する。
   → 空セルを 1 つ置くだけで巡回範囲を区切れる (追加 UI が要らない)。
