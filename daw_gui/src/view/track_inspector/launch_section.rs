@@ -104,7 +104,12 @@ pub(super) fn draw_launch_section(
     if !cells.is_empty() {
         y = draw_cell_rows(app, ui, area, pad, y, &cells);
     }
-    y = draw_scene_follow_rows(app, ui, area, pad, y, &cells, &scene_ids);
+    // 列のフォローアクションは **列見出しを選んだときだけ**出す (r.md #153)。セルを選んだだけで
+    // 「セルが乗っている列」の設定まで並ぶと、セルのフォローアクションと紛れる。
+    // `scenes_of` は明示的な列選択があればそれを返すので、表示と書き込み先は食い違わない。
+    if !app.cur.selection.selected_scene_ids.is_empty() {
+        y = draw_scene_follow_rows(app, ui, area, pad, y, &cells, &scene_ids);
+    }
     draw_midi_rows(app, ui, area, pad, y, &cells, &scene_ids)
 }
 
