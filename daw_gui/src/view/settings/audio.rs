@@ -209,8 +209,8 @@ fn draw_sample_rate(ui: &mut Ui<'_, AppData>, pg: &mut Page<'_>) {
         pg.value(ui, "sample_rate", rect, "—", true);
         return;
     };
-    if info.sample_rates.is_empty() {
-        // ホストからは選べない。OS 標準のレートは OS のサウンド設定が決める。
+    if info.sample_rates.len() <= 1 {
+        // ホストからは選べない (候補が無い / 1 つだけ)。OS 標準のレートは OS のサウンド設定が決める。
         let text = if info.driver == AudioDriverKind::System {
             let os = if cfg!(windows) { "Windows" } else { "OS" };
             format!("{} ({os} の設定)", hz(info.sample_rate))
@@ -234,8 +234,9 @@ fn draw_buffer_size(ui: &mut Ui<'_, AppData>, pg: &mut Page<'_>) {
         pg.value(ui, "buffer_size", rect, "—", true);
         return;
     };
-    if info.buffer_sizes.is_empty() {
-        // ホストからは選べない。ASIO はドライバーのコントロールパネルで変える。
+    if info.buffer_sizes.len() <= 1 {
+        // ホストからは選べない (候補が無い / 1 つだけ — 実物の「FL Studio ASIO」「Realtek ASIO」は今の値 1 つを
+        // 返す)。ASIO はドライバーのコントロールパネルで変える。
         let text = if info.has_control_panel {
             format!("{} (パネルで変更)", samples(info.buffer_frames))
         } else {
@@ -252,24 +253,19 @@ fn draw_buffer_size(ui: &mut Ui<'_, AppData>, pg: &mut Page<'_>) {
 }
 
 /// 入力 / 出力のレイテンシ (読むだけ)。デバイスの申告値で、先読みの遅れは含まない。
+/// 0 は「まだ分からない」(OS 標準は開いた後の観測値なので、開いた直後は 0) — 「0.0 ms」とは出さない。
 fn draw_latency(ui: &mut Ui<'_, AppData>, pg: &mut Page<'_>) {
     let info = pg.app.audio_device.info.as_ref();
-    let input = info.filter(|info| info.active_inputs.count > 0 && !info.input_channels.is_empty());
-    let rect = pg.row(ui, "latency_in", "入力レイテンシ");
-    match input {
-        Some(info) => {
-            let text = latency(info.input_latency_frames, info.sample_rate);
-            pg.value(ui, "latency_in", rect, &text, false);
+    let input = info
+        .filter(|info| info.active_inputs.count > 0 && !info.input_channels.is_empty())
+        .map(|info| (info.input_latency_frames, info.sample_rate));
+    let output = info.map(|info| (info.output_latency_frames, info.sample_rate));
+    for (id, label, value) in [("latency_in", "入力レイテンシ", input), ("latency_out", "出力レイテンシ", output)] {
+        let rect = pg.row(ui, id, label);
+        match value {
+            Some((frames, rate)) if frames > 0 => pg.value(ui, id, rect, &latency(frames, rate), false),
+            _ => pg.value(ui, id, rect, "—", true),
         }
-        None => pg.value(ui, "latency_in", rect, "—", true),
-    }
-    let rect = pg.row(ui, "latency_out", "出力レイテンシ");
-    match info {
-        Some(info) => {
-            let text = latency(info.output_latency_frames, info.sample_rate);
-            pg.value(ui, "latency_out", rect, &text, false);
-        }
-        None => pg.value(ui, "latency_out", rect, "—", true),
     }
 }
 

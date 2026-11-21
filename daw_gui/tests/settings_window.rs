@@ -165,6 +165,25 @@ fn asio_state(app: &mut AppData) {
     });
 }
 
+/// 実物の「Realtek ASIO」が報告した形 (headless で取った値): ch の名前が長く、バッファの候補は今の値 1 つだけ。
+fn asio_fixed_buffer_state(app: &mut AppData) {
+    asio_state(app);
+    app.audio_device.config.asio_driver = Some(AudioDeviceRef { id: "{B}".into(), name: "Realtek ASIO".into() });
+    app.audio_device.config.buffer_frames = None;
+    if let Some(info) = &mut app.audio_device.info {
+        info.output_name = "Realtek ASIO".into();
+        info.input_name = Some("Realtek ASIO".into());
+        info.sample_rates = vec![44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+        info.buffer_frames = 144;
+        info.buffer_sizes = vec![144];
+        info.output_channels = channels(2, "HD Audio output");
+        info.input_channels = channels(2, "HD Audio input");
+        info.output_first_channel = 0;
+        info.input_latency_frames = 144;
+        info.output_latency_frames = 144;
+    }
+}
+
 /// ASIO のドライバーを選んだが開けず、OS 標準の既定デバイスへ戻っている。
 fn fallback_state(app: &mut AppData) {
     system_state(app);
@@ -185,6 +204,7 @@ fn pages() -> Vec<PageCase> {
         ("audio_disconnected", SettingsCategory::Audio, |_| {}),
         ("audio_system", SettingsCategory::Audio, system_state),
         ("audio_asio", SettingsCategory::Audio, asio_state),
+        ("audio_asio_fixed", SettingsCategory::Audio, asio_fixed_buffer_state),
         ("audio_fallback", SettingsCategory::Audio, fallback_state),
         ("voicevox", SettingsCategory::Voicevox, |_| {}),
         ("theme", SettingsCategory::Theme, |_| {}),
@@ -488,6 +508,8 @@ fn a_failed_device_shows_the_reason_and_what_is_actually_open() {
     assert!(failed.contains("外した機材の ASIO (見つかりません)"), "{failed}");
 
     assert!(!page_text(asio_state).contains("で動いています"));
+    // 候補が今の値 1 つだけのバッファは選ぶものが無い: 読むだけの値と、変える場所を出す。
+    assert!(page_text(asio_fixed_buffer_state).contains("144 サンプル (パネルで変更)"));
     assert!(page_text(|_| {}).contains("オーディオエンジンと繋がっていません"));
 
     // どの実機も開けず、engine だけが合成のデバイスで動いている: デバイス名ではなく「音は出ません」。
