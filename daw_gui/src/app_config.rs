@@ -37,6 +37,11 @@ pub struct AppConfig {
     /// r.md #48: 設定 window の位置・サイズ `[x, y, w, h]` (px)。 `None` = 未配置。
     #[serde(default)]
     pub settings_rect: Option<[f32; 4]>,
+    /// r.md #156: 設定 window で選んでいるカテゴリ ([`crate::state::SettingsCategory::id`])。
+    /// **名前で保存する** — 知らない名前 (新しい版が足したカテゴリ) は既定のカテゴリへ倒すだけで、
+    /// 設定ファイル全体の読み込みを失敗させない。
+    #[serde(default)]
+    pub settings_category: String,
     /// r.md #50: 画面右端のマスターパネルを出すか。 default = true
     /// (「常に音を視覚的にも確認できるように」が要求なので既定で見えている)。
     #[serde(default = "default_true")]
@@ -118,6 +123,7 @@ impl AppConfig {
             theme: theme_id,
             settings_open: prefs.settings_open,
             settings_rect: prefs.settings_rect.map(|r| [r.x, r.y, r.w, r.h]),
+            settings_category: prefs.settings_category.id().to_string(),
             // r.md #50: マスターパネルの見え方は「この人の画面の使い方」なので
             // プロジェクト (`ViewState`) ではなくアプリ設定側に持つ。
             master_panel_open: prefs.master_panel_open,
@@ -166,6 +172,7 @@ impl Default for AppConfig {
             theme: default_theme(),
             settings_open: false,
             settings_rect: None,
+            settings_category: String::new(),
             master_panel_open: true,
             master_panel_w: default_master_panel_w(),
             master_panel_sections: default_master_panel_sections(),
@@ -235,6 +242,7 @@ mod tests {
             theme: "light".to_string(),
             settings_open: true,
             settings_rect: Some([1.0, 2.0, 300.0, 400.0]),
+            settings_category: "theme".to_string(),
             master_panel_open: false,
             master_panel_w: 412.0,
             master_panel_sections: [0.4, 0.2, 0.2, 0.2],
@@ -260,6 +268,7 @@ mod tests {
         assert_eq!(loaded.theme, "light");
         assert!(loaded.settings_open);
         assert_eq!(loaded.settings_rect, Some([1.0, 2.0, 300.0, 400.0]));
+        assert_eq!(loaded.settings_category, "theme");
         assert!(!loaded.master_panel_open);
         assert_eq!(loaded.master_panel_w, 412.0);
         assert_eq!(loaded.master_panel_sections, [0.4, 0.2, 0.2, 0.2]);

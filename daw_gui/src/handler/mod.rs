@@ -70,6 +70,8 @@ pub mod sc_listen;
 pub mod device_mix;
 pub mod select_all;
 pub mod selection_view;
+/// r.md #156: 設定 window の開閉と、左のカテゴリの切り替え。
+pub mod settings;
 /// r.md #61: 終了シーケンスの実行 (子プロセス teardown の待ち合わせ)。
 pub mod shutdown;
 /// r.md #132: 分割 (`E` / `Shift+E`) と結合 (`J`) の入口。

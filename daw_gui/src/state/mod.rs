@@ -46,7 +46,7 @@ pub use ipc::{DeviceParamKey, IpcState};
 pub use voicevox::VoicevoxState;
 pub use media::MediaState;
 pub use recording::{HeldPreview, ParamSurface, RecordingState};
-pub use ui_prefs::UiPrefs;
+pub use ui_prefs::{SettingsCategory, UiPrefs};
 pub use ui_ephemeral::{ModRackHover, ScrubGesture, UiEphemeral};
 pub use launcher_ui::{LauncherFocus, LauncherUiState};
 pub use sampler::SamplerState;
