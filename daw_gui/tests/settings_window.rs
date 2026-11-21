@@ -489,6 +489,17 @@ fn a_failed_device_shows_the_reason_and_what_is_actually_open() {
 
     assert!(!page_text(asio_state).contains("で動いています"));
     assert!(page_text(|_| {}).contains("オーディオエンジンと繋がっていません"));
+
+    // どの実機も開けず、engine だけが合成のデバイスで動いている: デバイス名ではなく「音は出ません」。
+    let silent = page_text(|app| {
+        fallback_state(app);
+        if let Some(info) = &mut app.audio_device.info {
+            info.driver = AudioDriverKind::Synthetic;
+            info.output_name = "Synthetic (null)".into();
+        }
+    });
+    assert!(silent.contains("が見つかりません — 音は出ません"), "{silent}");
+    assert!(!silent.contains("Synthetic (null)"), "{silent}");
 }
 
 /// 設定 window を開いたルート view を GPU で描き、窓の矩形が一様塗りでないこと (= 中身が実際に

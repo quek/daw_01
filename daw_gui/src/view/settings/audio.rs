@@ -146,6 +146,13 @@ fn draw_notice(ui: &mut Ui<'_, AppData>, pg: &mut Page<'_>) {
             // (OS 標準の既定デバイスへ戻した / 入力だけ無し / 音の出ないデバイス) は engine が決めるので、
             // ここでは決め付けず、開いているものの名前をそのまま出す。
             Some(reason) if info.output_name.is_empty() => (reason.clone(), p.text_error),
+            // 選んでいないのに合成のデバイス (実機を開かない) で動いている = どの実機も開けなかった。
+            Some(reason)
+                if info.driver == AudioDriverKind::Synthetic
+                    && dev.config.driver != AudioDriverKind::Synthetic =>
+            {
+                (format!("{reason} — 音は出ません"), p.text_error)
+            }
             Some(reason) => (format!("{reason} — 「{}」で動いています", info.output_name), p.text_error),
             None if dev.listing && dev.devices.is_none() => {
                 ("デバイスの一覧を取得しています…".to_string(), p.text_faint)
