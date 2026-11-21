@@ -238,7 +238,7 @@ pub(crate) fn draw_items_popup<'a, M: ?Sized + 'static>(
 
 /// popup body の hover 判定に使う pointer 位置。
 /// - viewport (popup rect) の外なら `None` (スクロールで枠外へ出た item を掴ませない)
-/// - scrollbar thumb を drag 中も `None` (thumb を掴んだまま item 上で離しても選ばれない)
+/// - scrollbar を掴んでいる間も `None` (thumb を掴んだまま item 上で離しても選ばれない)
 fn hover_pos_in_popup(
     pos: Option<(f32, f32)>,
     popup_rect: Rect,

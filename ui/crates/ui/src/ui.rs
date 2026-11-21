@@ -1116,7 +1116,7 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// 「自分自身の popup state」に scroll 量を書くために使う (id を引数で持ち回すと
     /// 呼び出し側が別 popup の id を渡せてしまう = ずれの温床)。cascade は nest するので
     /// popup_layer が退避 / 復元する。
-    current_popup: Option<WidgetId>,
+    pub(crate) current_popup: Option<WidgetId>,
     /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだら true。
     /// `UiHost::frame` の末尾で `redraw_requested_in_last_frame` に commit され、
     /// 次のフレーム redraw の発火条件に含まれる。
@@ -1433,31 +1433,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         );
     }
 
-    /// `popup_layer` の body で描画中の popup の縦スクロール state
-    /// `(scroll_offset, scroll_drag)`。body の外では `None`。
-    /// 実処理は [`Ui::popup_scroll`] (popup.rs) が担う。
-    pub(crate) fn current_popup_scroll(&self) -> Option<(f32, Option<(f32, f32)>)> {
-        let wid = self.current_popup?;
-        self.open_popups
-            .get(&wid)
-            .map(|s| (s.scroll_offset, s.scroll_drag))
-    }
-
     /// `popup_layer` の body で描画中の popup の id (body の外では `ROOT`)。 popup の中身
     /// (項目行) が click 所有者 id の親に使う ([`crate::click`])。
     pub(crate) fn current_popup_id(&self) -> WidgetId {
         self.current_popup.unwrap_or(WidgetId::ROOT)
-    }
-
-    /// [`Ui::current_popup_scroll`] の書き込み側。body の外では no-op。
-    pub(crate) fn set_current_popup_scroll(&mut self, offset: f32, drag: Option<(f32, f32)>) {
-        let Some(wid) = self.current_popup else {
-            return;
-        };
-        if let Some(state) = self.open_popups.get_mut(&wid) {
-            state.scroll_offset = offset;
-            state.scroll_drag = drag;
-        }
     }
 
     /// M14 Phase 95 (daw_01 #066): 開いている popup の `dismiss_on_outside_click` を更新する。
