@@ -295,7 +295,6 @@ impl Driver {
 
     /// ドライバーの設定画面を開く。 画面は**呼んだスレッド**に属する窓として出るので、
     /// そのスレッドが message を回し続けていること ([`super`] の module doc)。
-    #[expect(dead_code, reason = "呼び手はデバイス設定 (r.md #156 の次の段) で入る")]
     pub fn control_panel(&self) -> Result<(), Error> {
         // SAFETY: 引数なし。
         check("controlPanel", unsafe { (self.vtbl().control_panel)(self.as_ptr()) })

@@ -249,7 +249,6 @@ FN-NESTING | daw_plugin_host/src/builtin/voicevox.rs::VoicevoxBuiltin::start_syn
 FN-NESTING | daw_plugin_host/src/builtin/voicevox.rs::VoicevoxAudioHalf[AudioProcessorHalf]::process | 7/39 | FFI/状態機械。未起票
 FN-NESTING | daw_plugin_host/src/editor_window.rs::editor_wnd_proc                                 | 7/15   | FFI/状態機械。未起票
 FN-NESTING | daw_plugin_host/src/main.rs::PluginHost::poll_editor_close_requests                   | 7/12   | FFI/状態機械。未起票
-FN-NESTING | daw_gui/src/bootstrap.rs::ChildSupervisor::spawn_and_handshake_one                    | 7/10   | FFI/状態機械。未起票
 FN-NESTING | daw_plugin_host/src/plugin_scan.rs::scan_system                                       | 7/7    | FFI/状態機械。未起票
 
 # 6. daw_audio のオーディオグラフ構築 / バッファ合成。

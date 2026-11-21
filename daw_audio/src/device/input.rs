@@ -20,9 +20,10 @@ use common::audio_device::ChannelRange;
 /// デバイスの入力 1 ブロック。ch は planar の f32 で、長さはどれも [`Self::frames`]。入力の無いデバイスでは空。
 #[derive(Clone, Copy)]
 pub struct InputBlock<'a> {
-    /// 使っている入力 ch の k 番目 (= デバイスの ch `channels.first + k`) は `data[k * stride..][..frames]`。
+    /// 使っている入力 ch の k 番目 (= デバイスの ch `channels.first + k`) は `data[k * stride + offset..][..frames]`。
     data: &'a [f32],
     stride: usize,
+    offset: usize,
     frames: usize,
     channels: ChannelRange,
     device_frame: u64,
@@ -33,6 +34,7 @@ impl<'a> InputBlock<'a> {
     pub const EMPTY: InputBlock<'static> = InputBlock {
         data: &[],
         stride: 0,
+        offset: 0,
         frames: 0,
         channels: ChannelRange { first: 0, count: 0 },
         device_frame: 0,
@@ -44,13 +46,19 @@ impl<'a> InputBlock<'a> {
     #[must_use]
     pub fn new(data: &'a [f32], stride: usize, frames: usize, channels: ChannelRange, device_frame: u64) -> Self {
         debug_assert!(frames <= stride || channels.count == 0);
-        Self { data, stride, frames, channels, device_frame }
+        Self { data, stride, offset: 0, frames, channels, device_frame }
     }
 
-    /// 入力 ch の無いブロック (時刻だけ進む)。入力を開いていないデバイスでも [`InputTap::capture`] は毎回呼ばれる。
+    /// このブロックの `offset` フレーム目から `frames` フレームぶん (範囲は呼び側が保証する)。
     #[must_use]
-    pub fn without_channels(frames: usize, device_frame: u64) -> InputBlock<'static> {
-        InputBlock { data: &[], stride: 0, frames, channels: ChannelRange { first: 0, count: 0 }, device_frame }
+    pub fn part(&self, offset: usize, frames: usize) -> Self {
+        debug_assert!(offset + frames <= self.frames);
+        Self {
+            offset: self.offset + offset,
+            frames,
+            device_frame: self.device_frame + offset as u64,
+            ..*self
+        }
     }
 
     /// このブロックのフレーム数。
@@ -66,7 +74,7 @@ impl<'a> InputBlock<'a> {
         if !self.channels.contains(device_ch) {
             return None;
         }
-        let start = usize::from(device_ch - self.channels.first) * self.stride;
+        let start = usize::from(device_ch - self.channels.first) * self.stride + self.offset;
         self.data.get(start..start + self.frames)
     }
 
@@ -84,7 +92,8 @@ impl<'a> InputBlock<'a> {
     }
 }
 
-/// 録音用の取り出し口。**デバイスのコールバックのスレッド**で、届いたままの入力で毎回呼ばれる。
+/// 録音用の取り出し口。**デバイスのコールバックのスレッド**で、届いたままの入力で毎回呼ばれる
+/// (入力を開いていないデバイスでも、ch の無いブロックで時刻だけ進む)。
 ///
 /// 呼ぶ順番の保証: `capture` (`device_frame` = D) は、`out_frame <= D` の描画 ([`DeviceIo::out_frame`]) が全部
 /// 済んでから呼ばれる (先読みしないときは同じコールバックの描画の後。先読みのときは描画が先行している)。
@@ -135,7 +144,12 @@ mod tests {
         assert_eq!(block.channel(4), None, "範囲の外");
         assert_eq!(InputBlock::EMPTY.channel(0), None);
         assert_eq!(InputBlock::EMPTY.frames(), 0);
-        let timed = InputBlock::without_channels(256, 512);
+        // 途中から切り出しても ch 番号と時刻が合う。
+        let tail = block.part(1, 2);
+        assert_eq!(tail.channel(3), Some(&[20.0, 30.0][..]));
+        assert_eq!(tail.device_frame(), 101);
+        // 入力 ch の無いブロックは時刻だけ持つ。
+        let timed = InputBlock::new(&[], 0, 256, ChannelRange::default(), 512);
         assert_eq!((timed.frames(), timed.device_frame(), timed.channel(0)), (256, 512, None));
     }
 }
