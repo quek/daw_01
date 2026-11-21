@@ -394,8 +394,28 @@ mod tests {
         let mut app = app_with_chain();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         app.ipc.plugin_tx = Some(tx);
+        // 2 本目のトラック (音源 5) にも MIDI クリップを置く。
+        app.edit_song(|song| {
+            let cid = song.alloc_content_id();
+            song.clip_contents.insert(
+                cid,
+                common::model::ClipContent::Midi(common::model::MidiContent::default()),
+            );
+            song.tracks.push(crate::app::track_with(|t| {
+                t.id = 2;
+                let synth = PortConfig { has_note_input: true, has_audio_output: true, ..PortConfig::default() };
+                t.devices = vec![device(5, synth)];
+                t.clips = vec![common::model::Clip {
+                    id: 20,
+                    content_id: cid,
+                    length_beats: 4.0,
+                    ..common::model::Clip::default()
+                }];
+            }));
+        });
         let mut asked = |app: &mut AppData| -> Vec<u64> {
-            app.refresh_key_names_on_show();
+            // 本番と同じ口 (Tick) から回す。
+            app.on_tick(0, 0.0, false);
             std::iter::from_fn(|| rx.try_recv().ok())
                 .filter_map(|cmd| match cmd {
                     PluginCommand::RefreshKeyNames { device } => Some(device.device_id),
@@ -413,5 +433,14 @@ mod tests {
         assert!(asked(&mut app).is_empty());
         app.cur.view.bottom_panel = Some(1);
         assert_eq!(asked(&mut app), vec![2], "開き直したらまた頼む");
+
+        app.set_clip_selection(vec![ClipKey { track_id: 2, clip_id: 20 }]);
+        assert_eq!(asked(&mut app), vec![5], "別トラックのクリップを選んだらその音源の分を頼む");
+
+        // 同じタブに Audio Editor が出ている間はピアノロールは見えていない。
+        app.cur.peph.audio_editor_clip = Some(ClipKey { track_id: 2, clip_id: 20 });
+        assert!(asked(&mut app).is_empty());
+        app.cur.peph.audio_editor_clip = None;
+        assert_eq!(asked(&mut app), vec![5], "ピアノロールに戻ったらまた頼む");
     }
 }

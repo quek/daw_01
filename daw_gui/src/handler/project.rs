@@ -1066,6 +1066,8 @@ impl AppData {
         self.cur.pipc.open_plugin_guis.clear();
         self.cur.pipc.plugin_params.clear();
         self.cur.pipc.plugin_key_names.clear();
+        // device id は曲ごとの空間なので、前の曲の id を「出している」扱いのまま残さない。
+        self.cur.pipc.key_names_shown_device = None;
         self.cur.pipc.plugin_param_values.clear();
         self.cur.pipc.plugins_with_gestures.clear();
         self.forget_all_plugin_window_gestures();

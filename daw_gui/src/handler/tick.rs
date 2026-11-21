@@ -43,7 +43,12 @@ impl AppData {
     /// 選んだ) ときに、plugin host へ名前の取り直しを頼む。通知せずに名前を変える plugin
     /// (MDrummer はキットを替えても何も通知しない) の、エディタ窓を閉じたまま起きた変更を拾う。
     pub(crate) fn refresh_key_names_on_show(&mut self) {
-        let shown = (self.cur.view.bottom_panel == Some(1))
+        // タブ 1 は Automation Editor / Audio Editor / Piano Roll のどれかを描く
+        // (`view::bottom_panel::draw` と同じ順)。ピアノロールが見えているときだけ「出している」。
+        let piano_roll_shown = self.cur.view.bottom_panel == Some(1)
+            && self.cur.peph.audio_editor_clip.is_none()
+            && self.automation_editor_target().is_none();
+        let shown = piano_roll_shown
             .then(|| self.pianoroll_target_clip())
             .flatten()
             .and_then(|clip| crate::widgets::piano_roll::view_build::key_names_device(self, clip.track_id));
