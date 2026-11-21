@@ -40,6 +40,8 @@ struct Rig {
     done: tokio::sync::mpsc::UnboundedReceiver<AudioEvent>,
     device_frame: u64,
     latency: u32,
+    /// master 出力の遅延補償の遅れ (frames)。
+    pdc: u32,
 }
 
 impl Rig {
@@ -49,7 +51,7 @@ impl Rig {
         let ctl = hub.start(ProjectKey(1), AudioTakeRequest { take_id: 7, takes }, SR, out_tx);
         let mut drive = TakeDrive::default();
         assert!(drive.install(Some(Arc::clone(&ctl))).is_none());
-        Self { drive, tap, ctl, done, device_frame: 0, latency }
+        Self { drive, tap, ctl, done, device_frame: 0, latency, pdc: 0 }
     }
 
     /// 1 block。`live` = この block は録音中、`playhead` = block 先頭の曲の位置 (拍は sample / 1000)。
@@ -62,6 +64,7 @@ impl Rig {
             out_frame: d,
             frames: BLOCK as u32,
             latency: self.latency,
+            pdc: self.pdc,
         });
         let chans: Vec<Vec<f32>> = (0..2u16).map(|c| (0..BLOCK as u64).map(|i| sample(c, d + i)).collect()).collect();
         self.tap.capture_block(d, BLOCK, |ch| chans.get(usize::from(ch)).map(Vec::as_slice));
@@ -118,8 +121,8 @@ fn wav_は録音開始の_block_からレイテンシを補正した入力を_�
     assert_eq!((spec.channels, spec.sample_rate, spec.bits_per_sample), (2, SR, 32));
     assert_eq!(samples.len(), 7 * BLOCK * 2);
     let first = 3 * BLOCK as u64 + u64::from(latency);
-    for (i, frame) in samples.chunks_exact(2).enumerate() {
-        assert_eq!(frame, [sample(0, first + i as u64), sample(1, first + i as u64)], "frame {i}");
+    for (i, frame) in samples.as_chunks::<2>().0.iter().enumerate() {
+        assert_eq!(*frame, [sample(0, first + i as u64), sample(1, first + i as u64)], "frame {i}");
     }
 }
 
@@ -149,6 +152,30 @@ fn 曲の位置が飛ぶと区間が分かれる() {
     assert_eq!(spec.channels, 1);
     // モノは選んだ ch (1) だけ。レイテンシ 0 なので WAV のフレーム i はデバイスのフレーム i。
     assert!(samples.iter().enumerate().all(|(i, &s)| s == sample(1, i as u64)));
+}
+
+/// プラグインの遅延補償がある曲では、曲の位置の音が聞こえるのはその分だけ後。区間の頭 (録り始めも折り返しも)
+/// をその分だけ後ろのフレームに置く — 折り返しの直後に聞こえているのは、まだ折り返す前の尻尾。
+#[test]
+fn 遅延補償の分だけ区間の頭が後ろのフレームになる() {
+    let wav = TempWav::new("pdc");
+    let mut rig = Rig::new(
+        vec![AudioTakeSpec { track_id: 1, input: TrackInput::AudioMono { channel: 0 }, path: wav.0.clone() }],
+        0,
+    );
+    rig.pdc = 100;
+    for k in 0..4 {
+        rig.callback(true, 8_000 + k * BLOCK as u64);
+    }
+    for k in 0..3 {
+        rig.callback(true, 2_000 + k * BLOCK as u64);
+    }
+    rig.ctl.request_stop();
+    rig.callback(false, 0);
+    let result = rig.finished();
+    let segs: Vec<(u64, f64)> = result.segments.iter().map(|s| (s.file_frame, s.start_beat)).collect();
+    assert_eq!(segs, [(100, 8.0), (4 * BLOCK as u64 + 100, 2.0)]);
+    assert_eq!(result.takes[0].frames, 7 * BLOCK as u64, "取り込む長さは変わらない");
 }
 
 /// count-in の間に取り消した録音は、空の結果を返してファイルを残さない。

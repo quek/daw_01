@@ -971,6 +971,7 @@ impl ProjectRt {
             out_frame: io.out_frame,
             frames: frames as u32,
             latency: io.input_latency_frames.saturating_add(io.output_latency_frames),
+            pdc: self.cached_schedule.master_latency_samples,
         });
     }
 

@@ -71,7 +71,7 @@ impl AppData {
         let song = self.cur.song_doc.song();
         let selected = &self.cur.selection.selected_track_ids;
         let ids: Vec<u32> = if selected.len() > 1 {
-            selected.iter().copied().collect()
+            selected.to_vec()
         } else {
             self.cursor_track_id().into_iter().collect()
         };

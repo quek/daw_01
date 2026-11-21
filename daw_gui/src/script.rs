@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+mod audio_rec;
 mod editing;
 mod host;
 mod native_device;
@@ -122,6 +123,18 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("setDeviceMix", native_device::daw_set_device_mix, 2),
     ("toggleDeviceDelta", native_device::daw_toggle_device_delta, 1),
     ("masterPeakDbfs", native_device::daw_master_peak_dbfs, 1),
+    // ----- r.md #156 オーディオ入力の録音 -----
+    ("setTrackInput", audio_rec::daw_set_track_input, 3),
+    ("setTrackMonitor", audio_rec::daw_set_track_monitor, 2),
+    ("toggleTrackArmed", audio_rec::daw_toggle_track_armed, 1),
+    ("appRecord", audio_rec::daw_app_record, 0),
+    ("appUndo", audio_rec::daw_app_undo, 0),
+    ("appRedo", audio_rec::daw_app_redo, 0),
+    ("appSaveAs", audio_rec::daw_app_save_as, 1),
+    ("appSave", audio_rec::daw_app_save, 0),
+    ("appTick", audio_rec::daw_app_tick, 0),
+    ("audioRecStateJson", audio_rec::daw_audio_rec_state_json, 0),
+    ("trackPeak", audio_rec::daw_track_peak, 2),
 ];
 
 fn register_daw_globals(ctx: &mut Context) -> Result<()> {

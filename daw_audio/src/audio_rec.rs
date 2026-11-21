@@ -10,8 +10,9 @@
 //!   ring へ出す。先読みに遅らされない。
 //! - **書き手** ([`writer`]): ring を WAV (32-bit float) へ書き、終わったら結果を GUI へ返す。
 //!
-//! 描画側と tap は確保・ロック・I/O をしない。WAV の先頭フレームは「録音が始まった block の先頭の
-//! 曲の位置で鳴っていた音」なので、GUI は補正なしでその拍に置けばよい。
+//! 描画側と tap は確保・ロック・I/O をしない。区間の表は「WAV のこのフレームから先が、曲のこの拍から
+//! **聞こえていた** ときの入力」(入出力のレイテンシ・先読み・プラグインの遅延補償を引いた後) なので、GUI は
+//! 補正なしでその拍に置けばよい。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -122,6 +123,10 @@ pub struct TakeBlock {
     pub frames: u32,
     /// 入力レイテンシ + 出力レイテンシ (frames)。
     pub latency: u32,
+    /// master 出力に現れる遅延補償の遅れ (`Schedule::master_latency_samples`)。出力のフレームに載っているのは
+    /// 曲の位置をこの分さかのぼった音なので、`playhead` の位置の音が **聞こえる** のはこの分だけ後。区間の頭を
+    /// この分だけ後ろのフレームに置く (演奏者は聞こえている音に合わせて弾く)。
+    pub pdc: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -186,7 +191,7 @@ impl TakeDrive {
             Phase::Armed if block.live => {
                 self.origin = block.out_frame;
                 self.latency = block.latency;
-                ctl.push_segment(0, block.beat);
+                ctl.push_segment(u64::from(block.pdc), block.beat);
                 ctl.start.store(block.out_frame.saturating_add(u64::from(block.latency)), Ordering::Release);
                 self.phase = Phase::Rolling;
                 self.next_playhead = block.playhead + frames;
@@ -199,7 +204,7 @@ impl TakeDrive {
             Phase::Rolling => {
                 // 曲の位置かデバイスの時計が飛んだ (ループの折り返し / seek / 描画が止まっていた): 新しい区間。
                 if block.playhead != self.next_playhead || block.out_frame != self.next_out {
-                    ctl.push_segment(block.out_frame - self.origin, block.beat);
+                    ctl.push_segment(block.out_frame - self.origin + u64::from(block.pdc), block.beat);
                 }
                 self.next_playhead = block.playhead + frames;
                 self.next_out = block.out_frame + frames;
@@ -270,10 +275,10 @@ pub struct TakeSet {
 
 /// デバイスのコールバックから呼ばれる取り込み口。
 pub struct RecorderTap {
-    incoming: rtrb::Consumer<Box<TakeSet>>,
+    incoming: rtrb::Consumer<TakeSet>,
     /// 終わった録音を off-thread へ返す口 (RT で解放しない)。
-    retired: rtrb::Producer<Box<TakeSet>>,
-    active: Vec<Box<TakeSet>>,
+    retired: rtrb::Producer<TakeSet>,
+    active: Vec<TakeSet>,
     /// 直前の block の末尾 (時計が戻ったら stream の作り直し)。
     last_end: u64,
 }
@@ -367,8 +372,8 @@ impl RecorderTap {
 
 /// recv loop 側の口: 録音を作って tap と書き手へ渡す。
 pub struct RecHub {
-    take_tx: rtrb::Producer<Box<TakeSet>>,
-    retired_rx: rtrb::Consumer<Box<TakeSet>>,
+    take_tx: rtrb::Producer<TakeSet>,
+    retired_rx: rtrb::Consumer<TakeSet>,
 }
 
 /// recv loop の口と、デバイスのコールバックへ差し込む tap。
@@ -402,7 +407,7 @@ impl RecHub {
             lanes.push(TakeLane { left, right, stereo: channels == 2, tx, gap: 0, dropped: Arc::clone(&dropped) });
             files.push(writer::TakeFile::new(spec.track_id, spec.path, channels, rx, dropped));
         }
-        let set = Box::new(TakeSet { ctl: Arc::clone(&ctl), lanes, next: NOT_SET });
+        let set = TakeSet { ctl: Arc::clone(&ctl), lanes, next: NOT_SET };
         if self.take_tx.push(set).is_err() {
             // tap が居ない / 詰まっている: 取り込めないので、書き手は空の結果を返す。
             tracing::error!(project = project.0, "audio take: tap delivery ring full");
