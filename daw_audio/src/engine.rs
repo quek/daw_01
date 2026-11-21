@@ -2414,6 +2414,69 @@ mod multi_project_tests {
         }
     }
 
+    /// r.md #156: デバイスの入力は、モニターが効いているトラック (オン、または自動で録音待機中) のチェーンを通って
+    /// マスターへ出る (止まっていても)。オフ・自動で待機していない・背景のタブでは出ない。
+    #[test]
+    fn モニターが効いているトラックだけ入力がマスターへ出る() {
+        use crate::device::input::{DeviceIo, InputBlock};
+        use common::audio_device::ChannelRange;
+        use common::model::{MonitorMode, TrackInput};
+        const N: usize = 256;
+        let key = ProjectKey(1);
+        // デバイスの入力 ch 2 だけに音がある (ch 番号で引けていること)。
+        let mut data = vec![0.0_f32; N * 3];
+        for (i, s) in data[2 * N..].iter_mut().enumerate() {
+            *s = 0.25 + i as f32 / 1024.0;
+        }
+        // (モニター, 録音待機, アクティブなタブか, 聞こえるか)
+        let cases = [
+            (MonitorMode::Off, true, true, false),
+            (MonitorMode::Auto, false, true, false),
+            (MonitorMode::Auto, true, true, true),
+            (MonitorMode::On, false, true, true),
+            (MonitorMode::On, true, false, false),
+        ];
+        for (i, (monitor, armed, active, heard)) in cases.into_iter().enumerate() {
+            let mut r = rig(&format!("monitor{i}"));
+            let (_shared, mut bundle_tx) = open(&mut r, key);
+            r.engine.scope_project.store(if active { key.0 } else { 99 }, Ordering::Release);
+            let mut t = track(1);
+            t.input = TrackInput::AudioMono { channel: 2 };
+            t.monitor = monitor;
+            t.armed = armed;
+            let song = Arc::new(Song { tracks: vec![t], ..Song::default() });
+            let mut b = bundle(&song);
+            b.input_stage = Some(crate::graph::input_stage::InputStage::new(
+                &crate::graph::input_stage::input_plan(&song),
+                common::process_data::MAX_FRAMES,
+            ));
+            bundle_tx.push(b).ok().unwrap();
+            for k in 0..4 {
+                let io = DeviceIo {
+                    input: InputBlock::new(&data, N, N, ChannelRange { first: 0, count: 3 }, k * N as u64),
+                    out_frame: k * N as u64,
+                    input_latency_frames: 0,
+                    output_latency_frames: 0,
+                };
+                r.dev.process_buffer(&r.shared, &r.bridge, &r.scope, &r.device_scope, 48_000, N, io);
+            }
+            let case = format!("{monitor:?} armed={armed} active={active}");
+            if heard {
+                // フェーダー 1.0・pan 中央なので、モノの入力がそのまま L / R に出る。
+                for ch in [&r.dev.master_l, &r.dev.master_r] {
+                    for (o, s) in ch[..N].iter().zip(&data[2 * N..]) {
+                        assert!((o - s).abs() < 1e-6, "{case}: {o} != {s}");
+                    }
+                }
+            } else {
+                assert!(r.dev.master_l[..N].iter().chain(&r.dev.master_r[..N]).all(|&v| v == 0.0), "{case}");
+            }
+            assert_eq!(r.dev.any_input_monitoring(), heard, "{case}");
+            // 録音待機でモニターしていなければ、入力メーターのために入力を読み続ける (アクティブなタブだけ)。
+            assert_eq!(r.dev.any_input_live(), heard || (armed && active), "{case}");
+        }
+    }
+
     /// **1 件のまとまりに載った transport 要求とランチャー操作は、同じ buffer で効く。** 以前は受信スレッドが
     /// transport を共有面の atomic へ、ランチャーの操作を ring へ別々に書いていて、間に buffer が挟まると
     /// 「seek + 再生開始」だけが先に消費され、セルの頭出しが 1 buffer 遅れた (位相がアレンジとずれたまま回る)。

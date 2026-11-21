@@ -175,8 +175,13 @@ impl AppData {
     }
 
     /// Tick ごと: 録音中の帯をプレイヘッドまで伸ばす。録り終えた帯は、クリップが置かれるまでそのまま残す
-    /// (止めた瞬間に帯が消えてからクリップが出る、にしない)。
-    pub(crate) fn update_audio_rec_region(&mut self, playhead_beat: f64) {
+    /// (止めた瞬間に帯が消えてからクリップが出る、にしない)。書き出しの間預かっていた結果は、終わったらクリップにする。
+    pub(crate) fn audio_rec_tick(&mut self, playhead_beat: f64) {
+        if !self.cur.recording.deferred_audio_takes.is_empty() && !self.offline_render_busy() {
+            for result in std::mem::take(&mut self.cur.recording.deferred_audio_takes) {
+                self.handle_audio_takes_finished(result);
+            }
+        }
         let live = self.cur.recording.live;
         let Some(region) = self.cur.recording.audio_rec_region.as_mut() else { return };
         if !live {
@@ -193,6 +198,11 @@ impl AppData {
     /// `AudioEvent::AudioTakesFinished`: engine が録音を書き終えた。WAV を素材にして、録った区間にクリップを置く
     /// (録った全トラックぶんで 1 undo step)。
     pub(crate) fn handle_audio_takes_finished(&mut self, result: AudioTakesFinished) {
+        // 書き出し / 焼き込みの間は曲を編集できない (`edit_song` が拒否する)。捨てずに終わるまで預かる。
+        if self.offline_render_busy() {
+            self.cur.recording.deferred_audio_takes.push(result);
+            return;
+        }
         let rec = &mut self.cur.recording;
         let Some(i) = rec.audio_takes.iter().position(|t| t.take_id == result.take_id) else {
             tracing::warn!(take = result.take_id, "AudioTakesFinished with no pending take; ignoring");
@@ -276,8 +286,16 @@ impl AppData {
     pub(crate) fn abort_pending_audio_takes(&mut self) {
         let rec = &mut self.cur.recording;
         rec.audio_rec_region = None;
-        let lost: Vec<PathBuf> =
-            rec.audio_takes.drain(..).flat_map(|t| t.tracks.into_iter().map(|p| p.file)).collect();
+        // 結果がもう届いている録音 (書き出しの間預かっている) は失われていない。
+        let deferred = &rec.deferred_audio_takes;
+        let mut lost: Vec<PathBuf> = Vec::new();
+        rec.audio_takes.retain(|t| {
+            if deferred.iter().any(|r| r.take_id == t.take_id) {
+                return true;
+            }
+            lost.extend(t.tracks.iter().map(|p| p.file.clone()));
+            false
+        });
         let Some(first) = lost.first() else { return };
         tracing::warn!(files = ?lost, "audio takes lost: daw_audio disconnected before finishing them");
         self.ui_ephemeral.status_message = format!(

@@ -74,7 +74,7 @@ impl AppData {
         }
         self.refresh_key_names_on_show();
         // r.md #156: オーディオ入力の録音中の帯をプレイヘッドまで伸ばす。
-        self.update_audio_rec_region(playhead_beat);
+        self.audio_rec_tick(playhead_beat);
 
         // パニックの遅延 reinit を発火する。 master の declick フェード
         // アウトが終わった頃 (`PANIC_REINIT_DELAY` 経過) に `ReinitAllPlugins` を

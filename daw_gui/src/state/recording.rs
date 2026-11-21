@@ -173,4 +173,7 @@ pub struct RecordingState {
     /// r.md #156: いま録っているオーディオ入力の録音の、レーンに伸びていく帯 (`handler::audio_rec`)。
     /// `None` = 録っていない。session-only。
     pub audio_rec_region: Option<crate::handler::audio_rec::LiveTakeRegion>,
+    /// r.md #156: 書き出し / 焼き込みの間 (曲を編集できない) に届いた録音の結果。終わったらクリップにする
+    /// (`AppData::audio_rec_tick`)。録音中に書き出しを始めると録音が閉じ、その結果が書き出しの最中に届く。
+    pub deferred_audio_takes: Vec<common::audio_take::AudioTakesFinished>,
 }

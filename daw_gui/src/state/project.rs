@@ -897,6 +897,7 @@ impl ProjectState {
                 audio_takes: Vec::new(),
                 next_audio_take_id: 1,
                 audio_rec_region: None,
+                deferred_audio_takes: Vec::new(),
             },
             // r.md #87: ランチャーの一時状態 (フォーカス / hover / MIDI bind)。
             launcher: LauncherUiState::default(),
