@@ -134,6 +134,8 @@ fn bundle(song: &Arc<Song>) -> RtBundle {
         device_scope_watch: [0; MAX_DEVICE_SCOPES],
         mod_plan: None,
         mod_phase_table: None,
+        input_stage: None,
+        audio_take: None,
     }
 }
 

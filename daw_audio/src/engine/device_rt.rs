@@ -344,6 +344,7 @@ impl DeviceRt {
                 device_scope: is_scope
                     .then_some(DeviceScopeCtx { bridge: device_scope, headers: &mut self.scope_headers }),
                 frames_rendered,
+                io: BlockIo::default(),
             };
             let slot = bridge.project(p.telemetry_slot);
             p.render_buffer(ctx, slot, sample_rate, n);

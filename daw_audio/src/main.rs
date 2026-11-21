@@ -25,6 +25,7 @@ use tokio::io::ReadHalf;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
 mod audio_clip_renderer;
+mod audio_rec;
 mod audio_worker;
 mod automation;
 #[cfg(test)]
@@ -140,6 +141,8 @@ async fn main() -> Result<()> {
     let (device_tx, device_rx) = rtrb::RingBuffer::<DeviceBundle>::new(DEVICE_RING_CAP);
     let (device_recycle_tx, device_recycle_rx) =
         rtrb::RingBuffer::<DeviceBundle>::new(DEVICE_RING_CAP);
+    // r.md #156: オーディオ入力の録音。recv loop の口と、デバイスのコールバックへ差し込む tap。
+    let (rec_hub, _rec_tap) = audio_rec::channel();
 
     let stream = start_output_stream(
         Arc::clone(&shared),
@@ -217,6 +220,7 @@ async fn main() -> Result<()> {
         device_publisher: DevicePublisher { tx: device_tx, parked: None },
         device_recycle_rx,
         park: Arc::clone(&park),
+        rec: rec_hub,
     })
     .await;
 
@@ -551,6 +555,8 @@ struct RecvLoop {
     device_publisher: DevicePublisher,
     device_recycle_rx: rtrb::Consumer<DeviceBundle>,
     park: Park,
+    /// r.md #156: オーディオ入力の録音を作って tap と書き手へ渡す口。
+    rec: audio_rec::RecHub,
 }
 
 /// recv loop の周期処理 (メッセージ処理とは独立に走る)。
@@ -577,6 +583,8 @@ fn recv_loop_housekeeping(
     rl.device_publisher.flush();
     // ring が満杯の間に溜めた EngineCommand を流す (次のコマンドが来なくても届く)。
     rl.cmd_tx.flush();
+    // r.md #156: tap が手放した録音の取り込み口を解放する。
+    rl.rec.housekeeping();
     let mut finished = phase_tables.take_finished();
     for ctl in projects.values_mut() {
         let key = ctl.key();
@@ -786,6 +794,17 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
                     warm,
                     scope,
                 );
+            }
+            // r.md #156: オーディオ入力の録音の準備。WAV の書き手を起こし、取り込み口を tap へ、判定の共有面を
+            // 便で描画側へ届ける (この後に来る `StartRecording` で録音が始まる)。
+            AudioCommand::StartAudioTakes { project, request } => {
+                let Some(ctl) = projects.get_mut(&project) else {
+                    tracing::warn!(project = project.0, "StartAudioTakes for an unknown project; ignored");
+                    continue;
+                };
+                tracing::info!(project = project.0, take = request.take_id, tracks = request.takes.len(), "received StartAudioTakes");
+                let take = rl.rec.start(project, request, rl.session_sample_rate, rl.out_tx.clone());
+                ctl.set_audio_take(take, &rl.engine_shared, rl.session_sample_rate, &phase_tables);
             }
             // それ以外は全部 project 宛 (`AudioCommand::project` が SSoT)。閉じた
             // タブへの遅延 command は捨てる。

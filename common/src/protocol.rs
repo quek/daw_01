@@ -677,6 +677,10 @@ pub enum AudioCommand {
     /// engine は preroll を捨て、auto-stop の抑止と `recording_live` を解除する。
     /// transport は **止めない** — 停止は `Stop` の仕事 (パンチアウトは再生継続)。
     StopRecording { project: ProjectKey },
+    /// r.md #156: オーディオ入力の録音の準備。**`StartRecording` より前に送る**。engine は書き先の WAV を作り、
+    /// 録音が実際に始まった (`recording_live`) ところから `StopRecording` まで、各トラックの入力 ch を書く。
+    /// 終わったら `AudioEvent::AudioTakesFinished` を返す (録音が始まる前に取り消されても返す)。
+    StartAudioTakes { project: ProjectKey, request: crate::audio_take::AudioTakeRequest },
     /// Stand up the per-buffer plugin process worker pool ([`WorkerPoolSpec`]、plugin host にも同じものを送る)。
     /// pool はデバイス全体で 1 つ (全 project が共有)。
     OpenWorkerPool(WorkerPoolSpec),
@@ -839,6 +843,7 @@ impl AudioCommand {
             | PreviewNoteOff { project, .. }
             | StartRecording { project, .. }
             | StopRecording { project }
+            | StartAudioTakes { project, .. }
             | OpenPluginShmem { project, .. }
             | ClosePluginShmem { project, .. }
             | LaunchCell { project, .. }
@@ -956,6 +961,8 @@ pub enum AudioEvent {
         error: Option<String>,
         frames: u64,
     },
+    /// r.md #156: オーディオ入力の録音 1 回が終わり、WAV を書き終えた (`AudioCommand::StartAudioTakes` の返事)。
+    AudioTakesFinished { project: ProjectKey, result: Box<crate::audio_take::AudioTakesFinished> },
     /// (v29, `docs/plan_arch_refactor.md` §4) worker dispatch が
     /// `DISPATCH_TIMEOUT_MS` 内に完了せず、該当 device を quarantine した
     /// (以後 mix から外して無音バイパス)。 GUI は該当デバイスを可視化し、
@@ -977,7 +984,8 @@ impl AudioEvent {
             | ExportWavProgress { project, .. }
             | LoudnessAnalysisProgress { project, .. }
             | LoudnessAnalysisComplete { project, .. }
-            | BounceClipFxComplete { project, .. } => Some(*project),
+            | BounceClipFxComplete { project, .. }
+            | AudioTakesFinished { project, .. } => Some(*project),
             PluginUnresponsive { device } => Some(device.project),
             Hello { .. } | ChildDisconnected | WorkerPoolStalled => None,
         }

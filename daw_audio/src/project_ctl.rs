@@ -216,6 +216,8 @@ pub struct BundlePublisher {
     last_compiled_frames: Option<u32>,
     /// 直近の便の song から作った索引 / 曲の範囲 / テンポ表 ([`Self::song_derived`])。
     derived: Option<SongDerived>,
+    /// r.md #156: RT へ渡してある入力の受け皿の組 (`RtBundle::input_stage`)。
+    delivered_input_plan: crate::graph::input_stage::InputPlan,
 }
 
 /// song 1 枚から作る、RT へ song と同じ便で届ける派生物。
@@ -246,7 +248,20 @@ impl BundlePublisher {
             mod_plans: ModPlanPublisher::default(),
             last_compiled_frames: None,
             derived: None,
+            delivered_input_plan: Vec::new(),
         }
+    }
+
+    /// 差し替え便 (r.md #156): 曲の「オーディオ入力のトラックの組」が RT へ渡してある受け皿と違えば、作り直す
+    /// (`RtBundle::input_stage`)。モニターの切り替えや録音待機では作り直さない (組に含めていない)。
+    fn input_stage(&mut self, song: Option<&common::model::Song>) -> Option<crate::graph::input_stage::InputStage> {
+        let plan = song.map(crate::graph::input_stage::input_plan).unwrap_or_default();
+        if plan == self.delivered_input_plan {
+            return None;
+        }
+        let stage = crate::graph::input_stage::InputStage::new(&plan, common::process_data::MAX_FRAMES);
+        self.delivered_input_plan = plan;
+        Some(stage)
     }
 
     /// `song` の索引 / 曲の範囲 / テンポ表。直近の便と同じ song (同じ `Arc`) なら作り直さずに共有する — 再配送
@@ -421,6 +436,9 @@ pub struct ProjectCtl {
     pub device_scope_watch: [u64; MAX_DEVICE_SCOPES],
     /// transport 要求とランチャー操作の送り口 (`BeginAtomic` 〜 `EndAtomic` の括りを溜める)。
     pub atomic: BatchGate,
+    /// r.md #156: 進行中のオーディオ入力の録音 (`StartAudioTakes`)。便で RT へ届ける。次の録音が来るまで
+    /// 持ち続ける (終わった録音は RT 側で閉じていて、何もしない)。
+    pub audio_take: Option<Arc<crate::audio_rec::TakeCtl>>,
 }
 
 /// `SetDeviceScopes` の device id 列を slot 表にする: 0 と重複を除き、先頭 [`MAX_DEVICE_SCOPES`] 個に切り詰める。
@@ -472,6 +490,8 @@ impl ProjectCtl {
             device_scope_watch: self.device_scope_watch,
             mod_plan: None,
             mod_phase_table: None,
+            input_stage: None,
+            audio_take: self.audio_take.clone(),
         }
     }
 
@@ -552,7 +572,9 @@ impl ProjectCtl {
             }
             None => (None, None, self.publisher.plane(PlaneCapacity::default())),
         };
+        let input_stage = self.publisher.input_stage(song.as_deref());
         let bundle = RtBundle {
+            input_stage,
             scratch_growth,
             launcher_growth,
             plane,
@@ -569,6 +591,20 @@ impl ProjectCtl {
             ..self.snapshot_bundle(song, sample_rate)
         };
         self.publisher.send(bundle);
+    }
+
+    /// `StartAudioTakes` (r.md #156): 録音を便に載せて RT へ届ける。前の録音が残っていれば閉じさせる。
+    pub fn set_audio_take(
+        &mut self,
+        take: Arc<crate::audio_rec::TakeCtl>,
+        engine_shared: &EngineShared,
+        sample_rate: u32,
+        phase_tables: &ModPhaseTableBuilder,
+    ) {
+        if let Some(old) = self.audio_take.replace(take) {
+            old.request_stop();
+        }
+        self.republish(engine_shared, sample_rate, phase_tables);
     }
 
     /// 現在の song をそのまま値のみ bundle で送り直す (mirror が変わったとき)。
@@ -718,6 +754,7 @@ pub fn open_project(
             recording_lanes: Arc::new(RecordingLanes::new()),
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             atomic: BatchGate::default(),
+            audio_take: None,
         },
     );
     tracing::info!(project = key.0, slot, "project slot opened");
@@ -742,6 +779,10 @@ pub fn close_project(
     engine_shared.projects.store(Arc::new(map));
     if project_tx.push(ProjectDelivery::Close(key)).is_err() {
         tracing::error!(project = key.0, "CloseProject: delivery ring full");
+    }
+    // r.md #156: 録音の途中で閉じた。描画側はもう回らないので、書き手に待つのをやめさせる。
+    if let Some(take) = &ctl.audio_take {
+        take.request_stop();
     }
     // ctl (publisher / recycle ring) はここで drop。RT が持つ `ProjectRt` 側の
     // ring 片割れは abandoned になるだけで panic しない。
@@ -928,6 +969,11 @@ pub fn handle_project_command(
             shared.recording_requested.store(false, Ordering::Release);
             shared.preroll_remaining_samples.store(0, Ordering::Release);
             shared.preroll_total_samples.store(0, Ordering::Release);
+            // r.md #156: オーディオ入力の録音も終わり。描画側が次の block で取り込みの範囲を閉じる
+            // (`recording_requested` の一瞬の上げ下げを RT が見逃しても閉じるよう、録音ごとの旗で伝える)。
+            if let Some(take) = &ctl.audio_take {
+                take.request_stop();
+            }
             tracing::info!(project = key.0, "received StopRecording");
         }
         AudioCommand::SetMetronomeEnabled { enabled, .. } => {
@@ -1229,6 +1275,8 @@ mod tests {
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,
             mod_phase_table: None,
+            input_stage: None,
+            audio_take: None,
         }
     }
 

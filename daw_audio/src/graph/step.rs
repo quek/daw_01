@@ -136,7 +136,7 @@ impl<'a> RenderCtx<'a> {
     /// 列挙でなく機械で見るための列で、field を残らず分解する — 指す物を足すと、ここに足さない限り組めない。
     /// 空の slice の番地は dangling (どのスタックにも無い)。読むのは debug build の `audio_worker::gate::in_flight` だけ。
     #[cfg(debug_assertions)]
-    pub fn referents(&self) -> [(&'static str, usize); 30] {
+    pub fn referents(&self) -> [(&'static str, usize); 31] {
         fn at<T: ?Sized>(r: &T) -> usize {
             std::ptr::from_ref(r).cast::<u8>() as usize
         }
@@ -183,7 +183,7 @@ impl<'a> RenderCtx<'a> {
         let ModTickPlaneRef { ids, col_of, values, depth_ids, depth_col_of, depths, lead: _, first_sample: _, nodes: mod_nodes } =
             mod_plane;
         let FollowerDrive { spans, first_sample: _, col_of_slot, eff, n_cols: _ } = follower_drive;
-        let NativeIo { sc_listen: _, scopes, delta: _ } = native_io;
+        let NativeIo { sc_listen: _, scopes, delta: _, input } = native_io;
         [
             ("song", at(*song)),
             ("index", at(*index)),
@@ -215,6 +215,7 @@ impl<'a> RenderCtx<'a> {
             ("rows", at(*rows)),
             ("native_io.scopes.bridge", scopes.map_or(0, |s| at(s.bridge))),
             ("native_io.scopes.watch", scopes.map_or(0, |s| at(s.watch))),
+            ("native_io.input", input.map_or(0, at)),
         ]
     }
 

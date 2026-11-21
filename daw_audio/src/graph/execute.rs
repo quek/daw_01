@@ -327,6 +327,12 @@ pub fn process_track_owned(
             },
         );
     }
+    // r.md #156: モニター中のデバイス入力を、クリップの音と同じ所 (チェーンの入口) へ足す。再生していなくても
+    // 流す。書き出しは `NativeIo::default()` (入力なし) なので焼き込まれない。
+    let input_slot = native_io.input.and_then(|stage| stage.slot(track_idx));
+    if let Some(slot) = input_slot.filter(|s| s.monitor) {
+        slot.mix_into(&mut scratch.track_l[..n], &mut scratch.track_r[..n]);
+    }
     // PR4.5 sidechain plugin-internal alignment: main 信号を遅延させて sidechain
     // source と musical time を揃える。capacity は edit-time 確保済 (RT で再確保なし)。
     if input_delay_samples > 0 {
@@ -447,6 +453,11 @@ pub fn process_track_owned(
         mod_plane,
     );
     apply_strip(scratch, n, muted, effective_mute);
+    // r.md #156: 録音待機中でモニターしていないトラックは、メーターに入力レベルを出す (音は流さない)。
+    if let Some(slot) = input_slot.filter(|s| s.metered) {
+        scratch.peak_l = scratch.peak_l.max(slot.peak_l);
+        scratch.peak_r = scratch.peak_r.max(slot.peak_r);
+    }
 }
 
 /// master bus の audio fx chain を直列 process する。 全 track mix 後に

@@ -55,6 +55,8 @@ const WIRE_SOURCES: &[&str] = &[
     // RowPlayback。Song に載って `LoadSong` の wire を渡るので登録必須 (不変条件 7)。
     "src/model/session.rs",
     "src/loudness_report.rs",
+    // r.md #156: オーディオ入力の録音の指示と結果 (StartAudioTakes / AudioTakesFinished)。
+    "src/audio_take.rs",
     // Song.scale_changes が持つ型 (Scale / KeySignature 等) の定義。model.rs から
     // 参照され `LoadSong` の wire に載るのに未登録だった (r.md #54 レビューで発覚)。
     "src/scale.rs",
