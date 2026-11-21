@@ -15,7 +15,11 @@
 //   loopback 位置の補正: 鳴らしたクリックを LOOPBACK で録り、録れた位置が曲の位置と一致する
 //
 // 共通の引数: dir=<書いてよいフォルダ>、renderAhead=0|1 (先読み。省略 = 環境設定のまま)、
-// bufferFrames=<合成デバイスのバッファ長。省略 = 既定>
+// bufferFrames=<合成デバイスのバッファ長。省略 = 既定>、sampleRate=<合成デバイスのレート。省略 = 48000>
+
+// デバイスのレート (= engine のレート = 録音の WAV のレート)。曲は 120 BPM なので 1 拍 = SR / 2 フレーム。
+const SR = Number(daw.scriptArgs.sampleRate || 48000);
+const FRAMES_PER_BEAT = SR / 2;
 
 function check(cond, msg) {
   if (!cond) {
@@ -61,13 +65,13 @@ function openSynthetic(device) {
   if (daw.scriptArgs.renderAhead !== undefined) {
     daw.appSetRenderAhead(daw.scriptArgs.renderAhead === "1");
   }
-  const spec = { driver: "synthetic", device: device };
+  const spec = { driver: "synthetic", device: device, sampleRate: SR };
   if (daw.scriptArgs.bufferFrames !== undefined) {
     spec.bufferFrames = Number(daw.scriptArgs.bufferFrames);
   }
   const info = daw.setAudioDevice(spec);
   check(
-    info !== null && info.driver === "synthetic" && info.fallbackReason === null && info.sampleRate === 48000,
+    info !== null && info.driver === "synthetic" && info.fallbackReason === null && info.sampleRate === SR,
     "合成デバイスが開けていない: " + JSON.stringify(info),
   );
   check(info.activeInputs.count === 4, "入力 4 ch が開いていない: " + JSON.stringify(info));
@@ -223,9 +227,14 @@ function stageRamp() {
   tickUntil(() => rec().live, 8000, "count-in が明けない");
   tickFor(1300);
   st = rec();
-  // 曲末 (1 拍) を越えても録音は続く。帯は録り始め (拍 0) からプレイヘッドまで。
+  // 曲末 (1 拍) を越えても録音は続く。帯は録り始めからプレイヘッドまで (Tick の刻みぶんの粗さ)。engine が
+  // 知らせた区間の頭は正確に拍 0 で、描くときはこちらを帯の頭に使う。
   check(st.live, "曲末で録音が止まった: " + JSON.stringify(st));
-  check(st.region.span !== null && st.region.span[0] === 0 && st.region.span[1] > 2.0, "帯: " + JSON.stringify(st));
+  check(st.region.span !== null && st.region.span[0] < 0.2 && st.region.span[1] > 2.0, "帯: " + JSON.stringify(st));
+  check(
+    st.region.segment !== null && st.region.segment.startBeat === 0 && st.region.segment.fileFrame === 0,
+    "録音中の区間: " + JSON.stringify(st),
+  );
   // 帯の中の波形: 山が届いていて、高さは入力の振幅 0.5 (= 255 段階の 128)。
   const peaks = st.region.peaks;
   check(
@@ -249,14 +258,16 @@ function stageRamp() {
   const c = clips[0];
   daw.log("RAMP_CLIP=" + JSON.stringify(c));
   check(c.clip.start_beat === 0, "クリップの始まりが拍 0 でない: " + c.clip.start_beat);
-  check(c.source.sample_rate === 48000 && c.source.channels === 2, "素材の形式: " + JSON.stringify(c.source));
-  check(c.source.frames > 48000 && c.source.frames < 48000 * 4, "録れた長さ: " + c.source.frames);
+  check(c.source.sample_rate === SR && c.source.channels === 2, "素材の形式: " + JSON.stringify(c.source));
+  check(c.source.frames > SR && c.source.frames < SR * 4, "録れた長さ: " + c.source.frames);
   check(
     c.event.source_start_frames === 0 && c.event.source_end_frames === c.source.frames && c.event.stretch_mode === "Raw",
     "event: " + JSON.stringify(c.event),
   );
-  // 120 BPM / 48 kHz = 24,000 フレーム / 拍。
-  check(Math.abs(c.clip.length_beats - c.source.frames / 24000) < 1e-6, "クリップの長さ: " + c.clip.length_beats);
+  check(
+    Math.abs(c.clip.length_beats - c.source.frames / FRAMES_PER_BEAT) < 1e-6,
+    "クリップの長さ: " + c.clip.length_beats,
+  );
   // 止めた位置まで録れている (録音は拍 0 から)。
   const stopped = daw.transportState();
   daw.log("RAMP_STOP=" + JSON.stringify(stopped));
@@ -312,8 +323,12 @@ function stageLoop() {
   daw.setLoop(0.0, 2.0);
   daw.sleepMs(300);
   const last = recordFor(2500);
-  // 折り返すたびに帯は折り返し先から伸び直す。
-  check(last.region.span[0] === 0 && last.region.span[1] < 2.1, "折り返した後の帯: " + JSON.stringify(last));
+  // 折り返すたびに帯は折り返し先から伸び直す。いまの区間は 3 周目 (WAV の 2 周ぶんより後ろが、拍 0 から)。
+  check(last.region.span[0] < 0.2 && last.region.span[1] < 2.1, "折り返した後の帯: " + JSON.stringify(last));
+  check(
+    last.region.segment.startBeat === 0 && last.region.segment.fileFrame >= 2 * SR,
+    "折り返した後の区間: " + JSON.stringify(last),
+  );
 
   // 後の周が前の周を上書きする: 最後の周 (途中まで) が頭から、その後ろに 1 つ前の周の残り。
   const s = song();
@@ -331,12 +346,13 @@ function stageLoop() {
   check(end >= 2.0 && end < 2.1, "前の周の終わり: " + end);
   check(head.event.source_id === tail.event.source_id, "2 つのクリップの素材が別");
   check(Object.keys(s.audio_sources).length === 1, "素材が 1 つでない");
-  // 最後の周は WAV の 3 周目 (2 周ぶん = 96,000 フレームより後ろ)、残りは 2 周目。
-  check(head.event.source_start_frames >= 96000, "最後の周の素材位置: " + head.event.source_start_frames);
+  // 最後の周は WAV の 3 周目 (1 周 = 2 拍 = SR フレーム。2 周ぶんより後ろ)、残りは 2 周目。
+  check(head.event.source_start_frames >= 2 * SR, "最後の周の素材位置: " + head.event.source_start_frames);
   check(
-    tail.event.source_start_frames >= 48000 && tail.event.source_end_frames <= head.event.source_start_frames,
+    tail.event.source_start_frames >= SR && tail.event.source_end_frames <= head.event.source_start_frames,
     "前の周の素材位置: " + JSON.stringify(tail.event),
   );
+  check(head.source.sample_rate === SR, "素材のレート: " + JSON.stringify(head.source));
   // undo 1 回で、録った全部の周が消える。
   daw.appUndo();
   check(song().tracks[0].clips.length === 0, "undo で全部の周が消えない");

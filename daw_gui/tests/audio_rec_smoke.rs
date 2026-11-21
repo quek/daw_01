@@ -81,7 +81,7 @@ fn find_takes(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// 録音の WAV を 1 つだけ見つけて読む (32-bit float であること)。
+/// 録音の WAV を 1 つだけ見つけて読む (32-bit float、デバイスのレート 48 kHz であること)。
 fn read_take(dir: &Path) -> (hound::WavSpec, Vec<f32>) {
     let takes = find_takes(dir);
     assert_eq!(takes.len(), 1, "録音の WAV が 1 つでない: {takes:?}");
@@ -138,11 +138,12 @@ fn 合成入力を録音してクリップにし_保存して開き直しても�
     assert!(silent, "書き出しに入力音が入っている");
 }
 
-/// ループ録音: 後の周が前の周を上書きし、undo 1 回で全部消える (script が見る)。
+/// ループ録音: 後の周が前の周を上書きし、undo 1 回で全部消える (script が見る)。デバイスのレートは 44.1 kHz で
+/// 回す (録音の WAV と拍の換算が、デバイスのレートに付いてくること)。
 #[test]
 fn ループ録音は後の周が前の周を上書きする() {
     let dir = tempfile::tempdir().expect("tempdir");
-    run_stage("loop", &[("dir", &js_path(dir.path()))]);
+    run_stage("loop", &[("dir", &js_path(dir.path())), ("sampleRate", "44100")]);
 }
 
 /// 録音の位置の補正: 曲の `CLICK` フレーム目で鳴らしたクリックを LOOPBACK (出力が「入力レイテンシ + 出力
