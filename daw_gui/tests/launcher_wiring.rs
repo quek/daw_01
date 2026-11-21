@@ -880,6 +880,47 @@ fn セルを途中から撃つと再生開始と位相付き発火が出る() {
     );
 }
 
+/// 再生が読み込み待ちで預かりになったら、位相付きの発火も一緒に預け、再発火した `Play` の
+/// **後に** 送る。先に送ると、後から届く `Play` の撃ち直し (reseed) が位相を捨て、セルは次の
+/// 境界で頭から鳴る。
+#[test]
+fn 読み込み待ちの間に途中から撃つと位相付き発火は_play_の後に出る() {
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 1, 1);
+    let cell = put_cell(&mut app, 1, 0);
+    app.cur.pipc.pending_plugin_loads.insert(99, 1);
+    while audio_rx.try_recv().is_ok() {}
+    let is_launch = |c: &AudioCommand| {
+        matches!(c, AudioCommand::LaunchCellFrom { .. } | AudioCommand::RephaseLauncherRows { .. })
+    };
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::PlayFromCellBeat { cell, phase_beats: 1.5 }));
+    let mut sent = Vec::new();
+    while let Ok(c) = audio_rx.try_recv() {
+        sent.push(c);
+    }
+    assert!(
+        !sent.iter().any(|c| is_launch(c) || matches!(c, AudioCommand::Play { .. })),
+        "読み込み待ちの間は Play も発火も送らない: {sent:?}"
+    );
+
+    // 読み込みが確定した後の event の終わりで、預かった再生が再発火する。
+    app.cur.pipc.pending_plugin_loads.clear();
+    let q = app.global_launch_quantize();
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetGlobalQuantize(q)));
+    let mut sent = Vec::new();
+    while let Ok(c) = audio_rx.try_recv() {
+        sent.push(c);
+    }
+    let play = sent.iter().position(|c| matches!(c, AudioCommand::Play { .. }));
+    let launch = sent.iter().position(is_launch);
+    assert!(
+        matches!((play, launch), (Some(p), Some(l)) if p < l),
+        "Play の後に位相付き発火を送る: {sent:?}"
+    );
+    assert_eq!(sent.iter().filter(|c| is_launch(c)).count(), 2, "発火と他行の揃えを 1 回ずつ: {sent:?}");
+}
+
 /// 再生中に撃ったときは Play を重ねて送らない (二重に送ると開始位置が戻る)。
 #[test]
 fn 再生中に撃っても_play_を重ねない() {

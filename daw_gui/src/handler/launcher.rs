@@ -439,7 +439,7 @@ impl AppData {
     /// 1. song の playhead を **相対 seek** する ([`Self::cell_beat_to_song_beat`]:
     ///    `cell` が今 song 上のどこで鳴っているかを基準に、同じ周回の中でその拍に当たる
     ///    song 位置へ)。アレンジは今いる場所の近くに留まり、アレンジ主導の行はこれで
-    ///    動く。`cell` が鳴っていなければ基準が無いので seek しない (停止中なら現在位置から
+    ///    動く。`cell` が鳴っていなければ基準が無いので seek しない (停止中ならホームから
     ///    再生を始めるだけ)。
     /// 2. `cell` をその拍から撃つ。`Song` へは [`Self::launch_cell`] の押下と同じ
     ///    「このセルを撃った」だけを書く (走行位置は engine が持つ、計画書 §1.4)。
@@ -448,6 +448,10 @@ impl AppData {
     ///    しない (engine の `launch_cell_from` も同じ)。
     /// 3. セルを鳴らしている他の全行も同じ拍へ揃える (engine の `rephase_running`。
     ///    停止中の行は鳴らさない)。`Song` 側の「最後に撃った状態」は変わらないので書かない。
+    ///
+    /// 2 / 3 は **`Play` の後に** engine へ届ける。再生が読み込み待ちで預かりになったら
+    /// (`TransportState::pending_play`) 一緒に預け、再発火した `Play` の後に送る — 先に送ると、
+    /// 後から届く `Play` の撃ち直し (reseed) が位相を捨て、セルは次の境界で頭から鳴る。
     pub fn play_from_cell_beat(&mut self, cell: LauncherCellKey, phase_beats: f64) {
         let row = cell.row();
         let clip_id = cell.clip_id();
@@ -459,6 +463,16 @@ impl AppData {
             Some(song_beat) => self.action_play_from_cursor(song_beat),
             None => self.ensure_transport_rolling(),
         }
+        if self.cur.transport.pending_play.is_some() {
+            self.cur.transport.pending_play_cell_from = Some((cell, phase_beats));
+            return;
+        }
+        self.send_play_from_cell(cell, phase_beats);
+    }
+
+    /// [`Self::play_from_cell_beat`] の 2 / 3 を engine へ送る。
+    pub(crate) fn send_play_from_cell(&self, cell: LauncherCellKey, phase_beats: f64) {
+        let (row, clip_id) = (cell.row(), cell.clip_id());
         self.send_launcher_audio(LauncherAudioCommand::LaunchCellFrom { row, clip_id, phase_beats });
         self.send_launcher_audio(LauncherAudioCommand::RephaseRows { phase_beats });
     }

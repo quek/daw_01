@@ -86,14 +86,14 @@ pub enum LaunchRequest {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Queued {
     target: QueueTarget,
-    /// 発火する song 拍 (量子化済み)。
+    /// 発火する song 拍 (量子化するかは予約を置く側が決める)。
     at_beat: f64,
     /// 前のセルの位相を引き継ぐ (Legato)。
     legato: bool,
     /// [`LaunchMode::Repeat`] の自動再予約。離したときに取り消す対象。
     from_repeat: bool,
     /// セルのどの拍から鳴らすか (セルの `start_beat` からの拍、`0` = 頭)。
-    /// [`LaunchRequest::CellFrom`] だけが `0` 以外を置く。
+    /// [`LaunchRequest::CellFrom`] / [`LaunchRequest::RephaseRunning`] だけが `0` 以外を置く。
     start_phase: f64,
 }
 
@@ -700,11 +700,12 @@ impl LauncherRuntime {
                 };
                 self.press_cell(song, fire, key, clip_id, pressed);
             }
+            // 「カーソルの拍から」は **量子化を待たない** ([`Self::launch_cell_from`])。
             LaunchRequest::CellFrom { key, clip_id, phase_beats } => {
-                self.launch_cell_from(song, at, key, clip_id, phase_beats);
+                self.launch_cell_from(song, now_at, key, clip_id, phase_beats);
             }
             LaunchRequest::RephaseRunning { phase_beats } => {
-                self.rephase_running(song, at, phase_beats);
+                self.rephase_running(now_at, phase_beats);
             }
             LaunchRequest::Scene { scene_id, pressed, immediate } => {
                 let fire = if immediate {
@@ -869,19 +870,24 @@ impl LauncherRuntime {
     /// [`Self::press_cell`] と違い [`LaunchMode`] を見ない (Toggle の「もう一度
     /// 押したら止める」/ Gate の握り / Repeat の撃ち直しは起きない) — 「ここから
     /// 鳴らせ」は押下 / 離しの対を持たない操作なので、鳴っているセルを止める
-    /// 解釈が入る余地は無い。量子化はセル自身の設定に従う (Live のクリップビューの
-    /// 頭出しと同じ)。位相の折り返しは発火時 ([`CellRef::phase_from`]) に行う。
+    /// 解釈が入る余地は無い。位相の折り返しは発火時 ([`CellRef::phase_from`]) に行う。
+    ///
+    /// **Launch の量子化は待たない** (`at` = この buffer の先頭)。GUI は同時に song を
+    /// 「その拍に当たる位置」へ seek する (アレンジの `f` と同じ即時の頭出し) ので、seek 先は
+    /// 小節の途中になる。境界まで待つと、再生中は次の境界まで元の位置のまま鳴り続け、
+    /// 停止中からは再生開始の seed ([`seed_row`]) が行を無音にした後なので次の境界まで何も鳴らない。
     fn launch_cell_from(
         &mut self,
         song: SongRef<'_>,
-        fire: FireAt,
+        at: f64,
         key: RowKey,
         clip_id: u32,
         phase_beats: f64,
     ) {
         let Some((cells, _)) = row_of(song, key) else { return };
-        let Some(cell) = cells.find_by_clip(clip_id) else { return };
-        let at = fire.beat(cell.quantize, song.time_sig);
+        if cells.find_by_clip(clip_id).is_none() {
+            return;
+        }
         if let Some(idx) = self.row_idx(song.index, key) {
             self.rows[idx].queued = Some(Queued {
                 target: QueueTarget::Cell(clip_id),
@@ -896,28 +902,38 @@ impl LauncherRuntime {
     /// [`LaunchRequest::RephaseRunning`]: セルを鳴らしている全行を、それぞれのセル内の
     /// 拍 `phase_beats` へ揃える (「全体をカーソルの拍から」)。
     ///
-    /// 対象は供給元がセル (`RowPhase::Cell`) の行だけ — 停止中 (Silent) と
-    /// アレンジ主導の行は触らない (アレンジ側は同時に届く `SeekTo` が動かす)。
-    /// 停止中の transport で `Cell` のまま残っている行も対象 (再生を始めた瞬間に
-    /// その拍から鳴る)。既に予約が生きている行 (量子化待ち / 列の発火) は、その予約の
-    /// 行き先と発火拍を保ったまま位相だけ載せる — ここで予約を置き換えると、直前に
-    /// 撃った別のセルへの遷移が消える。
+    /// 対象は供給元がセル (`RowPhase::Cell`) の行と、予約が生きている行 — 予約の無い停止中
+    /// (Silent) とアレンジ主導の行は触らない (アレンジ側は同時に届く `SeekTo` が動かす)。
+    ///
+    /// **発火は `at` (この buffer の先頭) で、Launch の量子化を待たない**
+    /// ([`Self::launch_cell_from`] と同じ理由)。予約が生きている行 (量子化待ち / 列の発火 /
+    /// 再生開始の seed) は **行き先を保ったまま `at` へ前倒しする** — 行き先を置き換えると直前に
+    /// 撃った別のセルへの遷移が消え、境界に残すとその行だけ違う瞬間に切り替わる (列を撃った
+    /// 直後なら、境界まで新旧の列が混ざって鳴る)。停止 / アレンジ復帰の予約も同じ瞬間に効かせる。
+    /// セルへの予約には位相を載せ、Legato の引き継ぎは捨てる (位相はここで決まる)。
+    ///
+    /// 列の連鎖の時計も同じ起点 (`at - 位相`) へ張り直す — セルだけ動かすと、列のフォロー
+    /// アクションがセルの周回の途中で発火する。
     ///
     /// RT 安全: 行の線形走査のみ。
-    fn rephase_running(&mut self, song: SongRef<'_>, fire: FireAt, phase_beats: f64) {
+    fn rephase_running(&mut self, at: f64, phase_beats: f64) {
         let start_phase = if phase_beats.is_finite() { phase_beats.max(0.0) } else { 0.0 };
+        if self.scene.scene_id != 0 {
+            let base = at - start_phase;
+            self.scene.base = base;
+            self.scene.at = follow::next_due_beat(&self.scene.armed, base, self.scene.longest, at)
+                .unwrap_or(f64::INFINITY);
+        }
         for idx in 0..self.rows.len() {
             if let Some(q) = &mut self.rows[idx].queued {
+                q.at_beat = at;
                 if matches!(q.target, QueueTarget::Cell(_)) {
                     q.start_phase = start_phase;
+                    q.legato = false;
                 }
                 continue;
             }
             let RowPhase::Cell { clip_id, .. } = self.rows[idx].phase else { continue };
-            let key = self.rows[idx].key;
-            let Some((cells, _)) = row_of(song, key) else { continue };
-            let Some(cell) = cells.find_by_clip(clip_id) else { continue };
-            let at = fire.beat(cell.quantize, song.time_sig);
             self.rows[idx].queued = Some(Queued {
                 target: QueueTarget::Cell(clip_id),
                 at_beat: at,
@@ -1523,6 +1539,58 @@ mod tests {
         let t1 = rt.rows().track_row(0).tail;
         assert_eq!(t1.cell_clip_id(), Some(11), "予約の行き先が消えた: {t1:?}");
         assert!((cell_launch_beat(t1) - (4.0 - 1.0)).abs() < 1e-9, "{t1:?}");
+    }
+
+    /// **「カーソルの拍から」は Launch 量子化を待たない。** GUI は同時に song を小節の途中へ
+    /// seek するので、境界待ちにすると再生中は次の小節まで元の位置のまま鳴り続け、停止中からは
+    /// 次の小節まで無音になる (同じ位置でもう一度押すと seek 先がたまたま境界に乗って即座に鳴る)。
+    #[test]
+    fn 途中から撃つのは量子化を待たない() {
+        let mut song = two_rows();
+        song.tracks[0].launcher = RowPlayback::Launcher { clip_id: 10 };
+        song.tracks[1].launcher = RowPlayback::Launcher { clip_id: 20 };
+        song.tracks[0].session_clips[1].launch.legato = true;
+        song.scenes[1].follow =
+            FollowAction { enabled: true, a: FollowActionKind::Next, chance_a: 100, ..FollowAction::default() };
+        let index = SongIndex::build(&song);
+        let bar = LaunchQuantize::Bars(1);
+        let at_phase = |rt: &LauncherRuntime, row: usize, beat: f64, want: f64| {
+            let tail = rt.rows().track_row(row).tail;
+            tail.effective_beat(beat).is_some_and(|b| (b - want).abs() < 1e-9)
+        };
+
+        // 停止中から: 再生開始 (reseed) と同じ buffer に届く。小節の途中 (6.5 拍) から走り出す。
+        let mut rt = LauncherRuntime::for_song(&song);
+        rt.update(&song, &index, span_at(3.0), bar, false);
+        rt.on_transport_jump(6.5 - 3.0);
+        rt.arm_reseed();
+        press_from(&mut rt, 1, 10, 2.5);
+        rt.push_request(LaunchRequest::RephaseRunning { phase_beats: 2.5 });
+        rt.update(&song, &index, span_at(6.5), bar, false);
+        assert!(at_phase(&rt, 0, 6.5, 2.5), "撃ったセルが境界待ちになった");
+        assert!(at_phase(&rt, 1, 6.5, 2.5), "再生開始で seed された他の行が境界待ちになった");
+
+        // 再生中: song の seek (跳び) の後に届く。
+        rt.update(&song, &index, span_at(7.0), bar, true);
+        rt.on_transport_jump(9.3 - 7.0);
+        press_from(&mut rt, 1, 10, 1.0);
+        rt.push_request(LaunchRequest::RephaseRunning { phase_beats: 1.0 });
+        rt.update(&song, &index, span_at(9.3), bar, true);
+        assert!(at_phase(&rt, 0, 9.3, 1.0), "鳴っているセルが境界待ちになった");
+        assert!(at_phase(&rt, 1, 9.3, 1.0), "鳴っている他の行が境界待ちになった");
+
+        // 列 2 を撃って境界 (12 拍) 待ちの間に、頭 (位相 0) から: 予約は行き先を保ったまま全部
+        // 今すぐ効く。track 1 は Legato のセル 11 へ頭から、track 2 (列 2 は空 = 停止) も同時に止まる。
+        rt.push_request(LaunchRequest::Scene { scene_id: 2, pressed: true, immediate: false });
+        rt.update(&song, &index, span_at(9.5), bar, true);
+        rt.push_request(LaunchRequest::RephaseRunning { phase_beats: 0.0 });
+        rt.update(&song, &index, span_at(10.0), bar, true);
+        let t1 = rt.rows().track_row(0).tail;
+        assert_eq!(t1.cell_clip_id(), Some(11), "予約の行き先が消えた: {t1:?}");
+        assert!(at_phase(&rt, 0, 10.0, 0.0), "Legato の引き継ぎが残った: {t1:?}");
+        assert_eq!(rt.rows().track_row(1).tail, RowPhase::Silent, "停止の予約だけ境界に残った");
+        // 列の連鎖の時計もセルと同じ起点 (10 拍) から 1 周 (4 拍) 後。
+        assert!((rt.scene.at - 14.0).abs() < 1e-9, "{:?}", rt.scene);
     }
 
     /// 列 1 に「1 周したら次の列へ」を付け、`Song` 側は「列 1 を撃った状態」に

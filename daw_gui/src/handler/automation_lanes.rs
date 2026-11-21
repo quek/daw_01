@@ -886,6 +886,7 @@ impl AppData {
             app.cur.transport.preroll_remaining = 0;
             app.cur.transport.pending_play = None;
             app.cur.transport.pending_play_record = None;
+            app.cur.transport.pending_play_cell_from = None;
             app.close_recording_session();
             app.silence_monitor_notes();
             app.cur.recording.active_param_gestures.clear();

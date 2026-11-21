@@ -697,12 +697,12 @@ pub enum AudioCommand {
         /// 量子化を待たず今すぐ撃つ (r.md #126: ▶ の Alt+click)。
         immediate: bool,
     },
-    /// セルを **セル内の拍 `phase_beats` から** 鳴らす (ピアノロールの `f` =
-    /// Live のクリップビューでの頭出し)。
+    /// セルを **セル内の拍 `phase_beats` から** 鳴らす (ピアノロールの `f`)。
     ///
     /// [`LaunchCell`](Self::LaunchCell) と違い **[`LaunchMode`](crate::model::LaunchMode)
     /// を見ない** — 「ここから鳴らせ」に押下 / 離しの対は無く、Toggle で鳴っている
-    /// セルを止めたり Gate で握ったりしてはいけない。量子化はセルの設定に従う。
+    /// セルを止めたり Gate で握ったりしてはいけない。**Launch の量子化は待たない**
+    /// (届いた buffer の先頭で効く。GUI は song の `SeekTo` を同時に送る)。
     /// `phase_beats` はセルの `start_beat` からの拍で、engine がループ長へ折り返す
     /// (ワンショットは末尾で切る)。
     LaunchCellFrom {
@@ -717,8 +717,8 @@ pub enum AudioCommand {
     ///
     /// 対象は供給元がセルの行だけ — 停止中 (Stop Clips) の行とアレンジ主導の行は
     /// 触らない (アレンジ側は同時に送る `SeekTo` が動かす)。予約が生きている行は
-    /// その予約の発火位置に位相を載せる。折り返し / 量子化は
-    /// [`LaunchCellFrom`](Self::LaunchCellFrom) と同じ。
+    /// その予約 (セル / 停止 / アレンジ復帰) を今すぐ発火させ、セルへの予約には位相を載せる。
+    /// 折り返しと「量子化を待たない」は [`LaunchCellFrom`](Self::LaunchCellFrom) と同じ。
     RephaseLauncherRows { project: ProjectKey, phase_beats: f64 },
     /// r.md #87: 列 ([`Scene::id`](crate::model::Scene)) をまとめて撃つ / 離す。
     /// その列にセルを持たない行は **停止**する (Q11、空セル = 停止)。

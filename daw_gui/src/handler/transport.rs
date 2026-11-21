@@ -60,6 +60,7 @@ impl AppData {
         if self.audio_decode_pending() {
             self.cur.transport.pending_play = Some(from);
             self.cur.transport.pending_play_record = record;
+            self.cur.transport.pending_play_cell_from = None;
             self.ui_ephemeral.status_message = "プロジェクト読込中...".into();
             return PlayOutcome::Queued;
         }
@@ -72,6 +73,7 @@ impl AppData {
         if !self.cur.pipc.pending_plugin_loads.is_empty() {
             self.cur.transport.pending_play = Some(from);
             self.cur.transport.pending_play_record = record;
+            self.cur.transport.pending_play_cell_from = None;
             self.ui_ephemeral.status_message = format!(
                 "プラグイン読み込み中... (残 {})",
                 self.cur.pipc.pending_plugin_loads.len()
@@ -129,7 +131,18 @@ impl AppData {
     pub(crate) fn fire_pending_play(&mut self) {
         let Some(from) = self.cur.transport.pending_play.take() else { return };
         let record = self.cur.transport.pending_play_record.take();
-        self.start_transport(record, from);
+        let cell_from = self.cur.transport.pending_play_cell_from.take();
+        match self.start_transport(record, from) {
+            // 「セルをこの拍から」は `Play` の後 (`TransportState::pending_play_cell_from` の doc)。
+            PlayOutcome::Started => {
+                if let Some((cell, phase_beats)) = cell_from {
+                    self.send_play_from_cell(cell, phase_beats);
+                }
+            }
+            // まだ揃っていない (queue し直した): 次の再発火まで持ち越す。
+            PlayOutcome::Queued => self.cur.transport.pending_play_cell_from = cell_from,
+            PlayOutcome::Refused => {}
+        }
     }
 
     /// プレイヘッドを `beat` に置き、 ホーム ([`TransportState::home_beat`] = Space が
@@ -299,6 +312,7 @@ impl AppData {
     pub(crate) fn stop(&mut self) {
         self.cur.transport.pending_play = None;
         self.cur.transport.pending_play_record = None;
+        self.cur.transport.pending_play_cell_from = None;
         self.send_audio(AudioCommand::Stop { project: self.pk() });
         self.close_recording_session();
     }

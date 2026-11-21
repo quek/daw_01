@@ -252,9 +252,9 @@ pub enum LauncherEvent {
     /// - セルを鳴らしている他の全行も同じ拍へ揃える ([`LauncherAudioCommand::RephaseRows`])
     /// - song の playhead を **相対 seek** する (鳴っている `cell` の今の周回を基準に、
     ///   その拍に当たる song 位置へ。アレンジは今いる場所の近くに留まる)。`cell` が
-    ///   鳴っていなければ seek せず、停止中なら現在位置から再生を始める
+    ///   鳴っていなければ seek せず、停止中ならホームから再生を始める
     ///
-    /// 量子化はセルの設定に従う。
+    /// Launch の量子化は待たない (アレンジの `f` と同じ即時の頭出し)。
     PlayFromCellBeat { cell: LauncherCellKey, phase_beats: f64 },
     /// 列 (シーン) を撃つ / 離す。
     LaunchScene { scene_id: u32, pressed: bool, immediate: bool },

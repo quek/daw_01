@@ -232,6 +232,11 @@ pub struct TransportState {
     /// とき、再発火でも録音と count-in を落とさないために覚えておく (r.md #51)。
     /// `None` = ただの再生。
     pub pending_play_record: Option<u64>,
+    /// queue された再生要求に付いていた「セルをこの拍から」 (ピアノロール / Automation Editor の `f`、
+    /// 値はセルとセル内の拍)。 `Play` より先に engine へ送ると、再生開始の撃ち直し (reseed) が
+    /// 位相を捨ててセルを頭から鳴らすので、再発火した `Play` の後に送る
+    /// (`fire_pending_play`)。 `None` = ただの再生。
+    pub pending_play_cell_from: Option<(crate::event_launcher::LauncherCellKey, f64)>,
 
     /// 進行中 export の現在フェーズ + 進捗 ([`ExportStage`])。音声 freewheel
     /// (標準 WAV export / video 前段) は daw_audio の `ExportWavProgress`、映像
@@ -295,6 +300,7 @@ impl TransportState {
             track_voices: Vec::new(),
             pending_play: None,
             pending_play_record: None,
+            pending_play_cell_from: None,
             pending_render: None,
             export_stage: None,
             export_progress_at: None,
