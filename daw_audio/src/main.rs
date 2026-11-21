@@ -24,6 +24,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::io::ReadHalf;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
+// r.md #156: ASIO ドライバーを SDK 無しで直接呼ぶ層 (64 bit Windows 専用、`asio` の module doc)。
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod asio;
 mod audio_clip_renderer;
 mod audio_worker;
 mod automation;
@@ -80,6 +83,12 @@ const DEVICE_RING_CAP: usize = 8;
 async fn main() -> Result<()> {
     let _log_guard = common::logging::init_tracing_for("daw_audio");
     tracing::info!("daw_audio started");
+
+    // `--asio-probe [名前]`: ASIO 層の実測だけして終わる (IPC を張らない、`asio::probe`)。
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    if let Some(code) = asio::probe::run_from_args() {
+        std::process::exit(code);
+    }
 
     let pipe_name = std::env::args()
         .nth(1)
