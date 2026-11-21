@@ -120,3 +120,7 @@ required-features = ["script"]
 [[test]]
 name = "track_duplicate_smoke"
 required-features = ["script"]
+
+[[test]]
+name = "audio_rec_smoke"
+required-features = ["script"]
