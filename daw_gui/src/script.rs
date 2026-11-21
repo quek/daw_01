@@ -127,6 +127,8 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("setTrackInput", audio_rec::daw_set_track_input, 3),
     ("setTrackMonitor", audio_rec::daw_set_track_monitor, 2),
     ("toggleTrackArmed", audio_rec::daw_toggle_track_armed, 1),
+    ("setCountInBars", audio_rec::daw_set_count_in_bars, 1),
+    ("setLoop", audio_rec::daw_set_loop, 2),
     ("appRecord", audio_rec::daw_app_record, 0),
     ("appUndo", audio_rec::daw_app_undo, 0),
     ("appRedo", audio_rec::daw_app_redo, 0),

@@ -63,6 +63,27 @@ pub(super) fn daw_app_record(_this: &JsValue, _args: &[JsValue], _ctx: &mut Cont
     Ok(JsValue::undefined())
 }
 
+/// `daw.setCountInBars(bars)` — transport bar の count-in と同じ `AppEvent::SetCountInBars` (0〜2 小節)。
+pub(super) fn daw_set_count_in_bars(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let bars = u8::try_from_js(args.get_or_undefined(0), ctx)?;
+    with_app(move |app, _side, _io| app.handle_event(AppEvent::SetCountInBars(bars)));
+    Ok(JsValue::undefined())
+}
+
+/// `daw.setLoop(startBeat, endBeat)` — ルーラーでループ範囲を引いて有効にしたのと同じ
+/// (`AppEvent::SetLoopRange`、無効なら `AppEvent::ToggleLoop` で有効にする)。
+pub(super) fn daw_set_loop(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let start = f64::try_from_js(args.get_or_undefined(0), ctx)?;
+    let end = f64::try_from_js(args.get_or_undefined(1), ctx)?;
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::SetLoopRange { start, end });
+        if !app.cur.transport.loop_region.enabled {
+            app.handle_event(AppEvent::ToggleLoop);
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
 /// `daw.appUndo()` — Ctrl+Z と同じ `AppEvent::Undo`。
 pub(super) fn daw_app_undo(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     with_app(|app, _side, _io| app.handle_event(AppEvent::Undo));
