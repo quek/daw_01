@@ -927,6 +927,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             wheel_claims: &mut self.wheel_claims,
             drag_cancel,
             hover_blocked,
+            hit_clip: None,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -1197,6 +1198,9 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// daw_01 r.md #124: ドラッグ中 (別 widget が press を掴んだまま) は hover を出さない
     /// ([`Ui::hover_pos`] / [`Ui::hovers`])。
     pub(crate) hover_blocked: bool,
+    /// 有効な当たり判定の clip ([`crate::hit_clip`])。 `Some` の間、 `pointer` と保留 click は
+    /// clip 済みの値で、 clip 前の値はこの中にある。
+    pub(crate) hit_clip: Option<crate::hit_clip::HitClip>,
     _m: PhantomData<&'a M>,
 }
 
@@ -1539,6 +1543,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let Some(state) = self.open_popups.get(&wid).copied() else {
             return;
         };
+        // popup は開いた widget の scroll viewport の外へはみ出して描かれる。 close 判定も
+        // 中身も、 viewport で clip する前の入力で動かす ([`crate::hit_clip`])。
+        let hit_clip = self.suspend_hit_clip();
+        self.popup_layer_open(wid, state, f);
+        self.resume_hit_clip(hit_clip);
+    }
+
+    /// [`Self::popup_layer`] の本体 (popup が開いているときだけ呼ばれる)。
+    fn popup_layer_open<F>(&mut self, wid: WidgetId, state: PopupOpenState, f: F)
+    where
+        F: FnOnce(&mut Self),
+    {
 
         // outside-click 検出 (closure 実行前に判定 / 自動 close)。
         // daw_01 #038 fix: 「outside」 = 自分の anchor 外 **かつ 他の open popup の anchor 外**。
@@ -1665,6 +1681,12 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// popup_layer 内部 (= modal の body) では `drawing_in_popup == true` なので false を
     /// 返し、通常通り消費可能。
     pub(crate) fn pointer_blocked_by_modal_popup(&self) -> bool {
+        self.pointer_blocked_by_modal_popup_except(None)
+    }
+
+    /// [`Self::pointer_blocked_by_modal_popup`] の、 `own` の popup を数えない版。 自分の popup の
+    /// anchor に自分の本体が入っている widget (dropdown) が、 **他人の** popup の下かどうかを見る。
+    pub(crate) fn pointer_blocked_by_modal_popup_except(&self, own: Option<WidgetId>) -> bool {
         if self.drawing_in_popup {
             return false;
         }
@@ -1679,8 +1701,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             return false;
         };
         self.open_popups
-            .values()
-            .any(|s| s.modal && s.anchor.contains(px, py))
+            .iter()
+            .any(|(wid, s)| Some(*wid) != own && s.modal && s.anchor.contains(px, py))
     }
 
     /// エディットを Scene に積む (外部 widget extension で利用可能)。

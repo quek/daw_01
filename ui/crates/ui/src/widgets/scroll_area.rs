@@ -232,9 +232,11 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
 
         // ---- 3. 内側を with_clip_rect で描画 ----
         // viewport rect は scrollbar 領域を除いた本体エリア (scrollbar との重なり禁止)。
+        // 当たり判定も viewport で切る: スクロールで外へ出た widget は見えないので、 その位置の
+        // click / hover / ホイールを受けさせない ([`crate::hit_clip`])。
         let viewport = inner_viewport_rect(rect, need_h, need_v);
         self.with_clip_rect(viewport, |ui| {
-            f(ui, offset);
+            ui.with_hit_clip(viewport, |ui| f(ui, offset));
         });
 
         // ---- 4. scrollbar 描画 (track + thumb)。drag hit-test と同一 thumb rect を使う ----
