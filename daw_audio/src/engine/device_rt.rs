@@ -33,7 +33,7 @@ pub struct DeviceRt {
     pub project_rx: rtrb::Consumer<ProjectDelivery>,
     /// 撤去した `ProjectRt` を off-thread で drop させる口 (RT で free しない)。
     pub project_recycle_tx: rtrb::Producer<Box<ProjectRt>>,
-    /// Pending preview / launcher commands from the receive loop ([`EngineCommandSender`]).
+    /// Pending transport / launcher / preview commands from the receive loop ([`EngineCommandSender`]).
     /// Drained at the top of every `process_buffer`.
     pub cmd_rx: rtrb::Consumer<EngineCommand>,
     /// Resources shared with the export / notify threads.
@@ -197,17 +197,35 @@ impl DeviceRt {
         }
     }
 
+    /// transport 要求とランチャー操作のまとまりを配る。transport は共有面 (`pending_seek` / `playback`) へ
+    /// 置き、同じ buffer の `begin_buffer` が消費する — ランチャー操作と同じ 1 件で届くので、両方が
+    /// 同じ buffer で効く。
+    ///
+    /// **窓の間 (凍結中) の project にも transport は置く** (共有面は atomic で、`ProjectRt` の中身には
+    /// 触らない)。窓が閉じた buffer で消費される — 捨てると、その間に押した Stop が消える。
+    /// ランチャー操作は他のコマンドと同じく窓の間は捨てる。
+    fn apply_atomic(&mut self, key: ProjectKey, batch: &AtomicBatch) {
+        if !self.projects.iter().any(|p| p.key == key) {
+            // 開いた直後の project: 開く便は必ずこのコマンドより先に積まれているので、取り込み直せば居る
+            // (この buffer の頭で便を読んだ後に、便とコマンドの両方が届いたとき)。
+            self.refresh_projects();
+        }
+        let Some(p) = self.projects.iter().find(|p| p.key == key) else { return };
+        batch.store_transport(&p.shared);
+        if let Some(p) = self.project_mut(key) {
+            for req in batch.launches() {
+                p.launcher.push_request(req);
+            }
+        }
+    }
+
     /// コマンドを 1 つ配る。窓の間 (凍結中) の project 宛ては捨てる ([`Self::project_mut`]) — 鍵盤プレビューの対の
     /// 片割れは、窓が閉じるときに積まれたまま残った方も捨てる (`ProjectRt::settle_window`)。
     fn apply_command(&mut self, cmd: EngineCommand) {
         match cmd {
-            // r.md #87: ランチャーの操作。発火拍の解決は buffer 頭の
+            // transport 要求と r.md #87 のランチャーの操作。発火拍の解決は buffer 頭の
             // `launcher.update` (= song snapshot が入ってから) が行う。
-            EngineCommand::Launch { project, req } => {
-                if let Some(p) = self.project_mut(project) {
-                    p.launcher.push_request(req);
-                }
-            }
+            EngineCommand::Atomic { project, batch } => self.apply_atomic(project, &batch),
             EngineCommand::SamplerPreview { start, end } => self.sampler_rt.set_preview(start, end),
             EngineCommand::SamplerPreviewStop => self.sampler_rt.stop_preview(),
             // 鍵盤プレビュー: 該当 track の pending_preview に積む。

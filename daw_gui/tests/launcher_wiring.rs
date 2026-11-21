@@ -921,6 +921,112 @@ fn 読み込み待ちの間に途中から撃つと位相付き発火は_play_�
     assert_eq!(sent.iter().filter(|c| is_launch(c)).count(), 2, "発火と他行の揃えを 1 回ずつ: {sent:?}");
 }
 
+/// 同じ buffer で効かせたい要求 (transport + 発火、頭出し + 他行の揃え) は **1 つの括り** で送る
+/// (`AudioCommand::BeginAtomic`)。括りの外へ漏れた分は、engine で別の buffer に割れうる。
+#[test]
+fn 同時に効かせる_transport_と発火は括って送る() {
+    let drain = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<AudioCommand>| {
+        let mut sent = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            sent.push(c);
+        }
+        sent
+    };
+    let batched = |c: &AudioCommand| {
+        matches!(
+            c,
+            AudioCommand::SeekTo { .. }
+                | AudioCommand::Play { .. }
+                | AudioCommand::LaunchCell { .. }
+                | AudioCommand::LaunchScene { .. }
+                | AudioCommand::LaunchCellFrom { .. }
+                | AudioCommand::RephaseLauncherRows { .. }
+        )
+    };
+    // 括りの中身の数 (transport, 発火) を返す。括りの外に 1 件でも出ていたら落とす。
+    let bracketed = |sent: &[AudioCommand], what: &str| {
+        let begin = sent.iter().position(|c| matches!(c, AudioCommand::BeginAtomic { .. }));
+        let end = sent.iter().position(|c| matches!(c, AudioCommand::EndAtomic { .. }));
+        let (Some(begin), Some(end)) = (begin, end) else { panic!("{what}: 括りが無い: {sent:?}") };
+        let outside = sent[..begin].iter().chain(&sent[end + 1..]).filter(|c| batched(c)).count();
+        assert_eq!(outside, 0, "{what}: 括りの外に出た: {sent:?}");
+        let inside = &sent[begin + 1..end];
+        let transport = inside.iter().filter(|c| matches!(c, AudioCommand::SeekTo { .. } | AudioCommand::Play { .. }));
+        (transport.count(), inside.iter().filter(|c| batched(c)).count())
+    };
+
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 1, 1);
+    let cell = put_cell(&mut app, 1, 0);
+    let scene_id = app.cur.song_doc.song().scenes[0].id;
+    drain(&mut audio_rx);
+
+    // 停止中の発火: 再生開始 + 発火。
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchCell { cell, pressed: true, immediate: false }));
+    assert_eq!(bracketed(&drain(&mut audio_rx), "セル"), (1, 2));
+    app.handle_event(AppEvent::Launcher(LauncherEvent::LaunchScene { scene_id, pressed: true, immediate: false }));
+    assert_eq!(bracketed(&drain(&mut audio_rx), "列"), (1, 2));
+
+    // 停止中の `f`: 再生開始 + 頭出し + 他行の揃え。
+    app.handle_event(AppEvent::Launcher(LauncherEvent::PlayFromCellBeat { cell, phase_beats: 1.5 }));
+    assert_eq!(bracketed(&drain(&mut audio_rx), "停止中の f"), (1, 3));
+
+    // 再生中の `f` (そのセルは鳴っていない): transport は動かさないが、頭出しと揃えは括る。
+    app.cur.transport.is_playing = true;
+    app.handle_event(AppEvent::Launcher(LauncherEvent::PlayFromCellBeat { cell, phase_beats: 1.5 }));
+    assert_eq!(bracketed(&drain(&mut audio_rx), "再生中の f"), (0, 2));
+    app.cur.transport.is_playing = false;
+
+    // 読み込み待ちで預かった `f` が再発火するときも同じ。
+    app.cur.pipc.pending_plugin_loads.insert(99, 1);
+    app.handle_event(AppEvent::Launcher(LauncherEvent::PlayFromCellBeat { cell, phase_beats: 1.5 }));
+    drain(&mut audio_rx);
+    app.cur.pipc.pending_plugin_loads.clear();
+    let q = app.global_launch_quantize();
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetGlobalQuantize(q)));
+    let sent = drain(&mut audio_rx);
+    let refire = sent.iter().rposition(|c| matches!(c, AudioCommand::BeginAtomic { .. })).expect("括りが無い");
+    assert_eq!(bracketed(&sent[refire..], "預かった f"), (1, 3));
+}
+
+/// 1 つのパッドに割り当てた複数の発火は、まとめて 1 つの括りで送る (括りは入れ子にならない)。
+/// 発火ごとに括ると、停止中に押した 2 つ目のセルが再生開始に乗り遅れうる。
+#[test]
+fn 一つのパッドに割り当てた複数の発火は_1_つの括りで送る() {
+    use common::model::{BindingTarget, MidiBindInput, MidiBinding};
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 2, 1);
+    put_cell(&mut app, 1, 0);
+    put_cell(&mut app, 2, 0);
+    let scene_id = app.cur.song_doc.song().scenes[0].id;
+    app.edit_song(|song| {
+        for track_id in [1, 2] {
+            song.midi_bindings.push(MidiBinding {
+                channel: 9,
+                input: MidiBindInput::Note(36),
+                legacy_controller: None,
+                target: BindingTarget::LaunchCell { track_id, scene_id },
+            });
+        }
+    });
+    while audio_rx.try_recv().is_ok() {}
+
+    app.handle_event(AppEvent::MidiNoteOn { channel: 9, pitch: 36, velocity: 100 });
+    let mut sent = Vec::new();
+    while let Ok(c) = audio_rx.try_recv() {
+        sent.push(c);
+    }
+    let count = |f: fn(&AudioCommand) -> bool| sent.iter().filter(|c| f(c)).count();
+    assert_eq!(count(|c| matches!(c, AudioCommand::BeginAtomic { .. })), 1, "{sent:?}");
+    assert_eq!(count(|c| matches!(c, AudioCommand::EndAtomic { .. })), 1, "{sent:?}");
+    let begin = sent.iter().position(|c| matches!(c, AudioCommand::BeginAtomic { .. })).unwrap();
+    let end = sent.iter().position(|c| matches!(c, AudioCommand::EndAtomic { .. })).unwrap();
+    let launches = |s: &[AudioCommand]| s.iter().filter(|c| matches!(c, AudioCommand::LaunchCell { .. })).count();
+    assert_eq!(launches(&sent[begin..end]), 2, "2 つの発火が同じ括りに入る: {sent:?}");
+    assert_eq!(launches(&sent), 2);
+    assert!(sent[begin..end].iter().any(|c| matches!(c, AudioCommand::Play { .. })), "{sent:?}");
+}
+
 /// 再生中に撃ったときは Play を重ねて送らない (二重に送ると開始位置が戻る)。
 #[test]
 fn 再生中に撃っても_play_を重ねない() {

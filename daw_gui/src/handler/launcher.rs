@@ -157,9 +157,13 @@ impl AppData {
         if targets.is_empty() {
             return false;
         }
-        for target in targets {
-            self.fire_bind_target(target, pressed);
-        }
+        // 1 つの入力に割り当てた操作は同じ buffer で効かせる。別々に届くと、停止中に押した
+        // 2 つ目以降のセルが再生開始に乗り遅れ、次の量子化境界まで鳴らない。
+        self.send_atomic(|app| {
+            for target in targets {
+                app.fire_bind_target(target, pressed);
+            }
+        });
         true
     }
 
@@ -422,15 +426,25 @@ impl AppData {
         if let Some(next) = next {
             self.set_row_playback(row, next);
         }
-        if pressed {
-            self.ensure_transport_rolling();
+        let launch = LauncherAudioCommand::LaunchCell { row, clip_id, pressed, immediate };
+        self.send_launch_with_transport(pressed, launch);
+    }
+
+    /// 発火を engine へ送る。`start` なら停止中の transport も走らせる ([`Self::ensure_transport_rolling`])。
+    ///
+    /// **再生を始めるときは、発火と同じ buffer で効かせる** (`send_atomic`)。別々に届いて間に
+    /// 1 buffer 挟まると、engine は再生開始の buffer で発火を知らず、次の buffer で受けた発火を
+    /// 「小節頭を過ぎた」として次の量子化境界まで待たせる (稀に 1 小節鳴らない)。
+    /// 再生中は transport を動かさない (送るのは発火 1 件) ので括らない。
+    fn send_launch_with_transport(&mut self, start: bool, launch: LauncherAudioCommand) {
+        if start && !self.cur.transport.is_playing {
+            self.send_atomic(|app| {
+                app.ensure_transport_rolling();
+                app.send_launcher_audio(launch);
+            });
+        } else {
+            self.send_launcher_audio(launch);
         }
-        self.send_launcher_audio(LauncherAudioCommand::LaunchCell {
-            row,
-            clip_id,
-            pressed,
-            immediate,
-        });
     }
 
     /// ピアノロールの `f`: **全体を `phase_beats` (セルの `start_beat` からの拍) から再生**
@@ -449,9 +463,10 @@ impl AppData {
     /// 3. セルを鳴らしている他の全行も同じ拍へ揃える (engine の `rephase_running`。
     ///    停止中の行は鳴らさない)。`Song` 側の「最後に撃った状態」は変わらないので書かない。
     ///
-    /// 2 / 3 は **`Play` の後に** engine へ届ける。再生が読み込み待ちで預かりになったら
-    /// (`TransportState::pending_play`) 一緒に預け、再発火した `Play` の後に送る — 先に送ると、
-    /// 後から届く `Play` の撃ち直し (reseed) が位相を捨て、セルは次の境界で頭から鳴る。
+    /// 1 の seek / 再生開始と 2 / 3 は **1 つの括りで** engine へ届ける (`send_atomic`)。再生が
+    /// 読み込み待ちで預かりになったら (`TransportState::pending_play`) 2 / 3 も一緒に預け、
+    /// 再発火した `Play` と同じ括りで送る — 先に送ると、後から届く `Play` の撃ち直し (reseed) が
+    /// 位相を捨て、セルは次の境界で頭から鳴る。
     pub fn play_from_cell_beat(&mut self, cell: LauncherCellKey, phase_beats: f64) {
         let row = cell.row();
         let clip_id = cell.clip_id();
@@ -459,18 +474,25 @@ impl AppData {
             return;
         }
         self.set_row_playback(row, RowPlayback::Launcher { clip_id });
-        match self.cell_beat_to_song_beat(cell, phase_beats) {
-            Some(song_beat) => self.action_play_from_cursor(song_beat),
-            None => self.ensure_transport_rolling(),
-        }
-        if self.cur.transport.pending_play.is_some() {
-            self.cur.transport.pending_play_cell_from = Some((cell, phase_beats));
-            return;
-        }
-        self.send_play_from_cell(cell, phase_beats);
+        let seek = self.cell_beat_to_song_beat(cell, phase_beats);
+        // seek / 再生開始 / セルの頭出し / 他行の揃えを、同じ buffer で効かせる。頭出しと揃えの
+        // 2 つだけ (再生中で `cell` が鳴っていない) でも括る — 割れると、先に鳴り出した `cell` を
+        // 次の buffer の揃えがもう一度撃ち直す。
+        self.send_atomic(|app| {
+            match seek {
+                Some(song_beat) => app.action_play_from_cursor(song_beat),
+                None => app.ensure_transport_rolling(),
+            }
+            if app.cur.transport.pending_play.is_some() {
+                app.cur.transport.pending_play_cell_from = Some((cell, phase_beats));
+                return;
+            }
+            app.send_play_from_cell(cell, phase_beats);
+        });
     }
 
-    /// [`Self::play_from_cell_beat`] の 2 / 3 を engine へ送る。
+    /// [`Self::play_from_cell_beat`] の 2 / 3 を engine へ送る。**呼び出しは `send_atomic` の中で** —
+    /// 2 つが別の buffer に割れると、鳴り出したセルを揃えがもう一度撃ち直す。
     pub(crate) fn send_play_from_cell(&self, cell: LauncherCellKey, phase_beats: f64) {
         let (row, clip_id) = (cell.row(), cell.clip_id());
         self.send_launcher_audio(LauncherAudioCommand::LaunchCellFrom { row, clip_id, phase_beats });
@@ -558,10 +580,8 @@ impl AppData {
         }
         // 実体の無い列 (`scene_id == 0`) を撃つのは「全行停止」なので、**これで
         // 再生を始めない** — 止めるつもりの操作が再生の開始になってしまう。
-        if pressed && scene_id != 0 {
-            self.ensure_transport_rolling();
-        }
-        self.send_launcher_audio(LauncherAudioCommand::LaunchScene { scene_id, pressed, immediate });
+        let launch = LauncherAudioCommand::LaunchScene { scene_id, pressed, immediate };
+        self.send_launch_with_transport(pressed && scene_id != 0, launch);
     }
 
     /// 列の **離し**。engine の `release_scene` → `release_cell` と同じ解釈を

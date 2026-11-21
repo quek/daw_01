@@ -19,8 +19,8 @@ use common::song_index::SongIndex;
 use common::timing::SongBounds;
 
 use crate::engine::{
-    self, EngineCommand, EngineCommandSender, EngineShared, PluginEntry, ProjectDelivery, ProjectRt,
-    ProjectShared, RecordingLanes, RtBundle,
+    self, BatchGate, BatchItem, EngineCommand, EngineCommandSender, EngineShared, PluginEntry,
+    ProjectDelivery, ProjectRt, ProjectShared, RecordingLanes, RtBundle,
 };
 use crate::graph::{DelayLine, Schedule, compile_schedule};
 use crate::launcher::LauncherGrowth;
@@ -419,6 +419,8 @@ pub struct ProjectCtl {
     pub recording_lanes: Arc<RecordingLanes>,
     /// device scope の対象 (`SetDeviceScopes`、[`device_scope_watch`] で切り詰め済み)。
     pub device_scope_watch: [u64; MAX_DEVICE_SCOPES],
+    /// transport 要求とランチャー操作の送り口 (`BeginAtomic` 〜 `EndAtomic` の括りを溜める)。
+    pub atomic: BatchGate,
 }
 
 /// `SetDeviceScopes` の device id 列を slot 表にする: 0 と重複を除き、先頭 [`MAX_DEVICE_SCOPES`] 個に切り詰める。
@@ -715,6 +717,7 @@ pub fn open_project(
             loop_region: common::model::LoopRegion::default(),
             recording_lanes: Arc::new(RecordingLanes::new()),
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
+            atomic: BatchGate::default(),
         },
     );
     tracing::info!(project = key.0, slot, "project slot opened");
@@ -782,21 +785,23 @@ pub fn handle_project_command(
     let shared = Arc::clone(&ctl.shared);
     let key = shared.key;
     match cmd {
+        // transport 要求は共有面へ直接書かず、command ring で audio thread へ渡す (`BatchGate`) —
+        // ランチャー操作と同じ ring を通るので前後が決まり、括りの中身は同じ buffer で効く。
         // r.md #118: `PlayContinue` は launcher を再シードしない (engine 側で分岐)。
         AudioCommand::Play { .. } => {
             tracing::info!(project = key.0, "received Play");
-            shared.playback.store(engine::PlaybackCommand::Play as u8, Ordering::Release);
+            ctl.atomic.submit(key, cmd_tx, BatchItem::Playback(engine::PlaybackCommand::Play));
         }
         AudioCommand::PlayContinue { .. } => {
             tracing::info!(project = key.0, "received PlayContinue");
-            shared
-                .playback
-                .store(engine::PlaybackCommand::PlayContinue as u8, Ordering::Release);
+            ctl.atomic.submit(key, cmd_tx, BatchItem::Playback(engine::PlaybackCommand::PlayContinue));
         }
         AudioCommand::Stop { .. } => {
             tracing::info!(project = key.0, "received Stop");
-            shared.playback.store(engine::PlaybackCommand::Stop as u8, Ordering::Release);
+            ctl.atomic.submit(key, cmd_tx, BatchItem::Playback(engine::PlaybackCommand::Stop));
         }
+        AudioCommand::BeginAtomic { .. } => ctl.atomic.begin(key, cmd_tx),
+        AudioCommand::EndAtomic { .. } => ctl.atomic.end(key, cmd_tx),
         AudioCommand::SetLoop { mut region, .. } => {
             // IPC は信頼境界。 NaN / 負値の拍位置は samples_per_beat 換算を
             // 壊すので載せる前に正規化する (LoadSong の sanitize_ranges と同旨)。
@@ -809,11 +814,11 @@ pub fn handle_project_command(
             // audio thread も buffer 末で playhead を store するため、両者が
             // 同一 atomic を別スレッドから書く race になり、Stop 直後の開始
             // 位置への巻き戻しが in-flight buffer の advance に上書きされて
-            // 停止位置から再生されるバグを生む。seek 要求は
-            // pending_seek に積み、audio thread が process_buffer 冒頭で
-            // swap 消費して playhead に反映する (playhead の writer を audio
+            // 停止位置から再生されるバグを生む。seek 要求は command ring で
+            // audio thread へ渡し、audio thread が process_buffer 冒頭で
+            // playhead に反映する (playhead の writer を audio
             // thread 単独に保つ)。ruler click / Stop 復帰の双方ともこの経路。
-            shared.pending_seek.store(samples, Ordering::Release);
+            ctl.atomic.submit(key, cmd_tx, BatchItem::Seek(samples));
             tracing::info!(project = key.0, samples, "received SeekTo");
         }
         AudioCommand::LoadSong { mut song, .. } => {
@@ -901,7 +906,9 @@ pub fn handle_project_command(
         | AudioCommand::StopAllRows { .. }
         | AudioCommand::SwitchRowToArranger { .. }
         | AudioCommand::SwitchAllToArranger { .. }) => {
-            launcher::ipc::dispatch(cmd, cmd_tx);
+            if let Some(req) = launcher::ipc::request(&cmd) {
+                ctl.atomic.submit(key, cmd_tx, BatchItem::Launch(req));
+            }
         }
         AudioCommand::StartRecording { preroll_samples, .. } => {
             // r.md #51: 録音セッションの開始。 `recording_requested` は
@@ -1274,6 +1281,47 @@ mod tests {
         assert_eq!(Arc::strong_count(&old_renderer), 2, "旧 renderer は RT ではなく recycle ring が持っている");
         ctl.housekeeping(&engine, sr, &phase_tables, None);
         assert_eq!(Arc::strong_count(&old_renderer), 1, "housekeeping (off-thread) が捨てる");
+    }
+
+    /// transport 要求とランチャー操作は command ring で audio thread へ渡る。括りの中身は閉じたときの 1 件に
+    /// まとまり、括りの外は届いた順に 1 件ずつ出る (共有面の atomic を受信スレッドから直接書かない)。
+    #[test]
+    fn transport_とランチャー操作は_ring_で渡り括りは_1_件になる() {
+        let engine = EngineShared::new();
+        let bridge = AudioBridgeHandle::create(&format!("daw01_test_ctl_atomic_{}", std::process::id())).unwrap();
+        let (mut project_tx, _project_rx) = rtrb::RingBuffer::new(4);
+        let mut projects = HashMap::new();
+        let project = ProjectKey(1);
+        assert!(open_project(project, &mut projects, &engine, &bridge, &mut project_tx));
+        let ctl = projects.get_mut(&project).expect("ctl");
+        let phase_tables = ModPhaseTableBuilder::spawn();
+        let (mut cmd_tx, mut cmd_rx) = EngineCommandSender::channel();
+        let (decode_tx, _decode_rx) = std::sync::mpsc::channel();
+        let mut send = |ctl: &mut ProjectCtl, cmd| {
+            handle_project_command(ctl, cmd, &engine, 48_000, &mut cmd_tx, &decode_tx, &phase_tables);
+        };
+
+        send(ctl, AudioCommand::BeginAtomic { project });
+        send(ctl, AudioCommand::SeekTo { project, samples: 4_800 });
+        send(ctl, AudioCommand::Play { project });
+        send(ctl, AudioCommand::LaunchCellFrom { project, track_id: 1, lane_id: 0, clip_id: 9, phase_beats: 1.5 });
+        send(ctl, AudioCommand::RephaseLauncherRows { project, phase_beats: 1.5 });
+        assert!(cmd_rx.pop().is_err(), "括りが閉じる前に出た");
+        send(ctl, AudioCommand::EndAtomic { project });
+        send(ctl, AudioCommand::Stop { project });
+
+        let mut got = Vec::new();
+        while let Ok(EngineCommand::Atomic { batch, .. }) = cmd_rx.pop() {
+            got.push(batch);
+        }
+        assert_eq!(got.len(), 2, "括りで 1 件 + 括りの外の Stop で 1 件: {got:?}");
+        assert_eq!(got[0].launches().count(), 2);
+        // 受信スレッドは共有面へ書いていない (置くのは audio thread の `pump_commands`)。
+        assert_eq!(ctl.shared.pending_seek.load(Ordering::Acquire), engine::NO_PENDING_SEEK);
+        assert_eq!(ctl.shared.playback.load(Ordering::Acquire), engine::PlaybackCommand::Stop as u8);
+        got[0].store_transport(&ctl.shared);
+        assert_eq!(ctl.shared.pending_seek.load(Ordering::Acquire), 4_800);
+        assert_eq!(ctl.shared.playback.load(Ordering::Acquire), engine::PlaybackCommand::Play as u8);
     }
 
     /// r.md #131: 読み込み中の device の表 (`SetLoadingDevices`) は compile の入力。曲より先に届いた表も `LoadSong` の

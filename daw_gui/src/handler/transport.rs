@@ -125,24 +125,43 @@ impl AppData {
         PlayOutcome::Started
     }
 
+    /// `f` が送る transport の要求 (seek / Play) とランチャーの操作を、engine の **同じ buffer で**
+    /// 効かせる (`AudioCommand::BeginAtomic` の doc)。「再生を始めて (seek して)、そこからセルを
+    /// 鳴らす」を別々に届けると、間にオーディオの 1 buffer が挟まったときにセルだけ乗り遅れる。
+    ///
+    /// 括りは必ず閉じる (開いている間、transport の要求は engine に効かない) ので、開閉をこの
+    /// 関数の外へ出さない。入れ子にしてよい — 開閉を送るのは一番外側だけで、中身は全部
+    /// 1 つの括りに入る (`f` の中でアクティブなタブを切り替えないこと)。
+    pub(crate) fn send_atomic(&mut self, f: impl FnOnce(&mut Self)) {
+        if self.ipc.atomic_depth == 0 {
+            self.send_audio(AudioCommand::BeginAtomic { project: self.pk() });
+        }
+        self.ipc.atomic_depth += 1;
+        f(self);
+        self.ipc.atomic_depth -= 1;
+        if self.ipc.atomic_depth == 0 {
+            self.send_audio(AudioCommand::EndAtomic { project: self.pk() });
+        }
+    }
+
     /// 読み込み待ちで queue しておいた再生要求を発火する (読み込みと asset decode が揃った
     /// event の終わりに `resume_after_plugin_loads` が呼ぶ)。 queue 時に「録音だったか /
     /// count-in が何拍か」を復元するので、録音開始が queue されても録音のまま再開する。
     pub(crate) fn fire_pending_play(&mut self) {
         let Some(from) = self.cur.transport.pending_play.take() else { return };
         let record = self.cur.transport.pending_play_record.take();
-        let cell_from = self.cur.transport.pending_play_cell_from.take();
-        match self.start_transport(record, from) {
-            // 「セルをこの拍から」は `Play` の後 (`TransportState::pending_play_cell_from` の doc)。
-            PlayOutcome::Started => {
-                if let Some((cell, phase_beats)) = cell_from {
-                    self.send_play_from_cell(cell, phase_beats);
-                }
-            }
+        let Some((cell, phase_beats)) = self.cur.transport.pending_play_cell_from.take() else {
+            self.start_transport(record, from);
+            return;
+        };
+        // 「セルをこの拍から」は `Play` の後に、同じ buffer で
+        // (`TransportState::pending_play_cell_from` の doc)。
+        self.send_atomic(|app| match app.start_transport(record, from) {
+            PlayOutcome::Started => app.send_play_from_cell(cell, phase_beats),
             // まだ揃っていない (queue し直した): 次の再発火まで持ち越す。
-            PlayOutcome::Queued => self.cur.transport.pending_play_cell_from = cell_from,
+            PlayOutcome::Queued => app.cur.transport.pending_play_cell_from = Some((cell, phase_beats)),
             PlayOutcome::Refused => {}
-        }
+        });
     }
 
     /// プレイヘッドを `beat` に置き、 ホーム ([`TransportState::home_beat`] = Space が

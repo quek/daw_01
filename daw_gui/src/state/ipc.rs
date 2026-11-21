@@ -40,6 +40,9 @@ pub struct IpcState {
 
     // -------- IPC senders --------
     pub audio_tx: Option<UnboundedSender<AudioCommand>>,
+    /// `send_atomic` の入れ子の深さ。`BeginAtomic` / `EndAtomic` を送るのは一番外側だけ
+    /// (engine の括りは入れ子にできない)。
+    pub atomic_depth: u32,
     pub plugin_tx: Option<UnboundedSender<PluginCommand>>,
     /// 子プロセス自動再起動 supervisor (`bootstrap::ChildSupervisor`)。
     /// production (GUI mode) では `Some`、 script / test 経路では `None`。

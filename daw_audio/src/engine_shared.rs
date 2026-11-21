@@ -413,14 +413,14 @@ pub struct ProjectShared {
     pub playback: AtomicU8,
     /// Last published playhead in samples. Mirrored to shmem for the GUI
     /// playhead cursor. **書き込みは audio thread (`process_buffer`) 単独**。
-    /// IPC スレッドは seek を `pending_seek` に積むだけで、ここを直接書かない
+    /// IPC スレッドは seek を command ring で audio thread へ渡すだけで、ここを直接書かない
     /// (直接書くと buffer 末の advance store と race して、Stop 直後
     /// に停止位置へ巻き戻る = 開始位置に戻らないバグになる)。
     pub playhead: AtomicU64,
-    /// GUI からの `SeekTo` 要求を audio thread に渡す single-writer
-    /// チャネル。IPC 受信スレッドが目標サンプル位置を `store`、audio thread が
-    /// `process_buffer` 冒頭で `swap` 消費して `playhead` に反映する。これにより
-    /// `playhead` の writer を audio thread 単独に保ち、停止/seek の競合を排除する。
+    /// GUI からの `SeekTo` 要求の置き場。**書くのも読むのも audio thread** — 要求は command ring
+    /// (`EngineCommand::Atomic`) で届き、`pump_commands` がここへ置いて、同じ buffer の
+    /// `consume_transport_requests` が `swap` 消費して `playhead` に反映する。置き場を共有面に
+    /// 残しているのは、窓の間 (凍結中) に届いた要求を窓が閉じるまで預かるため (`playback` も同じ)。
     /// `NO_PENDING_SEEK` = 要求なし。多重要求は last-wins。
     pub pending_seek: AtomicU64,
     /// メトロノーム on/off。 GUI が `AudioCommand::SetMetronomeEnabled` で更新、

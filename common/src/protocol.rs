@@ -429,6 +429,23 @@ pub enum AudioCommand {
     /// 撃ち直さず、 止まったときの位相のまま鳴らす。
     PlayContinue { project: ProjectKey },
     Stop { project: ProjectKey },
+    /// ここから [`EndAtomic`](Self::EndAtomic) までの transport 要求 (`SeekTo` / `Play` 系) と
+    /// ランチャーの操作を、engine の **同じ buffer で** 効かせる。
+    ///
+    /// 別々の message のままだと、間にオーディオの 1 buffer が挟まることがある — 「seek して、
+    /// その位置からセルを鳴らす」が割れると、セルがアレンジより 1 buffer 遅れたまま回り続け、
+    /// 停止中からセルを撃つと再生開始に乗り遅れて次の量子化境界まで鳴らない。engine の受信側は
+    /// 括りの中身を溜め、`EndAtomic` で audio thread へ 1 件として渡す
+    /// (daw_audio の `engine::BatchGate`)。
+    ///
+    /// **まとめるのは `SeekTo` / `Play` / `PlayContinue` / `Stop` とランチャーの操作だけ。**
+    /// それ以外 (`LoadSong` / `StartRecording` / `SetLoop` 等) は括りの中でも届いた時点で処理される。
+    /// 括りは必ず閉じること — 開いている間、上の要求は engine に効かない。入れ子にはできない。
+    /// 1 つの括りに載るランチャーの操作には上限があり (daw_audio の `ATOMIC_BATCH_LAUNCHES`)、
+    /// 超えた分は順序を保ったまま次の buffer へ回りうる。
+    BeginAtomic { project: ProjectKey },
+    /// [`BeginAtomic`](Self::BeginAtomic) の括りを閉じる。
+    EndAtomic { project: ProjectKey },
     /// パニックボタン — master 出力を declick フェードで一瞬ミュート
     /// する。 panic は直後に（master がミュートされてから）plugin_host へ
     /// `ReinitAllPlugins` が送られるので、 全 plugin を mix から外す瞬間の
@@ -777,6 +794,8 @@ impl AudioCommand {
             | CloseProject { project }
             | SetScopeProject { project }
             | Play { project }
+            | BeginAtomic { project }
+            | EndAtomic { project }
             | PlayContinue { project }
             | Stop { project }
             | LoadSong { project, .. }

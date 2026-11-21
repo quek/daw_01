@@ -1,74 +1,70 @@
 //! GUI からのランチャー操作 (`AudioCommand` の launcher 系) を受ける口。
 //!
 //! `recv_loop` (IPC スレッド) から呼ばれる。ここで **audio thread が読む形**
-//! (`EngineCommand` / `SharedState` の atomic) へ落とすので、RT 側は
-//! 「積まれた `LaunchRequest` を drain する」だけで済む。
+//! ([`LaunchRequest`]) へ落とすので、RT 側は「積まれた `LaunchRequest` を drain する」
+//! だけで済む。
 //!
 //! `main.rs` は実コード 1,569 行の baseline 天井ちょうどなので、
 //! **launcher の分岐を `recv_loop` の中へ書かない** (不変条件 9)。
 
-use common::protocol::{AudioCommand, ProjectKey};
+use common::protocol::AudioCommand;
 
 use super::runtime::LaunchRequest;
 use super::RowKey;
-use crate::engine::{EngineCommand, EngineCommandSender};
 
-/// この `AudioCommand` が launcher 系なら処理して `true`。
+/// launcher 系の `AudioCommand` を audio thread 用の操作へ落とす。launcher 系でなければ `None`。
 ///
 /// 発火の判断には `Song` が要る (どのセルがどの列に居るか) ので、
 /// すべて audio thread のキューへ渡す。**グローバルローンチ量子化はここを通らない** —
 /// `Song.global_launch_quantize` が SSoT で、`LoadSong` に載って届く
 /// (値の経路を 2 本持つと、どちらが効いたか分からなくなる)。
-pub fn dispatch(cmd: AudioCommand, cmd_tx: &mut EngineCommandSender) -> bool {
-    let (project, req): (ProjectKey, LaunchRequest) = match cmd {
-        AudioCommand::LaunchCell { project, track_id, lane_id, clip_id, pressed, immediate } => {
-            (project, LaunchRequest::Cell { key: RowKey::lane(track_id, lane_id), clip_id, pressed, immediate })
+#[must_use]
+pub fn request(cmd: &AudioCommand) -> Option<LaunchRequest> {
+    Some(match *cmd {
+        AudioCommand::LaunchCell { track_id, lane_id, clip_id, pressed, immediate, .. } => {
+            LaunchRequest::Cell { key: RowKey::lane(track_id, lane_id), clip_id, pressed, immediate }
         }
-        AudioCommand::LaunchCellFrom { project, track_id, lane_id, clip_id, phase_beats } => {
-            (project, LaunchRequest::CellFrom { key: RowKey::lane(track_id, lane_id), clip_id, phase_beats })
+        AudioCommand::LaunchCellFrom { track_id, lane_id, clip_id, phase_beats, .. } => {
+            LaunchRequest::CellFrom { key: RowKey::lane(track_id, lane_id), clip_id, phase_beats }
         }
-        AudioCommand::RephaseLauncherRows { project, phase_beats } => {
-            (project, LaunchRequest::RephaseRunning { phase_beats })
+        AudioCommand::RephaseLauncherRows { phase_beats, .. } => LaunchRequest::RephaseRunning { phase_beats },
+        AudioCommand::LaunchScene { scene_id, pressed, immediate, .. } => {
+            LaunchRequest::Scene { scene_id, pressed, immediate }
         }
-        AudioCommand::LaunchScene { project, scene_id, pressed, immediate } => {
-            (project, LaunchRequest::Scene { scene_id, pressed, immediate })
+        AudioCommand::StopRow { track_id, lane_id, immediate, .. } => {
+            LaunchRequest::StopRow { key: RowKey::lane(track_id, lane_id), immediate }
         }
-        AudioCommand::StopRow { project, track_id, lane_id, immediate } => {
-            (project, LaunchRequest::StopRow { key: RowKey::lane(track_id, lane_id), immediate })
+        AudioCommand::StopAllRows { immediate, .. } => LaunchRequest::StopAll { immediate },
+        AudioCommand::SwitchRowToArranger { track_id, lane_id, .. } => {
+            LaunchRequest::RowToArranger { key: RowKey::lane(track_id, lane_id) }
         }
-        AudioCommand::StopAllRows { project, immediate } => (project, LaunchRequest::StopAll { immediate }),
-        AudioCommand::SwitchRowToArranger { project, track_id, lane_id } => {
-            (project, LaunchRequest::RowToArranger { key: RowKey::lane(track_id, lane_id) })
-        }
-        AudioCommand::SwitchAllToArranger { project } => (project, LaunchRequest::AllToArranger),
-        _ => return false,
-    };
-    cmd_tx.send(EngineCommand::Launch { project, req });
-    true
+        AudioCommand::SwitchAllToArranger { .. } => LaunchRequest::AllToArranger,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::protocol::ProjectKey;
 
     #[test]
-    fn 発火系の_command_は_audio_thread_へ渡る() {
-        let (mut tx, mut rx) = EngineCommandSender::channel();
-
+    fn 発火系の_command_は_audio_thread_用の操作になる() {
         // 行の宛先は安定 id で運ばれる (lane_id = 0 がトラック行)。
-        assert!(dispatch(AudioCommand::LaunchCell { project: ProjectKey(4), track_id: 3, lane_id: 0, clip_id: 9, pressed: true, immediate: false }, &mut tx));
-        let got = rx.pop().expect("audio thread へ渡る");
-        match got {
-            EngineCommand::Launch { project, req: LaunchRequest::Cell { key, clip_id, pressed, .. } } => {
-                assert_eq!(project, ProjectKey(4));
-                assert_eq!(key, RowKey::track(3));
-                assert_eq!(clip_id, 9);
-                assert!(pressed);
-            }
-            other => panic!("{other:?} が来た"),
-        }
+        let cmd = AudioCommand::LaunchCell {
+            project: ProjectKey(4),
+            track_id: 3,
+            lane_id: 0,
+            clip_id: 9,
+            pressed: true,
+            immediate: false,
+        };
+        assert_eq!(
+            request(&cmd),
+            Some(LaunchRequest::Cell { key: RowKey::track(3), clip_id: 9, pressed: true, immediate: false })
+        );
 
         // launcher 以外は素通り (recv_loop の他の arm が処理する)。
-        assert!(!dispatch(AudioCommand::Play { project: ProjectKey(4) }, &mut tx));
+        assert_eq!(request(&AudioCommand::Play { project: ProjectKey(4) }), None);
     }
 }

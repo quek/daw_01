@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
     // the notify thread.
     let engine_shared = Arc::new(EngineShared::new());
 
-    // Preview / launcher channel: the receive loop pushes light commands here;
+    // Transport / launcher / preview channel: the receive loop pushes light commands here;
     // the audio thread drains it at the top of every buffer (rtrb、RT で確保も解放もしない)。
     // shmem / worker pool の重い扱いは bundle ring 経由 (plan §4)。
     let (cmd_tx, cmd_rx) = EngineCommandSender::channel();

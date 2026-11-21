@@ -67,14 +67,14 @@ pub(crate) const PREVIEW_NOTE_ID: u32 = common::process_data::NOTE_ID_NONE;
 /// [`DeviceRt::projects`] を線形走査 (≤ `MAX_PROJECTS`) して配る。
 #[derive(Debug)]
 pub enum EngineCommand {
-    /// r.md #87: ランチャーの操作 (セル / 列の発火、停止、アレンジへ返す)。
-    /// 発火の判断には `Song` (セルの [`common::model::LaunchSettings`]) が要るので、
-    /// IPC スレッドでは解決せず audio thread の
+    /// transport 要求 (seek / Play / Stop) とランチャーの操作 (r.md #87: セル / 列の発火、停止、
+    /// アレンジへ返す)。1 件に載った分は **同じ buffer で** 効く ([`AtomicBatch`])。
+    ///
+    /// transport 要求もここを通すので、共有面の `pending_seek` / `playback` へ書くのは audio thread
+    /// だけで、ランチャー操作との前後は ring の順で決まる。発火の判断には `Song` (セルの
+    /// [`common::model::LaunchSettings`]) が要るので、IPC スレッドでは解決せず audio thread の
     /// [`crate::launcher::LauncherRuntime`] へそのまま積む。
-    Launch {
-        project: ProjectKey,
-        req: crate::launcher::LaunchRequest,
-    },
+    Atomic { project: ProjectKey, batch: AtomicBatch },
     /// 鍵盤レーン click のプレビュー note-on (gui_01 #055)。 `track` は
     /// song.tracks の Vec index (= main.rs が `track_id` から現 song snapshot
     /// で解決済)、 `velocity` は normalized 0..=1。 `pump_commands` が該当
@@ -146,7 +146,7 @@ impl EngineCommandSender {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackCommand {
     Stop = 0,
     Play = 1,
@@ -1454,6 +1454,8 @@ fn native_io_for_buffer<'a>(
     NativeIo { sc_listen, scopes, delta }
 }
 
+mod atomic_batch;
+pub use atomic_batch::{AtomicBatch, BatchGate, BatchItem};
 mod device_rt;
 pub use device_rt::DeviceRt;
 mod transport_out;
@@ -2224,6 +2226,7 @@ mod multi_project_tests {
 
     struct Rig {
         dev: DeviceRt,
+        cmd_tx: EngineCommandSender,
         project_tx: rtrb::Producer<ProjectDelivery>,
         project_recycle_rx: rtrb::Consumer<Box<ProjectRt>>,
         _device_tx: rtrb::Producer<DeviceBundle>,
@@ -2237,7 +2240,7 @@ mod multi_project_tests {
 
     fn rig(tag: &str) -> Rig {
         let engine = Arc::new(EngineShared::new());
-        let (_cmd_tx, cmd_rx) = EngineCommandSender::channel();
+        let (cmd_tx, cmd_rx) = EngineCommandSender::channel();
         let (project_tx, project_rx) = rtrb::RingBuffer::new(8);
         let (project_recycle_tx, project_recycle_rx) = rtrb::RingBuffer::new(8);
         let (device_tx, device_rx) = rtrb::RingBuffer::new(4);
@@ -2260,6 +2263,7 @@ mod multi_project_tests {
         let device_scope = DeviceScopeBridgeHandle::create(&format!("daw01_test_mp_dscope_{tag}_{pid}")).unwrap();
         Rig {
             dev,
+            cmd_tx,
             project_tx,
             project_recycle_rx,
             _device_tx: device_tx,
@@ -2342,6 +2346,59 @@ mod multi_project_tests {
         for _ in 0..buffers {
             r.dev.process_buffer(&r.shared, &r.bridge, &r.scope, &r.device_scope, 48_000, 256);
         }
+    }
+
+    /// **1 件のまとまりに載った transport 要求とランチャー操作は、同じ buffer で効く。** 以前は受信スレッドが
+    /// transport を共有面の atomic へ、ランチャーの操作を ring へ別々に書いていて、間に buffer が挟まると
+    /// 「seek + 再生開始」だけが先に消費され、セルの頭出しが 1 buffer 遅れた (位相がアレンジとずれたまま回る)。
+    #[test]
+    fn まとまりの_transport_とランチャー操作は同じ_buffer_で効く() {
+        use crate::launcher::{LaunchRequest, RowKey, RowPhase};
+        use common::model::{Clip, LaunchSettings, Scene, SessionClip};
+        let mut song = Song { bpm: 120.0, ..Song::default() };
+        song.scenes = vec![Scene::new(1)];
+        let mut t = track(1);
+        t.session_clips.push(SessionClip {
+            scene_id: 1,
+            clip: Clip { id: 10, start_beat: 0.0, length_beats: 4.0, ..Clip::default() },
+            launch: LaunchSettings::default(),
+        });
+        song.tracks.push(t);
+        let song = Arc::new(song);
+        let key = ProjectKey(1);
+        // 6.5 拍 (120 BPM / 48 kHz = 24,000 samples / 拍)。
+        let seek = 156_000_u64;
+        let launch_beat = |r: &Rig| match r.dev.projects[0].launcher.rows().track_row(0).tail {
+            RowPhase::Cell { launch_beat, .. } => Some(launch_beat),
+            _ => None,
+        };
+
+        let mut r = rig("atomic");
+        let (a, mut a_tx) = open(&mut r, key);
+        a_tx.push(bundle(&song)).ok().unwrap();
+        run(&mut r, 1);
+
+        // ピアノロールの `f` が送る中身: seek + 再生開始 + セルをその拍から + 他行の揃え。
+        let mut batch = AtomicBatch::default();
+        for item in [
+            BatchItem::Seek(seek),
+            BatchItem::Playback(PlaybackCommand::Play),
+            BatchItem::Launch(LaunchRequest::CellFrom { key: RowKey::track(1), clip_id: 10, phase_beats: 2.5 }),
+            BatchItem::Launch(LaunchRequest::RephaseRunning { phase_beats: 2.5 }),
+        ] {
+            batch.push(item).unwrap();
+        }
+        r.cmd_tx.send(EngineCommand::Atomic { project: key, batch });
+        run(&mut r, 1);
+        assert!(r.dev.projects[0].playing);
+        assert_eq!(a.playhead.load(Ordering::Acquire), seek + 256);
+        let got = launch_beat(&r).expect("セルが鳴っている");
+        assert!((got - 4.0).abs() < 1e-9, "セルの 2.5 拍目が song の 6.5 拍に乗っていない: {got}");
+
+        // transport 要求だけのまとまり (ふつうの Stop) も同じ口で届く。
+        r.cmd_tx.send(EngineCommand::Atomic { project: key, batch: AtomicBatch::of(BatchItem::Playback(PlaybackCommand::Stop)) });
+        run(&mut r, 1);
+        assert!(!r.dev.projects[0].playing);
     }
 
     #[test]

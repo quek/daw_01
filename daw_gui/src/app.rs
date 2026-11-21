@@ -159,6 +159,7 @@ impl AppData {
                 plugin_us: std::collections::HashMap::new(),
                 plugin_db,
                 audio_tx: Some(audio_tx),
+                atomic_depth: 0,
                 plugin_tx: Some(plugin_tx),
                 next_plugin_load_generation: 0,
                 rescan_result: Arc::new(Mutex::new(None)),
