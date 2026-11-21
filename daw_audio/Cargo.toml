@@ -3,7 +3,10 @@ name = "daw_audio"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+# 自作コードは GPL-3.0-or-later。 加えて `src/asio/sys.rs` が ASIO SDK のヘッダの宣言を
+# 書き起こしたもの = SDK の GPL Version 3 (or later 無し) の派生物なので複合式で宣言する
+# (REUSE.toml と一致)。
+license = "GPL-3.0-or-later AND GPL-3.0-only"
 repository.workspace = true
 publish.workspace = true
 
