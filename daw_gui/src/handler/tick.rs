@@ -39,6 +39,23 @@ impl AppData {
         });
     }
 
+    /// r.md #138: ピアノロールが鍵盤の名前を引く音源が替わった (開いた / 別トラックのクリップを
+    /// 選んだ) ときに、plugin host へ名前の取り直しを頼む。通知せずに名前を変える plugin
+    /// (MDrummer はキットを替えても何も通知しない) の、エディタ窓を閉じたまま起きた変更を拾う。
+    pub(crate) fn refresh_key_names_on_show(&mut self) {
+        let shown = (self.cur.view.bottom_panel == Some(1))
+            .then(|| self.pianoroll_target_clip())
+            .flatten()
+            .and_then(|clip| crate::widgets::piano_roll::view_build::key_names_device(self, clip.track_id));
+        if shown == self.cur.pipc.key_names_shown_device {
+            return;
+        }
+        self.cur.pipc.key_names_shown_device = shown;
+        if let Some(device_id) = shown {
+            self.send_plugin(PluginCommand::RefreshKeyNames { device: self.dev(device_id) });
+        }
+    }
+
     /// `playhead_beat` は engine が publish した `playhead_samples` の位置の拍 (r.md #147)。
     pub(crate) fn on_tick(&mut self, playhead_samples: u64, playhead_beat: f64, stopped: bool) {
         // r.md #67: カーソルキーの音程変更で鳴らした試聴音を期限で消音する
@@ -50,6 +67,7 @@ impl AppData {
         if !self.cur.pipc.inferred_plugin_gestures.is_empty() && !crate::os_file_drag::primary_button_down() {
             self.close_inferred_plugin_gestures();
         }
+        self.refresh_key_names_on_show();
 
         // パニックの遅延 reinit を発火する。 master の declick フェード
         // アウトが終わった頃 (`PANIC_REINIT_DELAY` 経過) に `ReinitAllPlugins` を

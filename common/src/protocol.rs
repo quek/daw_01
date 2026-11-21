@@ -1090,6 +1090,11 @@ pub enum PluginCommand {
     /// Ask the plugin_host to capture state for every device of `project` at once.
     /// Reply is `PluginEvent::AllPluginStates`. Used for project save.
     RequestAllStates { project: ProjectKey },
+    /// r.md #138: 鍵盤ごとの名前を取り直し、 前回送った内容から変わっていたら
+    /// `PluginEvent::PluginKeyNames` を送る (変わっていなければ返事は無い)。 daw_gui が
+    /// ピアノロールにその音源の鍵盤を出し始めたときに送る — 通知せずに名前を変える plugin の、
+    /// エディタ窓を閉じたまま起きた変更を拾う。
+    RefreshKeyNames { device: DeviceAddr },
     /// Open the plugin editor (top-level window は plugin-host プロセス所有)。
     /// `title` is the window caption daw_gui composed (プロジェクト名込み —
     /// 背景タブの窓も開いたまま残るので、どのタブの窓かはタイトルで区別する)。
@@ -1341,7 +1346,8 @@ pub enum PluginEvent {
     /// r.md #138: plugin が申告する鍵盤ごとの名前 (key 昇順・重複なし。空 = 申告なし)。
     /// load 直後に 1 度、 CLAP `clap_host_note_name.changed` / VST3
     /// `IUnitHandler::notifyProgramListChange` で再送。 通知しない plugin のために、 エディタ窓が
-    /// 開いている間は plugin host が取り直し、 変わっていたら再送する。 daw_gui はピアノロールの鍵盤に
+    /// 開いている間と `PluginCommand::RefreshKeyNames` を受けたときに plugin host が取り直し、
+    /// 変わっていたら再送する。 daw_gui はピアノロールの鍵盤に
     /// 描くだけで Song には保存しない (plugin からの派生情報)。
     PluginKeyNames {
         device: DeviceAddr,

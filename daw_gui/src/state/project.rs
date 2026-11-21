@@ -68,6 +68,9 @@ pub struct ProjectIpc {
     /// (plugin からの派生情報なので Song には保存せず dirty も立てない。reload で再取得)。
     pub plugin_key_names:
         std::collections::HashMap<u64, std::sync::Arc<crate::widgets::piano_roll::KeyNames>>,
+    /// r.md #138: ピアノロールがいま鍵盤の名前を引いている device (閉じている / 音源無しは `None`)。
+    /// 替わったときに plugin host へ取り直しを頼む (`AppData::refresh_key_names_on_show`)。
+    pub key_names_shown_device: Option<u64>,
     /// `device_id` → 現在 plugin_host に load されている plugin の情報。
     /// Undo/Redo の reconcile (`reconcile_plugins_with_song`) で「Song の各
     /// device の plugin が host 側と一致しているか」 を device 粒度で diff する
@@ -902,6 +905,7 @@ impl ProjectState {
                 inferred_plugin_gestures: std::collections::HashSet::new(),
                 plugin_params: PluginParamTable::default(),
                 plugin_key_names: std::collections::HashMap::new(),
+                key_names_shown_device: None,
                 loaded_devices: std::collections::HashMap::new(),
                 pending_clip_fx_bounce: None,
                 pending_glue_bake: None,

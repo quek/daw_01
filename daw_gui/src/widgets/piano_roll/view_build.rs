@@ -251,9 +251,13 @@ pub(super) fn build(
 /// r.md #138: トラックの最初の音源 (MIDI を受けて音を出す device = note 入力 + audio 出力。
 /// `migrate_legacy_vocal_tracks` と同じ判定) が申告している鍵盤の名前。
 fn target_key_names(app: &AppData, track_id: u32) -> Option<Arc<KeyNames>> {
+    app.cur.pipc.plugin_key_names.get(&key_names_device(app, track_id)?).cloned()
+}
+
+/// r.md #138: ピアノロールが鍵盤の名前を引く device (`track_id` のトラックの最初の音源) の id。
+pub(crate) fn key_names_device(app: &AppData, track_id: u32) -> Option<u64> {
     let track = app.cur.song_doc.song().track_by_id(track_id)?;
-    let source = track.plugins().find(|p| p.ports.has_note_input && p.ports.has_audio_output)?;
-    app.cur.pipc.plugin_key_names.get(&source.id).cloned()
+    track.plugins().find(|p| p.ports.has_note_input && p.ports.has_audio_output).map(|p| p.id)
 }
 
 /// 表示対象クリップ群 (`shown`) の note を **すべて** `super::Note` に変換する。
@@ -380,5 +384,34 @@ mod tests {
         assert_eq!(c.kbd.w, super::super::key_names::NAME_COLUMN_X + 100.0 + 6.0);
         assert_eq!(c.view.keyboard_w, c.kbd.w, "widget へ渡す幅と layout の幅が一致");
         assert_eq!(c.grid.x, c.kbd.x + c.kbd.w, "grid は広げた鍵盤の右から");
+    }
+
+    /// r.md #138: ピアノロールが鍵盤を出す音源が替わったときにだけ、plugin host へ名前の
+    /// 取り直しを頼む (出したままの間は頼み直さない。開き直したらまた頼む)。
+    #[test]
+    fn showing_the_piano_roll_asks_the_host_to_refresh_key_names() {
+        use common::protocol::PluginCommand;
+        let mut app = app_with_chain();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.ipc.plugin_tx = Some(tx);
+        let mut asked = |app: &mut AppData| -> Vec<u64> {
+            app.refresh_key_names_on_show();
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|cmd| match cmd {
+                    PluginCommand::RefreshKeyNames { device } => Some(device.device_id),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        app.cur.view.bottom_panel = None;
+        assert!(asked(&mut app).is_empty(), "閉じている間は頼まない");
+        app.cur.view.bottom_panel = Some(1);
+        assert_eq!(asked(&mut app), vec![2], "最初の音源の分を頼む");
+        assert!(asked(&mut app).is_empty(), "出したままなら頼み直さない");
+        app.cur.view.bottom_panel = None;
+        assert!(asked(&mut app).is_empty());
+        app.cur.view.bottom_panel = Some(1);
+        assert_eq!(asked(&mut app), vec![2], "開き直したらまた頼む");
     }
 }

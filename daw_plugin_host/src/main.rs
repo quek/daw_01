@@ -996,6 +996,7 @@ impl PluginHost {
                 let entries = self.collect_all_states(project);
                 self.emit(PluginEvent::AllPluginStates { project, entries });
             }
+            PluginCommand::RefreshKeyNames { device } => self.refresh_key_names(device),
             PluginCommand::OpenSlotGuiEmbedded {
                 device,
                 title,
