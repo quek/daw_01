@@ -30,6 +30,7 @@ mod plugin_instance;
 mod process_scaffold;
 mod process_server;
 mod quiesce;
+mod thread_timer;
 mod vst3_events;
 mod vst3_host;
 mod vst3_params;
@@ -55,8 +56,8 @@ use tokio::sync::mpsc as tmpsc;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, KillTimer, MSG, PM_REMOVE, PeekMessageW,
-    PostThreadMessageW, SetTimer, TranslateMessage, WM_APP, WM_TIMER,
+    DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW,
+    PostThreadMessageW, TranslateMessage, WM_APP,
 };
 
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, load_plugin};
@@ -69,9 +70,8 @@ use crate::process_server::{
 /// loop after a command has been pushed into the mpsc queue.
 const WM_COMMAND_WAKE: u32 = WM_APP + 1;
 
-/// (r.md #5 ARA2) Thread-timer id + interval used by the plugin-main thread to
+/// (r.md #5 ARA2) Thread-timer interval used by the plugin-main thread to
 /// pump every loaded ARA document's `notifyModelUpdates`.
-const ARA_NOTIFY_TIMER_ID: usize = 1;
 const ARA_NOTIFY_TIMER_MS: u32 = 30;
 
 /// plugin 発 restart 要求の per-plugin cooldown 窓 (Melda 型 reinit 無限
@@ -136,6 +136,8 @@ struct InstanceRecord {
     token: InstanceToken,
     /// plugin 発 restart 要求の cooldown。
     restarts: RestartWindowTracker,
+    /// r.md #138: 最後に daw_gui へ送った鍵盤ごとの名前 (取り直しの変化検出用)。
+    key_names: Vec<common::protocol::KeyName>,
 }
 
 /// 開いているプロジェクト (= タブ) ごとの状態。`SetProjectDir` で upsert、
@@ -887,18 +889,6 @@ impl PluginHost {
         self.emit(PluginEvent::PluginParamList { device, params });
     }
 
-    /// r.md #138: 鍵盤ごとの名前を (再) 送信する (load 直後 / plugin の変更通知)。
-    fn emit_key_names(&mut self, device: DeviceAddr) {
-        let Some(rec) = self.instances.get_mut(&device) else {
-            return;
-        };
-        let names = rec.plugin.key_names();
-        if !names.is_empty() {
-            tracing::info!(?device, count = names.len(), "plugin reported key names");
-        }
-        self.emit(PluginEvent::PluginKeyNames { device, names });
-    }
-
     // ----------------------------------------------------------------
     // command handlers
     // ----------------------------------------------------------------
@@ -1311,6 +1301,7 @@ impl PluginHost {
                 shmem_id: shmem_id.clone(),
                 token,
                 restarts: RestartWindowTracker::default(),
+                key_names: Vec::new(),
             },
         );
         registry_insert(
@@ -1889,6 +1880,10 @@ impl PluginHost {
             .get(&device)
             .and_then(|rec| rec.editor.as_ref())
             .and_then(editor_window::EditorWindow::owner_to_restore_if_foreground);
+        // r.md #138: 窓が閉じると取り直しの poll が止まるので、最後の 1 回をここで取る。
+        if self.instances.get(&device).is_some_and(|rec| rec.editor.is_some()) {
+            self.refresh_key_names(device);
+        }
         if let Some(rec) = self.instances.get_mut(&device) {
             let _ = rec.plugin.gui_hide();
             rec.plugin.gui_destroy();
@@ -2183,7 +2178,9 @@ fn plugin_main_loop(
 
     // (r.md #5 ARA2) ARA notify timer (hwnd = None → WM_TIMER がこの thread
     // のキューに入り GetMessageW を起こす)。ARA session が居るときだけ回す。
-    let mut ara_timer_active = false;
+    let mut ara_timer = thread_timer::ThreadTimer::new(ARA_NOTIFY_TIMER_MS);
+    // r.md #138: 鍵盤の名前の取り直し。エディタ窓が開いているときだけ回す。
+    let mut key_names_timer = thread_timer::ThreadTimer::new(key_names::POLL_MS);
 
     // (r.md #61) 抜け方は 3 通り (cmd channel 切断 / `HostMsg::Shutdown` /
     // `GetMessageW` の WM_QUIT・エラー) あるが、**後始末は loop の直後 1 箇所**に
@@ -2225,14 +2222,8 @@ fn plugin_main_loop(
         }
 
         // ARA notify timer を live session の有無に同期。
-        let want_ara_timer = host.has_any_ara_session();
-        if want_ara_timer && !ara_timer_active {
-            unsafe { SetTimer(None, ARA_NOTIFY_TIMER_ID, ARA_NOTIFY_TIMER_MS, None) };
-            ara_timer_active = true;
-        } else if !want_ara_timer && ara_timer_active {
-            let _ = unsafe { KillTimer(None, ARA_NOTIFY_TIMER_ID) };
-            ara_timer_active = false;
-        }
+        ara_timer.sync(host.has_any_ara_session());
+        key_names_timer.sync(host.has_open_editor());
 
         unsafe {
             let mut msg = MSG::default();
@@ -2244,9 +2235,11 @@ fn plugin_main_loop(
             // `WH_GETMESSAGE` フック (= この `GetMessageW` の内側でも、 プラグインが自前で
             // 回す `PeekMessageW` の内側でも同じ判定)。 飲み込まれたものは `WM_NULL` に
             // なって降りてくるので、 ここで特別扱いする分岐は無い。
-            if msg.message == WM_TIMER && msg.wParam.0 == ARA_NOTIFY_TIMER_ID {
+            if ara_timer.fired(&msg) {
                 // (r.md #5 ARA2) Pump every ARA document's deferred analysis.
                 host.notify_ara_model_updates();
+            } else if key_names_timer.fired(&msg) {
+                host.poll_key_names();
             } else if msg.message != WM_COMMAND_WAKE {
                 // r.md #65: この dispatch の中でキャプション / サイズ枠のドラッグが
                 // 始まると `DefWindowProc` の modal ループへ入って戻ってこない。
@@ -2256,9 +2249,8 @@ fn plugin_main_loop(
         }
     };
 
-    if ara_timer_active {
-        let _ = unsafe { KillTimer(None, ARA_NOTIFY_TIMER_ID) };
-    }
+    ara_timer.sync(false);
+    key_names_timer.sync(false);
     host.shutdown();
     tracing::info!(reason = exit_reason, "plugin-main thread exiting");
 }

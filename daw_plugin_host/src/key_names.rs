@@ -4,7 +4,57 @@
 
 use clap_sys::ext::note_name::{CLAP_EXT_NOTE_NAME, clap_note_name, clap_plugin_note_name};
 use clap_sys::plugin::clap_plugin;
-use common::protocol::KeyName;
+use common::protocol::{DeviceAddr, KeyName, PluginEvent};
+
+use crate::PluginHost;
+
+/// エディタ窓が開いている間、鍵盤の名前を取り直す間隔。
+///
+/// 変更を通知しない plugin がある (MeldaProduction MDrummer の VST3 はキットを替えても
+/// `notifyProgramListChange` / `restartComponent` を呼ばない — 2026-11-21 の実ログ)。
+/// 名前が変わるのは plugin の GUI を操作したときなので、窓が開いている間だけ聞き直す。
+pub const POLL_MS: u32 = 500;
+
+impl PluginHost {
+    /// 鍵盤ごとの名前を送る (load 直後 / plugin の変更通知)。
+    pub(crate) fn emit_key_names(&mut self, device: DeviceAddr) {
+        self.send_key_names(device, true);
+    }
+
+    /// 取り直して、前回送った内容から変わっていたら送る。
+    pub(crate) fn refresh_key_names(&mut self, device: DeviceAddr) {
+        self.send_key_names(device, false);
+    }
+
+    /// エディタ窓が開いている instance の名前を取り直す ([`POLL_MS`] ごと)。
+    pub(crate) fn poll_key_names(&mut self) {
+        let open: Vec<DeviceAddr> =
+            self.instances.iter().filter(|(_, rec)| rec.editor.is_some()).map(|(&d, _)| d).collect();
+        for device in open {
+            self.refresh_key_names(device);
+        }
+    }
+
+    pub(crate) fn has_open_editor(&self) -> bool {
+        self.instances.values().any(|rec| rec.editor.is_some())
+    }
+
+    fn send_key_names(&mut self, device: DeviceAddr, even_if_unchanged: bool) {
+        let Some(rec) = self.instances.get_mut(&device) else {
+            return;
+        };
+        let names = rec.plugin.key_names();
+        let changed = names != rec.key_names;
+        if !changed && !even_if_unchanged {
+            return;
+        }
+        if changed {
+            tracing::info!(?device, count = names.len(), "plugin reported key names");
+            rec.key_names.clone_from(&names);
+        }
+        self.emit(PluginEvent::PluginKeyNames { device, names });
+    }
+}
 
 /// plugin が返した 1 件。`port` / `channel` の `-1` は「全 port / 全 channel」
 /// (CLAP `ext/note-name.h` の `clap_note_name`)。

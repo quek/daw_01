@@ -1340,7 +1340,8 @@ pub enum PluginEvent {
     },
     /// r.md #138: plugin が申告する鍵盤ごとの名前 (key 昇順・重複なし。空 = 申告なし)。
     /// load 直後に 1 度、 CLAP `clap_host_note_name.changed` / VST3
-    /// `IUnitHandler::notifyProgramListChange` で再送。 daw_gui はピアノロールの鍵盤に
+    /// `IUnitHandler::notifyProgramListChange` で再送。 通知しない plugin のために、 エディタ窓が
+    /// 開いている間は plugin host が取り直し、 変わっていたら再送する。 daw_gui はピアノロールの鍵盤に
     /// 描くだけで Song には保存しない (plugin からの派生情報)。
     PluginKeyNames {
         device: DeviceAddr,
