@@ -120,6 +120,8 @@ pub struct Vst3AudioHalf {
     offline: Arc<AtomicBool>,
     /// Transport block the plugin reads via `ProcessData.processContext`.
     process_context: ProcessContext,
+    /// [`AudioProcessorHalf::set_ara_idle`]。
+    ara_idle: bool,
 }
 
 // SAFETY: the raw processor pointer is only used inside the AudioHalf
@@ -137,6 +139,13 @@ impl AudioProcessorHalf for Vst3AudioHalf {
         transport: &crate::plugin_instance::TransportContext,
     ) -> Result<i32> {
         anyhow::ensure!(self.processing, "VST3 plugin not processing");
+        if self.ara_idle {
+            // region の無い ARA instance は呼ばずに無音を返す (`AudioProcessorHalf::set_ara_idle`)。
+            let n = frames as usize;
+            process_scaffold::silence_planar(&mut self.output_buffers, n);
+            process_scaffold::silence_planar_ports(&mut self.extra_output_buffers, n);
+            return Ok(kResultOk);
+        }
 
         // --- Copy inputs / aux inputs and refresh channel pointers
         // (format-independent scaffold).
@@ -388,6 +397,10 @@ impl AudioProcessorHalf for Vst3AudioHalf {
         out.append(&mut self.collected_out_notes);
     }
 
+    fn set_ara_idle(&mut self, idle: bool) {
+        self.ara_idle = idle;
+    }
+
     fn on_activate(&mut self, sample_rate: f64, max_frames: u32) {
         let mf = max_frames as usize;
         self.sample_rate = sample_rate;
@@ -457,6 +470,9 @@ pub struct Vst3Plugin {
 
     /// ARA session bound to this instance, if any.
     ara: Option<crate::ara::session::AraSession>,
+    /// この instance を ARA の document に bind したことがあるか (bind は instance が死ぬまで解けない。
+    /// session を畳んだ後も `true` のまま — `crate::ara::is_idle`)。
+    ara_bound: bool,
     /// Last activate params (ARA setup の deactivate → reactivate 用)。
     last_activate: Option<(f64, u32, u32)>,
 
@@ -698,6 +714,7 @@ impl Vst3Plugin {
             process_status_err: Arc::clone(&process_status_err),
             offline: Arc::clone(&offline),
             process_context: unsafe { std::mem::zeroed() },
+            ara_idle: false,
         }));
 
         Ok(Self {
@@ -711,6 +728,7 @@ impl Vst3Plugin {
             _component_handler: component_handler,
             controller_separate,
             ara: None,
+            ara_bound: false,
             last_activate: None,
             active: false,
             processing: false,
@@ -1218,6 +1236,7 @@ impl LoadedPlugin for Vst3Plugin {
             })
         }?;
         self.ara = Some(session);
+        self.ara_bound = true;
         Ok(true)
     }
 
@@ -1351,6 +1370,9 @@ impl LoadedPlugin for Vst3Plugin {
         // transport block.
         // SAFETY: quiesced window (install / reinit / ARA setup call sites).
         unsafe { self.audio_half_mut().on_activate(sample_rate, max_frames) };
+        let ara_idle = crate::ara::is_idle(self.ara_bound, self.ara.as_ref());
+        // SAFETY: 上の `on_activate` と同じ quiesced window。
+        unsafe { self.audio_half_mut().set_ara_idle(ara_idle) };
         self.active = true;
         tracing::info!(name = %self.name, sample_rate, max_frames, "VST3 plugin activated");
         Ok(())

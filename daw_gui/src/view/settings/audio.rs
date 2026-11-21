@@ -109,10 +109,15 @@ fn draw_asio_driver(ui: &mut Ui<'_, AppData>, pg: &mut Page<'_>) {
 }
 
 /// ドライバーの設定画面を開くボタン。ドライバーを開けていない間は行だけ取って何も置かない
-/// (行の数を変えない)。
+/// (行の数を変えない)。押してみてドライバーが「設定画面は無い」と答えたら (daw_audio が
+/// `has_control_panel = false` を送り直す)、ボタンの場所にそう書く — 押しても何も起きないままにしない。
 fn draw_control_panel(ui: &mut Ui<'_, AppData>, pg: &mut Page<'_>) {
     let rect = pg.row(ui, "asio_panel", "");
-    if !pg.app.audio_device.info.as_ref().is_some_and(|info| info.has_control_panel) {
+    let Some(info) = pg.app.audio_device.info.as_ref().filter(|info| info.driver == AudioDriverKind::Asio) else {
+        return;
+    };
+    if !info.has_control_panel {
+        pg.value(ui, "asio_panel_none", rect, "このドライバーに設定画面はありません", true);
         return;
     }
     let button = Rect { w: rect.w.min(PANEL_BUTTON_W), ..rect };

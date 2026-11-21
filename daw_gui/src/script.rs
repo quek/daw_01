@@ -150,6 +150,7 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("audioDevices", audio_device::daw_audio_devices, 0),
     ("audioDeviceInfo", audio_device::daw_audio_device_info, 0),
     ("audioInputStats", audio_device::daw_audio_input_stats, 0),
+    ("setRespawnCrashedChildren", audio_device::daw_set_respawn_crashed_children, 1),
 ];
 
 fn register_daw_globals(ctx: &mut Context) -> Result<()> {
@@ -276,7 +277,7 @@ fn daw_set_slot_plugin(
     };
     // closure は event loop スレッドで走り得るので Send な値 (String) で返し、JsError には
     // script スレッドで包む。
-    with_app(move |app, side, io| -> Result<(), String> {
+    with_app(move |app, side, _io| -> Result<(), String> {
         // v29: 安定 device id でアドレスする。 事前に loadSongFromObject /
         // loadSongFile 済みの song から解決する (ensure_ids 済み)。
         let Some(device_id) = device_id_at_app(app, track_id, index) else {
@@ -290,7 +291,7 @@ fn daw_set_slot_plugin(
         side.next_raw_load_generation = side.next_raw_load_generation.wrapping_add(1).max(1);
         let generation = side.next_raw_load_generation;
         app.cur.pipc.pending_plugin_loads.insert(device_id, generation);
-        let _ = io.plugin_tx.send(PluginCommand::SetSlotPlugin {
+        app.send_plugin(PluginCommand::SetSlotPlugin {
             device: app.dev(device_id),
             format,
             path: PathBuf::from(path_str),
@@ -586,9 +587,8 @@ fn daw_sleep_ms(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
 /// GUI's pre-export reinit step so the headless harness exercises the real fix.
 fn daw_reinit_for_export(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let timeout_ms = u64::try_from_js(args.get_or_undefined(0), ctx).unwrap_or(30_000);
-    let project = with_app(|app, _, _| app.pk());
+    with_app(|app, _, _| app.send_plugin(PluginCommand::ReinitAllPlugins { project: Some(app.pk()) }));
     let res = with_host(|h| {
-        let _ = h.io.plugin_tx.send(PluginCommand::ReinitAllPlugins { project: Some(project) });
         h.pump_until(
             |msg| matches!(msg, ChildEvent::Plugin(PluginEvent::PluginsReinitDone { .. })),
             Duration::from_millis(timeout_ms),

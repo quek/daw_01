@@ -85,6 +85,21 @@ pub fn copy_aux_inputs_planar(
     }
 }
 
+/// planar buffer の先頭 `n` フレームを無音にする (RT: 確保しない)。
+pub fn silence_planar(bufs: &mut [Vec<f32>], n: usize) {
+    for buf in bufs {
+        let len = n.min(buf.len());
+        buf[..len].fill(0.0);
+    }
+}
+
+/// per-port 版 [`silence_planar`]。
+pub fn silence_planar_ports(port_bufs: &mut [Vec<Vec<f32>>], n: usize) {
+    for bufs in port_bufs {
+        silence_planar(bufs, n);
+    }
+}
+
 /// channel pointer scratch を planar buffer の現在の base pointer で更新。
 pub fn refresh_ptrs(bufs: &mut [Vec<f32>], ptrs: &mut [*mut f32]) {
     for (i, buf) in bufs.iter_mut().enumerate() {

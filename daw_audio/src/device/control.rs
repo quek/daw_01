@@ -389,8 +389,16 @@ impl Control {
             let granted = unsafe { SetForegroundWindow(HWND(self.sys_window)) }.as_bool();
             tracing::info!(granted, "foreground for the driver control panel");
         }
-        if let Err(e) = backend.control_panel() {
-            tracing::warn!(error = %e, "failed to open the driver control panel");
+        match backend.control_panel() {
+            Ok(true) => {}
+            Ok(false) => {
+                // 開いてみるまで有無は分からない (ASIO に問い合わせる口は無い)。無いと分かったら設定画面に
+                // 知らせて、ボタンを「設定画面はありません」の表示に替えてもらう。
+                tracing::info!("the driver has no control panel");
+                self.info.has_control_panel = false;
+                self.send_info();
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to open the driver control panel"),
         }
     }
 

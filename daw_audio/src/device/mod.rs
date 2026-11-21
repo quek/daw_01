@@ -85,12 +85,12 @@ impl Backend {
         }
     }
 
-    /// ドライバーのコントロールパネルを開く (ASIO だけ)。
-    pub fn control_panel(&self) -> Result<(), String> {
+    /// ドライバーのコントロールパネルを開く (ASIO だけ)。`Ok(false)` = このデバイスにパネルは無い。
+    pub fn control_panel(&self) -> Result<bool, String> {
         match self {
             #[cfg(all(windows, target_pointer_width = "64"))]
             Self::Asio(d) => d.control_panel(),
-            _ => Err("このデバイスにコントロールパネルはありません".to_string()),
+            _ => Ok(false),
         }
     }
 }

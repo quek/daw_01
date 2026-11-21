@@ -358,6 +358,7 @@ fn bounded(what: &'static str, value: i32, max: u32) -> Result<u32, Error> {
 }
 
 /// ドライバーが書いた ANSI (システムの code page) の C 文字列を読む。 末尾は必ず NUL にしてから走査する。
+/// 前後の空白・改行は落とす (「Prism Sound USB Audio Class 2.0」は ch 名を `"AO 1\n"` と改行付きで返す)。
 fn ansi_to_string(buf: &mut [u8]) -> String {
     let Some(last) = buf.last_mut() else { return String::new() };
     *last = 0;
@@ -371,5 +372,5 @@ fn ansi_to_string(buf: &mut [u8]) -> String {
         MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), &buf[..len], Some(&mut wide))
     };
     let written = usize::try_from(written).unwrap_or(0).min(wide.len());
-    String::from_utf16_lossy(&wide[..written])
+    String::from_utf16_lossy(&wide[..written]).trim().to_owned()
 }

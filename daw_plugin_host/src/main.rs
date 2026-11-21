@@ -27,6 +27,7 @@ mod load_bench;
 mod module_cache;
 mod editor_window;
 mod plugin_instance;
+mod plugin_thread;
 mod process_scaffold;
 mod process_server;
 mod quiesce;
@@ -43,7 +44,6 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -53,14 +53,13 @@ use common::protocol::{AudioSession, DeviceAddr, InstanceToken, PluginCommand, P
 use common::wire::{read_msg, write_msg};
 use tokio::net::windows::named_pipe::NamedPipeClient;
 use tokio::sync::mpsc as tmpsc;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW,
-    PostThreadMessageW, TranslateMessage, WM_APP,
+    DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_APP,
 };
 
 use crate::plugin_instance::{HostCallbacks, LoadedPlugin, load_plugin};
+use crate::plugin_thread::{MainLoopExit, PluginThread, PluginThreadSender};
 use crate::process_server::{
     METRIC_SLOT_UNASSIGNED, PluginEntry, PluginRegistry, registry_insert, registry_release_metric_slot,
     registry_remove, registry_take_all,
@@ -189,7 +188,7 @@ enum HostMsg {
 async fn main() -> Result<()> {
     // probe (--probe-vst3 / --probe-clap) の早期 return より前に guard を束縛し、
     // probe 実行分のログも flush されるようにする。
-    let _log_guard = common::logging::init_tracing_for("daw_plugin_host");
+    let log_guard = common::logging::init_tracing_for("daw_plugin_host");
     tracing::info!("daw_plugin_host started");
 
     // one-shot VST3 port-probe モード。 daw_gui の rescan が VST3 ごとに
@@ -307,13 +306,30 @@ async fn main() -> Result<()> {
     tracing::info!(?session, "audio session received");
 
     let (evt_tx, evt_rx) = tmpsc::unbounded_channel::<PluginEvent>();
-    let plugin_thread = PluginThread::spawn(session, evt_tx)?;
+    let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<MainLoopExit>();
+    let plugin_thread = PluginThread::spawn(session, evt_tx, exit_tx)?;
 
     // Multiplex pipe I/O: read commands in, write events out.
-    pipe_loop(pipe, plugin_thread.sender(), evt_rx).await;
-
-    tracing::info!("daw_plugin_host shutting down");
+    // plugin-main が終わるのは普通 `pipe_loop` が終わった後 (下の `plugin_thread.shutdown()` が頼む)。先に
+    // 終わったら **自分から終わった** (worker の wedge / plugin が投げた WM_QUIT / panic): 命令を受ける
+    // 相手がもう居ないので、pipe を開いたまま残らずにプロセスを終えて daw_gui の respawn に任せる
+    // (`plugin_thread` の module doc)。`None` = panic (送らずに sender が落ちた)。
+    let early_exit = tokio::select! {
+        () = pipe_loop(pipe, plugin_thread.sender(), evt_rx) => None,
+        exit = &mut exit_rx => Some(exit.ok()),
+    };
+    match early_exit {
+        Some(Some(MainLoopExit::Wedged)) => plugin_thread::terminate_wedged(log_guard),
+        Some(exit) => {
+            tracing::error!(?exit, "plugin-main thread ended on its own; exiting daw_plugin_host so daw_gui respawns it");
+        }
+        None => tracing::info!("daw_plugin_host shutting down"),
+    }
     plugin_thread.shutdown();
+    // 終了要求で畳んだときに worker が固まっていた場合も、普通の終了 (DLL の後始末) を通さない。
+    if early_exit.is_none() && matches!(exit_rx.try_recv(), Ok(MainLoopExit::Wedged)) {
+        plugin_thread::terminate_wedged(log_guard);
+    }
     tracing::info!("daw_plugin_host exiting");
     Ok(())
 }
@@ -488,7 +504,13 @@ fn ara_selftest(path: &std::path::Path, target_id: &str, wav: Option<&str>) -> R
         // (r.md #5 ARA2) Render repro: a render thread drives the audio
         // half's process() while this thread pumps `notifyModelUpdates`.
         if wav.is_some() {
-            ara_render_concurrency_test(plugin.as_ref(), &step);
+            // region を作れなかった instance の `process()` は plugin を呼ばない (`set_ara_idle`)。呼んでいない
+            // のに「固まらなかった」と出さない。
+            if plugin.ara_session().is_some_and(|s| s.has_playback_regions()) {
+                ara_render_concurrency_test(plugin.as_ref(), &step);
+            } else {
+                step("render test SKIPPED: no playback region was created (process() would not call the plug-in)");
+            }
         }
     }
     step("dropping plugin (teardown)");
@@ -618,77 +640,6 @@ fn ara_render_concurrency_test(plugin: &dyn LoadedPlugin, step: &dyn Fn(&str)) {
         std::mem::forget(render);
     } else {
         let _ = render.join();
-    }
-}
-
-// --- PluginThread wrapper --------------------------------------------------
-
-struct PluginThread {
-    join: Option<JoinHandle<()>>,
-    cmd_tx: mpsc::Sender<HostMsg>,
-    thread_id: u32,
-}
-
-impl PluginThread {
-    fn spawn(session: AudioSession, evt_tx: tmpsc::UnboundedSender<PluginEvent>) -> Result<Self> {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<HostMsg>();
-        let (tid_tx, tid_rx) = mpsc::channel::<u32>();
-
-        let join = std::thread::Builder::new()
-            .name("plugin-main".into())
-            .spawn(move || {
-                let tid = unsafe { GetCurrentThreadId() };
-                let _ = tid_tx.send(tid);
-                plugin_main_loop(session, cmd_rx, evt_tx);
-            })
-            .context("failed to spawn plugin-main thread")?;
-
-        let thread_id = tid_rx
-            .recv()
-            .context("plugin-main thread failed to report its id")?;
-
-        Ok(Self {
-            join: Some(join),
-            cmd_tx,
-            thread_id,
-        })
-    }
-
-    fn sender(&self) -> PluginThreadSender {
-        PluginThreadSender {
-            cmd_tx: self.cmd_tx.clone(),
-            thread_id: self.thread_id,
-        }
-    }
-
-    fn shutdown(mut self) {
-        let _ = self.cmd_tx.send(HostMsg::Shutdown);
-        wake_thread(self.thread_id);
-        if let Some(handle) = self.join.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-#[derive(Clone)]
-struct PluginThreadSender {
-    cmd_tx: mpsc::Sender<HostMsg>,
-    thread_id: u32,
-}
-
-impl PluginThreadSender {
-    fn send(&self, msg: HostMsg) {
-        if self.cmd_tx.send(msg).is_err() {
-            tracing::warn!("plugin-main thread channel closed; command dropped");
-            return;
-        }
-        wake_thread(self.thread_id);
-    }
-}
-
-fn wake_thread(thread_id: u32) {
-    unsafe {
-        let _ = PostThreadMessageW(thread_id, WM_COMMAND_WAKE, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -2084,7 +2035,9 @@ impl PluginHost {
     ///
     /// `UnloadProject` と同じ列挙 (= plugin_host 自身の `instances`。こちらは project で
     /// 絞らない) と同じ teardown を通すので、「全部畳め」の実装は 1 つしかない。
-    fn shutdown(mut self) {
+    /// 戻り値 = `process()` から戻らない worker が残ったか (`wedged`)。残っていたら呼び出し側がプロセスを
+    /// 後始末を通さずに終える (`plugin_thread::terminate_wedged`)。
+    fn shutdown(mut self) -> bool {
         // (1) worker pool を先に止める。`shutdown` は全 worker thread を join
         //     するので、以後 registry を触る RT スレッドは存在しない
         //     (= teardown_device の `detach_and_quiesce` より強い保証)。
@@ -2098,6 +2051,7 @@ impl PluginHost {
         for id in ids {
             self.teardown_device(id, false);
         }
+        !self.wedged.is_empty()
     }
 }
 
@@ -2171,7 +2125,7 @@ fn plugin_main_loop(
     session: AudioSession,
     cmd_rx: mpsc::Receiver<HostMsg>,
     evt_tx: tmpsc::UnboundedSender<PluginEvent>,
-) {
+) -> MainLoopExit {
     // plugin 発の非同期 host 要求 (resize / close / restart / ...) を
     // callback → channel → この loop で直列化する。tokio unbounded sender
     // は `Send + Sync` (HostCallbacks の閉包要件)。
@@ -2190,8 +2144,8 @@ fn plugin_main_loop(
     // r.md #138: 鍵盤の名前の取り直し。エディタ窓が開いているときだけ回す。
     let mut key_names_timer = thread_timer::ThreadTimer::new(key_names::POLL_MS);
 
-    // (r.md #61) 抜け方は 3 通り (cmd channel 切断 / `HostMsg::Shutdown` /
-    // `GetMessageW` の WM_QUIT・エラー) あるが、**後始末は loop の直後 1 箇所**に
+    // (r.md #61) 抜け方は 4 通り (cmd channel 切断 / `HostMsg::Shutdown` /
+    // `GetMessageW` の WM_QUIT・エラー / worker の wedge) あるが、**後始末は loop の直後 1 箇所**に
     // 集約する。旧実装は 3 箇所に散っていて、Disconnected 経路だけ `KillTimer` を
     // 呼ばない非対称があった。
     let exit_reason = 'main: loop {
@@ -2206,7 +2160,7 @@ fn plugin_main_loop(
                 HostMsg::Cmd(cmd) => host.handle_command(cmd),
             }
             if !host.wedged.is_empty() {
-                break 'main "worker wedged in plugin process()";
+                break 'main WEDGED_REASON;
             }
         }
 
@@ -2259,9 +2213,20 @@ fn plugin_main_loop(
 
     ara_timer.sync(false);
     key_names_timer.sync(false);
-    host.shutdown();
-    tracing::info!(reason = exit_reason, "plugin-main thread exiting");
+    if exit_reason == WEDGED_REASON {
+        // ほかの plugin を畳まずに抜ける: 固まったスレッドが握っているロックを teardown が待つと (同じ DLL の
+        // 別 instance など)、ここから戻れず、プロセスが終わらない。すぐ `terminate_wedged` に渡す。
+        tracing::error!(reason = exit_reason, "plugin-main thread exiting without teardown");
+        std::mem::forget(host);
+        return MainLoopExit::Wedged;
+    }
+    let wedged = host.shutdown();
+    tracing::info!(reason = exit_reason, wedged, "plugin-main thread exiting");
+    if wedged { MainLoopExit::Wedged } else { MainLoopExit::Normal }
 }
+
+/// [`plugin_main_loop`] が「worker が plugin の `process()` から戻らない」で抜けるときの理由。
+const WEDGED_REASON: &str = "worker wedged in plugin process()";
 
 /// CLAP / VST3 spec の teardown 順 (stop_processing → deactivate →
 /// gui_destroy → drop) を実行する。呼び出し側は事前に registry detach +

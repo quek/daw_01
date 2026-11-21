@@ -79,6 +79,9 @@ ASIO のドライバーは作ったスレッドに縛られる (STA の COM obje
   送る直前に `AllowSetForegroundWindow` し、daw_audio が隠し窓を前面にしてから `controlPanel()` を呼ぶ。
   modal なパネルが開いている間、制御スレッドはその中に居る (park の追従と終了はパネルを閉じるまで待つ。
   終了は daw_gui が 3 秒で見切る)。
+- **パネルの有無は開いてみるまで分からない** (ASIO に問い合わせる口は無い)。`controlPanel()` が
+  `ASE_NotPresent` を返したら `has_control_panel = false` で `DeviceInfo` を送り直し、設定画面はボタンの
+  場所に「このドライバーに設定画面はありません」と出す (実機: Prism Sound USB Audio Class 2.0)。
 
 ## 5. 開けないとき
 
@@ -106,6 +109,7 @@ OS 標準で入力だけ開けないとき (入力デバイスが無い / 入力
 - `daw_gui/tests/scripts/audio_device_switch.js` (`cargo test -p daw_gui --features script --test audio_device_smoke`):
   OS 標準 → 合成 → 開き直し → 存在しないデバイス → 既定。`--arg "asio=<名前>|<名前>"` でその ASIO ドライバーにも
   切り替える (使用中の実機を指さないこと。ドライバーは排他のことが多い)。
-- script の口: `daw.setAudioDevice` / `audioDevices` / `audioDeviceInfo` / `audioInputStats`
-  (`daw_gui/src/script/audio_device.rs`)。窓なしの script は隔離した設定で動き、保存された実機は開かない。
+- script の口: `daw.setAudioDevice` / `audioDevices` / `audioDeviceInfo` / `audioInputStats` /
+  `setRespawnCrashedChildren` (`daw_gui/src/script/audio_device.rs`)。窓なしの script は隔離した設定で動き、
+  保存された実機は開かない。
 - `daw_audio --asio-probe [名前]`: ASIO の層だけの実測 (列挙 / 申告値 / 無音 1 秒)。

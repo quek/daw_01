@@ -122,6 +122,8 @@ pub struct ClapAudioHalf {
     /// r.md #117: `process()` の通し番号 (`ClapParamMeta::per_note_epoch` の比較相手)。 0 始まりで
     /// 最初の buffer は 1 なので、 初期値 0 の印はどの buffer にも一致しない。
     process_epoch: u64,
+    /// [`AudioProcessorHalf::set_ara_idle`]。
+    ara_idle: bool,
     /// Last absolute value the host sent per param (base for the
     /// non-modulatable fold path). Seeded with defaults at load — process()
     /// only updates existing keys (no RT heap alloc).
@@ -251,6 +253,13 @@ impl AudioProcessorHalf for ClapAudioHalf {
         transport: &crate::plugin_instance::TransportContext,
     ) -> Result<i32> {
         anyhow::ensure!(self.processing, "plugin not processing");
+        if self.ara_idle {
+            // region の無い ARA instance は呼ばずに無音を返す (`AudioProcessorHalf::set_ara_idle`)。
+            let n = frames as usize;
+            process_scaffold::silence_planar(&mut self.output_buffers, n);
+            process_scaffold::silence_planar_ports(&mut self.aux_output_buffers, n);
+            return Ok(clap_sys::process::CLAP_PROCESS_CONTINUE);
+        }
 
         self.pending_events.clear();
         for ev in events {
@@ -477,6 +486,10 @@ impl AudioProcessorHalf for ClapAudioHalf {
         out.append(&mut self.collected_out_param_releases);
     }
 
+    fn set_ara_idle(&mut self, idle: bool) {
+        self.ara_idle = idle;
+    }
+
     fn on_activate(&mut self, _sample_rate: f64, max_frames: u32) {
         let mf = max_frames as usize;
         self.gestures.clear();
@@ -525,6 +538,9 @@ pub struct ClapPlugin {
     id: String,
     /// ARA session bound to this instance, if any.
     ara: Option<crate::ara::session::AraSession>,
+    /// この instance を ARA の document に bind したことがあるか (bind は instance が死ぬまで解けない。
+    /// session を畳んだ後も `true` のまま — `crate::ara::is_idle`)。
+    ara_bound: bool,
     /// Last successful `activate` params (ARA setup の deactivate →
     /// reactivate 用)。
     last_activate: Option<(f64, u32, u32)>,
@@ -750,6 +766,7 @@ impl ClapPlugin {
             pending_param_mods: Vec::with_capacity(common::process_data::MAX_PARAM_MODS),
             param_meta,
             process_epoch: 0,
+            ara_idle: false,
             last_param_value,
             event_order: Vec::with_capacity(common::process_data::MAX_RT_EVENT_BUFFER),
             collected_out_notes: Vec::with_capacity(256),
@@ -765,6 +782,7 @@ impl ClapPlugin {
             host,
             id,
             ara: None,
+            ara_bound: false,
             last_activate: None,
             name,
             path: path.to_path_buf(),
@@ -876,6 +894,9 @@ impl LoadedPlugin for ClapPlugin {
         // SAFETY: quiesced window (install / reinit / ARA setup — the entry
         // is detached from the registry at every call site).
         unsafe { self.audio_half_mut().on_activate(sample_rate, max_frames) };
+        let ara_idle = crate::ara::is_idle(self.ara_bound, self.ara.as_ref());
+        // SAFETY: 上の `on_activate` と同じ quiesced window。
+        unsafe { self.audio_half_mut().set_ara_idle(ara_idle) };
         tracing::info!(sample_rate, max_frames, "plugin activated");
         Ok(())
     }
@@ -1064,6 +1085,7 @@ impl LoadedPlugin for ClapPlugin {
             })
         }?;
         self.ara = Some(session);
+        self.ara_bound = true;
         Ok(true)
     }
 
@@ -2124,6 +2146,7 @@ mod tests {
             pending_param_mods: Vec::new(),
             param_meta: [(1, meta(false)), (2, meta(true))].into_iter().collect(),
             process_epoch: 0,
+            ara_idle: false,
             last_param_value: [(1, 2.0), (2, 2.0)].into_iter().collect(),
             event_order: Vec::new(),
             collected_out_notes: Vec::new(),

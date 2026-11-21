@@ -204,3 +204,19 @@ pub(super) fn daw_audio_input_stats(_this: &JsValue, _args: &[JsValue], ctx: &mu
     });
     JsValue::from_json(&json, ctx)
 }
+
+/// `daw.setRespawnCrashedChildren(on)` — 落ちた子プロセスを本番と同じに起こし直すか。窓なしの script の
+/// 既定は `false` (検証の途中で子が落ちたことを、起こし直しで隠さない。`--script --gui` は本番と同じ `true`)。
+/// 「子が落ちた後に立ち直ること」そのものを確かめる script だけが `true` にする。`on` は真偽値だけ受ける。
+pub(super) fn daw_set_respawn_crashed_children(
+    _this: &JsValue,
+    args: &[JsValue],
+    _ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let on = args
+        .get_or_undefined(0)
+        .as_boolean()
+        .ok_or_else(|| js_native("setRespawnCrashedChildren: 引数は true / false で渡してください"))?;
+    with_app(move |app, _side, _io| app.ipc.respawn_crashed_children = on);
+    Ok(JsValue::undefined())
+}

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use boa_engine::{Context, Source};
-use common::protocol::{AudioCommand, DeviceAddr, PluginCommand, PluginEvent};
+use common::protocol::{AudioCommand, DeviceAddr, PluginEvent};
 
 use crate::app::{AppData, AppEvent};
 use crate::bootstrap::{Bootstrap, ChildEvent};
@@ -80,11 +80,11 @@ fn eval_script(source: &str) -> Result<()> {
 /// script が触る IPC / shmem のハンドル。`Bootstrap` から抜いた clone で、headless でも
 /// GUI でも同じ形 (= API 実装がモードを意識しない)。
 ///
-/// **daw_audio への送り口はここに持たない** — daw_audio はオーディオデバイスの切り替えで起こし直され
-/// (r.md #156)、送り口が差し替わる。`AppData::send_audio` (今の送り口の SSoT) を使う。
+/// **子プロセスへの送り口はここに持たない** — daw_audio はオーディオデバイスの切り替えで (r.md #156)、
+/// daw_plugin_host は落ちた後の respawn で起こし直され、送り口が差し替わる。`AppData::send_audio` /
+/// `AppData::send_plugin` (今の送り口の SSoT) を使う。
 #[derive(Clone)]
 pub struct ScriptIo {
-    pub plugin_tx: tokio::sync::mpsc::UnboundedSender<PluginCommand>,
     pub bridge: Arc<common::audio_bridge::AudioBridgeHandle>,
     pub metrics: Arc<common::metrics_bridge::MetricsBridgeHandle>,
     pub scope: Arc<common::scope_bridge::ScopeBridgeHandle>,
@@ -94,7 +94,6 @@ pub struct ScriptIo {
 impl ScriptIo {
     pub fn from_bootstrap(b: &Bootstrap) -> Self {
         Self {
-            plugin_tx: b.plugin_tx.clone(),
             bridge: Arc::clone(&b.bridge),
             metrics: Arc::clone(&b.metrics),
             scope: Arc::clone(&b.scope),
@@ -391,8 +390,7 @@ impl ScriptHost {
             return;
         };
         let HeadlessLink { bootstrap, mut app, .. } = *headless;
-        // `AppData` には supervisor を渡していない (script mode は respawn しない)
-        // ので、pipe loop への「これ以降の切断は crash ではない」通知はここで直接。
+        // pipe loop への「これ以降の切断は crash ではない」通知は、app の終了シーケンスより先にここで直接。
         let supervisor = Arc::clone(&bootstrap.supervisor);
         supervisor.begin_shutdown();
         app.begin_shutdown(crate::shutdown::QuitRequest::USER);
@@ -548,6 +546,12 @@ fn dispatch_incoming_headless(app: &mut AppData, msg: &ChildEvent) {
         PluginEvent::SlotPluginLoaded { .. }
         | PluginEvent::SlotPluginShmemReleased { .. }
         | PluginEvent::SlotPluginLoadFailed { .. } => {
+            app.handle_event(AppEvent::Plugin(msg.clone()));
+        }
+        // plugin host が落ちた。`daw.setRespawnCrashedChildren(true)` の script だけ、本番と同じ respawn +
+        // 復元へ通す。既定では通さない: handler は起こし直さないときも「読み込み待ち」を空にするので、
+        // 落ちたことが `pendingPluginLoadsJson()` から見えなくなる (待ちが timeout する方が検証として正しい)。
+        PluginEvent::ChildDisconnected if app.ipc.respawn_crashed_children => {
             app.handle_event(AppEvent::Plugin(msg.clone()));
         }
         PluginEvent::SlotPluginUnloaded { device: DeviceAddr { device_id, .. } } => {

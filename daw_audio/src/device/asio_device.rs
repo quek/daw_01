@@ -182,8 +182,13 @@ impl AsioDevice {
         result.map_err(|e| e.to_string())
     }
 
-    pub fn control_panel(&self) -> Result<(), String> {
-        self.driver.control_panel().map_err(|e| e.to_string())
+    /// `Ok(false)` = ドライバーが「設定画面は無い」と答えた (`ASE_NotPresent`。ASIO SDK の `ASIOControlPanel`)。
+    pub fn control_panel(&self) -> Result<bool, String> {
+        match self.driver.control_panel() {
+            Ok(()) => Ok(true),
+            Err(crate::asio::driver::Error::Call { code: crate::asio::sys::ASE_NOT_PRESENT, .. }) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// コールバックが数えた「ドライバー側の変更」を拾う。開き直しの求めは [`SETTLE`] の間止むのを待ってから

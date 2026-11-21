@@ -184,6 +184,14 @@ fn asio_fixed_buffer_state(app: &mut AppData) {
     }
 }
 
+/// コントロールパネルを押したら、ドライバーが「設定画面は無い」と答えた後 (ボタンの場所に文が出る)。
+fn asio_no_panel_state(app: &mut AppData) {
+    asio_fixed_buffer_state(app);
+    if let Some(info) = &mut app.audio_device.info {
+        info.has_control_panel = false;
+    }
+}
+
 /// ASIO のドライバーを選んだが開けず、OS 標準の既定デバイスへ戻っている。
 fn fallback_state(app: &mut AppData) {
     system_state(app);
@@ -205,6 +213,7 @@ fn pages() -> Vec<PageCase> {
         ("audio_system", SettingsCategory::Audio, system_state),
         ("audio_asio", SettingsCategory::Audio, asio_state),
         ("audio_asio_fixed", SettingsCategory::Audio, asio_fixed_buffer_state),
+        ("audio_asio_no_panel", SettingsCategory::Audio, asio_no_panel_state),
         ("audio_fallback", SettingsCategory::Audio, fallback_state),
         ("voicevox", SettingsCategory::Voicevox, |_| {}),
         ("theme", SettingsCategory::Theme, |_| {}),
