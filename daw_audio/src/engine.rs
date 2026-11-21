@@ -2403,7 +2403,6 @@ mod multi_project_tests {
     fn run(r: &mut Rig, buffers: usize) {
         for _ in 0..buffers {
             r.dev.process_buffer(
-                &r.shared,
                 &r.bridge,
                 &r.scope,
                 &r.device_scope,
@@ -2458,7 +2457,7 @@ mod multi_project_tests {
                     input_latency_frames: 0,
                     output_latency_frames: 0,
                 };
-                r.dev.process_buffer(&r.shared, &r.bridge, &r.scope, &r.device_scope, 48_000, N, io);
+                r.dev.process_buffer(&r.bridge, &r.scope, &r.device_scope, 48_000, N, io);
             }
             let case = format!("{monitor:?} armed={armed} active={active}");
             if heard {

@@ -28,6 +28,8 @@ struct Rig {
     shared: Arc<SharedState>,
     project: Arc<ProjectShared>,
     buf: Vec<f32>,
+    /// コールバックに届いたフレームの通し番号 (本番は `EngineCallback` が数える)。
+    device_frame: u64,
     // 生かしておくだけ (落とすと RT 側の受け口が閉じる)。
     _keep: (rtrb::Producer<RtBundle>, rtrb::Producer<ProjectDelivery>),
 }
@@ -90,6 +92,8 @@ fn rig(tag: &str, ahead: bool) -> Rig {
         device_scope,
         SR,
         CH,
+        // 入力の無いデバイス。
+        crate::device::monitor::monitor_pair(common::audio_device::ChannelRange::default(), 1).1,
     );
     let (stage, worker) = OutputStage::new(renderer);
     Rig {
@@ -99,6 +103,7 @@ fn rig(tag: &str, ahead: bool) -> Rig {
         shared,
         project,
         buf: vec![0.0; FRAMES * CH],
+        device_frame: 0,
         _keep: (bundle_tx, project_tx),
     }
 }
@@ -142,7 +147,8 @@ fn bundle(song: &Arc<Song>) -> RtBundle {
 impl Rig {
     /// コールバック 1 回と、それに起こされた描画スレッドの 1 回分。
     fn cycle(&mut self) {
-        self.stage.on_callback(&mut self.buf);
+        self.stage.on_callback(&mut self.buf, self.device_frame);
+        self.device_frame += FRAMES as u64;
         self.worker.step();
     }
 

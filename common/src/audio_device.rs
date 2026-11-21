@@ -28,9 +28,14 @@ pub enum AudioDriverKind {
 pub mod synthetic {
     /// 入力 ch `c` の、入力の通し番号 `i` のフレームが `(c, i)` から決まる値 (`ramp_sample`)。
     pub const RAMP: &str = "ramp";
-    /// 1 つ前のコールバックで出した出力 (L / R) を次のコールバックの入力 ch 0 / 1 に返す。
-    /// 申告レイテンシは「入力 0 + 出力 1 周期」。
+    /// 入力 ch 0 / 1 = デバイスへ出した出力 L / R (`mute_output` で消す前) を「入力レイテンシ + 出力レイテンシ」
+    /// フレーム遅らせたもの (他の入力 ch は無音)。申告レイテンシは入力 [`LOOPBACK_INPUT_LATENCY`]、出力
+    /// [`LOOPBACK_OUTPUT_LATENCY`] + バッファ 1 枚ぶん (実機と同じく、出力レイテンシはバッファを含む)。
     pub const LOOPBACK: &str = "loopback";
+    /// `LOOPBACK` の入力レイテンシ (frames)。
+    pub const LOOPBACK_INPUT_LATENCY: u32 = 64;
+    /// `LOOPBACK` の出力レイテンシのうち、バッファ 1 枚ぶんを除いた分 (frames)。
+    pub const LOOPBACK_OUTPUT_LATENCY: u32 = 128;
     /// 合成のデバイスの入力 ch 数。
     pub const INPUT_CHANNELS: u16 = 4;
     /// `RAMP` ののこぎり波の周期 (フレーム)。
@@ -214,7 +219,9 @@ pub struct AudioDeviceInfo {
     pub output_latency_frames: u32,
     /// ドライバーのコントロールパネルを開けるか (ASIO だけ)。
     pub has_control_panel: bool,
-    /// 設定どおりに開けず、OS 標準の既定デバイスへ戻したときの理由 (人が読む 1 行)。
+    /// 設定どおりに開けなかったときの理由 (人が読む 1 行)。出力が開けなければ OS 標準の既定デバイスへ戻す
+    /// (それも無ければ、音の出ない合成のデバイスで engine だけ動かす)。OS 標準で入力だけ開けなかったときは、
+    /// 出力は設定どおりで入力なしになる。
     pub fallback_reason: Option<String>,
 }
 

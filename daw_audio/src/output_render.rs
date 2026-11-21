@@ -14,17 +14,25 @@
 //! 遅れの勘定: 先読み中のエンジンの「今」はスピーカーより [`RENDER_AHEAD_PERIODS`] 周期先に居る。GUI が見る
 //! transport (再生位置・走行・count-in・録音してよいか) はその回数ぶん遅らせて出す (`engine::TransportOut`)。
 //!
+//! デバイスの時計 (r.md #156、`crate::device::input`): 描く 1 回ごとに「このブロックの先頭がデバイスへ渡る
+//! 時点の通し番号」(`out_frame`) を engine へ渡す。コールバックの中で描くときは今のコールバックの番号そのもの。
+//! 先読みのときは「これまでにリングへ積んだフレーム数 + リングを通らずにデバイスへ渡ったフレーム数
+//! (コールバックの中で描いた分と、リングが空で無音を渡した分。[`Link::not_from_ring`])」。描いた後でリングが
+//! 空になる回があると、描き済みのブロックはその分だけ後ろへずれる (描いた時点の見込み)。
+//!
 //! RT: コールバックと描画スレッドは確保・ロック・I/O をしない。リングは rtrb (wait-free SPSC)、
 //! 起こしは `Thread::unpark` (Windows は WakeByAddress、確保もロックも無い)。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use common::audio_bridge::AudioBridgeHandle;
 use common::metrics_bridge::MetricsBridgeHandle;
 use common::scope_bridge::ScopeBridgeHandle;
 
+use crate::device::input::DeviceIo;
+use crate::device::monitor::MonitorInput;
 use crate::engine::{self, DeviceRt, SharedState};
 
 /// 先読みで先に描く周期の数。「90% の次に 110%」の重い 1 回を前の回の余りで吸収できる最小の数
@@ -53,6 +61,8 @@ pub(crate) struct OutputRenderer {
     dsp_load_ema: f32,
     // r.md #49: アイドル park に入るまでの連続無音サンプル数。
     idle_park_samples: u64,
+    /// r.md #156: デバイスの入力の受け口 (コールバックが積み、描く 1 回ごとに取り出す)。
+    monitor: MonitorInput,
 }
 
 impl OutputRenderer {
@@ -66,6 +76,7 @@ impl OutputRenderer {
         device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
         session_sample_rate: u32,
         channels: usize,
+        monitor: MonitorInput,
     ) -> Self {
         // panic-button master declick. `AudioCommand::Panic` sets
         // `shared.panic_declick`; the renderer consumes that edge and fades the
@@ -91,6 +102,7 @@ impl OutputRenderer {
             declick_released_at: None,
             dsp_load_ema: 0.0,
             idle_park_samples: sr64 * engine::IDLE_PARK_DELAY_SECS,
+            monitor,
         }
     }
 
@@ -99,7 +111,9 @@ impl OutputRenderer {
     /// `ahead`: 描画スレッドが先読みで描いているか。transport の publish を遅らせるか (`engine::TransportOut`) と、
     /// 「処理時間 > 周期」を xrun として数えるか (コールバックの中で描くときだけ — 先読みの xrun は
     /// 「リングが空だった回」でコールバックが数える) を決める。
-    pub(crate) fn render(&mut self, data: &mut [f32], ahead: bool) {
+    ///
+    /// `out_frame`: このブロックの先頭がデバイスへ渡る時点の通し番号 (module doc)。
+    pub(crate) fn render(&mut self, data: &mut [f32], ahead: bool, out_frame: u64) {
         // resource monitor (r.md #3): 描く処理全体の時間を測る。 plugin 処理は worker pool でブロッキング同期
         // されるため、 この区間に plugin 負荷が含まれる。 `Instant::now()` は RT 許容。
         let cb_start = std::time::Instant::now();
@@ -110,15 +124,17 @@ impl OutputRenderer {
         self.local.render_ahead = ahead;
         self.metrics.set_render_ahead(ahead);
 
-        self.local.process_buffer(
-            &self.shared,
-            &self.bridge,
-            &self.scope,
-            &self.device_scope,
-            sr,
-            frames,
-            crate::device::input::DeviceIo::NONE,
-        );
+        // r.md #156: この回に混ぜる入力。コールバックの中で描くときは同じコールバックに届いた分 (番号が同じ)。
+        // 先読みのときは描画が描き溜めの周期ぶん先に走っているので、その分だけ前の番号の入力
+        // (= いま届いている一番新しい分) を使う。
+        let lead = if ahead { (RENDER_AHEAD_PERIODS * frames) as u64 } else { 0 };
+        let io = DeviceIo {
+            input: self.monitor.take(frames, out_frame.saturating_sub(lead), &self.metrics),
+            out_frame,
+            input_latency_frames: self.shared.input_latency_frames.load(Ordering::Relaxed),
+            output_latency_frames: self.shared.output_latency_frames.load(Ordering::Relaxed),
+        };
+        self.local.process_buffer(&self.bridge, &self.scope, &self.device_scope, sr, frames, io);
 
         // consume the panic edge to (re)start the master
         // declick envelope at sample 0 of this buffer.
@@ -258,6 +274,9 @@ struct Link {
     /// 描画スレッドが最後に描いた回が再生中だったか (リングが空の回を xrun として数えるかの判定)。
     playing: AtomicBool,
     stop: AtomicBool,
+    /// リングを通らずにデバイスへ渡ったフレーム数 (累積): コールバックの中で描いた分と、リングが空で無音を
+    /// 渡した分。描画スレッドが `out_frame` を出すのに使う (module doc)。
+    not_from_ring: AtomicU64,
 }
 
 /// 停止中か (描き手を替えてよいか)。count-in も走っている扱い ([`DeviceRt::any_rolling`])。
@@ -265,9 +284,10 @@ fn may_switch(r: &OutputRenderer) -> bool {
     !r.local.any_rolling()
 }
 
-/// CPAL クロージャの持ち物: 描き手 (先読みしない間)・リングの読み口・描き手の受け渡し口・描画スレッド。
+/// デバイスのコールバック (`crate::device::callback::EngineCallback`) の持ち物: 描き手 (先読みしない間)・
+/// リングの読み口・描き手の受け渡し口・描画スレッド。
 ///
-/// drop (= CPAL の stream とクロージャが捨てられたとき) で描画スレッドを止めて join する。描画スレッドが
+/// drop (= プロセスの終わりにコールバックごと捨てられたとき) で描画スレッドを止めて join する。描画スレッドが
 /// 持っていた `OutputRenderer` はそのスレッドの上で、こちらが持っていた分はここで drop される (どちらも RT の外)。
 pub(crate) struct OutputStage {
     /// コールバックが描き手のとき `Some`。
@@ -306,6 +326,7 @@ impl OutputStage {
             period: AtomicUsize::new(0),
             playing: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            not_from_ring: AtomicU64::new(0),
         });
         let worker = RenderThread {
             held: None,
@@ -316,6 +337,7 @@ impl OutputStage {
             shared: Arc::clone(&shared),
             scratch: vec![0.0; common::process_data::MAX_FRAMES * channels],
             channels,
+            pushed: 0,
         };
         let stage = Self {
             inline: Some(Box::new(renderer)),
@@ -331,8 +353,10 @@ impl OutputStage {
         (stage, worker)
     }
 
-    /// CPAL コールバックの本体。待たない。
-    pub(crate) fn on_callback(&mut self, data: &mut [f32]) {
+    /// デバイスのコールバックの本体 (`MAX_FRAMES` 以下の 1 回ぶん)。待たない。
+    ///
+    /// `device_frame`: この回の先頭のフレームの通し番号 (`crate::device::input` の時計)。
+    pub(crate) fn on_callback(&mut self, data: &mut [f32], device_frame: u64) {
         let frames = data.len() / self.channels;
         self.link
             .period
@@ -343,7 +367,7 @@ impl OutputStage {
             self.inline = Some(r);
         }
         if self.inline.is_some() {
-            self.render_inline(data);
+            self.render_inline(data, device_frame);
         } else {
             self.take_from_ring(data);
         }
@@ -354,7 +378,7 @@ impl OutputStage {
 
     /// 先読みしない間: 先読みから戻った直後に残っている描き溜めを先に出し切り (時間を連続に保つ)、残りを自分で描く。
     /// 停止中に先読みを望まれていれば、描き溜めが空になった回の後で描き手を描画スレッドへ渡す。
-    fn render_inline(&mut self, data: &mut [f32]) {
+    fn render_inline(&mut self, data: &mut [f32], device_frame: u64) {
         let drained = self.cons.slots().min(data.len());
         if drained > 0
             && let Ok(chunk) = self.cons.read_chunk(drained)
@@ -366,7 +390,11 @@ impl OutputStage {
         }
         let Some(r) = self.inline.as_mut() else { return };
         if drained < data.len() {
-            r.render(&mut data[drained..], false);
+            let drained_frames = (drained / self.channels) as u64;
+            r.render(&mut data[drained..], false, device_frame + drained_frames);
+            self.link
+                .not_from_ring
+                .fetch_add((data.len() / self.channels) as u64 - drained_frames, Ordering::Release);
         }
         if self.shared.render_ahead_wanted.load(Ordering::Acquire) && may_switch(r) && self.cons.is_empty() {
             let Some(r) = self.inline.take() else { return };
@@ -388,6 +416,7 @@ impl OutputStage {
             }
             Err(_) => {
                 data.fill(0.0);
+                self.link.not_from_ring.fetch_add((data.len() / self.channels) as u64, Ordering::Release);
                 if self.link.playing.load(Ordering::Acquire) {
                     self.metrics.add_xrun();
                 }
@@ -420,6 +449,8 @@ struct RenderThread {
     /// 1 回分を描く作業場 (起動時に確保、以後使い回す)。
     scratch: Vec<f32>,
     channels: usize,
+    /// これまでにリングへ積んだフレーム数 (`out_frame` の勘定、module doc)。
+    pushed: u64,
 }
 
 impl RenderThread {
@@ -467,7 +498,8 @@ impl RenderThread {
             && let Ok(mut chunk) = self.prod.write_chunk(len)
         {
             let buf = &mut self.scratch[..len];
-            r.render(buf, true);
+            r.render(buf, true, self.pushed + self.link.not_from_ring.load(Ordering::Acquire));
+            self.pushed += p as u64;
             let (a, b) = chunk.as_mut_slices();
             let split = a.len();
             a.copy_from_slice(&buf[..split]);

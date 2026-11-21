@@ -936,7 +936,11 @@ impl AppData {
                 export_aborted |= self.any_tab_mut(|app| {
                     app.abort_audio_export("音声エンジンがクラッシュしたため書き出しを中止しました".into())
                 });
-                tracing::warn!("daw_audio child disconnected");
+                if planned {
+                    tracing::info!("restarting daw_audio (audio device change)");
+                } else {
+                    tracing::warn!("daw_audio child disconnected");
+                }
             }
             ChildKind::PluginHost => {
                 self.ipc.plugin_tx = None;
@@ -1021,7 +1025,7 @@ impl AppData {
             self.ipc.supervisor.clone().filter(|_| planned || self.ipc.respawn_crashed_children);
         let Some(supervisor) = supervisor else {
             if kind == ChildKind::Audio {
-                self.audio_device.info = None;
+                self.on_audio_child_gone(None);
             }
             self.ui_ephemeral.status_message = format!(
                 "{}が切断されました{}{} — supervisor 無効",
@@ -1053,10 +1057,12 @@ impl AppData {
                         "audio respawn changed the session sample rate"
                     );
                     self.ipc.sample_rate = r.sample_rate;
+                    // r.md #156: plugin は古いレートで activate されたままなので、新しいレートでやり直させる
+                    // (追従しないと音程と長さがレートの比だけずれる)。
+                    self.send_plugin(common::protocol::PluginCommand::SetSessionSampleRate(r.sample_rate));
                 }
                 // r.md #156: 新しい daw_audio が開いたデバイス。
-                self.audio_device.info = Some(r.device_info);
-                self.audio_device.error = None;
+                self.on_audio_child_respawned(r.device_info);
                 self.send_plugin(common::protocol::PluginCommand::CloseWorkerPool);
                 self.send_plugin(common::protocol::PluginCommand::OpenWorkerPool(r.pool));
             }),
@@ -1081,9 +1087,7 @@ impl AppData {
             }
             Err(e) => {
                 if kind == ChildKind::Audio {
-                    // r.md #156: daw_audio が居ない = どのデバイスも開いていない。
-                    self.audio_device.info = None;
-                    self.audio_device.error = Some(format!("{e:#}"));
+                    self.on_audio_child_gone(Some(format!("{e:#}")));
                 }
                 // (v29 §3) ビルド世代不一致は respawn を繰り返しても直らない。
                 // ユーザー向けに「make build」 を明示し、 これ以上の自動

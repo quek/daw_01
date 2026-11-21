@@ -23,6 +23,7 @@
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::ptr::{NonNull, null_mut};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -46,10 +47,6 @@ pub struct ChannelSpec {
 /// 有効にした ch 1 本の buffer (ドライバー所有の 2 面)。
 pub struct ChannelBuffer {
     pub is_input: bool,
-    #[expect(dead_code, reason = "読み手は sample type 変換 (r.md #156 の次の段) で入る")]
-    pub channel: u32,
-    #[expect(dead_code, reason = "読み手は sample type 変換 (r.md #156 の次の段) で入る")]
-    pub sample_type: sys::AsioSampleType,
     pub bytes_per_sample: usize,
     halves: [NonNull<u8>; 2],
 }
@@ -72,7 +69,6 @@ impl IoBuffers<'_> {
     }
 
     /// `index` 番目が入力 ch なら、届いた sample。
-    #[expect(dead_code, reason = "呼び手は入力の録音 (r.md #156 の次の段) で入る")]
     pub fn input(&self, index: usize) -> Option<&[u8]> {
         let ch = self.channels.get(index).filter(|ch| ch.is_input)?;
         // SAFETY: `Stream::create` が null でないことと長さ (`frames * bytes_per_sample` が溢れない
@@ -145,7 +141,7 @@ pub struct StatsSnapshot {
 }
 
 struct State {
-    /// `outputReady` を callback のスレッドから呼ぶための object (寿命は `Stream` の `&Driver`)。
+    /// `outputReady` を callback のスレッドから呼ぶための object (寿命は `Stream` が握る `Rc<Driver>`)。
     driver: *mut sys::IAsio,
     post_output: bool,
     frames: usize,
@@ -328,17 +324,19 @@ impl Drop for Claim {
 }
 
 /// buffer を作った ASIO の stream。 drop で `stop` → `disposeBuffers` → 状態の片付け。
-pub struct Stream<'d> {
-    driver: &'d Driver,
+///
+/// ドライバーを一緒に握る (`Rc`) ので、stream が生きている間はドライバーも生きている。
+pub struct Stream {
+    driver: Rc<Driver>,
     state: NonNull<State>,
     running: bool,
 }
 
-impl<'d> Stream<'d> {
+impl Stream {
     /// `channels` を有効にして buffer を作る (まだ鳴らない)。 出力の 2 面は無音で埋めておく
     /// (`start` の直後に鳴るのはホストが `start` の前に埋めた面、`asio.h` の `ASIOStart` の説明)。
     pub fn create(
-        driver: &'d Driver,
+        driver: &Rc<Driver>,
         channels: &[ChannelSpec],
         frames: u32,
         callback: Callback,
@@ -375,7 +373,12 @@ impl<'d> Stream<'d> {
         let state = NonNull::from(Box::leak(state));
         ACTIVE.store(state.as_ptr(), Ordering::SeqCst);
         std::mem::forget(claim);
-        Ok(Self { driver, state, running: false })
+        Ok(Self { driver: Rc::clone(driver), state, running: false })
+    }
+
+    /// 動いているか (`start` 済みで `stop` していない)。
+    pub fn is_running(&self) -> bool {
+        self.running
     }
 
     /// ドライバーが `outputReady` を使うか。
@@ -415,7 +418,7 @@ impl<'d> Stream<'d> {
     }
 }
 
-impl Drop for Stream<'_> {
+impl Drop for Stream {
     fn drop(&mut self) {
         if self.running {
             let _ = self.driver.stop();
@@ -439,12 +442,8 @@ impl Drop for Stream<'_> {
     }
 }
 
-/// ch ごとの (sample type, 1 sample の byte 数)。 引数の検査もここで済ませる。
-fn channel_layout(
-    driver: &Driver,
-    channels: &[ChannelSpec],
-    frames: u32,
-) -> Result<Vec<(sys::AsioSampleType, usize)>, Error> {
+/// ch ごとの 1 sample の byte 数。 引数の検査もここで済ませる。
+fn channel_layout(driver: &Driver, channels: &[ChannelSpec], frames: u32) -> Result<Vec<usize>, Error> {
     if channels.is_empty() || channels.len() > MAX_STREAM_CHANNELS {
         return Err(Error::Invalid(format!("{} stream channels", channels.len())));
     }
@@ -466,7 +465,7 @@ fn channel_layout(
         (frames as usize)
             .checked_mul(bytes)
             .ok_or_else(|| Error::Invalid(format!("buffer size {frames}")))?;
-        layout.push((info.sample_type, bytes));
+        layout.push(bytes);
     }
     Ok(layout)
 }
@@ -474,12 +473,12 @@ fn channel_layout(
 /// `createBuffers` が返したポインタを検査して受け取り、出力の 2 面を無音にする。
 fn adopt_buffers(
     channels: &[ChannelSpec],
-    layout: &[(sys::AsioSampleType, usize)],
+    layout: &[usize],
     infos: &[sys::AsioBufferInfo],
     frames: u32,
 ) -> Result<Box<[ChannelBuffer]>, Error> {
     let mut buffers = Vec::with_capacity(channels.len());
-    for ((spec, &(sample_type, bytes_per_sample)), info) in channels.iter().zip(layout).zip(infos) {
+    for ((spec, &bytes_per_sample), info) in channels.iter().zip(layout).zip(infos) {
         let raw = info.buffers;
         let (Some(a), Some(b)) = (NonNull::new(raw[0].cast::<u8>()), NonNull::new(raw[1].cast::<u8>()))
         else {
@@ -495,8 +494,6 @@ fn adopt_buffers(
         }
         buffers.push(ChannelBuffer {
             is_input: spec.is_input,
-            channel: spec.channel,
-            sample_type,
             bytes_per_sample,
             halves: [a, b],
         });

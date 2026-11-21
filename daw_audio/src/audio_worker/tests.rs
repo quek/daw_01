@@ -25,7 +25,7 @@ use super::AudioWorkerPool;
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::engine::{
     DeviceBundle, DeviceRt, EngineCommand, EngineCommandSender, EngineShared, PlaybackCommand, PluginEntry, PluginRefs, ProjectDelivery,
-    ProjectRt, ProjectShared, RecordingLanes, RtBundle, SharedState, SyncSlot, WorkerRig,
+    ProjectRt, ProjectShared, RecordingLanes, RtBundle, SyncSlot, WorkerRig,
 };
 
 /// pool の世代 (依頼番号に焼き込む)。
@@ -251,7 +251,6 @@ struct Live {
     bridge: AudioBridgeHandle,
     scope: common::scope_bridge::ScopeBridgeHandle,
     device_scope: DeviceScopeBridgeHandle,
-    shared: SharedState,
 }
 
 /// off-thread 側の 1 project の口。
@@ -290,7 +289,6 @@ impl Live {
             bridge: AudioBridgeHandle::create(&format!("daw01_test_stall_ab_{tag}_{pid}")).unwrap(),
             scope: common::scope_bridge::ScopeBridgeHandle::create(&format!("daw01_test_stall_sc_{tag}_{pid}")).unwrap(),
             device_scope: DeviceScopeBridgeHandle::create(&format!("daw01_test_stall_ds_{tag}_{pid}")).unwrap(),
-            shared: SharedState::new(),
         }
     }
 
@@ -315,7 +313,6 @@ impl Live {
 
     fn callback(&mut self) {
         self.dev.process_buffer(
-            &self.shared,
             &self.bridge,
             &self.scope,
             &self.device_scope,
