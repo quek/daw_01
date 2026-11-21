@@ -26,7 +26,17 @@ impl AppData {
             return;
         };
         if let Err(e) = tx.send(msg) {
-            tracing::error!(error = %e, "failed to enqueue audio command");
+            self.log_send_failure("audio", &e);
+        }
+    }
+
+    /// 子プロセスへの送信が失敗した (= 送り先の pipe loop が終わっている)。終了処理中は子を先に畳むので
+    /// 起きて当たり前 (frame ごとの同期などは event の遮断を通らずに送る) — error にしない。
+    fn log_send_failure(&self, child: &str, error: &dyn std::fmt::Display) {
+        if self.shutdown.is_shutting_down() {
+            tracing::debug!(child, %error, "command dropped: child already shut down");
+        } else {
+            tracing::error!(child, %error, "failed to enqueue command to child");
         }
     }
 
@@ -38,7 +48,7 @@ impl AppData {
             return;
         };
         if let Err(e) = tx.send(msg) {
-            tracing::error!(error = %e, "failed to enqueue plugin command");
+            self.log_send_failure("plugin_host", &e);
         }
     }
 

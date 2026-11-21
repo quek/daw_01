@@ -51,6 +51,15 @@ pub trait AraLifecycleHost {
     fn do_activate(&mut self, sample_rate: f64, min_frames: u32, max_frames: u32) -> Result<()>;
 }
 
+/// ARA に bind した instance に、鳴らす playback region が 1 つも無いか
+/// (`AudioProcessorHalf::set_ara_idle` に渡す値)。ARA に bind したことが無ければ `false`。
+///
+/// `bound` = bind したことがあるか。bind は instance が死ぬまで解けないので、session を畳んだ後
+/// ([`run_clear_ara`]) の instance も「bind 済みで region が無い」に入る。
+pub fn is_idle(bound: bool, session: Option<&AraSession>) -> bool {
+    bound && !session.is_some_and(AraSession::has_playback_regions)
+}
+
 /// Shared `setup_ara`: ARA の `addPlaybackRegion` / region detach は instance
 /// inactive を要求するので、更新の前後で deactivate → reactivate する。bind
 /// 自体は load 時 (`bind_ara_if_capable`) に済んでいる。グラフの差分編集と、

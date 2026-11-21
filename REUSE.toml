@@ -65,6 +65,20 @@ SPDX-FileCopyrightText = "Copyright (c) 2000-2026 the FFmpeg developers"
 SPDX-License-Identifier = "LGPL-2.1-or-later"
 SPDX-FileComment = "rust-bindgen 0.71.1 output generated from the FFmpeg 7.1 public headers. See NOTICE."
 
+# --- ASIO (Steinberg) -------------------------------------------------------
+# ASIO SDK (2025 年の dual license 版) の公開ヘッダ common/asio.h / common/iasiodrv.h の型・定数・struct・
+# IASIO の vtable の宣言を、Rust へ手で書き起こしたもの (SDK のファイルそのものは repo に入れていない)。
+# 宣言の写しなのでヘッダの派生物として扱う。SDK の LICENSE.txt は「Steinberg ASIO License、または
+# General Public License (GPL) Version 3」の二択で **"or any later version" が無い** ので、このファイルは
+# GPL-3.0-only (ほかの自作物は GPL-3.0-or-later のまま)。このファイルを含む成果物は GPLv3 の条件で配る。
+# 将来 GPLv4 以降へ上げるなら、先にこのファイルを SDK に依らず書き直すか Steinberg の条件を確かめること。
+[[annotations]]
+path = "daw_audio/src/asio/sys.rs"
+precedence = "override"
+SPDX-FileCopyrightText = ["Copyright (C) 2026 Tahara Yoshinori", "Copyright (c) 2025, Steinberg Media Technologies GmbH, All Rights Reserved"]
+SPDX-License-Identifier = "GPL-3.0-only"
+SPDX-FileComment = "Rust declarations transcribed by hand from the public headers of the Steinberg ASIO SDK (common/asio.h, common/iasiodrv.h), used under the GPL Version 3 option of the SDK's dual license. No SDK file is vendored. See NOTICE."
+
 # --- 自作だがヘッダを書けない / 書いても消えるファイル ----------------------
 [[annotations]]
 path = "Cargo.lock"

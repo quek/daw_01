@@ -9,6 +9,9 @@
 
 use super::*;
 
+/// r.md #156: 録音中の区間の帯 (この file の描画の 1 段)。
+mod rec_region;
+
 pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> ArrangementResponse {
     // 入力ビューは `arrangement()` のスタックに置いたまま、 `frame` がそこから借りる。
     let built = view_build::build(app, area);
@@ -72,6 +75,8 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     );
     // 6c. r.md #131: 無効トラックの行を沈める (レーンのクリップとランチャーのセルの上に乗るので帯の後)。
     disabled_rows::draw(ui, &f);
+    // 6d. r.md #156: オーディオ入力を録音中の区間 (レーンのクリップの上に乗る)。
+    rec_region::draw(ui, app, &f);
     launcher::release::commit(ui, &f, launcher_sessions, &mut response);
     // 7. caller 向け rect 群の収集。
     rects::collect(&f, &live, &mut response);

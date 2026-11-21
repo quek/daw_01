@@ -863,6 +863,25 @@ impl AppData {
     /// 自動 seek すると意図しない位置から再生になるので、 user に明示
     /// 操作してもらう方が安全。
     pub(crate) fn handle_child_disconnected(&mut self, kind: common::protocol::ChildKind) {
+        self.recover_child(kind, false);
+    }
+
+    /// r.md #156: daw_audio を **こちらの都合で** 起こし直す (オーディオデバイスの切り替え)。crash からの復帰と
+    /// 同じ道 (全タブの transport を畳む → respawn → 全タブを復元) を通るが、crash としては数えない。
+    /// 開くデバイスは `ChildSupervisor::set_device_config` で先に渡しておく。結果は
+    /// `audio_device.info` / `audio_device.error` に入る。
+    pub(crate) fn restart_audio_child(&mut self) {
+        // 今の daw_audio には自分で終わってもらう (stream を止めてデバイスを手放してから exit する)。その切断を
+        // crash として拾わないよう、先に pipe loop へ知らせる。respawn は古い方の exit を有界に待ってから起こす。
+        if let Some(supervisor) = &self.ipc.supervisor {
+            supervisor.expect_audio_exit();
+        }
+        self.send_audio(common::protocol::AudioCommand::Shutdown);
+        self.recover_child(common::protocol::ChildKind::Audio, true);
+    }
+
+    /// `planned`: 子が落ちたのではなく、こちらが起こし直す ([`Self::restart_audio_child`])。
+    fn recover_child(&mut self, kind: common::protocol::ChildKind, planned: bool) {
         use common::protocol::ChildKind;
         // (r.md #61) 終了シーケンス中の切断は crash ではなく **こちらが頼んだ
         // 結果**。ここで respawn すると「終了しようとしているのに子が生き返る」。
@@ -907,6 +926,8 @@ impl AppData {
         match kind {
             ChildKind::Audio => {
                 self.ipc.audio_tx = None;
+                // r.md #156: 結果待ちのオーディオ入力の録音はもう返ってこない。
+                self.for_each_tab(AppData::abort_pending_audio_takes);
                 // 音声 render 中の crash なら ExportWavComplete が永遠に来ない。
                 // export を強制終了して overlay / 入力 gate を解除する（解除しないと
                 // GUI が永久ロックする）。AudioRender 中でなければ no-op。中止した
@@ -915,7 +936,11 @@ impl AppData {
                 export_aborted |= self.any_tab_mut(|app| {
                     app.abort_audio_export("音声エンジンがクラッシュしたため書き出しを中止しました".into())
                 });
-                tracing::warn!("daw_audio child disconnected");
+                if planned {
+                    tracing::info!("restarting daw_audio (audio device change)");
+                } else {
+                    tracing::warn!("daw_audio child disconnected");
+                }
             }
             ChildKind::PluginHost => {
                 self.ipc.plugin_tx = None;
@@ -956,13 +981,16 @@ impl AppData {
         let now = std::time::Instant::now();
         self.ipc.child_disconnect_log
             .retain(|(_, t)| now.duration_since(*t) < CRASH_WINDOW);
-        self.ipc.child_disconnect_log.push((kind, now));
+        // こちらが起こし直す分は crash ではない (デバイスを続けて切り替えても止めない)。
+        if !planned {
+            self.ipc.child_disconnect_log.push((kind, now));
+        }
         let recent = self
             .ipc.child_disconnect_log
             .iter()
             .filter(|(k, _)| *k == kind)
             .count();
-        if recent >= CRASH_LIMIT {
+        if !planned && recent >= CRASH_LIMIT {
             self.ui_ephemeral.status_message = format!(
                 "{}が繰り返しクラッシュしています — 自動再起動を停止しました。\
                  プロジェクトのプラグインを確認してください{}{}",
@@ -991,9 +1019,14 @@ impl AppData {
         if self.suppress_child_respawn(kind) {
             return;
         }
-        // supervisor 経由で respawn を試みる。 supervisor が None
-        // (= script / test 経路) なら通知だけで終わる。
-        let Some(supervisor) = self.ipc.supervisor.clone() else {
+        // supervisor 経由で respawn を試みる。 supervisor が None (= test 経路) か、落ちた子を起こし直さない
+        // 経路 (headless script — 落ちたことを隠さない) なら通知だけで終わる。
+        let supervisor =
+            self.ipc.supervisor.clone().filter(|_| planned || self.ipc.respawn_crashed_children);
+        let Some(supervisor) = supervisor else {
+            if kind == ChildKind::Audio {
+                self.on_audio_child_gone(None);
+            }
             self.ui_ephemeral.status_message = format!(
                 "{}が切断されました{}{} — supervisor 無効",
                 kind.as_str(),
@@ -1024,7 +1057,12 @@ impl AppData {
                         "audio respawn changed the session sample rate"
                     );
                     self.ipc.sample_rate = r.sample_rate;
+                    // r.md #156: plugin は古いレートで activate されたままなので、新しいレートでやり直させる
+                    // (追従しないと音程と長さがレートの比だけずれる)。
+                    self.send_plugin(common::protocol::PluginCommand::SetSessionSampleRate(r.sample_rate));
                 }
+                // r.md #156: 新しい daw_audio が開いたデバイス。
+                self.on_audio_child_respawned(r.device_info);
                 self.send_plugin(common::protocol::PluginCommand::CloseWorkerPool);
                 self.send_plugin(common::protocol::PluginCommand::OpenWorkerPool(r.pool));
             }),
@@ -1048,6 +1086,9 @@ impl AppData {
                 tracing::info!(?kind, "child respawn + state restore completed");
             }
             Err(e) => {
+                if kind == ChildKind::Audio {
+                    self.on_audio_child_gone(Some(format!("{e:#}")));
+                }
                 // (v29 §3) ビルド世代不一致は respawn を繰り返しても直らない。
                 // ユーザー向けに「make build」 を明示し、 これ以上の自動
                 // respawn には入らない (この handler は respawn 失敗時に

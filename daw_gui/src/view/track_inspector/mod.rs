@@ -13,6 +13,8 @@ mod chain_sections;
 mod device_panel;
 /// 選択クリップの「Image Event」 セクション。
 mod image_event_section;
+/// r.md #156: トラックの「入力」と「モニター」。
+mod input_section;
 /// r.md #87: 選択中のランチャーセルのローンチ設定 (Q7 / 計画書 §3.4)。
 mod launch_section;
 /// r.md #151: Rack の行の Mix ノブ (Alt+クリックで Δ)。
@@ -280,6 +282,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let measured_body_h = std::cell::Cell::new(0.0_f32);
     ui.scroll_area("inspector_body", param_vp, (param_vp.w, content_h), |ui, scroll_off| {
         let mut y = body_top - scroll_off.1;
+
+        // ---- r.md #156: トラックの入力 / モニター (高さ固定。開閉で下を動かさない) ----
+        y = input_section::draw_input_section(app, ui, area, pad, y);
 
         // ---- r.md #87: ランチャーのセルのローンチ設定 (Q7) -------------------
         // 選択にセルが 1 つも無ければ何も描かない (= 通常のクリップ編集時は

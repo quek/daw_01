@@ -165,4 +165,15 @@ pub struct RecordingState {
     /// `ViewState` で保存する。 step input (recording 停止中の MIDI input) には適用しない
     /// (= pitch を「聞いて」 決める用途、 Cubase / Bitwig も同方針)。
     pub snap_live_input: bool,
+    /// r.md #156: engine に頼んで結果 (`AudioEvent::AudioTakesFinished`) を待っているオーディオ入力の録音
+    /// (`handler::audio_rec`)。パンチアウトの直後にパンチインすると 2 つ並ぶ。session-only。
+    pub audio_takes: Vec<crate::handler::audio_rec::PendingAudioTake>,
+    /// r.md #156: 次の録音の `take_id` (このタブの中で一意)。
+    pub next_audio_take_id: u64,
+    /// r.md #156: いま録っているオーディオ入力の録音の、レーンに伸びていく帯 (`handler::audio_rec`)。
+    /// `None` = 録っていない。session-only。
+    pub audio_rec_region: Option<crate::handler::audio_rec::LiveTakeRegion>,
+    /// r.md #156: 書き出し / 焼き込みの間 (曲を編集できない) に届いた録音の結果。終わったらクリップにする
+    /// (`AppData::audio_rec_tick`)。録音中に書き出しを始めると録音が閉じ、その結果が書き出しの最中に届く。
+    pub deferred_audio_takes: Vec<common::audio_take::AudioTakesFinished>,
 }

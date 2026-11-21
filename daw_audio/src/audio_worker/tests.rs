@@ -25,7 +25,7 @@ use super::AudioWorkerPool;
 use crate::audio_clip_renderer::AudioClipRenderer;
 use crate::engine::{
     DeviceBundle, DeviceRt, EngineCommand, EngineCommandSender, EngineShared, PlaybackCommand, PluginEntry, PluginRefs, ProjectDelivery,
-    ProjectRt, ProjectShared, RecordingLanes, RtBundle, SharedState, SyncSlot, WorkerRig,
+    ProjectRt, ProjectShared, RecordingLanes, RtBundle, SyncSlot, WorkerRig,
 };
 
 /// pool の世代 (依頼番号に焼き込む)。
@@ -251,7 +251,6 @@ struct Live {
     bridge: AudioBridgeHandle,
     scope: common::scope_bridge::ScopeBridgeHandle,
     device_scope: DeviceScopeBridgeHandle,
-    shared: SharedState,
 }
 
 /// off-thread 側の 1 project の口。
@@ -290,7 +289,6 @@ impl Live {
             bridge: AudioBridgeHandle::create(&format!("daw01_test_stall_ab_{tag}_{pid}")).unwrap(),
             scope: common::scope_bridge::ScopeBridgeHandle::create(&format!("daw01_test_stall_sc_{tag}_{pid}")).unwrap(),
             device_scope: DeviceScopeBridgeHandle::create(&format!("daw01_test_stall_ds_{tag}_{pid}")).unwrap(),
-            shared: SharedState::new(),
         }
     }
 
@@ -314,7 +312,14 @@ impl Live {
     }
 
     fn callback(&mut self) {
-        self.dev.process_buffer(&self.shared, &self.bridge, &self.scope, &self.device_scope, SR, FRAMES);
+        self.dev.process_buffer(
+            &self.bridge,
+            &self.scope,
+            &self.device_scope,
+            SR,
+            FRAMES,
+            crate::device::input::DeviceIo::NONE,
+        );
     }
 
     /// recv loop の housekeeping と同じく、RT が返した物を off-thread で落とす。
@@ -363,6 +368,8 @@ fn bundle(song: &Arc<Song>, refs: &Arc<PluginRefs>) -> RtBundle {
         device_scope_watch: [0; MAX_DEVICE_SCOPES],
         mod_plan: None,
         mod_phase_table: None,
+        input_stage: None,
+        audio_take: None,
     }
 }
 
@@ -733,9 +740,9 @@ fn live_の窓の間に_callback_のスタックを使い回しても_生き残�
 
 /// 窓の規則の口 (`in_flight`) そのもの: 器の referent が呼び側のスレッドのスタックに居る文脈で InFlight を返したら
 /// 止め、スタックに居る物を残らず名指しする (debug build)。スタックの範囲の取り方や比較が崩れて口が黙って素通り
-/// する形と、`RenderCtx::referents` の列の項目が 0 や heap の番地にすり替わる形を捕まえる。referent 30 個のうち
+/// する形と、`RenderCtx::referents` の列の項目が 0 や heap の番地にすり替わる形を捕まえる。referent 31 個のうち
 /// `Schedule` の `Vec` の中身 5 個 (track の program / delay line / follower / node / 入力遅延) は型の上で heap なので
-/// 置けず、残り 25 個を全部スタックに置く。
+/// 置けず、残り 26 個を全部スタックに置く。
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "[\"song\", \"index\", \"scratch\", \"master_program\", \"master_l\", \"master_r\", \"solo\", \
@@ -743,7 +750,7 @@ fn live_の窓の間に_callback_のスタックを使い回しても_生き残�
                            \"mod_plane.col_of\", \"mod_plane.values\", \"mod_plane.depth_ids\", \"mod_plane.depth_col_of\", \
                            \"mod_plane.depths\", \"mod_plane.nodes\", \"follower_drive.spans\", \
                            \"follower_drive.col_of_slot\", \"follower_drive.eff\", \"rows\", \"native_io.scopes.bridge\", \
-                           \"native_io.scopes.watch\"] が呼び側のスレッドのスタック")]
+                           \"native_io.scopes.watch\", \"native_io.input\"] が呼び側のスレッドのスタック")]
 fn 器が呼び側のスタックを指したまま_in_flight_を返すと_スタックに居る物を全部名指しして止める() {
     let mut song = chain_song(1);
     song.mod_sources = vec![common::model::ModSource {
@@ -780,6 +787,7 @@ fn 器が呼び側のスタックを指したまま_in_flight_を返すと_ス�
     let rows = crate::launcher::RowSourceTable::default();
     let scope_bridge = DeviceScopeBridgeHandle::create(&format!("daw01_test_stall_ds_onstack_{pid}")).unwrap();
     let scope_watch = [0u64; MAX_DEVICE_SCOPES];
+    let input_stage = crate::graph::input_stage::InputStage::default();
     let params = crate::graph::step::BufferParams {
         sample_rate: SR,
         frames: FRAMES as u32,
@@ -805,6 +813,7 @@ fn 器が呼び側のスタックを指したまま_in_flight_を返すと_ス�
         native_io: crate::graph::NativeIo {
             sc_listen: 0,
             scopes: Some(crate::graph::DeviceScopeTap { bridge: &scope_bridge, watch: &scope_watch }),
+            input: Some(&input_stage),
             ..Default::default()
         },
         transpose: 0,

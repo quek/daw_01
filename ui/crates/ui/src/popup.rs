@@ -17,12 +17,16 @@
 //!   早い段階に置くこと。この前提は `feedback_pursue_best_practice` の妥協ポイントとして
 //!   `docs/history.html` に記録)
 
+use std::time::Instant;
+
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Rect, RectCommand};
 
 use crate::id::WidgetId;
 use crate::ui::Ui;
-use crate::widgets::scroll_area::{SCROLLBAR_W, thumb_rect_vertical, vertical_scrollbar_rect};
+use crate::widgets::scroll_area::{
+    BarGeom, BarGrab, BarPointer, SCROLLBAR_W, bar_update, thumb_rect_vertical, vertical_scrollbar_rect,
+};
 
 /// popup が現在 open している間 `UiHost` に保持される情報。
 // modal / capture_input / capture_keyboard / dismiss_on_outside_click は、 それぞれ
@@ -66,10 +70,10 @@ pub struct PopupOpenState {
     /// 「開き直したら必ず先頭から」が構造的に保証される (widget_state 側に持つと popup の
     /// 寿命とズレて、閉じたはずの popup の scroll 位置が次の open に漏れる)。
     pub scroll_offset: f32,
-    /// scrollbar thumb を drag 中の anchor `(押下時の pointer y, 押下時の scroll_offset)`。
-    /// drag 中は item の hover / click を抑止する (thumb を掴んだまま item 上で離しても
+    /// scrollbar を掴んでいる間の状態 (thumb のドラッグ / 溝のページ送り)。
+    /// 掴んでいる間は item の hover / click を抑止する (thumb を掴んだまま item 上で離しても
     /// 選択されない)。
-    pub scroll_drag: Option<(f32, f32)>,
+    pub(crate) scroll_drag: Option<BarGrab>,
 }
 
 /// [`Ui::popup_scroll`] の結果。
@@ -83,7 +87,8 @@ pub struct PopupScroll {
     /// item を描ける幅。 scrollbar を出している間は [`SCROLLBAR_W`] 分だけ狭い
     /// (item が scrollbar の下に潜らない)。
     pub content_w: f32,
-    /// scrollbar thumb を drag 中。 `true` の frame は item の hover / click を抑止する。
+    /// scrollbar を掴んでいる (thumb のドラッグ / 溝のページ送り)。 `true` の frame は item の
+    /// hover / click を抑止する。
     pub dragging: bool,
 }
 
@@ -232,6 +237,42 @@ pub fn popup_rect_clamped_at(
 }
 
 impl<M: ?Sized + 'static> Ui<'_, M> {
+    /// pointer が **modal popup の anchor 内** にあり、現在の widget が `drawing_in_popup`
+    /// でない (= popup_layer の外で動いている) とき `true`。
+    ///
+    /// daw_01 #015 の root cause: arrangement_view が plugin_picker (modal) より先に走り
+    /// `take_scroll_in_rect(lanes)` が pointer (modal panel 内) の scroll_delta を消費 →
+    /// list_view が呼ぶ頃には (0, 0)。modal の下に隠れている widget は pointer 入力を
+    /// 一切消費すべきでない (overlay の意味が失われる) ため、`take_scroll_in_rect` /
+    /// `take_drag_rect_in_rect` / `take_double_click_in_rect` 冒頭で早期 return する。
+    ///
+    /// popup_layer 内部 (= modal の body) では `drawing_in_popup == true` なので false を
+    /// 返し、通常通り消費可能。
+    pub(crate) fn pointer_blocked_by_modal_popup(&self) -> bool {
+        self.pointer_blocked_by_modal_popup_except(None)
+    }
+
+    /// [`Self::pointer_blocked_by_modal_popup`] の、 `own` の popup を数えない版。 自分の popup の
+    /// anchor に自分の本体が入っている widget (dropdown) が、 **他人の** popup の下かどうかを見る。
+    pub(crate) fn pointer_blocked_by_modal_popup_except(&self, own: Option<WidgetId>) -> bool {
+        if self.drawing_in_popup {
+            return false;
+        }
+        // M14 Phase 94 (daw_01 #065): 真のモーダル中は anchor 内外を問わず全 background を遮断。
+        // `self.pointer` は既に masking されているので大半の take_* は pos = None で自然に
+        // 何も返さないが、`take_double_click_in_rect` (pending_double_click は生 pointer 由来) /
+        // `take_file_drop_in_rect` (drop 位置で判定) はこの早期 return で確実に止める。
+        if self.modal_capturing {
+            return true;
+        }
+        let Some((px, py)) = self.pointer.pos else {
+            return false;
+        };
+        self.open_popups
+            .iter()
+            .any(|(wid, s)| Some(*wid) != own && s.modal && s.anchor.contains(px, py))
+    }
+
     /// この context menu が今フレームも呼ばれたことを記録する (開いているときだけ)。
     pub(crate) fn mark_context_menu_seen(&mut self, id: impl std::hash::Hash) {
         let wid = WidgetId::ROOT.child((b"popup", &id));
@@ -249,6 +290,24 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
     pub(crate) fn close_stale_context_menus(&mut self) {
         let seen = std::mem::take(&mut self.context_menus_seen);
         self.open_popups.retain(|wid, s| !s.context_menu || seen.contains(wid));
+    }
+
+    /// `popup_layer` の body で描画中の popup の縦スクロール state
+    /// `(scroll_offset, scroll_drag)`。body の外では `None`。
+    fn current_popup_scroll(&self) -> Option<(f32, Option<BarGrab>)> {
+        let wid = self.current_popup?;
+        self.open_popups.get(&wid).map(|s| (s.scroll_offset, s.scroll_drag))
+    }
+
+    /// [`Ui::current_popup_scroll`] の書き込み側。body の外では no-op。
+    fn set_current_popup_scroll(&mut self, offset: f32, drag: Option<BarGrab>) {
+        let Some(wid) = self.current_popup else {
+            return;
+        };
+        if let Some(state) = self.open_popups.get_mut(&wid) {
+            state.scroll_offset = offset;
+            state.scroll_drag = drag;
+        }
     }
 
     /// popup body の縦スクロールを 1 フレーム分処理し、 scrollbar を描く。
@@ -281,37 +340,35 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         let track = vertical_scrollbar_rect(viewport, false);
         let wheel = self.take_scroll_in_rect(viewport).1;
         let pointer = self.pointer();
-        let mut offset = (prev_offset - wheel).clamp(0.0, max_offset);
-        let mut thumb = thumb_rect_vertical(track, content_h, viewport.h, offset, max_offset);
+        let offset = (prev_offset - wheel).clamp(0.0, max_offset);
 
-        // ---- 2. thumb drag (scroll_area と同じ「現在 offset の thumb で hit-test」) ----
-        let mut drag = prev_drag;
-        if drag.is_none()
-            && pointer.primary_just_pressed
-            && let Some((px, py)) = pointer.pos
-            && thumb.contains(px, py)
-        {
-            drag = Some((py, offset));
-            // thumb を掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
+        // ---- 2. scrollbar の操作 (scroll_area と同じ [`bar_update`]: thumb のドラッグ / 溝のページ送り) ----
+        let in_track = pointer.pos.is_some_and(|(px, py)| track.contains(px, py));
+        if pointer.primary_just_pressed && in_track {
+            // scrollbar を押した press の所有者を名乗る (r.md #122 / [`crate::click`])。
             let scrollbar = self.current_popup_id().child(b"popup_scrollbar");
             self.claim_press(scrollbar);
         }
-        if let Some((anchor_py, anchor_offset)) = drag
-            && let Some((_, py)) = pointer.pos
-        {
-            let drag_range = (track.h - thumb.h).max(1.0);
-            offset = (anchor_offset + (py - anchor_py) / drag_range * max_offset)
-                .clamp(0.0, max_offset);
-            thumb = thumb_rect_vertical(track, content_h, viewport.h, offset, max_offset);
-        }
+        let mut drag = prev_drag;
+        let geom = BarGeom {
+            track_start: track.y,
+            track_len: track.h,
+            content: content_h,
+            viewport: viewport.h,
+            page: viewport.h,
+            max: max_offset,
+        };
+        let bar_pointer = BarPointer { pos: pointer.pos.map(|p| p.1), in_track, frame: pointer };
+        let offset = bar_update(&mut drag, geom, offset, bar_pointer, Instant::now());
         // release frame も「この frame の pointer は scrollbar のもの」と扱う
         // (thumb を掴んだまま item の上へ動かして離しても、 その item を選ばない)。
-        let dragging = drag.is_some();
-        if pointer.primary_just_released {
-            drag = None;
-        }
+        let dragging = prev_drag.is_some() || drag.is_some();
+        let thumb_grabbed = matches!(prev_drag.or(drag), Some(BarGrab::Thumb { .. }));
+        let paging = matches!(drag, Some(BarGrab::Page { .. })) && in_track;
+        let thumb = thumb_rect_vertical(track, content_h, viewport.h, offset, max_offset);
         self.set_current_popup_scroll(offset, drag);
-        if (offset - prev_offset).abs() > 1e-4 {
+        // 溝の上で押し続けてページを送っている間は、 次に送る時刻が入力なしで来る。
+        if (offset - prev_offset).abs() > 1e-4 || paging {
             self.request_redraw();
         }
 
@@ -321,7 +378,7 @@ impl<M: ?Sized + 'static> Ui<'_, M> {
         let hovered = pointer.pos.is_some_and(|(px, py)| thumb.contains(px, py));
         self.push_rect(RectCommand::uniform_radius(
             thumb,
-            if hovered || dragging { p.scrollbar_thumb_hover } else { p.scrollbar_thumb },
+            if hovered || thumb_grabbed { p.scrollbar_thumb_hover } else { p.scrollbar_thumb },
             3.0,
         ));
 

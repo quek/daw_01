@@ -26,6 +26,8 @@ const WIRE_SOURCES: &[&str] = &[
     // (Track.devices / master_fx_chain の要素として LoadSong の wire を渡る)。
     "src/model/plugin_instance.rs",
     "src/model/track.rs",
+    // r.md #156: TrackInput / MonitorMode (Track.input / Track.monitor として LoadSong の wire を渡る)。
+    "src/model/track_input.rs",
     // r.md #110: Device / Parallel / ParallelChain (Track.devices / master_fx_chain の要素として
     // LoadSong の wire を渡る)。
     "src/model/device.rs",
@@ -53,6 +55,8 @@ const WIRE_SOURCES: &[&str] = &[
     // RowPlayback。Song に載って `LoadSong` の wire を渡るので登録必須 (不変条件 7)。
     "src/model/session.rs",
     "src/loudness_report.rs",
+    // r.md #156: オーディオ入力の録音の指示と結果 (StartAudioTakes / AudioTakesFinished)。
+    "src/audio_take.rs",
     // Song.scale_changes が持つ型 (Scale / KeySignature 等) の定義。model.rs から
     // 参照され `LoadSong` の wire に載るのに未登録だった (r.md #54 レビューで発覚)。
     "src/scale.rs",
@@ -73,6 +77,8 @@ const WIRE_SOURCES: &[&str] = &[
     "src/sampler_ring.rs",
     "src/worker_bridge.rs",
     "src/plugin_ref.rs",
+    // r.md #156: オーディオデバイスの設定・一覧・情報 (`OpenDevice` / `DeviceInfo` / `AudioDevices` として wire を渡る)。
+    "src/audio_device.rs",
     // r.md #132 残件: ARA の persistent id の読み替え表 (`SetupAraDocument.archive_ids` として wire を渡る)。
     "src/ara_ids.rs",
 ];

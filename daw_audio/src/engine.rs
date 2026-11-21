@@ -36,6 +36,8 @@ use common::song_index::SongIndex;
 use common::timing::{SongBounds, effective_loop_bounds, ended_at};
 
 use crate::audio_clip_renderer::AudioClipRenderer;
+use crate::audio_rec::{TakeBlock, TakeCtl, TakeDrive};
+use crate::graph::input_stage::InputStage;
 use crate::graph::{DelayLine, DeviceScopeTap, NativeIo, Schedule, render_master_buffer};
 use crate::launcher::LauncherGrowth;
 use crate::metronome::{ClickVoice, render_metronome};
@@ -271,6 +273,11 @@ pub struct RtBundle {
     /// plan とは別便で届く — 表の構築は曲長ぶんの刻みループなので、plan の
     /// 配送を待たせない (構築中は旧表 + 閉形式シードで凌ぐ)。
     pub mod_phase_table: Option<Arc<common::mod_graph::ModPhaseTable>>,
+    /// **差し替え便** (r.md #156): デバイス入力の受け皿 (曲の「オーディオ入力のトラックの組」が変わったときだけ。
+    /// `None` = 据え置き)。buffer をまたぐ状態は持たないので、新しい便がそのまま勝つ。
+    pub input_stage: Option<InputStage>,
+    /// r.md #156: 進行中のオーディオ入力の録音 (snapshot、`AudioCommand::StartAudioTakes`)。`None` = 無し。
+    pub audio_take: Option<Arc<TakeCtl>>,
 }
 
 impl RtBundle {
@@ -330,6 +337,10 @@ impl RtBundle {
         }
         if self.mod_phase_table.is_none() {
             self.mod_phase_table = older.mod_phase_table.take();
+        }
+        // 入力の受け皿も delta (`None` = 据え置き)。新しい便が持っていればそれが最新の組。
+        if self.input_stage.is_none() {
+            self.input_stage = older.input_stage.take();
         }
         // 「捨てろ」は一度でも要求されたら畳み込み後も残す (OR)。落とすと
         // project 切替の走行状態リセットが coalescing で消える。
@@ -443,6 +454,10 @@ pub struct ProjectRt {
     pub window: Option<Arc<WorkerRig>>,
     /// GUI へ出す transport の観測値 (先読みのときは聞こえている回まで遅らせる — [`TransportOut`])。
     pub transport_out: TransportOut,
+    /// r.md #156: デバイス入力の受け皿 (bundle 由来)。毎 buffer、描画の前に写す。
+    pub input_stage: InputStage,
+    /// r.md #156: オーディオ入力の録音の、描画側の状態 (どの block から / まで取り込むか)。
+    pub take: TakeDrive,
     /// Debug-only: playhead at the last heartbeat log. Throttles
     /// `engine heartbeat` to once per second of audio time.
     #[cfg(debug_assertions)]
@@ -469,6 +484,9 @@ pub struct DeviceCtx<'a> {
     pub device_scope: Option<DeviceScopeCtx<'a>>,
     /// stream 開始からの累積 render フレーム数 (MIDI 試聴シーケンスの時計)。
     pub frames_rendered: u64,
+    /// r.md #156: この描画ブロックのデバイスの入出力 (入力 ch の音・出ていく時点・レイテンシ、
+    /// `crate::device::input`)。入力をトラックへ流すのは「聴き方」の側 — 書き出しには渡らない。
+    pub io: crate::device::input::DeviceIo<'a>,
 }
 
 /// r.md #129 §11.2: device scope の書き先と、slot の見出し表 (`DeviceRt` が持つ)。見出しの書き手は
@@ -528,6 +546,8 @@ impl ProjectRt {
             master_limiter: MasterLimiterState::new(),
             window: None,
             transport_out: TransportOut::default(),
+            input_stage: InputStage::default(),
+            take: TakeDrive::default(),
             #[cfg(debug_assertions)]
             last_heartbeat_playhead: 0,
             #[cfg(debug_assertions)]
@@ -598,6 +618,9 @@ impl ProjectRt {
         if let Some(plane) = new.plane.take() {
             new.plane = self.plane.replace(plane);
         }
+        // r.md #156: 入力の受け皿と進行中の録音。押し出した物は recycle へ (解放は off-thread)。
+        let retired_stage = new.input_stage.take().map(|s| std::mem::replace(&mut self.input_stage, s));
+        let retired_take = self.take.install(new.audio_take.take());
 
         let mut old_schedule: Option<Schedule> = None;
         let mut retired_lines: Vec<Option<DelayLine>> = Vec::new();
@@ -673,6 +696,8 @@ impl ProjectRt {
             device_scope_watch: new.device_scope_watch,
             mod_plan: retired_plan,
             mod_phase_table: retired_table,
+            input_stage: retired_stage,
+            audio_take: retired_take,
         };
         let _ = self.bundle_recycle_tx.push(recycled);
     }
@@ -936,6 +961,20 @@ impl ProjectRt {
         }
     }
 
+    /// r.md #156: オーディオ入力の録音に、この block を伝える ([`TakeDrive::observe`])。`live` = この block は
+    /// 録音中か、`playhead` = block 先頭の曲の位置。拍は `playhead_beats` (呼ぶ前に block 頭の値にしておく)。
+    fn observe_take(&mut self, live: bool, playhead: u64, io: crate::device::input::DeviceIo<'_>, frames: usize) {
+        self.take.observe(TakeBlock {
+            live,
+            playhead,
+            beat: self.playhead_beats,
+            out_frame: io.out_frame,
+            frames: frames as u32,
+            latency: io.input_latency_frames.saturating_add(io.output_latency_frames),
+            pdc: self.cached_schedule.master_latency_samples,
+        });
+    }
+
     /// 「今このプロジェクトは走っているか (count-in 込み)」 — デバイスの idle park 判定用。
     #[must_use]
     pub fn is_rolling(&self) -> bool {
@@ -1056,6 +1095,8 @@ impl ProjectRt {
             self.transport_out.now.preroll = new_preroll;
             // count-in 中のローンチ操作も溜めない (書き出し中と同じ理由)。
             self.launcher.clear_requests();
+            // r.md #156: count-in の間に録音が取り消されたら、待っている録音を閉じる。
+            self.observe_take(false, 0, ctx.io, n);
             return;
         }
 
@@ -1102,6 +1143,9 @@ impl ProjectRt {
         if song_ref.is_some() {
             self.playhead_beats = head_mark.beat;
         }
+        // r.md #156: オーディオ入力の録音。この block が録音中かと、その先頭の曲の位置を伝える
+        // (`recording_live` と同じ条件。count-in の block はここへ来ない)。
+        self.observe_take(recording_requested && playing, playhead, ctx.io, n);
         // Phase 4 Step C-2: 「現在 recording 中の lane」 (bundle 由来、この buffer の間は差し替わらない)。
         let recording_lanes: &RecordingLanes = &self.recording_lanes;
         // 今 buffer の effective bpm を SongTempo lane から評価する。
@@ -1156,15 +1200,23 @@ impl ProjectRt {
                 n,
             );
 
-            // r.md #129: この buffer の「聴き方・見方」(SC Listen / device scope)。scope の対象の
+            // r.md #156: デバイス入力を project の受け皿へ写す (モニター / 入力メーターが要るトラックの分だけ)。
+            // 入力を聞くのはアクティブなタブ (= scope の対象) だけ。
+            let input = ctx.io.input;
+            self.input_stage.fill(song, n, ctx.scope.is_some(), |ch| input.channel(ch));
+
+            // r.md #129: この buffer の「聴き方・見方」(SC Listen / device scope / デバイス入力)。scope の対象の
             // project だけが見出しを同期して scope へ書く。
-            let native_io = native_io_for_buffer(
-                self.key,
-                self.shared.sc_listen_device.load(Ordering::Acquire),
-                std::array::from_fn(|k| self.shared.delta_devices[k].load(Ordering::Acquire)),
-                ctx.device_scope,
-                &self.device_scope_watch,
-            );
+            let native_io = NativeIo {
+                input: Some(&self.input_stage),
+                ..native_io_for_buffer(
+                    self.key,
+                    self.shared.sc_listen_device.load(Ordering::Acquire),
+                    std::array::from_fn(|k| self.shared.delta_devices[k].load(Ordering::Acquire)),
+                    ctx.device_scope,
+                    &self.device_scope_watch,
+                )
+            };
 
             // live/export 共通の単一 render 経路 (§5): dispatch → schedule →
             // master fx → master gain → master limiter。
@@ -1451,7 +1503,7 @@ fn native_io_for_buffer<'a>(
         }
         DeviceScopeTap { bridge: ds.bridge, watch }
     });
-    NativeIo { sc_listen, scopes, delta }
+    NativeIo { sc_listen, scopes, delta, input: None }
 }
 
 mod atomic_batch;
@@ -1593,6 +1645,8 @@ mod bundle_install_tests {
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,
             mod_phase_table: None,
+            input_stage: None,
+            audio_take: None,
         }
     }
 
@@ -1618,6 +1672,8 @@ mod bundle_install_tests {
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,
             mod_phase_table: None,
+            input_stage: None,
+            audio_take: None,
         }
     }
 
@@ -2339,12 +2395,84 @@ mod multi_project_tests {
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,
             mod_phase_table: None,
+            input_stage: None,
+            audio_take: None,
         }
     }
 
     fn run(r: &mut Rig, buffers: usize) {
         for _ in 0..buffers {
-            r.dev.process_buffer(&r.shared, &r.bridge, &r.scope, &r.device_scope, 48_000, 256);
+            r.dev.process_buffer(
+                &r.bridge,
+                &r.scope,
+                &r.device_scope,
+                48_000,
+                256,
+                crate::device::input::DeviceIo::NONE,
+            );
+        }
+    }
+
+    /// r.md #156: デバイスの入力は、モニターが効いているトラック (オン、または自動で録音待機中) のチェーンを通って
+    /// マスターへ出る (止まっていても)。オフ・自動で待機していない・背景のタブでは出ない。
+    #[test]
+    fn モニターが効いているトラックだけ入力がマスターへ出る() {
+        use crate::device::input::{DeviceIo, InputBlock};
+        use common::audio_device::ChannelRange;
+        use common::model::{MonitorMode, TrackInput};
+        const N: usize = 256;
+        let key = ProjectKey(1);
+        // デバイスの入力 ch 2 だけに音がある (ch 番号で引けていること)。
+        let mut data = vec![0.0_f32; N * 3];
+        for (i, s) in data[2 * N..].iter_mut().enumerate() {
+            *s = 0.25 + i as f32 / 1024.0;
+        }
+        // (モニター, 録音待機, アクティブなタブか, 聞こえるか)
+        let cases = [
+            (MonitorMode::Off, true, true, false),
+            (MonitorMode::Auto, false, true, false),
+            (MonitorMode::Auto, true, true, true),
+            (MonitorMode::On, false, true, true),
+            (MonitorMode::On, true, false, false),
+        ];
+        for (i, (monitor, armed, active, heard)) in cases.into_iter().enumerate() {
+            let mut r = rig(&format!("monitor{i}"));
+            let (_shared, mut bundle_tx) = open(&mut r, key);
+            r.engine.scope_project.store(if active { key.0 } else { 99 }, Ordering::Release);
+            let mut t = track(1);
+            t.input = TrackInput::AudioMono { channel: 2 };
+            t.monitor = monitor;
+            t.armed = armed;
+            let song = Arc::new(Song { tracks: vec![t], ..Song::default() });
+            let mut b = bundle(&song);
+            b.input_stage = Some(crate::graph::input_stage::InputStage::new(
+                &crate::graph::input_stage::input_plan(&song),
+                common::process_data::MAX_FRAMES,
+            ));
+            bundle_tx.push(b).ok().unwrap();
+            for k in 0..4 {
+                let io = DeviceIo {
+                    input: InputBlock::new(&data, N, N, ChannelRange { first: 0, count: 3 }, k * N as u64),
+                    out_frame: k * N as u64,
+                    input_latency_frames: 0,
+                    output_latency_frames: 0,
+                };
+                r.dev.process_buffer(&r.bridge, &r.scope, &r.device_scope, 48_000, N, io);
+            }
+            let case = format!("{monitor:?} armed={armed} active={active}");
+            if heard {
+                // フェーダー 1.0・pan 中央なので、モノの入力がそのまま L / R に出る。
+                for ch in [&r.dev.master_l, &r.dev.master_r] {
+                    for (o, s) in ch[..N].iter().zip(&data[2 * N..]) {
+                        assert!((o - s).abs() < 1e-6, "{case}: {o} != {s}");
+                    }
+                }
+            } else {
+                assert!(r.dev.master_l[..N].iter().chain(&r.dev.master_r[..N]).all(|&v| v == 0.0), "{case}");
+            }
+            assert_eq!(r.dev.any_input_monitoring(), heard, "{case}");
+            // 録音待機でモニターしていなければ、入力メーターのために入力を読み続ける (アクティブなタブだけ)。
+            assert_eq!(r.dev.any_input_live(), heard || (armed && active), "{case}");
         }
     }
 

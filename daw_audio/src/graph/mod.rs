@@ -17,6 +17,8 @@ mod compile;
 mod delay_line;
 pub mod execute;
 pub mod follower;
+/// r.md #156: デバイス入力をトラックのチェーン入口へ流す受け皿。
+pub mod input_stage;
 mod mix;
 pub mod native;
 mod port_buffer;

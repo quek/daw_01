@@ -164,6 +164,7 @@ impl AppData {
                 next_plugin_load_generation: 0,
                 rescan_result: Arc::new(Mutex::new(None)),
                 supervisor,
+                respawn_crashed_children: true,
                 child_disconnect_log: Vec::new(),
                 is_rescanning: false,
                 event_proxy,
@@ -186,6 +187,8 @@ impl AppData {
                 settings_rect: app_config
                     .settings_rect
                     .map(|[x, y, w, h]| daw_ui_renderer::Rect { x, y, w, h }),
+                settings_category: crate::state::SettingsCategory::from_id(&app_config.settings_category)
+                    .unwrap_or_default(),
                 // r.md #54: ラウドネスレポート window の開閉/位置/サイズ。
                 loudness_report_open: app_config.loudness_report_open,
                 loudness_report_rect: app_config
@@ -281,6 +284,9 @@ impl AppData {
             sampler: crate::state::SamplerState::new(),
             midi_capture: crate::state::MidiCaptureState::new(),
             virtual_keyboard: crate::state::VirtualKeyboardState::default(),
+            // r.md #156: 開きたいデバイスは app_config から。実際に開いたデバイス (`info`) は、子プロセスを
+            // 起こした側 (main / script host) が `Bootstrap::device_info` を入れる。
+            audio_device: crate::state::AudioDeviceState::new(app_config.audio_device.clone(), None),
         };
         // recent_files / recent_saved の path 列から filename label cache を
         // 1 回構築。 push_recent / push_recent_saved 経由の更新でも自動的に
@@ -296,9 +302,9 @@ impl AppData {
         // 子プロセスが居ない経路 (test / script) では中で no-op。
         app.reopen_sampler_ring();
         // r.md #48: 設定 window が開いた状態で復元されたときは、最初のフレームまでに
-        // テーマ一覧が要る (描画側は毎フレーム作り直さない)。
+        // ページの中身 (テーマ一覧など) が要る (描画側は毎フレーム作り直さない)。
         if app.ui_prefs.settings_open {
-            app.refresh_available_themes();
+            app.settings_page_shown();
         }
         // cache が旧 port-probe 版 (PluginEntry の 3 bool 未取得) なら、
         // 起動時に 1 回だけ自動で再 probe (rescan) して port 構成を埋める。 production
@@ -580,16 +586,8 @@ impl AppData {
                 self.persist_app_config();
             }
             // r.md #48: 設定 window の開閉トグル (Edit メニュー / ✕ / Esc)。
-            AppEvent::ToggleSettings => {
-                self.ui_prefs.settings_open = !self.ui_prefs.settings_open;
-                if self.ui_prefs.settings_open {
-                    // テーマ一覧の実体は `themes/` の read_dir + JSON パース。
-                    // **開いたときに 1 回だけ**取る (描画ループでディスクを叩かない)。
-                    // 開き直せば新しく置いたファイルが出るので再起動は要らない。
-                    self.refresh_available_themes();
-                }
-                self.persist_app_config();
-            }
+            AppEvent::ToggleSettings => self.toggle_settings(),
+            AppEvent::SetSettingsCategory(category) => self.set_settings_category(category),
             // r.md #50: 画面右端のマスターパネルの開閉 (View メニュー / Ctrl+Alt+M)。
             AppEvent::ToggleMasterPanel => {
                 self.ui_prefs.master_panel_open = !self.ui_prefs.master_panel_open;
@@ -1014,6 +1012,8 @@ impl AppData {
                     if self.cur.view.bottom_panel == Some(0) { None } else { Some(0) };
             }
             AppEvent::Sampler(ev) => self.handle_sampler_event(ev),
+            AppEvent::AudioRec(ev) => self.handle_audio_rec_event(ev),
+            AppEvent::AudioDevice(ev) => self.handle_audio_device_event(ev),
             AppEvent::VirtualKeyboard(ev) => self.handle_virtual_keyboard_event(ev),
             AppEvent::SelectClip { target, additive } => {
                 self.select_clip(target, additive);

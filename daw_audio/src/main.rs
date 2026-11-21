@@ -20,13 +20,17 @@ use common::metrics_bridge::MetricsBridgeHandle;
 use common::protocol::{AudioCommand, AudioEvent, DeviceAddr, ProjectKey};
 use common::scope_bridge::ScopeBridgeHandle;
 use common::wire::{read_msg, write_msg};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::io::ReadHalf;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
+// r.md #156: ASIO ドライバーを SDK 無しで直接呼ぶ層 (64 bit Windows 専用、`asio` の module doc)。
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod asio;
 mod audio_clip_renderer;
+mod audio_rec;
 mod audio_worker;
 mod automation;
+mod device;
 #[cfg(test)]
 // r.md #129: 内蔵 device DSP の golden (`native_dsp/golden_v38.txt`) の刺激・統計・形式。
 // 比較は `native_dsp::tests`。
@@ -51,25 +55,11 @@ mod song_values;
 mod stretch_engine;
 
 use engine::{
-    DeviceBundle, DeviceRt, EngineCommand, EngineCommandSender, EngineShared, PluginEntry,
+    DeviceBundle, DeviceRt, EngineCommandSender, EngineShared, PluginEntry,
     ProjectDelivery, ProjectRt, SharedState, SyncSlot, WorkerRig,
 };
 use mod_plan_publish::ModPhaseTableBuilder;
 use project_ctl::{DecodeJob, ProjectCtl};
-
-/// A1 (r.md #8): 出力ストリームを開く前にデフォルト出力デバイスの実サンプルレートを
-/// 問い合わせる (stream は開かない)。 Hello で親へ報告し、 session.sample_rate の SSoT に
-/// する → engine / plugin / GUI / VOICEVOX が全てハードウェアのレートで揃う。 デバイス
-/// 無し / query 失敗時は `None` (親が `audio_bridge::DEFAULT_SAMPLE_RATE` へ fallback)。
-/// 後で `start_output_stream` が同じ `default_output_config` で stream を開くので、
-/// 報告値と実ストリームのレートは一致する。
-fn query_default_output_sample_rate() -> Option<u32> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let device = cpal::default_host().default_output_device()?;
-    let config = device.default_output_config().ok()?;
-    // cpal 0.17: `sample_rate()` は raw `u32` を返す (SampleRate newtype 廃止)。
-    Some(config.sample_rate())
-}
 
 /// project slot の生成 / 撤去便の ring 深さ (タブの開閉は人の速度)。
 const PROJECT_RING_CAP: usize = engine::MAX_PROJECTS;
@@ -81,16 +71,26 @@ async fn main() -> Result<()> {
     let _log_guard = common::logging::init_tracing_for("daw_audio");
     tracing::info!("daw_audio started");
 
+    // `--asio-probe [名前]`: ASIO 層の実測だけして終わる (IPC を張らない、`asio::probe`)。
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    if let Some(code) = asio::probe::run_from_args() {
+        std::process::exit(code);
+    }
+
     let pipe_name = std::env::args()
         .nth(1)
         .context("expected pipe name as first argument")?;
 
-    // A1 (r.md #8): デバイス実レートを Hello で親へ報告 → session.sample_rate の SSoT。
     // Hello には PROTOCOL_FINGERPRINT が同梱され、親がビルド世代を検証する (§3)。
-    let device_sample_rate = query_default_output_sample_rate();
-    let mut pipe =
-        common::client::perform_audio_handshake(&pipe_name, device_sample_rate).await?;
-    tracing::info!(?device_sample_rate, "daw_audio handshake complete");
+    let mut pipe = common::client::perform_audio_handshake(&pipe_name).await?;
+    // r.md #156: 親が「開くデバイス」を渡してくる。開いたデバイスを報告し、その実レートが
+    // session.sample_rate の SSoT になる (A1 r.md #8: engine はハードウェアのレートで動く)。
+    // デバイスに触るのは制御スレッドだけ (`device::control`)。ここは結果を待つ (有界)。まだ鳴らさない。
+    let device_config = common::client::read_open_device(&mut pipe).await?;
+    let device = device::control::DeviceControl::spawn().context("failed to spawn the audio device control thread")?;
+    let device_info = tokio::task::block_in_place(|| device.open(device_config))?;
+    common::client::send_device_info(&mut pipe, &device_info).await?;
+    tracing::info!(?device_info, "daw_audio handshake complete");
 
     let session = common::client::read_audio_session(&mut pipe).await?;
     tracing::info!(?session, "audio session ready");
@@ -140,31 +140,46 @@ async fn main() -> Result<()> {
     let (device_tx, device_rx) = rtrb::RingBuffer::<DeviceBundle>::new(DEVICE_RING_CAP);
     let (device_recycle_tx, device_recycle_rx) =
         rtrb::RingBuffer::<DeviceBundle>::new(DEVICE_RING_CAP);
+    // r.md #156: オーディオ入力の録音。recv loop の口と、デバイスのコールバックへ差し込む tap。
+    let (rec_hub, rec_tap) = audio_rec::channel();
 
-    let stream = start_output_stream(
-        Arc::clone(&shared),
+    // 描き手 (engine の RT の状態一式)。持ち主は常に 1 本のスレッド (コールバックか先読みの描画スレッド。
+    // 切り替えは `OutputStage` が停止中に行う — `output_render` の module doc)。
+    let local = DeviceRt::new(
+        common::process_data::MAX_FRAMES,
+        cmd_rx,
         Arc::clone(&engine_shared),
+        project_rx,
+        project_recycle_tx,
+        device_rx,
+        device_recycle_tx,
+    );
+    // r.md #156: デバイスの入力をコールバックから描き手へ渡す ring (運ぶのは開いている入力 ch)。
+    let (monitor_feed, monitor_input) = device::monitor::monitor_pair(
+        device_info.active_inputs,
+        (output_render::RENDER_AHEAD_PERIODS + 2) * common::process_data::MAX_FRAMES,
+    );
+    let renderer = output_render::OutputRenderer::new(
+        local,
+        Arc::clone(&shared),
         Arc::clone(&bridge),
         Arc::clone(&metrics),
         Arc::clone(&scope),
         Arc::clone(&device_scope),
         session.sample_rate,
+        device::callback::OUT_CHANNELS,
+        monitor_input,
+    );
+    let stage = output_render::OutputStage::spawn(renderer).context("failed to spawn audio render thread")?;
+    // r.md #156: 録音の取り出し口 (デバイスのコールバックのスレッドで、描画の後に毎回呼ばれる)。
+    let input_tap: Box<dyn device::input::InputTap> = Box::new(rec_tap);
+    let callback = device::callback::EngineCallback::new(
+        stage,
+        input_tap,
+        Arc::clone(&engine_shared),
         session.mute_output,
-        cmd_rx,
-        project_rx,
-        project_recycle_tx,
-        device_rx,
-        device_recycle_tx,
-    )
-    .context("failed to start audio stream")?;
-    tracing::info!("audio stream running");
-    // r.md #49: 以後 stream の pause / play は `ParkDriver` 経由でのみ行う
-    // (park を要求する CPAL コールバックと、解除を要求する receive loop の
-    // 2 系統を 1 本の Mutex に直列化する)。
-    let park: Park = Arc::new(std::sync::Mutex::new(ParkDriver {
-        stream,
-        parked: false,
-    }));
+        monitor_feed,
+    );
 
     // Split the pipe so the receive loop can keep reading while the
     // export thread (off-tokio) ships completion notifications back to
@@ -181,15 +196,20 @@ async fn main() -> Result<()> {
         }
     });
 
+    // engine をデバイスへつないで鳴らし始める。以後 stream を止める / 起こす (r.md #49 のアイドル park) のは
+    // 制御スレッドだけ: 描き手が `park_requested` を立て、制御スレッドが追従する。
+    device.install(device::control::Install {
+        callback,
+        shared: Arc::clone(&shared),
+        metrics: Arc::clone(&metrics),
+        events: out_tx.clone(),
+    });
+    tracing::info!("audio stream running");
+
     // plan §4: RT からは pipe に書けない (I/O 禁止) ので、 quarantine / pool
     // stall / MMCSS 失敗のフラグを 100ms 周期で poll して GUI へ通知する
     // 専用スレッド。 dedup は per-entry / per-rig の AtomicBool swap。
-    let notify = spawn_notify_thread(
-        Arc::clone(&engine_shared),
-        out_tx.clone(),
-        Arc::clone(&shared),
-        Arc::clone(&park),
-    );
+    let notify = spawn_notify_thread(Arc::clone(&engine_shared), out_tx.clone());
 
     // Background decode worker (r.md #7 decode 再設計 B): keeps large WAV
     // decodes off the tokio receive loop. The receive loop publishes a
@@ -204,134 +224,39 @@ async fn main() -> Result<()> {
             .context("failed to spawn audio decode worker")?;
     }
 
-    recv_loop(read_half, RecvLoop {
-        shared,
-        engine_shared: Arc::clone(&engine_shared),
-        bridge: Arc::clone(&bridge),
-        session_sample_rate: session.sample_rate,
-        cmd_tx,
-        out_tx,
-        decode_tx,
-        project_tx,
-        project_recycle_rx,
-        device_publisher: DevicePublisher { tx: device_tx, parked: None },
-        device_recycle_rx,
-        park: Arc::clone(&park),
-    })
+    recv_loop(
+        read_half,
+        RecvLoop {
+            shared,
+            engine_shared: Arc::clone(&engine_shared),
+            bridge: Arc::clone(&bridge),
+            session_sample_rate: session.sample_rate,
+            cmd_tx,
+            out_tx,
+            decode_tx,
+            project_tx,
+            project_recycle_rx,
+            device_publisher: DevicePublisher { tx: device_tx, parked: None },
+            device_recycle_rx,
+            rec: rec_hub,
+        },
+        &device,
+    )
     .await;
 
-    // (r.md #61) ここから graceful teardown。順序が意味を持つ:
-    //   1. notify thread を止めて join する — この thread が `park` の Arc clone を
-    //      持っている間は `cpal::Stream::drop` が走らない (旧実装の Arc リーク)。
-    //   2. stream を明示 pause してデバイスを解放する。
-    //   3. `park` の最後の Arc を落として `cpal::Stream` を drop する。
-    // 待ちはどれも有界 (join は poll 周期 100ms が上限)。
+    // (r.md #61) ここから graceful teardown。待ちはどれも有界:
+    //   1. notify thread を止めて join する (poll 周期 100ms が上限)。
+    //   2. 制御スレッドに stream を止めてデバイスを閉じさせ、描き手 (描画スレッド) を片付けさせる
+    //      (`DeviceControl::shutdown`。「解放できた」を表すログは制御スレッドの `audio stream released`)。
     if let Some(notify) = notify {
         notify.stop_and_join();
     }
-    {
-        let mut driver = park
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        driver.stop_for_shutdown();
-    }
-    // 不変条件: ここで `park` の Arc は 1 本だけ (notify thread と recv_loop の
-    // clone は上で落ちている)。残っていると `cpal::Stream::drop` が走らず
-    // デバイスが解放されない = r.md #61 で直した Arc リークの再発。
-    // panic ではなく error ログにするのは、**この時点でプロセスは終わるだけ**で、
-    // 落として exit code を汚し log flush を飛ばすより、リークの事実を記録して
-    // 静かに終わる方が診断に役立つため (探しに行く先はまさにこのログ)。
-    let remaining = Arc::strong_count(&park);
-    if remaining != 1 {
-        tracing::error!(
-            remaining,
-            "Park の Arc が他に残っている — cpal::Stream::drop が走らずデバイスが解放されない"
-        );
-    }
-    // ここで `cpal::Stream::drop` が run thread を畳み、WASAPI デバイスが
-    // 実際に解放される。**「解放できた」を表すのはこの行** (`stop_for_shutdown`
-    // の pause は要求をキューに積んだだけ)。
-    drop(park);
-    tracing::info!("audio stream released");
+    device.shutdown();
     tracing::info!("daw_audio exiting");
     Ok(())
 }
 
-/// r.md #49: CPAL stream の park / resume を直列化する唯一の口。
-///
-/// park を要求するのは CPAL コールバック (無音アイドルの検出者)、解除を要求するのは
-/// receive loop (コマンドの受け手) と、所有者が 2 つに割れる。どちらも非 RT スレッド
-/// なので Mutex で 1 本化し、「今 pause 済みか」をこの中だけが持つ状態にする
-/// (2 箇所が別々に `Stream` を触ると、pause と play が入れ違って **無音のまま
-/// 起きてこない** = 最悪の失敗モードになる)。
-///
-/// コールバック自身は stream を触れない (cpal のコマンドキュー経由なので
-/// コールバック内から呼ぶとデッドロックしうる) ため、要求は atomic フラグで渡す。
-struct ParkDriver {
-    stream: cpal::Stream,
-    parked: bool,
-}
-
-impl ParkDriver {
-    /// stream を `want` の状態へ遷移させる (既にその状態なら何もしない)。
-    /// **呼び出し側が Mutex を保持していること** — 「今どちらか」の判定と実際の
-    /// pause / play が割り込まれると、pause と play が入れ違って無音のまま
-    /// 起きてこなくなる。
-    fn apply(&mut self, want: bool) {
-        if self.parked == want {
-            return;
-        }
-        let result = if want {
-            self.stream.pause().map_err(|e| e.to_string())
-        } else {
-            self.stream.play().map_err(|e| e.to_string())
-        };
-        match result {
-            Ok(()) => {
-                self.parked = want;
-                tracing::info!(parked = want, "audio stream park state changed");
-            }
-            // 失敗しても状態は変えないので、次の reconcile で再試行される。
-            // デバイス消失等の恒常障害は CPAL の error callback が別途上げる。
-            Err(e) => tracing::error!(
-                error = %e,
-                want_parked = want,
-                "failed to change audio stream park state"
-            ),
-        }
-    }
-
-    /// (r.md #61) プロセス終了に向けて stream の停止を要求する。
-    ///
-    /// `apply` と違って「今の状態」を見ずに **必ず** 要求する。
-    ///
-    /// **これは「停止した」ではなく「停止を要求した」**。cpal 0.17 の wasapi
-    /// backend では `Stream::pause` は `Command::PauseStream` をキューに積んで
-    /// 即 `Ok(())` を返すだけで (`host/wasapi/stream.rs`)、実際の
-    /// `IAudioClient::Stop` は run thread の `process_commands` が後から実行し、
-    /// その失敗は `error_callback` へ行ってこの `Result` には現れない。
-    /// デバイスが実際に解放されるのは `Stream::drop` が run thread を畳んだ
-    /// 時点なので、確認したいログは後段の `audio stream released`。
-    fn stop_for_shutdown(&mut self) {
-        match self.stream.pause() {
-            Ok(()) => tracing::info!("requested audio stream pause for shutdown"),
-            Err(e) => tracing::warn!(error = %e, "failed to queue the audio stream pause"),
-        }
-        self.parked = true;
-    }
-}
-
-// `cpal::Stream` は wasapi backend で `Send + Sync`
-// (`cpal-0.17.1/src/host/wasapi/stream.rs:40,49`)。Mutex 越しに 2 スレッドから
-// pause / play を出すのはこの保証に依存している。
-type Park = Arc<std::sync::Mutex<ParkDriver>>;
-
-/// (r.md #61) notify thread の停止ハンドル。
-///
-/// 旧実装は脱出条件の無い `loop` で、`park: Park` の `Arc` clone を**永久に
-/// 保持**していた。そのため `main` が return しても strong count が 0 にならず、
-/// `cpal::Stream::drop` (= WASAPI デバイスの解放) が **原理的に走らなかった**。
-/// 「recv_loop を break する」だけでは直らない ので、停止フラグ + join を持つ。
+/// (r.md #61) notify thread の停止ハンドル (停止フラグ + join。脱出条件の無い loop にしない)。
 struct NotifyThread {
     stop: Arc<std::sync::atomic::AtomicBool>,
     join: std::thread::JoinHandle<()>,
@@ -349,69 +274,40 @@ impl NotifyThread {
     }
 }
 
-/// `park_requested` が指す状態へ stream を寄せる (reconciler)。notify thread が
-/// 100ms ごとに呼ぶ。
-///
-/// **要求の読み取りを Mutex の中で行う**のが要点。外で読むと、`wake_stream` が
-/// 要求を取り下げた**後**に古い `true` で pause してしまい、再生中に音が止まる。
-///
-/// 「要求 → 追従」の形にしておくと、コールバックが要求を取り下げただけの場合
-/// (= IPC を伴わずにアイドルが崩れた) も次の周回で自然に復帰する。
-fn reconcile_park(park: &Park, shared: &SharedState) {
-    let mut d = park
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let want = shared.park_requested.load(Ordering::Acquire);
-    d.apply(want);
-}
-
 /// park 要求を取り下げて即座に起こす。receive loop がコマンド受信時に呼ぶ。
 ///
-/// reconciler を待たずにここで起こすのは応答性のため (最大 100ms 遅れると
-/// 「Play を押してから音が出るまで一拍おく」になる)。要求の取り下げを先に
-/// 行うので、同時に走っている reconciler が pause 側へ倒すことはない。
-fn wake_stream(park: &Park, shared: &SharedState) {
+/// 制御スレッドの周期 (100ms) を待たずに起こすのは応答性のため (待つと「Play を押してから音が出るまで
+/// 一拍おく」になる)。要求の取り下げを先に行い、stream を触るのは制御スレッドだけなので、止める側と
+/// 入れ違うことはない (`device::control`)。
+fn wake_stream(device: &device::control::DeviceControl, shared: &SharedState) {
     shared.park_requested.store(false, Ordering::Release);
     shared.idle_silent_samples.store(0, Ordering::Release);
-    let mut d = park
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    d.apply(false);
+    device.wake();
 }
 
 /// plan §4: quarantine / pool stall / MMCSS 失敗フラグを 100ms 周期で poll
 /// して GUI へ `AudioEvent` を送る通知スレッド (RT からは atomic store のみ)。
 /// フラグの SSoT は `PluginEntry` / `WorkerRig` / `EngineShared` 上の
 /// AtomicBool で、 dedup は `*_notified` の swap。
-///
-/// r.md #49: アイドル park の実行もここが担う (コールバックは atomic を立てるだけ)。
 fn spawn_notify_thread(
     engine_shared: Arc<EngineShared>,
     out_tx: tokio::sync::mpsc::UnboundedSender<AudioEvent>,
-    shared: Arc<SharedState>,
-    park: Park,
 ) -> Option<NotifyThread> {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
     let join = std::thread::Builder::new()
         .name("audio-notify".to_string())
         .spawn(move || {
-            // (r.md #61) `park` の Arc clone をこの thread が持つので、
-            // **抜ける条件が無いと `cpal::Stream::drop` が永久に走らない**。
-            // `stop` を見て抜け、clone をここで落とす。
             // rig ごとに「pair が詰まったまま借り替えられない」状態が始まった時刻。
             let mut degraded_since: Option<(usize, std::time::Instant)> = None;
             while !stop_for_thread.load(Ordering::Acquire) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                // r.md #49: stream の状態をコールバックの park 要求へ追従させる。
-                // pause 側 (アイドル検出) も play 側 (要求の取り下げ) もここが拾う。
-                reconcile_park(&park, &shared);
-                // CPAL callback の MMCSS join 失敗の one-shot warn (RT では
+                // デバイスのコールバックの MMCSS join 失敗の one-shot warn (RT では
                 // tracing を出せないのでここで代行)。
                 if engine_shared.mmcss_join_failed.load(Ordering::Acquire)
                     && !engine_shared.mmcss_warned.swap(true, Ordering::AcqRel)
                 {
-                    tracing::warn!("CPAL callback: MMCSS join (Pro Audio) failed");
+                    tracing::warn!("audio callback: MMCSS join (Pro Audio) failed");
                 }
                 notify_quarantined_devices(&engine_shared, &out_tx);
                 // worker pool 全体の完了待ち timeout、または pair が詰まったまま予備も尽きた状態の持続 → pool 停止を
@@ -435,7 +331,7 @@ fn spawn_notify_thread(
     match join {
         Ok(join) => Some(NotifyThread { stop, join }),
         Err(e) => {
-            // spawn 失敗はアイドル park と quarantine 通知を失うだけで、
+            // spawn 失敗は quarantine 通知を失うだけで、
             // 音は鳴り続ける。終了時に join するものが無いだけなので None。
             tracing::error!(error = ?e, "failed to spawn audio notify thread");
             None
@@ -550,7 +446,8 @@ struct RecvLoop {
     project_recycle_rx: rtrb::Consumer<Box<ProjectRt>>,
     device_publisher: DevicePublisher,
     device_recycle_rx: rtrb::Consumer<DeviceBundle>,
-    park: Park,
+    /// r.md #156: オーディオ入力の録音を作って tap と書き手へ渡す口。
+    rec: audio_rec::RecHub,
 }
 
 /// recv loop の周期処理 (メッセージ処理とは独立に走る)。
@@ -577,6 +474,8 @@ fn recv_loop_housekeeping(
     rl.device_publisher.flush();
     // ring が満杯の間に溜めた EngineCommand を流す (次のコマンドが来なくても届く)。
     rl.cmd_tx.flush();
+    // r.md #156: tap が手放した録音の取り込み口を解放する。
+    rl.rec.housekeeping();
     let mut finished = phase_tables.take_finished();
     for ctl in projects.values_mut() {
         let key = ctl.key();
@@ -588,7 +487,11 @@ fn recv_loop_housekeeping(
     }
 }
 
-async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
+async fn recv_loop(
+    mut pipe: ReadHalf<NamedPipeClient>,
+    mut rl: RecvLoop,
+    device: &device::control::DeviceControl,
+) {
     let mut projects: HashMap<ProjectKey, ProjectCtl> = HashMap::new();
     // r.md #89: 位相表を張る専用スレッド (project ごとに最新の要求だけ残す郵便受け)。
     let phase_tables = ModPhaseTableBuilder::spawn();
@@ -625,7 +528,7 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
         // 起こしたあと条件がまだ揃っていれば、コールバックが改めて数え直して
         // 再び park するので、余分に起きても害はない。
         if !matches!(msg, Ok(AudioCommand::SetAppActive(false))) {
-            wake_stream(&rl.park, &rl.shared);
+            wake_stream(device, &rl.shared);
         }
         let cmd = match msg {
             Ok(cmd) => cmd,
@@ -639,6 +542,20 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
             // `read_audio_session` が消費済み — shmem 名と format はプロセス
             // 生存中不変)。
             AudioCommand::Ack | AudioCommand::Session(_) => {}
+            // r.md #156: 開くデバイスは起動時の handshake で受け取り済み (動いている daw_audio のデバイスは
+            // 替えない — 替えるときは daw_gui が daw_audio を起こし直す)。
+            AudioCommand::OpenDevice { .. } => {
+                tracing::warn!("OpenDevice after the handshake; ignored");
+            }
+            AudioCommand::ListAudioDevices => {
+                // 列挙は数十 ms かかりうる (全デバイスの問い合わせ) ので、受信ループの外で。
+                let out_tx = rl.out_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = out_tx.send(AudioEvent::AudioDevices(Box::new(device::enumerate::list())));
+                });
+            }
+            // ドライバーの設定画面は制御スレッドが開く (ASIO のドライバーは作ったスレッドに縛られる)。
+            AudioCommand::OpenDeviceControlPanel => device.open_control_panel(),
             // r.md #49: アプリの窓がアクティブかの報告。park してよいかの判断は
             // engine 側 (`buffer_is_idle`) が行うので、ここは事実の反映のみ。
             AudioCommand::SetAppActive(active) => {
@@ -787,6 +704,17 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
                     scope,
                 );
             }
+            // r.md #156: オーディオ入力の録音の準備。WAV の書き手を起こし、取り込み口を tap へ、判定の共有面を
+            // 便で描画側へ届ける (この後に来る `StartRecording` で録音が始まる)。
+            AudioCommand::StartAudioTakes { project, request } => {
+                let Some(ctl) = projects.get_mut(&project) else {
+                    tracing::warn!(project = project.0, "StartAudioTakes for an unknown project; ignored");
+                    continue;
+                };
+                tracing::info!(project = project.0, take = request.take_id, tracks = request.takes.len(), "received StartAudioTakes");
+                let take = rl.rec.start(project, request, rl.session_sample_rate, rl.out_tx.clone());
+                ctl.set_audio_take(take, &rl.engine_shared, rl.session_sample_rate, &phase_tables);
+            }
             // それ以外は全部 project 宛 (`AudioCommand::project` が SSoT)。閉じた
             // タブへの遅延 command は捨てる。
             cmd => {
@@ -857,77 +785,6 @@ fn build_worker_rig(spec: &common::protocol::WorkerPoolSpec) -> Result<WorkerRig
     Ok(WorkerRig::new(pool, slots, spec.n_runners as usize, bridge))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn start_output_stream(
-    shared: Arc<SharedState>,
-    engine_shared: Arc<EngineShared>,
-    bridge: Arc<AudioBridgeHandle>,
-    metrics: Arc<MetricsBridgeHandle>,
-    scope: Arc<ScopeBridgeHandle>,
-    device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
-    session_sample_rate: u32,
-    mute_output: bool,
-    cmd_rx: rtrb::Consumer<EngineCommand>,
-    project_rx: rtrb::Consumer<ProjectDelivery>,
-    project_recycle_tx: rtrb::Producer<Box<ProjectRt>>,
-    device_rx: rtrb::Consumer<DeviceBundle>,
-    device_recycle_tx: rtrb::Producer<DeviceBundle>,
-) -> Result<cpal::Stream> {
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .context("no default output device")?;
-    // cpal 0.17: `name()` は deprecated — `description()` (name + 種別) を使う。
-    let device_name = device
-        .description()
-        .map(|d| d.to_string())
-        .unwrap_or_else(|_| "<unknown>".into());
-    let supported = device
-        .default_output_config()
-        .context("failed to query default output config")?;
-
-    let sample_rate = supported.sample_rate();
-    let channels = supported.channels();
-    let sample_format = supported.sample_format();
-
-    tracing::info!(
-        device = %device_name,
-        sample_rate,
-        channels,
-        ?sample_format,
-        "opening output stream"
-    );
-
-    if sample_format != cpal::SampleFormat::F32 {
-        anyhow::bail!("unsupported sample format: {sample_format:?}, expected F32");
-    }
-
-    let config: cpal::StreamConfig = supported.into();
-    let local = DeviceRt::new(
-        common::process_data::MAX_FRAMES,
-        cmd_rx,
-        engine_shared,
-        project_rx,
-        project_recycle_tx,
-        device_rx,
-        device_recycle_tx,
-    );
-    let stream = build_stream(
-        &device,
-        &config,
-        channels,
-        shared,
-        bridge,
-        metrics,
-        scope,
-        device_scope,
-        session_sample_rate,
-        mute_output,
-        local,
-    )?;
-    stream.play().context("failed to start stream")?;
-    Ok(stream)
-}
 /// グラフの内訳 (自分の仕事 / plugin 待ち / 実効並列度) を metrics 面へ publish する。
 ///
 /// callback の末尾で 1 回だけ呼ぶ。ふつうこのとき runner は全員グラフを抜けている
@@ -947,78 +804,6 @@ fn publish_graph_profile(
     }
 }
 
-
-#[allow(clippy::too_many_arguments)]
-fn build_stream(
-    device: &cpal::Device,
-    config: &cpal::StreamConfig,
-    channels: u16,
-    shared: Arc<SharedState>,
-    bridge: Arc<AudioBridgeHandle>,
-    metrics: Arc<MetricsBridgeHandle>,
-    scope: Arc<ScopeBridgeHandle>,
-    device_scope: Arc<common::device_scope_bridge::DeviceScopeBridgeHandle>,
-    session_sample_rate: u32,
-    // `AudioSession::mute_output`: 描いた後、デバイスへ渡す直前に無音へ差し替える
-    // (メーター / scope は描画の中で既に書かれているので、テストは値を読める)。
-    mute_output: bool,
-    // `DeviceRt` is the CPAL closure's exclusive heap. It holds
-    // master_l/r and the per-project scratch — pre-allocated, never
-    // touched outside the audio thread.
-    local: DeviceRt,
-) -> Result<cpal::Stream> {
-    let channels_usize = channels as usize;
-    let mmcss_failed = Arc::clone(&local.shared);
-    let renderer = output_render::OutputRenderer::new(
-        local,
-        shared,
-        bridge,
-        Arc::clone(&metrics),
-        scope,
-        device_scope,
-        session_sample_rate,
-        channels_usize,
-    );
-    // 描き手 (コールバックの中か、先読みの描画スレッドか) の切り替えは停止中に `OutputStage` が行う
-    // (`output_render` の module doc)。
-    let mut stage =
-        output_render::OutputStage::spawn(renderer).context("failed to spawn audio render thread")?;
-    let mut starve = output_render::StarveProbe::new();
-    // E (plan §5): callback thread を MMCSS "Pro Audio" に自前 join する
-    // one-shot フラグ (per-thread once — CPAL は単一 stream thread で callback
-    // を直列に呼ぶ)。
-    let mut mmcss_tried = false;
-
-    let stream = device
-        .build_output_stream(
-            config,
-            move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                if !mmcss_tried {
-                    mmcss_tried = true;
-                    // E (plan §5): RT 優先度ポリシーの SSoT を自プロセスに持つ
-                    // (cpal 0.17 の内部対応と独立に自前 join)。 join handle は
-                    // callback thread の寿命 = stream の寿命なので forget で
-                    // 保持 (revert は thread 終了時に OS 側で行われる)。 失敗は
-                    // フラグに立て、 notify thread が 1 回だけ warn する
-                    // (RT では tracing 禁止)。
-                    if let Some(join) = common::mmcss::join_pro_audio() {
-                        std::mem::forget(join);
-                    } else {
-                        mmcss_failed.mmcss_join_failed.store(true, Ordering::Release);
-                    }
-                }
-                starve.observe(data.len() / channels_usize, &metrics);
-                stage.on_callback(data);
-                if mute_output {
-                    data.fill(0.0);
-                }
-            },
-            |err| tracing::error!(?err, "audio stream error"),
-            None,
-        )
-        .context("failed to build output stream")?;
-    Ok(stream)
-}
 
 /// master gain multiplier for the panic declick envelope at sample
 /// offset `t` (samples since the panic was armed):

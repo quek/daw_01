@@ -37,6 +37,11 @@ pub struct AppConfig {
     /// r.md #48: 設定 window の位置・サイズ `[x, y, w, h]` (px)。 `None` = 未配置。
     #[serde(default)]
     pub settings_rect: Option<[f32; 4]>,
+    /// r.md #156: 設定 window で選んでいるカテゴリ ([`crate::state::SettingsCategory::id`])。
+    /// **名前で保存する** — 知らない名前 (新しい版が足したカテゴリ) は既定のカテゴリへ倒すだけで、
+    /// 設定ファイル全体の読み込みを失敗させない。
+    #[serde(default)]
+    pub settings_category: String,
     /// r.md #50: 画面右端のマスターパネルを出すか。 default = true
     /// (「常に音を視覚的にも確認できるように」が要求なので既定で見えている)。
     #[serde(default = "default_true")]
@@ -80,6 +85,11 @@ pub struct AppConfig {
     /// 曲ではなく **この PC の処理能力への対処** なので app_config。default = true。
     #[serde(default = "default_true")]
     pub render_ahead: bool,
+    /// r.md #156: 開きたいオーディオデバイス (ドライバーの種類・デバイス・レート・バッファ・ch)。曲ではなく
+    /// **この PC の機材** なので app_config。default = OS 標準の既定デバイス。保存したデバイスが見つからない /
+    /// 開けないときは OS 標準の既定デバイスへ戻して動かすが、この値は変えない (つなぎ直せば元に戻る)。
+    #[serde(default)]
+    pub audio_device: common::audio_device::AudioDeviceConfig,
 }
 
 fn default_virtual_keyboard_base_pitch() -> u8 {
@@ -108,8 +118,14 @@ impl AppConfig {
     ///
     /// テーマは **id だけ**保存する (色を焼き込むとテーマファイルを編集しても
     /// 反映されず SSoT が二重化する。r.md #48)。
+    ///
+    /// オーディオデバイスの設定は `AppData::audio_device` が持つ (r.md #156) ので、同じく引数で受ける。
     #[must_use]
-    pub fn from_prefs(prefs: &crate::state::UiPrefs, theme_id: String) -> Self {
+    pub fn from_prefs(
+        prefs: &crate::state::UiPrefs,
+        theme_id: String,
+        audio_device: common::audio_device::AudioDeviceConfig,
+    ) -> Self {
         Self {
             resource_monitor_enabled: prefs.resource_monitor_enabled,
             automation_follows_clips: prefs.automation_follows_clips,
@@ -118,6 +134,7 @@ impl AppConfig {
             theme: theme_id,
             settings_open: prefs.settings_open,
             settings_rect: prefs.settings_rect.map(|r| [r.x, r.y, r.w, r.h]),
+            settings_category: prefs.settings_category.id().to_string(),
             // r.md #50: マスターパネルの見え方は「この人の画面の使い方」なので
             // プロジェクト (`ViewState`) ではなくアプリ設定側に持つ。
             master_panel_open: prefs.master_panel_open,
@@ -135,6 +152,7 @@ impl AppConfig {
             virtual_keyboard_base_pitch: prefs.virtual_keyboard_base_pitch,
             virtual_keyboard_velocity: prefs.virtual_keyboard_velocity,
             render_ahead: prefs.render_ahead,
+            audio_device,
         }
     }
 }
@@ -166,6 +184,7 @@ impl Default for AppConfig {
             theme: default_theme(),
             settings_open: false,
             settings_rect: None,
+            settings_category: String::new(),
             master_panel_open: true,
             master_panel_w: default_master_panel_w(),
             master_panel_sections: default_master_panel_sections(),
@@ -178,6 +197,7 @@ impl Default for AppConfig {
             virtual_keyboard_base_pitch: default_virtual_keyboard_base_pitch(),
             virtual_keyboard_velocity: default_virtual_keyboard_velocity(),
             render_ahead: true,
+            audio_device: common::audio_device::AudioDeviceConfig::default(),
         }
     }
 }
@@ -235,6 +255,7 @@ mod tests {
             theme: "light".to_string(),
             settings_open: true,
             settings_rect: Some([1.0, 2.0, 300.0, 400.0]),
+            settings_category: "theme".to_string(),
             master_panel_open: false,
             master_panel_w: 412.0,
             master_panel_sections: [0.4, 0.2, 0.2, 0.2],
@@ -251,6 +272,15 @@ mod tests {
             virtual_keyboard_base_pitch: 60,
             virtual_keyboard_velocity: 80,
             render_ahead: false,
+            audio_device: common::audio_device::AudioDeviceConfig {
+                driver: common::audio_device::AudioDriverKind::Asio,
+                asio_driver: Some(common::audio_device::AudioDeviceRef {
+                    id: "{00000000-0000-0000-0000-000000000000}".into(),
+                    name: "Some ASIO".into(),
+                }),
+                buffer_frames: Some(256),
+                ..Default::default()
+            },
         };
         save(&path, &cfg).unwrap();
         let loaded = load(&path);
@@ -260,6 +290,7 @@ mod tests {
         assert_eq!(loaded.theme, "light");
         assert!(loaded.settings_open);
         assert_eq!(loaded.settings_rect, Some([1.0, 2.0, 300.0, 400.0]));
+        assert_eq!(loaded.settings_category, "theme");
         assert!(!loaded.master_panel_open);
         assert_eq!(loaded.master_panel_w, 412.0);
         assert_eq!(loaded.master_panel_sections, [0.4, 0.2, 0.2, 0.2]);
@@ -272,6 +303,7 @@ mod tests {
         assert_eq!(loaded.virtual_keyboard_base_pitch, 60);
         assert_eq!(loaded.virtual_keyboard_velocity, 80);
         assert!(!loaded.render_ahead);
+        assert_eq!(loaded.audio_device, cfg.audio_device);
     }
 
     /// r.md #113: 手書きの `app_config.json` で C 揃えでない / 範囲外の鍵盤設定が来ても

@@ -927,6 +927,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             wheel_claims: &mut self.wheel_claims,
             drag_cancel,
             hover_blocked,
+            hit_clip: None,
             _m: PhantomData,
         };
         f(model, &mut ui);
@@ -1110,12 +1111,12 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// frame 末で `scene.popup_primitives` に move する。
     popup_primitives: Vec<Primitive>,
     /// `popup_layer` 内で描画中フラグ。push_* が popup_buffer に積むかを切替える。
-    drawing_in_popup: bool,
+    pub(crate) drawing_in_popup: bool,
     /// いま `popup_layer` の body を描いている popup の id。`Ui::popup_scroll` が
     /// 「自分自身の popup state」に scroll 量を書くために使う (id を引数で持ち回すと
     /// 呼び出し側が別 popup の id を渡せてしまう = ずれの温床)。cascade は nest するので
     /// popup_layer が退避 / 復元する。
-    current_popup: Option<WidgetId>,
+    pub(crate) current_popup: Option<WidgetId>,
     /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだら true。
     /// `UiHost::frame` の末尾で `redraw_requested_in_last_frame` に commit され、
     /// 次のフレーム redraw の発火条件に含まれる。
@@ -1197,6 +1198,9 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// daw_01 r.md #124: ドラッグ中 (別 widget が press を掴んだまま) は hover を出さない
     /// ([`Ui::hover_pos`] / [`Ui::hovers`])。
     pub(crate) hover_blocked: bool,
+    /// 有効な当たり判定の clip ([`crate::hit_clip`])。 `Some` の間、 `pointer` と保留 click は
+    /// clip 済みの値で、 clip 前の値はこの中にある。
+    pub(crate) hit_clip: Option<crate::hit_clip::HitClip>,
     _m: PhantomData<&'a M>,
 }
 
@@ -1429,31 +1433,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         );
     }
 
-    /// `popup_layer` の body で描画中の popup の縦スクロール state
-    /// `(scroll_offset, scroll_drag)`。body の外では `None`。
-    /// 実処理は [`Ui::popup_scroll`] (popup.rs) が担う。
-    pub(crate) fn current_popup_scroll(&self) -> Option<(f32, Option<(f32, f32)>)> {
-        let wid = self.current_popup?;
-        self.open_popups
-            .get(&wid)
-            .map(|s| (s.scroll_offset, s.scroll_drag))
-    }
-
     /// `popup_layer` の body で描画中の popup の id (body の外では `ROOT`)。 popup の中身
     /// (項目行) が click 所有者 id の親に使う ([`crate::click`])。
     pub(crate) fn current_popup_id(&self) -> WidgetId {
         self.current_popup.unwrap_or(WidgetId::ROOT)
-    }
-
-    /// [`Ui::current_popup_scroll`] の書き込み側。body の外では no-op。
-    pub(crate) fn set_current_popup_scroll(&mut self, offset: f32, drag: Option<(f32, f32)>) {
-        let Some(wid) = self.current_popup else {
-            return;
-        };
-        if let Some(state) = self.open_popups.get_mut(&wid) {
-            state.scroll_offset = offset;
-            state.scroll_drag = drag;
-        }
     }
 
     /// M14 Phase 95 (daw_01 #066): 開いている popup の `dismiss_on_outside_click` を更新する。
@@ -1539,6 +1522,18 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let Some(state) = self.open_popups.get(&wid).copied() else {
             return;
         };
+        // popup は開いた widget の scroll viewport の外へはみ出して描かれる。 close 判定も
+        // 中身も、 viewport で clip する前の入力で動かす ([`crate::hit_clip`])。
+        let hit_clip = self.suspend_hit_clip();
+        self.popup_layer_open(wid, state, f);
+        self.resume_hit_clip(hit_clip);
+    }
+
+    /// [`Self::popup_layer`] の本体 (popup が開いているときだけ呼ばれる)。
+    fn popup_layer_open<F>(&mut self, wid: WidgetId, state: PopupOpenState, f: F)
+    where
+        F: FnOnce(&mut Self),
+    {
 
         // outside-click 検出 (closure 実行前に判定 / 自動 close)。
         // daw_01 #038 fix: 「outside」 = 自分の anchor 外 **かつ 他の open popup の anchor 外**。
@@ -1651,36 +1646,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// body / 内部 internal traversal は別 API) では遮断しない。
     fn keyboard_blocked_by_modal(&self) -> bool {
         self.modal_capturing_keyboard && !self.drawing_in_popup
-    }
-
-    /// pointer が **modal popup の anchor 内** にあり、現在の widget が `drawing_in_popup`
-    /// でない (= popup_layer の外で動いている) とき `true`。
-    ///
-    /// daw_01 #015 の root cause: arrangement_view が plugin_picker (modal) より先に走り
-    /// `take_scroll_in_rect(lanes)` が pointer (modal panel 内) の scroll_delta を消費 →
-    /// list_view が呼ぶ頃には (0, 0)。modal の下に隠れている widget は pointer 入力を
-    /// 一切消費すべきでない (overlay の意味が失われる) ため、`take_scroll_in_rect` /
-    /// `take_drag_rect_in_rect` / `take_double_click_in_rect` 冒頭で早期 return する。
-    ///
-    /// popup_layer 内部 (= modal の body) では `drawing_in_popup == true` なので false を
-    /// 返し、通常通り消費可能。
-    pub(crate) fn pointer_blocked_by_modal_popup(&self) -> bool {
-        if self.drawing_in_popup {
-            return false;
-        }
-        // M14 Phase 94 (daw_01 #065): 真のモーダル中は anchor 内外を問わず全 background を遮断。
-        // `self.pointer` は既に masking されているので大半の take_* は pos = None で自然に
-        // 何も返さないが、`take_double_click_in_rect` (pending_double_click は生 pointer 由来) /
-        // `take_file_drop_in_rect` (drop 位置で判定) はこの早期 return で確実に止める。
-        if self.modal_capturing {
-            return true;
-        }
-        let Some((px, py)) = self.pointer.pos else {
-            return false;
-        };
-        self.open_popups
-            .values()
-            .any(|s| s.modal && s.anchor.contains(px, py))
     }
 
     /// エディットを Scene に積む (外部 widget extension で利用可能)。

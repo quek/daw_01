@@ -2,8 +2,11 @@ pub mod app_dirs;
 pub mod ara_ids;
 pub mod atomic_file;
 pub mod audio_bridge;
+pub mod audio_device;
 pub mod audio_decode;
 pub mod audio_render;
+/// r.md #156: オーディオ入力の録音の wire 型。
+pub mod audio_take;
 pub mod automation;
 pub mod cpu_topology;
 pub mod device_scope_bridge;

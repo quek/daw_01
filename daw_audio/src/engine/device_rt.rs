@@ -99,6 +99,19 @@ impl DeviceRt {
         self.projects.iter().any(|p| p.playing)
     }
 
+    /// r.md #156: 「どれかのトラックがデバイス入力をモニターしている」 — その間は先読みを使わない
+    /// (モニターの音を描き溜めのぶん遅らせない)。
+    #[must_use]
+    pub fn any_input_monitoring(&self) -> bool {
+        self.projects.iter().any(|p| p.input_stage.any_monitoring())
+    }
+
+    /// r.md #156: 「どれかのトラックがデバイス入力を使っている (モニターか入力メーター)」 — idle park 判定用。
+    #[must_use]
+    pub fn any_input_live(&self) -> bool {
+        self.projects.iter().any(|p| p.input_stage.any_live())
+    }
+
     /// `key` の project。窓の間 (凍結中) の project は引けない — RT はそれに触らない (module doc)。
     fn project_mut(&mut self, key: ProjectKey) -> Option<&mut ProjectRt> {
         self.projects.iter_mut().find(|p| p.key == key && !p.in_window()).map(|b| &mut **b)
@@ -252,16 +265,15 @@ impl DeviceRt {
     /// 予約 `export_running` は立てた **後** に読む)。
     pub fn process_buffer(
         &mut self,
-        shared: &SharedState,
         bridge: &AudioBridgeHandle,
         scope: &common::scope_bridge::ScopeBridgeHandle,
         device_scope: &DeviceScopeBridgeHandle,
         sample_rate: u32,
         frames: usize,
+        io: crate::device::input::DeviceIo<'_>,
     ) {
-        let _ = shared;
         self.shared.live_rendering.store(true, Ordering::SeqCst);
-        self.process_buffer_body(bridge, scope, device_scope, sample_rate, frames);
+        self.process_buffer_body(bridge, scope, device_scope, sample_rate, frames, io);
         self.shared.live_rendering.store(false, Ordering::SeqCst);
     }
 
@@ -272,6 +284,7 @@ impl DeviceRt {
         device_scope: &DeviceScopeBridgeHandle,
         sample_rate: u32,
         frames: usize,
+        io: crate::device::input::DeviceIo<'_>,
     ) {
         self.settle_windows();
         self.refresh_projects();
@@ -324,6 +337,9 @@ impl DeviceRt {
                 // r.md #87: 書き出し中に届いたローンチ操作は捨てる。溜めておくと
                 // 書き出し明けに **全部同時に**発火し、64 件で溢れた分は無言で消える。
                 p.launcher.clear_requests();
+                // r.md #156: 録音中に書き出しが始まったら、進行中のオーディオ入力の録音をここで閉じる (描画を
+                // 通らないので、閉じないと書き出しの間ずっと入力を取り込み続ける)。
+                p.observe_take(false, 0, io, n);
                 // 停止中も現在の playhead をそのまま publish する。
                 p.transport_out.now.playhead = p.shared.playhead.load(Ordering::Acquire);
                 p.transport_out.now.beat = p.playhead_beats;
@@ -344,6 +360,7 @@ impl DeviceRt {
                 device_scope: is_scope
                     .then_some(DeviceScopeCtx { bridge: device_scope, headers: &mut self.scope_headers }),
                 frames_rendered,
+                io,
             };
             let slot = bridge.project(p.telemetry_slot);
             p.render_buffer(ctx, slot, sample_rate, n);

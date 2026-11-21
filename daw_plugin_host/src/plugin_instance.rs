@@ -496,6 +496,20 @@ pub trait AudioProcessorHalf: Send {
     /// Free / clear activation-scoped buffers. Quiesced window のみ。
     fn on_deactivate(&mut self) {}
 
+    /// ARA に bind した instance の document に playback region が 1 つも無いか ([`crate::ara::is_idle`])。
+    /// main half が activate のたびに渡す (region の増減は必ず deactivate → activate を通る)。Quiesced window のみ。
+    ///
+    /// `true` の間、`process()` は **plugin を呼ばずに無音を返す**。ARA の playback renderer の出力は
+    /// 割り当てた region の音だけなので、region が無ければ無音で、呼んでも結果は同じ。呼ばない理由は
+    /// Melodyne 5.4.2: region の無い document で再生中の `process()` を 1024 回呼ぶと 1025 回目から戻らない
+    /// (buffer 長・レート・保存した状態に依らず再現。region が 1 つあれば起きない)。ほかの ARA host は
+    /// region ごとに instance を作るので、この状態の instance を回すことがない。
+    ///
+    /// 呼ばない間は、エディタ窓で動かした param も plugin の DSP へ届かない (VST3 は `process()` の
+    /// `inputParameterChanges`、CLAP は `process()` の event でしか渡せない)。鳴らす region が無い間の話で、
+    /// region ができれば次の `process()` から届く。
+    fn set_ara_idle(&mut self, _idle: bool) {}
+
     /// Mirror of the main half's processing gate (defensive check inside
     /// `process()`). Quiesced window のみ。
     fn set_processing(&mut self, _on: bool) {}

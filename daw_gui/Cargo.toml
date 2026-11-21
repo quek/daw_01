@@ -70,6 +70,10 @@ tempfile = "3"
 # 「--script requires --features script」で必ず落ちる。`make test` が
 # `--features daw_gui/script` を付けて全件実行する (Makefile が SSoT)。
 [[test]]
+name = "audio_device_smoke"
+required-features = ["script"]
+
+[[test]]
 name = "clip_label_display_smoke"
 required-features = ["script"]
 
@@ -87,6 +91,10 @@ required-features = ["script"]
 
 [[test]]
 name = "project_tabs_smoke"
+required-features = ["script"]
+
+[[test]]
+name = "settings_smoke"
 required-features = ["script"]
 
 [[test]]
@@ -119,4 +127,8 @@ required-features = ["script"]
 
 [[test]]
 name = "track_duplicate_smoke"
+required-features = ["script"]
+
+[[test]]
+name = "audio_rec_smoke"
 required-features = ["script"]

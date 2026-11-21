@@ -113,8 +113,9 @@ fn render_theme(renderer: &mut OffscreenRenderer, theme_id: &str, settings_open:
     assert_eq!(app.theme.id, theme_id, "テーマが適用されている");
     populate(&mut app);
     if settings_open {
-        // イベント経由で開く (テーマ一覧のキャッシュもここで埋まる — フラグ直書きだと
+        // イベント経由で「テーマ」のページを開く (テーマ一覧のキャッシュもここで埋まる — フラグ直書きだと
         // 一覧が空のまま描かれて「window は出るが中身が無い」 のを見逃す)。
+        app.handle_event(AppEvent::SetSettingsCategory(daw_gui::state::SettingsCategory::Theme));
         app.handle_event(AppEvent::ToggleSettings);
         assert!(app.ui_prefs.settings_open);
     }

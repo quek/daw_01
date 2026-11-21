@@ -194,8 +194,14 @@ fn main() -> Result<std::process::ExitCode> {
         None => common::app_dirs::AppDirs::production(),
     };
 
+    // r.md #156: 開くオーディオデバイスは app_config から (`AppData::new` が読むのと同じファイル)。検証用の起動は
+    // 隔離 root なので既定 (OS 標準の既定デバイス) で始まり、ユーザーが保存した実機のドライバーを勝手に開かない。
+    let device_config = app_dirs
+        .as_ref()
+        .map(|d| daw_gui::app_config::load(d.app_config()).audio_device)
+        .unwrap_or_default();
     // 窓の無い script 起動 (テスト) はスピーカーを鳴らさない。`--script --gui` は実機と同じ条件を見るので鳴らす。
-    let bootstrap = bootstrap_subprocess(cli.script.is_some() && !cli.gui)?;
+    let bootstrap = bootstrap_subprocess(cli.script.is_some() && !cli.gui, device_config)?;
 
     if let (Some(script_path), false) = (cli.script.as_ref(), cli.gui) {
         tracing::info!(script = %script_path.display(), "headless script mode");
@@ -275,6 +281,8 @@ fn run_gui(
     let supervisor = Arc::clone(&bootstrap.supervisor);
     // (A1 r.md #8) bootstrap が解決したデバイス実レート (Copy なので closure へ move)。
     let sample_rate = bootstrap.sample_rate;
+    // r.md #156: daw_audio が起動時に開いたオーディオデバイス。
+    let device_info = bootstrap.device_info.clone();
 
     // 前回終了時の window geometry を復元。 存在しなければ default (1280×800)。
     // 位置は physical (= screen 座標)、 サイズは logical (= DPI 差吸収) で保存。
@@ -334,6 +342,7 @@ fn run_gui(
             // resource monitor (r.md #3): per-plugin CPU の直接読み出し用に
             // MetricsBridge ハンドルを AppData へ持たせる。
             app.ipc.metrics_bridge = Some(Arc::clone(&metrics));
+            app.audio_device.info = Some(device_info.clone());
             // r.md #49: smoke test は preview 窓を `PrintWindow` で pixel capture して
             // 検証する。窓がフォーカスを得るかは実行環境次第なので、省電力で描画が
             // 止まると「真っ黒 = 視覚回帰」と誤検出しうる。検証対象は描画結果なので

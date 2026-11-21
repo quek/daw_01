@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use boa_engine::{Context, Source};
-use common::protocol::{AudioCommand, DeviceAddr, PluginCommand, PluginEvent};
+use common::protocol::{AudioCommand, DeviceAddr, PluginEvent};
 
 use crate::app::{AppData, AppEvent};
 use crate::bootstrap::{Bootstrap, ChildEvent};
@@ -79,10 +79,12 @@ fn eval_script(source: &str) -> Result<()> {
 
 /// script が触る IPC / shmem のハンドル。`Bootstrap` から抜いた clone で、headless でも
 /// GUI でも同じ形 (= API 実装がモードを意識しない)。
+///
+/// **子プロセスへの送り口はここに持たない** — daw_audio はオーディオデバイスの切り替えで (r.md #156)、
+/// daw_plugin_host は落ちた後の respawn で起こし直され、送り口が差し替わる。`AppData::send_audio` /
+/// `AppData::send_plugin` (今の送り口の SSoT) を使う。
 #[derive(Clone)]
 pub struct ScriptIo {
-    pub audio_tx: tokio::sync::mpsc::UnboundedSender<AudioCommand>,
-    pub plugin_tx: tokio::sync::mpsc::UnboundedSender<PluginCommand>,
     pub bridge: Arc<common::audio_bridge::AudioBridgeHandle>,
     pub metrics: Arc<common::metrics_bridge::MetricsBridgeHandle>,
     pub scope: Arc<common::scope_bridge::ScopeBridgeHandle>,
@@ -92,8 +94,6 @@ pub struct ScriptIo {
 impl ScriptIo {
     pub fn from_bootstrap(b: &Bootstrap) -> Self {
         Self {
-            audio_tx: b.audio_tx.clone(),
-            plugin_tx: b.plugin_tx.clone(),
             bridge: Arc::clone(&b.bridge),
             metrics: Arc::clone(&b.metrics),
             scope: Arc::clone(&b.scope),
@@ -349,7 +349,7 @@ impl ScriptHost {
         // BackgroundDispatcher として渡し、 background thread は
         // script では使わないので spawn されない (AppData の API を
         // 同期呼び出しするだけ)。
-        let app = AppData::new(
+        let mut app = AppData::new(
             bootstrap.audio_tx.clone(),
             bootstrap.plugin_tx.clone(),
             None,
@@ -362,15 +362,17 @@ impl ScriptHost {
             Arc::new(crate::dispatcher::Win32JobDispatcher::new(Arc::clone(
                 &bootstrap.job,
             ))),
-            // script mode は同 process 内の bootstrap が握る supervisor を
-            // 渡しても安全だが、 script 中に子プロセスが死ぬケースは
-            // テスト・録画用途では発生しない前提なので None で十分。
-            None,
+            // r.md #156: オーディオデバイスの切り替え (= daw_audio の起こし直し) を script からも通すために
+            // supervisor を渡す。**落ちた子は起こし直さない** (下の `respawn_crashed_children = false`) —
+            // 検証の途中で子が落ちたことを、起こし直しで隠さない。
+            Some(Arc::clone(&bootstrap.supervisor)),
             // テスト / 検証の起動なので、ユーザーの実データではなく隔離 root。
             app_dirs,
             // (A1 r.md #8) bootstrap が解決したデバイス実レート。
             bootstrap.sample_rate,
         );
+        app.ipc.respawn_crashed_children = false;
+        app.audio_device.info = Some(bootstrap.device_info.clone());
         let io = ScriptIo::from_bootstrap(&bootstrap);
         Self {
             script_args: ScriptArgs { output, extra },
@@ -388,8 +390,7 @@ impl ScriptHost {
             return;
         };
         let HeadlessLink { bootstrap, mut app, .. } = *headless;
-        // `AppData` には supervisor を渡していない (script mode は respawn しない)
-        // ので、pipe loop への「これ以降の切断は crash ではない」通知はここで直接。
+        // pipe loop への「これ以降の切断は crash ではない」通知は、app の終了シーケンスより先にここで直接。
         let supervisor = Arc::clone(&bootstrap.supervisor);
         supervisor.begin_shutdown();
         app.begin_shutdown(crate::shutdown::QuitRequest::USER);
@@ -408,7 +409,7 @@ impl ScriptHost {
     ///
     /// **この中で待ってはいけない** (`pump_until` / `sleepMs` を呼ぶと GUI の event loop を
     /// 塞ぐ)。送る → 待つ → 読む、は別々の手に分ける。
-    fn with_app<R, F>(&mut self, f: F) -> R
+    pub(super) fn with_app<R, F>(&mut self, f: F) -> R
     where
         R: Send + 'static,
         F: FnOnce(&mut AppData, &mut ScriptSide, &ScriptIo) -> R + Send + 'static,
@@ -497,7 +498,7 @@ impl ScriptHost {
                 match recv {
                     Ok(msg) => {
                         side.observe(&msg);
-                        dispatch_incoming_headless(app, &self.io, &msg);
+                        dispatch_incoming_headless(app, &msg);
                         // GUI の frame 末と同じ子プロセス sync (event の処理が Song を編集して
                         // いれば、次に送る命令より先に engine へ届く)。
                         app.flush_all_song_sync();
@@ -523,7 +524,7 @@ impl ScriptHost {
 /// これが無いと headless では**永久に完了しない** — script モードは実機と同じ経路を
 /// 通ってこそ検証になる。 走行中でない export の完了等は app 側が stale ガードで無視する
 /// (`handler::ipc`)。
-fn dispatch_incoming_headless(app: &mut AppData, io: &ScriptIo, msg: &ChildEvent) {
+fn dispatch_incoming_headless(app: &mut AppData, msg: &ChildEvent) {
     let msg = match msg {
         ChildEvent::Audio(ev) => {
             app.handle_event(AppEvent::Audio(ev.clone()));
@@ -547,8 +548,14 @@ fn dispatch_incoming_headless(app: &mut AppData, io: &ScriptIo, msg: &ChildEvent
         | PluginEvent::SlotPluginLoadFailed { .. } => {
             app.handle_event(AppEvent::Plugin(msg.clone()));
         }
+        // plugin host が落ちた。`daw.setRespawnCrashedChildren(true)` の script だけ、本番と同じ respawn +
+        // 復元へ通す。既定では通さない: handler は起こし直さないときも「読み込み待ち」を空にするので、
+        // 落ちたことが `pendingPluginLoadsJson()` から見えなくなる (待ちが timeout する方が検証として正しい)。
+        PluginEvent::ChildDisconnected if app.ipc.respawn_crashed_children => {
+            app.handle_event(AppEvent::Plugin(msg.clone()));
+        }
         PluginEvent::SlotPluginUnloaded { device: DeviceAddr { device_id, .. } } => {
-            let _ = io.audio_tx.send(AudioCommand::SetDeviceLatency {
+            app.send_audio(AudioCommand::SetDeviceLatency {
                 project: app.pk(),
                 device_id: *device_id,
                 samples: 0,
@@ -557,7 +564,7 @@ fn dispatch_incoming_headless(app: &mut AppData, io: &ScriptIo, msg: &ChildEvent
         PluginEvent::PluginLatencyChanged { device: DeviceAddr { device_id, .. }, samples } => {
             // GUI mode と同じく **device 単位のまま** engine へ中継する
             // (track 合計は `compile_schedule` が導出する = 集計を二重に持たない)。
-            let _ = io.audio_tx.send(AudioCommand::SetDeviceLatency {
+            app.send_audio(AudioCommand::SetDeviceLatency {
                 project: app.pk(),
                 device_id: *device_id,
                 samples: *samples,

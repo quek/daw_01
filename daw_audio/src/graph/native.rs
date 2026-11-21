@@ -184,6 +184,9 @@ pub struct NativeIo<'a> {
     pub scopes: Option<DeviceScopeTap<'a>>,
     /// r.md #151: Δ (差分試聴) 中の device id (`0` = 空き)。
     pub delta: [u64; common::model::MAX_DELTA_DEVICES],
+    /// r.md #156: この buffer のデバイス入力 (モニター / 入力メーター用に project の受け皿へ写したもの)。
+    /// live 描画だけ `Some` — 書き出しに入力音は入らない。
+    pub input: Option<&'a crate::graph::input_stage::InputStage>,
 }
 
 impl NativeIo<'_> {

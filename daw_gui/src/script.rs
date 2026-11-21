@@ -14,9 +14,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+mod audio_device;
+mod audio_rec;
 mod editing;
 mod host;
 mod native_device;
+mod settings;
 mod tabs;
 
 pub use host::{ScriptAttach, ScriptIo, ScriptStarter, prepare_gui, run_scripted};
@@ -63,6 +66,12 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("appStop", daw_app_stop, 0),
     ("appSetBpm", daw_app_set_bpm, 1),
     ("appSetRenderAhead", daw_app_set_render_ahead, 1),
+    // ----- r.md #156: 設定 window (開閉 / カテゴリ / ページの項目) -----
+    ("appSetSettingsOpen", settings::daw_app_set_settings_open, 1),
+    ("appSetSettingsCategory", settings::daw_app_set_settings_category, 1),
+    ("appSetTheme", settings::daw_app_set_theme, 1),
+    ("appSetVoicevoxChunkSecs", settings::daw_app_set_voicevox_chunk_secs, 1),
+    ("settingsJson", settings::daw_settings_json, 0),
     ("appRescanPlugins", daw_app_rescan_plugins, 0),
     ("play", daw_play, 0),
     ("stop", daw_stop, 0),
@@ -122,6 +131,26 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("setDeviceMix", native_device::daw_set_device_mix, 2),
     ("toggleDeviceDelta", native_device::daw_toggle_device_delta, 1),
     ("masterPeakDbfs", native_device::daw_master_peak_dbfs, 1),
+    // ----- r.md #156 オーディオ入力の録音 -----
+    ("setTrackInput", audio_rec::daw_set_track_input, 3),
+    ("setTrackMonitor", audio_rec::daw_set_track_monitor, 2),
+    ("toggleTrackArmed", audio_rec::daw_toggle_track_armed, 1),
+    ("setCountInBars", audio_rec::daw_set_count_in_bars, 1),
+    ("setLoop", audio_rec::daw_set_loop, 2),
+    ("appRecord", audio_rec::daw_app_record, 0),
+    ("appUndo", audio_rec::daw_app_undo, 0),
+    ("appRedo", audio_rec::daw_app_redo, 0),
+    ("appSaveAs", audio_rec::daw_app_save_as, 1),
+    ("appSave", audio_rec::daw_app_save, 0),
+    ("appTick", audio_rec::daw_app_tick, 0),
+    ("audioRecStateJson", audio_rec::daw_audio_rec_state_json, 0),
+    ("trackPeak", audio_rec::daw_track_peak, 2),
+    // ----- r.md #156 オーディオデバイス (`docs/plan_audio_io.md`) -----
+    ("setAudioDevice", audio_device::daw_set_audio_device, 1),
+    ("audioDevices", audio_device::daw_audio_devices, 0),
+    ("audioDeviceInfo", audio_device::daw_audio_device_info, 0),
+    ("audioInputStats", audio_device::daw_audio_input_stats, 0),
+    ("setRespawnCrashedChildren", audio_device::daw_set_respawn_crashed_children, 1),
 ];
 
 fn register_daw_globals(ctx: &mut Context) -> Result<()> {
@@ -248,7 +277,7 @@ fn daw_set_slot_plugin(
     };
     // closure は event loop スレッドで走り得るので Send な値 (String) で返し、JsError には
     // script スレッドで包む。
-    with_app(move |app, side, io| -> Result<(), String> {
+    with_app(move |app, side, _io| -> Result<(), String> {
         // v29: 安定 device id でアドレスする。 事前に loadSongFromObject /
         // loadSongFile 済みの song から解決する (ensure_ids 済み)。
         let Some(device_id) = device_id_at_app(app, track_id, index) else {
@@ -262,7 +291,7 @@ fn daw_set_slot_plugin(
         side.next_raw_load_generation = side.next_raw_load_generation.wrapping_add(1).max(1);
         let generation = side.next_raw_load_generation;
         app.cur.pipc.pending_plugin_loads.insert(device_id, generation);
-        let _ = io.plugin_tx.send(PluginCommand::SetSlotPlugin {
+        app.send_plugin(PluginCommand::SetSlotPlugin {
             device: app.dev(device_id),
             format,
             path: PathBuf::from(path_str),
@@ -367,14 +396,15 @@ fn daw_export_wav(
         // するので、 event drain して LoadSong を先に届けないと PDC が
         // 適用されない song で render が始まる。
         h.drain_pending_for(Duration::from_millis(50));
-        let _ = h.io.audio_tx.send(AudioCommand::ExportWav {
+        let export = AudioCommand::ExportWav {
             project,
             path: PathBuf::from(path_str),
             // scripting API は全曲 export (レンジ指定は GUI 専用)。
             range: None,
             // standalone WAV (video render なし) なので modulation sidecar は不要。
             write_mod_sidecar: false,
-        });
+        };
+        h.with_app(move |app, _, _| app.send_audio(export));
         h.pump_until(
             |msg| matches!(msg, ChildEvent::Audio(AudioEvent::ExportWavComplete { .. })),
             Duration::from_millis(timeout_ms),
@@ -487,17 +517,13 @@ fn daw_app_rescan_plugins(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context
 /// GUI play-gating, which assumes the winit loop). Used to reproduce the
 /// "played first" state where a synth holds a live voice.
 fn daw_play(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
-    with_app(move |app, _side, io| {
-        let _ = io.audio_tx.send(AudioCommand::Play { project: app.pk() });
-    });
+    with_app(move |app, _side, _io| app.send_audio(AudioCommand::Play { project: app.pk() }));
     Ok(JsValue::undefined())
 }
 
 /// `daw.stop()` — stop realtime transport.
 fn daw_stop(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
-    with_app(move |app, _side, io| {
-        let _ = io.audio_tx.send(AudioCommand::Stop { project: app.pk() });
-    });
+    with_app(move |app, _side, _io| app.send_audio(AudioCommand::Stop { project: app.pk() }));
     Ok(JsValue::undefined())
 }
 
@@ -507,9 +533,8 @@ fn daw_stop(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<
 /// auto-stop suppression, `recording_live` publication).
 fn daw_start_recording(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let preroll_samples = u64::try_from_js(args.get_or_undefined(0), ctx).unwrap_or(0);
-    with_app(move |app, _side, io| {
-        let _ = io.audio_tx
-            .send(AudioCommand::StartRecording { project: app.pk(), preroll_samples });
+    with_app(move |app, _side, _io| {
+        app.send_audio(AudioCommand::StartRecording { project: app.pk(), preroll_samples });
     });
     Ok(JsValue::undefined())
 }
@@ -517,9 +542,7 @@ fn daw_start_recording(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
 /// `daw.stopRecording()` — close the engine-side recording session (r.md #51).
 /// Does not stop the transport (punch-out keeps playing).
 fn daw_stop_recording(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
-    with_app(move |app, _side, io| {
-        let _ = io.audio_tx.send(AudioCommand::StopRecording { project: app.pk() });
-    });
+    with_app(move |app, _side, _io| app.send_audio(AudioCommand::StopRecording { project: app.pk() }));
     Ok(JsValue::undefined())
 }
 
@@ -564,9 +587,8 @@ fn daw_sleep_ms(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
 /// GUI's pre-export reinit step so the headless harness exercises the real fix.
 fn daw_reinit_for_export(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let timeout_ms = u64::try_from_js(args.get_or_undefined(0), ctx).unwrap_or(30_000);
-    let project = with_app(|app, _, _| app.pk());
+    with_app(|app, _, _| app.send_plugin(PluginCommand::ReinitAllPlugins { project: Some(app.pk()) }));
     let res = with_host(|h| {
-        let _ = h.io.plugin_tx.send(PluginCommand::ReinitAllPlugins { project: Some(project) });
         h.pump_until(
             |msg| matches!(msg, ChildEvent::Plugin(PluginEvent::PluginsReinitDone { .. })),
             Duration::from_millis(timeout_ms),
@@ -590,12 +612,13 @@ fn daw_export_wav_range(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
     let project = with_app(|app, _, _| app.pk());
     let pump_result = with_host(|h| {
         h.drain_pending_for(Duration::from_millis(50));
-        let _ = h.io.audio_tx.send(AudioCommand::ExportWav {
+        let export = AudioCommand::ExportWav {
             project,
             path: PathBuf::from(path_str),
             range: Some((start, end)),
             write_mod_sidecar: false,
-        });
+        };
+        h.with_app(move |app, _, _| app.send_audio(export));
         h.pump_until(
             |msg| matches!(msg, ChildEvent::Audio(AudioEvent::ExportWavComplete { .. })),
             Duration::from_millis(timeout_ms),
@@ -627,7 +650,7 @@ fn daw_analyze_loudness(_this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
     let project = with_app(|app, _, _| app.pk());
     let pump_result = with_host(|h| {
         h.drain_pending_for(Duration::from_millis(50));
-        let _ = h.io.audio_tx.send(AudioCommand::AnalyzeLoudness { project, range });
+        h.with_app(move |app, _, _| app.send_audio(AudioCommand::AnalyzeLoudness { project, range }));
         h.pump_until(
             |msg| {
                 matches!(
@@ -698,9 +721,8 @@ fn daw_set_device_latency(
 ) -> JsResult<JsValue> {
     let device_id = u64::try_from_js(args.get_or_undefined(0), ctx)?;
     let samples = u32::try_from_js(args.get_or_undefined(1), ctx)?;
-    with_app(move |app, _side, io| {
-        let _ = io.audio_tx
-            .send(AudioCommand::SetDeviceLatency { project: app.pk(), device_id, samples });
+    with_app(move |app, _side, _io| {
+        app.send_audio(AudioCommand::SetDeviceLatency { project: app.pk(), device_id, samples });
     });
     Ok(JsValue::undefined())
 }

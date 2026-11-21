@@ -2,6 +2,8 @@
 //! docs/plan_arch_refactor.md §7 に沿って分割したもの。 dispatch は
 //! app.rs の `handle_event`、 各 arm の本体がここのメソッド。
 pub mod activity;
+/// r.md #156: オーディオデバイスの設定変更 / 列挙 / daw_audio からの報告。
+pub mod audio_device;
 pub mod audio_editor;
 pub mod automation;
 pub mod automation_editor;
@@ -43,6 +45,8 @@ pub mod master_panel;
 pub mod media;
 pub mod midi;
 pub mod sampler;
+/// r.md #156: オーディオ入力の録音 (トラックの入力 / モニター、開始・終了とクリップ生成)。
+pub mod audio_rec;
 pub mod mixer;
 pub mod modulation;
 /// r.md #129: 内蔵 device / master Limiter の値編集と追加 (値 IPC の唯一の口)。
@@ -70,6 +74,8 @@ pub mod sc_listen;
 pub mod device_mix;
 pub mod select_all;
 pub mod selection_view;
+/// r.md #156: 設定 window の開閉と、左のカテゴリの切り替え。
+pub mod settings;
 /// r.md #61: 終了シーケンスの実行 (子プロセス teardown の待ち合わせ)。
 pub mod shutdown;
 /// r.md #132: 分割 (`E` / `Shift+E`) と結合 (`J`) の入口。

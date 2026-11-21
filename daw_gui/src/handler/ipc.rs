@@ -17,6 +17,10 @@ impl AppData {
     pub(crate) fn dispatch_audio_event(&mut self, ev: AudioEvent) {
         match ev {
             AudioEvent::Hello { .. } => {}
+            // r.md #156: オーディオデバイス (handler::audio_device)。
+            AudioEvent::DeviceInfo(info) => self.on_audio_device_info(*info),
+            AudioEvent::AudioDevices(list) => self.on_audio_devices_listed(*list),
+            AudioEvent::DeviceRestartRequired { reason } => self.on_audio_device_restart_required(reason),
             AudioEvent::ChildDisconnected => {
                 self.handle_child_disconnected(ChildKind::Audio);
             }
@@ -125,6 +129,9 @@ impl AppData {
                 }
                 self.handle_bounce_clip_fx_complete(path, source_track, source_clip, error, frames);
             }
+            // r.md #156: オーディオ入力の録音を engine が書き終えた (handler::audio_rec)。
+            AudioEvent::AudioTakesFinished { result, .. } => self.handle_audio_takes_finished(*result),
+            AudioEvent::AudioTakeProgress { progress, .. } => self.handle_audio_take_progress(*progress),
             AudioEvent::PluginUnresponsive { device: DeviceAddr { device_id, .. } } => {
                 // (v29 §4) dispatch timeout → 該当 device は quarantine 済み。
                 // どの plugin かを可視化する (解除は respawn / 再ロード)。

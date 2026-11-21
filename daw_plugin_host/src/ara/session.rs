@@ -694,6 +694,11 @@ impl AraSession {
         self.modifications.iter().map(|m| (m.persistent_id.as_str(), m.source_id.as_str()))
     }
 
+    /// document に playback region が 1 つでもあるか (`crate::ara::is_idle`)。
+    pub fn has_playback_regions(&self) -> bool {
+        !self.regions.is_empty()
+    }
+
     /// Update the placement / stretch of already-present regions in place,
     /// matched by `region_key`, without rebuilding the document. Safe while
     /// the plug-in renders: `updatePlaybackRegionProperties` only re-states

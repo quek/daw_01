@@ -33,6 +33,7 @@ mod native_param;
 mod param_address;
 mod param_range;
 mod plugin_instance;
+mod record_ops;
 mod section_ops;
 mod sections;
 mod session;
@@ -42,10 +43,12 @@ mod time_selection;
 mod view_state;
 mod track;
 mod track_enable;
+mod track_input;
 mod window_edit;
 pub use audio_take::TAKE_ORIGIN_DEPTH;
 pub use automation::*;
 pub use bounce_ops::*;
+pub use record_ops::RecordedWav;
 pub use clip_window::*;
 pub use master_limiter::*;
 pub use media_manifest::*;
@@ -68,6 +71,7 @@ pub use source_pools::*;
 pub use time_ops::*;
 pub use time_selection::*;
 pub use track::*;
+pub use track_input::*;
 pub use view_state::{RackPanelKey, ViewState};
 pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, run_fade, shown_in, shown_indices};
 
@@ -336,7 +340,11 @@ pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, ru
 /// `ImageEvent::speed`) を追加。旧ファイルは `serde(default)` の 1.0 (Mix 100% / 等速) で読める (migration 不要)。
 /// 新ファイルを旧ビルドで開くと Mix のレーンが unknown variant で落ち、Mix と速度は黙って捨てられる
 /// (保存し直すと消える) ので、版を上げて gate で弾く。
-pub const CURRENT_VERSION: u32 = 45;
+///
+/// v46 (r.md #156): トラックの「入力」と「モニター」(`Track::input` / `Track::monitor`、[`TrackInput`] /
+/// [`MonitorMode`])。旧ファイルは `serde(default)` の MIDI / 自動で読める (migration 不要)。新ファイルを
+/// 旧ビルドで開くとオーディオ入力の設定が黙って捨てられる (保存し直すと消える) ので、版を上げて gate で弾く。
+pub const CURRENT_VERSION: u32 = 46;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.

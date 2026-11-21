@@ -135,11 +135,13 @@ daw_01 は **GNU General Public License version 3 or later (GPL-3.0-or-later)** 
 | [ARA SDK](https://github.com/Celemony/ARA_SDK) (Celemony) | Apache-2.0 | `ara-sys/vendor/ARA_API/` に無改変で vendoring |
 | [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch) / [Linear](https://github.com/Signalsmith-Audio/linear) | MIT | `signalsmith-sys/vendor/` に無改変で vendoring |
 | VST 3 SDK (Steinberg) | MIT (SDK 3.8.0 以降) | `vst3` crate 経由。SDK は vendoring しない |
+| ASIO SDK (Steinberg) | GPL v3 (dual license の GPL 側) | SDK は使わずドライバーを直接呼ぶ。ヘッダの宣言を書き起こした `daw_audio/src/asio/sys.rs` だけ GPL-3.0-only |
 | [CLAP](https://github.com/free-audio/clap) | MIT | `clap-sys` crate 経由 |
 | Rust クレート 390 件 | MIT / Apache-2.0 / BSD / ISC / Zlib / MPL-2.0 ほか | [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) |
 
 いずれも GPL-3.0-or-later と互換。Apache-2.0 は GPLv3 とのみ互換なので、**このプロジェクトを
-GPLv2 系へ後退させることはできない**。
+GPLv2 系へ後退させることはできない**。ASIO の 1 ファイルは GPL-3.0-only (SDK の GPL の選択肢に
+"or later" が無い) なので、それを含む成果物は GPLv3 の条件で配布する。
 
 ### FFmpeg (LGPL v3)
 

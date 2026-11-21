@@ -83,6 +83,12 @@ pub struct MetricsBridge {
     /// 意味がこれで変わる (先読みでは xrun = リングが空だった回、load = 描画スレッドの 1 回の時間 ÷ 周期) ので、
     /// 計測と検査が「設定を送った」でなく「実際に替わった」を確かめるために読む。
     pub render_ahead: AtomicU32,
+
+    /// r.md #156: デバイスの入力を出力のコールバックへ合わせるときに **捨てた** / **無音で埋めた** フレーム数
+    /// (累積、monotonic)。OS 標準で入力と出力が別デバイス (時計が別) のときと、描き手が遅れた後に増える。
+    /// ASIO (入出力が同じコールバック) で先読みしないなら 0 のまま。
+    pub input_dropped_frames: AtomicU64,
+    pub input_filled_frames: AtomicU64,
 }
 
 /// [`MetricsBridge::load_hist`] の bucket 数 (5% 刻みで 0〜200%、最後は 200% 以上)。
@@ -253,6 +259,24 @@ impl MetricsBridgeHandle {
 
     pub fn starve_count(&self) -> u64 {
         self.bridge().starve_count.load(Ordering::Relaxed)
+    }
+
+    /// daw_audio (RT): 入力を `frames` フレーム捨てた ([`MetricsBridge::input_dropped_frames`])。
+    pub fn add_input_dropped(&self, frames: u64) {
+        self.bridge().input_dropped_frames.fetch_add(frames, Ordering::Relaxed);
+    }
+
+    /// daw_audio (RT): 入力を `frames` フレーム無音で埋めた ([`MetricsBridge::input_filled_frames`])。
+    pub fn add_input_filled(&self, frames: u64) {
+        self.bridge().input_filled_frames.fetch_add(frames, Ordering::Relaxed);
+    }
+
+    pub fn input_dropped(&self) -> u64 {
+        self.bridge().input_dropped_frames.load(Ordering::Relaxed)
+    }
+
+    pub fn input_filled(&self) -> u64 {
+        self.bridge().input_filled_frames.load(Ordering::Relaxed)
     }
 
     /// daw_audio (RT): 今の描き手を記録 ([`MetricsBridge::render_ahead`])。変わったときだけ書く。

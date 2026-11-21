@@ -97,6 +97,14 @@ pub struct Track {
     /// にできる)。 v8 file は `false` で forward-migrate (serde default)。
     #[serde(default)]
     pub armed: bool,
+    /// v46 (r.md #156): このトラックの入力 (MIDI / オーディオデバイスの入力 ch)。録音待機で録音すると、
+    /// MIDI なら MIDI クリップ、オーディオ入力ならオーディオクリップができる。旧ファイルは MIDI で読む。
+    #[serde(default, skip_serializing_if = "TrackInput::is_midi")]
+    pub input: TrackInput,
+    /// v46 (r.md #156): 入力モニター。オーディオ入力の音をこのトラックのデバイスチェーンへ流して聞くか
+    /// (実効値は [`Track::monitors_audio_input`])。旧ファイルは自動 (録音待機の間だけ) で読む。
+    #[serde(default, skip_serializing_if = "MonitorMode::is_auto")]
+    pub monitor: MonitorMode,
     /// v40 (r.md #131 `docs/plan_rmd_131_track_disable.md`): トラックの有効 / 無効。`false` の
     /// トラックは **プロジェクトに残るが実行系からは消える** — プラグインは host から降ろし
     /// (state は `PluginInstance.state` に保持)、レンダーグラフ / VOICEVOX 合成 / 映像 / 書き出しから
@@ -307,6 +315,8 @@ impl Default for Track {
             muted: false,
             solo: false,
             armed: false,
+            input: TrackInput::Midi,
+            monitor: MonitorMode::Auto,
             enabled: true,
             source: InstrumentSource::None,
             clips: Vec::new(),
@@ -374,6 +384,13 @@ impl Default for GroupTransform {
 }
 
 impl Track {
+    /// r.md #156: いまオーディオ入力の音をデバイスチェーンへ流すか (入力がオーディオで、モニターが
+    /// オン、または自動で録音待機中)。engine の流し込みはここ 1 本を読む。
+    #[must_use]
+    pub fn monitors_audio_input(&self) -> bool {
+        self.input.audio_channels().is_some() && self.monitor.active(self.armed)
+    }
+
     /// 表示名。未命名なら並び順の番号 (`index` は `Song::tracks` の 0 始まりの位置 = アレンジの上からの順。
     /// グループ / リターン / 折りたたまれた子も 1 本と数える)。位置が分からない呼び側は
     /// [`Song::track_display_name`] を使う。

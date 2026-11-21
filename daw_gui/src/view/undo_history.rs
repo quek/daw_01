@@ -18,7 +18,7 @@
 
 use std::cell::Cell;
 
-use daw_ui_core::{DragKind, Edit, Ui, WidgetId};
+use daw_ui_core::{DragKind, Edit, SCROLLBAR_W, Ui, WidgetId};
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, AppEvent};
@@ -40,8 +40,6 @@ const RESIZE_MARGIN: f32 = 6.0;
 /// 右下隅リサイズ grip の一辺 (px)。
 const CORNER: f32 = 14.0;
 const SCROLL_ID: &str = "undo_history_scroll";
-/// `scroll_area` 内部 scrollbar 幅 (mirror)。overflow 時に行幅から差し引く。
-const SCROLLBAR_W: f32 = 10.0;
 
 /// 初回 (未配置) の既定 window rect: 画面右上。
 fn default_rect(screen: Rect) -> Rect {
@@ -182,7 +180,7 @@ fn draw_chrome_and_list(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
 
     // リスト領域 (タイトル下、 右端と下端はリサイズ帯のぶん残す)。
     // 右端 RESIZE_MARGIN を空けないと、 scroll_area の縦スクロールバー
-    // (幅 SCROLLBAR_W=10、 右端に寄る) の右半分がリサイズ帯と重なり、
+    // (幅 SCROLLBAR_W、 右端に寄る) の右半分がリサイズ帯と重なり、
     // サムを掴もうとすると `take_drag_in_rect` が先に press を consume して
     // 「掴めずにウィンドウ幅リサイズが始まる」 状態になる。
     let list_rect = Rect {

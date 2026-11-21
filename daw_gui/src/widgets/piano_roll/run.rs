@@ -9,7 +9,7 @@
 
 use super::*;
 
-use daw_ui_core::{ButtonTextAlign, ToggleButtonStyle};
+use daw_ui_core::{ButtonTextAlign, SCROLLBAR_W, ToggleButtonStyle};
 
 use crate::app::{AppData, AppEvent, ClipKey};
 use crate::theme::Palette;
@@ -2033,7 +2033,7 @@ fn draw_legend(
         h: (rect.h - pad - 18.0).max(0.0),
     };
     let content_h = track_indices.len() as f32 * (row_h + gap);
-    let scrollbar_w = if content_h > list_rect.h { 10.0 } else { 0.0 };
+    let scrollbar_w = if content_h > list_rect.h { SCROLLBAR_W } else { 0.0 };
     ui.scroll_area("pr_legend_scroll", list_rect, (list_rect.w, content_h), |ui, scroll_off| {
         let mut y = list_rect.y - scroll_off.1;
         for (row_i, &ti) in track_indices.iter().enumerate() {

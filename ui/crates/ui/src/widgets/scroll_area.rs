@@ -1,4 +1,5 @@
 //! `scroll_area` widget — overflow をクリップし scrollbar + wheel/drag scroll を提供する。
+//! scrollbar の操作 (thumb のドラッグ / 溝の press でページ送り / Shift+press でその位置へ) は [`BarGrab`]。
 //!
 //! M7 Phase 22 (基本 widget 拡張)。`Ui::with_clip_rect` + `Ui::take_scroll_in_rect` の上に組む。
 //!
@@ -18,10 +19,12 @@
 //! はみ出しても安全。
 
 use std::hash::Hash;
+use std::time::{Duration, Instant};
 
 use daw_ui_renderer::{Rect, RectCommand};
 
 use crate::id::WidgetId;
+use crate::input::PointerFrame;
 use crate::ui::Ui;
 
 /// scrollbar の幅 (px)。track と thumb 共通。
@@ -33,27 +36,127 @@ pub const SCROLLBAR_W: f32 = 10.0;
 /// thumb の最低長さ (px)。content_size が極端に大きいときも掴める大きさを保つ。
 const THUMB_MIN_LEN: f32 = 24.0;
 
+/// 溝を押し続けたとき、2 ページ目を送るまでの待ち。
+const PAGE_REPEAT_DELAY: Duration = Duration::from_millis(400);
+/// 3 ページ目以降の間隔。
+const PAGE_REPEAT_INTERVAL: Duration = Duration::from_millis(50);
+
 /// scroll_area の永続状態。
 #[derive(Debug, Default)]
 pub(crate) struct ScrollState {
     pub offset: (f32, f32),
-    /// scrollbar drag 中: (押下時の pointer y/x, 押下時の offset y/x, axis)
-    drag: Option<DragAnchor>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DragAnchor {
-    /// 押下時の pointer 座標 (drag axis に対応する 1 軸のみ意味あり)。
-    pointer_axis: f32,
-    /// 押下時の offset 値 (同 axis)。
-    offset_axis: f32,
-    axis: Axis,
+    /// 掴んでいる scrollbar (どちらの軸か + 掴み方)。
+    grab: Option<(Axis, BarGrab)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Axis {
     Vertical,
     Horizontal,
+}
+
+/// scrollbar 1 本の掴み方 (press から release まで)。`scroll_area` と popup の縦スクロール
+/// ([`crate::ui::Ui::popup_scroll`]) が同じ [`bar_update`] で進める。
+///
+/// 操作は Windows の標準に合わせる: thumb はドラッグ、溝 (thumb の外) は press でその側へ 1 ページ、
+/// 押し続けると thumb がポインタに届くまで送り続ける。Shift+press はその位置へ thumb を運んで
+/// そのままドラッグ。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BarGrab {
+    /// thumb をドラッグ中: 押下時の pointer 座標 (この軸) と、押下時の offset。
+    Thumb { pointer: f32, offset: f32 },
+    /// 溝を押してページ送り中: 送る向き (`-1.0` / `1.0`) と、次に送る時刻。
+    Page { dir: f32, next: Instant },
+}
+
+/// scrollbar 1 本の寸法 (1 軸ぶん)。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BarGeom {
+    /// 溝の始点 (この軸の座標)。
+    pub track_start: f32,
+    /// 溝の長さ。
+    pub track_len: f32,
+    /// 中身の長さ。
+    pub content: f32,
+    /// 見えている長さ (thumb の長さを決める)。
+    pub viewport: f32,
+    /// 溝の press 1 回で送る量 (実際に見えている長さ。もう一方の scrollbar の帯は含めない)。
+    pub page: f32,
+    /// offset の上限 (`content - viewport`)。
+    pub max: f32,
+}
+
+/// このフレームの pointer (1 軸ぶん)。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BarPointer {
+    /// この軸の座標。window の外なら `None`。
+    pub pos: Option<f32>,
+    /// pointer が溝の矩形の中にあるか (thumb の上も含む)。
+    pub in_track: bool,
+    /// ボタンと修飾キー。
+    pub frame: PointerFrame,
+}
+
+/// scrollbar 1 本を 1 フレーム進め、新しい offset を返す ([`BarGrab`] の操作)。
+pub(crate) fn bar_update(grab: &mut Option<BarGrab>, geom: BarGeom, offset: f32, pointer: BarPointer, now: Instant) -> f32 {
+    if geom.max <= 0.0 {
+        *grab = None;
+        return 0.0;
+    }
+    let thumb = thumb_len(geom.content, geom.viewport, geom.track_len);
+    let slack = geom.track_len - thumb;
+    let thumb_start = |offset: f32| geom.track_start + slack * (offset / geom.max);
+    let page = |offset: f32, dir: f32| (offset + dir * geom.page).clamp(0.0, geom.max);
+    let mut offset = offset.clamp(0.0, geom.max);
+    let frame = pointer.frame;
+
+    if frame.primary_just_pressed
+        && pointer.in_track
+        && let Some(p) = pointer.pos
+    {
+        let start = thumb_start(offset);
+        if (start..start + thumb).contains(&p) {
+            *grab = Some(BarGrab::Thumb { pointer: p, offset });
+        } else if frame.modifiers.shift {
+            // thumb の中央をポインタへ運び、そのままドラッグへ。
+            offset = ((p - geom.track_start - thumb * 0.5) / slack.max(1.0) * geom.max).clamp(0.0, geom.max);
+            *grab = Some(BarGrab::Thumb { pointer: p, offset });
+        } else {
+            let dir = if p < start { -1.0 } else { 1.0 };
+            offset = page(offset, dir);
+            *grab = Some(BarGrab::Page { dir, next: now + PAGE_REPEAT_DELAY });
+        }
+    }
+    match grab {
+        Some(BarGrab::Thumb { pointer: anchor, offset: anchor_offset }) => {
+            if let Some(p) = pointer.pos {
+                offset = (*anchor_offset + (p - *anchor) / slack.max(1.0) * geom.max).clamp(0.0, geom.max);
+            }
+        }
+        Some(BarGrab::Page { dir, next }) => {
+            // 押したまま溝の上に居て、thumb がまだポインタに届いていない間だけ送る。
+            if frame.primary_pressed
+                && pointer.in_track
+                && now >= *next
+                && let Some(p) = pointer.pos
+            {
+                let start = thumb_start(offset);
+                let short_of_pointer = if *dir < 0.0 { p < start } else { p >= start + thumb };
+                if short_of_pointer {
+                    offset = page(offset, *dir);
+                    *next = now + PAGE_REPEAT_INTERVAL;
+                }
+            }
+        }
+        None => {}
+    }
+    // ページ送りはボタンを離したら終わり (release が他の窓に隠れて届かなくても残さない)。
+    let page_ended =
+        matches!(grab, Some(BarGrab::Page { .. })) && !frame.primary_pressed && !frame.primary_just_pressed;
+    if frame.primary_just_released || page_ended {
+        *grab = None;
+    }
+    offset
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -115,15 +218,19 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             (0.0, 0.0)
         };
 
-        // ---- 2. scrollbar drag 処理 + offset 更新 ----
-        // M9 Phase 45g (daw_01 conversation #010): drag 判定用 thumb_rect は **wheel 適用後の
+        // ---- 2. scrollbar の操作 + offset 更新 ----
+        // M9 Phase 45g (daw_01 conversation #010): 当たり判定の thumb は **wheel 適用後の
         // 現在 offset** で計算する。旧実装は `offset = 0.0` で計算していたため、scrolled 状態
         // で thumb の描画位置と hit-test 位置が乖離して drag が始まらない bug があった。
         let v_track_rect = vertical_scrollbar_rect(rect, need_h);
         let h_track_rect = horizontal_scrollbar_rect(rect, need_v);
 
         let scrolled = scroll.0.abs() > 1e-4 || scroll.1.abs() > 1e-4;
-        let (offset, v_thumb_rect, h_thumb_rect) = {
+        let now = Instant::now();
+        // 開いている popup (menu / dropdown の一覧) の下に溝が隠れているときは、その press を拾わない
+        // (ホイールと同じ基準。溝の上に重なった項目の click で背後がページ送りされる)。
+        let covered = self.pointer_blocked_by_modal_popup();
+        let (offset, v_thumb_rect, h_thumb_rect, pressed_bar, paging) = {
             let state: &mut ScrollState = self.widget_state(wid);
             // wheel 適用 (winit 慣行: y > 0 = wheel up = view 上方向)。offset.y -= scroll.y
             // で「wheel down → offset 増 → 下のコンテンツが見える」になる。
@@ -138,106 +245,73 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             state.offset.0 = (state.offset.0 - h_scroll).clamp(0.0, max_x);
             state.offset.1 = (state.offset.1 - v_scroll).clamp(0.0, max_y);
 
-            // wheel 適用後の現在 offset で thumb_rect を計算 (drag hit-test + 描画で共有)。
-            let v_thumb_rect = if need_v {
-                Some(thumb_rect_vertical(
-                    v_track_rect,
-                    content_size.1,
-                    rect.h,
-                    state.offset.1,
-                    max_y,
-                ))
-            } else {
-                None
+            // scrollbar の press / ドラッグ / ページ送り ([`BarGrab`])。当たり判定は wheel 適用後の
+            // 現在 offset の thumb で取る (`bar_update` の中)。掴めるのは 1 本だけ。
+            let on = |track: Rect| !covered && pointer.pos.is_some_and(|(px, py)| track.contains(px, py));
+            let in_v = need_v && on(v_track_rect);
+            let in_h = need_h && !in_v && on(h_track_rect);
+            let inner = inner_viewport_rect(rect, need_h, need_v);
+            let mut v_grab = match state.grab {
+                Some((Axis::Vertical, grab)) => Some(grab),
+                _ => None,
             };
-            let h_thumb_rect = if need_h {
-                Some(thumb_rect_horizontal(
-                    h_track_rect,
-                    content_size.0,
-                    rect.w,
-                    state.offset.0,
-                    max_x,
-                ))
-            } else {
-                None
+            let mut h_grab = match state.grab {
+                Some((Axis::Horizontal, grab)) => Some(grab),
+                _ => None,
             };
+            let bar_pointer = |pos: Option<f32>, in_track: bool| BarPointer { pos, in_track, frame: pointer };
+            let v_geom = BarGeom {
+                track_start: v_track_rect.y,
+                track_len: v_track_rect.h,
+                content: content_size.1,
+                viewport: rect.h,
+                page: inner.h,
+                max: max_y,
+            };
+            let h_geom = BarGeom {
+                track_start: h_track_rect.x,
+                track_len: h_track_rect.w,
+                content: content_size.0,
+                viewport: rect.w,
+                page: inner.w,
+                max: max_x,
+            };
+            state.offset.1 =
+                bar_update(&mut v_grab, v_geom, state.offset.1, bar_pointer(pointer.pos.map(|p| p.1), in_v), now);
+            state.offset.0 =
+                bar_update(&mut h_grab, h_geom, state.offset.0, bar_pointer(pointer.pos.map(|p| p.0), in_h), now);
+            state.grab = v_grab.map(|g| (Axis::Vertical, g)).or(h_grab.map(|g| (Axis::Horizontal, g)));
+            let paging = matches!(state.grab, Some((_, BarGrab::Page { .. }))) && (in_v || in_h);
 
-            // scrollbar drag 開始判定
-            if pointer.primary_just_pressed
-                && let Some((px, py)) = pointer.pos
-            {
-                if let Some(thumb) = v_thumb_rect
-                    && thumb.contains(px, py)
-                {
-                    state.drag = Some(DragAnchor {
-                        pointer_axis: py,
-                        offset_axis: state.offset.1,
-                        axis: Axis::Vertical,
-                    });
-                } else if let Some(thumb) = h_thumb_rect
-                    && thumb.contains(px, py)
-                {
-                    state.drag = Some(DragAnchor {
-                        pointer_axis: px,
-                        offset_axis: state.offset.0,
-                        axis: Axis::Horizontal,
-                    });
-                }
-            }
+            // 描画する thumb (このフレームの操作を反映した後の offset)。
+            let v_thumb_rect = need_v
+                .then(|| thumb_rect_vertical(v_track_rect, content_size.1, rect.h, state.offset.1, max_y));
+            let h_thumb_rect = need_h
+                .then(|| thumb_rect_horizontal(h_track_rect, content_size.0, rect.w, state.offset.0, max_x));
 
-            // drag 中: offset を再計算
-            if let Some(anchor) = state.drag
-                && let Some((px, py)) = pointer.pos
-            {
-                match anchor.axis {
-                    Axis::Vertical => {
-                        let track_h = v_track_rect.h;
-                        let thumb_h = thumb_len(content_size.1, rect.h, track_h);
-                        let drag_range = (track_h - thumb_h).max(1.0);
-                        let dy = py - anchor.pointer_axis;
-                        let new_offset =
-                            anchor.offset_axis + dy / drag_range * max_y;
-                        state.offset.1 = new_offset.clamp(0.0, max_y);
-                    }
-                    Axis::Horizontal => {
-                        let track_w = h_track_rect.w;
-                        let thumb_w = thumb_len(content_size.0, rect.w, track_w);
-                        let drag_range = (track_w - thumb_w).max(1.0);
-                        let dx = px - anchor.pointer_axis;
-                        let new_offset =
-                            anchor.offset_axis + dx / drag_range * max_x;
-                        state.offset.0 = new_offset.clamp(0.0, max_x);
-                    }
-                }
-            }
-            if pointer.primary_just_released {
-                state.drag = None;
-            }
-
-            (state.offset, v_thumb_rect, h_thumb_rect)
+            (state.offset, v_thumb_rect, h_thumb_rect, in_v || in_h, paging)
         };
-        // thumb を掴んだ press の所有者を名乗る (r.md #122 / [`crate::click`])。
-        if pointer.primary_just_pressed
-            && let Some((px, py)) = pointer.pos
-            && (v_thumb_rect.is_some_and(|t| t.contains(px, py))
-                || h_thumb_rect.is_some_and(|t| t.contains(px, py)))
-        {
+        // scrollbar (thumb も溝も) の press の所有者を名乗る (r.md #122 / [`crate::click`])。
+        if pointer.primary_just_pressed && pressed_bar {
             self.claim_press(wid);
         }
 
-        // wheel scroll / drag 中は次フレーム再描画を要求 (state 変化を視覚反映するため)
-        if scrolled {
+        // wheel scroll 直後と、溝の上で押し続けてページを送っている間 (次に送る時刻は入力が無くても来る) は
+        // 次フレーム再描画を要求する。
+        if scrolled || paging {
             self.request_redraw();
         }
 
         // ---- 3. 内側を with_clip_rect で描画 ----
         // viewport rect は scrollbar 領域を除いた本体エリア (scrollbar との重なり禁止)。
+        // 当たり判定も viewport で切る: スクロールで外へ出た widget は見えないので、 その位置の
+        // click / hover / ホイールを受けさせない ([`crate::hit_clip`])。
         let viewport = inner_viewport_rect(rect, need_h, need_v);
         self.with_clip_rect(viewport, |ui| {
-            f(ui, offset);
+            ui.with_hit_clip(viewport, |ui| f(ui, offset));
         });
 
-        // ---- 4. scrollbar 描画 (track + thumb)。drag hit-test と同一 thumb rect を使う ----
+        // ---- 4. scrollbar 描画 (track + thumb)。thumb はこのフレームの操作を反映した後の位置 ----
         // 溝と thumb は専用トークン (grid_line からの alpha 派生ではない): ライトテーマでは
         // 溝を「薄い暗」、thumb を「濃い暗」にする必要があり、alpha だけでは表現できない。
         let p = self.palette();
@@ -450,6 +524,51 @@ mod tests {
             "scrolled thumb 位置からの下方向 drag で offset.1 が 200 から進む (got {})",
             off.1
         );
+    }
+
+    /// 溝 (thumb の外) の press はその側へ 1 ページ送る。押したままでも待ち時間の前は送り直さず、
+    /// 待ち時間を過ぎると thumb がポインタに届くまで送り、届いたら止まる。Shift+press はその位置へ運ぶ。
+    #[test]
+    fn track_press_pages_then_repeats_until_thumb_reaches_pointer() {
+        // 溝 200、中身 1000、見えている 200 → thumb 40、max 800、1 ページ = 200。
+        let geom =
+            BarGeom { track_start: 0.0, track_len: 200.0, content: 1000.0, viewport: 200.0, page: 200.0, max: 800.0 };
+        let pointer = |pos: f32, just_pressed: bool, shift: bool| BarPointer {
+            pos: Some(pos),
+            in_track: true,
+            frame: PointerFrame {
+                primary_just_pressed: just_pressed,
+                primary_pressed: true,
+                modifiers: daw_ui_platform::Modifiers { shift, ..Default::default() },
+                ..PointerFrame::default()
+            },
+        };
+        let t0 = Instant::now();
+        let mut grab = None;
+
+        // thumb は 0..40。溝の y=130 を press → 下へ 1 ページ。
+        let off = bar_update(&mut grab, geom, 0.0, pointer(130.0, true, false), t0);
+        assert_eq!(off, 200.0);
+        // 押したまま、待ち時間の前は動かない。
+        let off = bar_update(&mut grab, geom, off, pointer(130.0, false, false), t0 + Duration::from_millis(100));
+        assert_eq!(off, 200.0);
+        // 待ち時間を過ぎると次のページ (thumb = 80..120。まだポインタに届かない)。
+        let t1 = t0 + PAGE_REPEAT_DELAY;
+        let off = bar_update(&mut grab, geom, off, pointer(130.0, false, false), t1);
+        assert_eq!(off, 400.0);
+        // 間隔ごとにもう 1 ページ (thumb = 120..160 でポインタに届く)。
+        let t2 = t1 + PAGE_REPEAT_INTERVAL;
+        let off = bar_update(&mut grab, geom, off, pointer(130.0, false, false), t2);
+        assert_eq!(off, 600.0);
+        // 届いた後は押し続けても送らない。
+        let off = bar_update(&mut grab, geom, off, pointer(130.0, false, false), t2 + Duration::from_secs(1));
+        assert_eq!(off, 600.0);
+
+        // Shift+press: thumb の中央が y=180 に来る位置へ (上限で止まる)。
+        let mut grab = None;
+        let off = bar_update(&mut grab, geom, 0.0, pointer(180.0, true, true), t0);
+        assert_eq!(off, 800.0);
+        assert!(matches!(grab, Some(BarGrab::Thumb { .. })), "そのままドラッグへ移る");
     }
 
     /// 1 フレーム分の wheel を scroll_area に与えて返り値 offset を観測するヘルパ。
