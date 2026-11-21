@@ -117,6 +117,8 @@ pub enum AppEvent {
     /// r.md #48: 設定 window の開閉トグル (Edit メニュー「設定...」 / ✕ / Esc)。
     /// 開閉状態は `app_config.json` に永続。 Song は触らないので Undo / dirty 対象外。
     ToggleSettings,
+    /// r.md #156: 設定 window の左のカテゴリを選ぶ。 選んだカテゴリは `app_config.json` に永続。
+    SetSettingsCategory(crate::state::SettingsCategory),
     /// r.md #50: 画面右端のマスターパネルの表示トグル (View メニュー / `Ctrl+Alt+M`)。
     /// 開閉は `app_config.json` に永続。Song は触らないので Undo / dirty 対象外。
     ToggleMasterPanel,

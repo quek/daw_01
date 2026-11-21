@@ -14,7 +14,21 @@ use crate::widgets::menu::draw_items_popup;
 const DROPDOWN_PAD_X: f32 = 8.0;
 const DROPDOWN_ARROW_W: f32 = 16.0;
 
+/// caller の `id` から dropdown の widget id (popup の id もここから決まる)。
+fn dropdown_wid(id: &impl Hash) -> WidgetId {
+    WidgetId::ROOT.child((b"dropdown", id))
+}
+
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
+    /// `id` の dropdown の一覧 (popup) が開いているか。
+    ///
+    /// 一覧は本体を置いた領域の外へはみ出して描かれる。 floating window の中に dropdown を置く側は
+    /// これを見て、 一覧が開いている間は window の外の入力も背景へ渡さないようにする
+    /// (渡すと、 はみ出した項目の click が背景の widget にも届く)。
+    pub fn is_dropdown_open(&self, id: impl Hash) -> bool {
+        self.is_popup_open(("dropdown_popup", dropdown_wid(&id)))
+    }
+
     /// dropdown / combobox widget。クリックで items の popup を開き、選択で `Some(idx)` を返す。
     /// 利用者は `Some(idx)` から `Edit::mutate(...)` で Model 側の選択 index を更新する。
     ///
@@ -46,9 +60,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let pointer = self.pointer;
         // popup state は caller-id ベース (rect 座標を入れると 1px 動いて state 蒸発 / 同位置別
         // dropdown で衝突する)。
-        let wid = WidgetId::ROOT.child((b"dropdown", &id));
+        let wid = dropdown_wid(&id);
         let popup_id = ("dropdown_popup", wid);
-        let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
+        // 開いている **別の** popup (上へ開いた隣の dropdown の一覧など) の下ではヒットさせない
+        // (button と同じ)。 自分の popup は anchor に本体を含むので数えない — 数えると、
+        // 開いている本体をもう一度 click して閉じることができなくなる。
+        let own_popup = WidgetId::ROOT.child((b"popup", &popup_id));
+        let blocked = self.pointer_blocked_by_modal_popup_except(Some(own_popup));
+        let inside = !blocked && pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
         let already_open = self.is_popup_open(popup_id);
         // 本体の click (press も release も本体の上)。 他所で始めたドラッグをここで
         // 離しても開かない (daw_01 r.md #122、 [`crate::click`])。
@@ -239,6 +258,49 @@ mod tests {
         run(&mut host, (110.0, 110.0), true, true, false);
         run(&mut host, (110.0, 110.0), false, false, true);
         assert!(opened.get(), "本体で press + release なら開く");
+    }
+
+    /// 縦に並んだ dropdown の下側を画面下端で開くと、 一覧は上へ開いて上側の本体に被さる。
+    /// **被さった項目を click すると下側の項目が選ばれ、 上側は開かない** (上側が先に描かれるので、
+    /// 上側が click を取ると下側の一覧は選べなくなる)。 開いている本体をもう一度 click すると閉じる。
+    #[test]
+    fn an_item_over_another_dropdown_selects_the_item_and_the_open_body_still_closes() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let items = ["a", "b", "c", "d"];
+        // 下側は画面下端 (下空き 6px) なので、 一覧 (4 × 24px) は上へ開いて y=474..570。
+        let upper = Rect { x: 100.0, y: 520.0, w: 120.0, h: 24.0 };
+        let lower = Rect { x: 100.0, y: 570.0, w: 120.0, h: 24.0 };
+        let chosen = std::cell::Cell::new((None, None));
+        let open = std::cell::Cell::new((false, false));
+        let mut click = |host: &mut UiHost<()>, pos: (f32, f32)| {
+            let input = FrameInput {
+                pointer: PointerFrame {
+                    pos: Some(pos),
+                    primary_just_pressed: true,
+                    primary_just_released: true,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            };
+            host.frame_to_edits(&(), &mut scene, SCREEN, input, |(), ui| {
+                let u = ui.dropdown("upper", upper, &items, 0);
+                let l = ui.dropdown("lower", lower, &items, 0);
+                chosen.set((u, l));
+                open.set((ui.is_dropdown_open("upper"), ui.is_dropdown_open("lower")));
+            });
+        };
+        click(&mut host, (110.0, 580.0));
+        assert_eq!(open.get(), (false, true), "下側が開く");
+        // 上側の本体 (y=520..544) の上に居るのは下側の 3 項目目 (y=522..546)。
+        click(&mut host, (110.0, 530.0));
+        assert_eq!(chosen.get(), (None, Some(2)), "下側の項目が選ばれる");
+        assert_eq!(open.get(), (false, false), "上側は開かない");
+
+        click(&mut host, (110.0, 580.0));
+        assert_eq!(open.get(), (false, true));
+        click(&mut host, (110.0, 580.0));
+        assert_eq!(open.get(), (false, false), "開いている本体の click で閉じる");
     }
 
     /// 画面に入りきらない項目数の dropdown を開き、 **ホイールで下へスクロールしてから

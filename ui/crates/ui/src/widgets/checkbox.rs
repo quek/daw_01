@@ -40,7 +40,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     {
         let wid = WidgetId::ROOT.child((b"checkbox", &id));
         let pointer = self.pointer;
-        let inside = pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
+        // 開いている modal popup (dropdown の一覧 / context menu) の下ではヒットさせない (button と同じ)。
+        let blocked = self.pointer_blocked_by_modal_popup();
+        let inside = !blocked && pointer.pos.is_some_and(|(px, py)| rect.contains(px, py));
 
         // click 判定 (button と同じ `primary_click`)。
         let crate::click::ClickState { clicked: click, held: visual_pressed } =

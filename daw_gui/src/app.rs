@@ -187,6 +187,8 @@ impl AppData {
                 settings_rect: app_config
                     .settings_rect
                     .map(|[x, y, w, h]| daw_ui_renderer::Rect { x, y, w, h }),
+                settings_category: crate::state::SettingsCategory::from_id(&app_config.settings_category)
+                    .unwrap_or_default(),
                 // r.md #54: ラウドネスレポート window の開閉/位置/サイズ。
                 loudness_report_open: app_config.loudness_report_open,
                 loudness_report_rect: app_config
@@ -300,9 +302,9 @@ impl AppData {
         // 子プロセスが居ない経路 (test / script) では中で no-op。
         app.reopen_sampler_ring();
         // r.md #48: 設定 window が開いた状態で復元されたときは、最初のフレームまでに
-        // テーマ一覧が要る (描画側は毎フレーム作り直さない)。
+        // ページの中身 (テーマ一覧など) が要る (描画側は毎フレーム作り直さない)。
         if app.ui_prefs.settings_open {
-            app.refresh_available_themes();
+            app.settings_page_shown();
         }
         // cache が旧 port-probe 版 (PluginEntry の 3 bool 未取得) なら、
         // 起動時に 1 回だけ自動で再 probe (rescan) して port 構成を埋める。 production
@@ -584,16 +586,8 @@ impl AppData {
                 self.persist_app_config();
             }
             // r.md #48: 設定 window の開閉トグル (Edit メニュー / ✕ / Esc)。
-            AppEvent::ToggleSettings => {
-                self.ui_prefs.settings_open = !self.ui_prefs.settings_open;
-                if self.ui_prefs.settings_open {
-                    // テーマ一覧の実体は `themes/` の read_dir + JSON パース。
-                    // **開いたときに 1 回だけ**取る (描画ループでディスクを叩かない)。
-                    // 開き直せば新しく置いたファイルが出るので再起動は要らない。
-                    self.refresh_available_themes();
-                }
-                self.persist_app_config();
-            }
+            AppEvent::ToggleSettings => self.toggle_settings(),
+            AppEvent::SetSettingsCategory(category) => self.set_settings_category(category),
             // r.md #50: 画面右端のマスターパネルの開閉 (View メニュー / Ctrl+Alt+M)。
             AppEvent::ToggleMasterPanel => {
                 self.ui_prefs.master_panel_open = !self.ui_prefs.master_panel_open;

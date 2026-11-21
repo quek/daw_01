@@ -1,6 +1,47 @@
 //! S3b-1: AppData state group (UiPrefs)。 docs/plan_arch_refactor.md §7.5
 //! の分割表に従って app.rs の AppData から機械移送したフィールド群。
 
+/// 設定 window の左に並ぶカテゴリ (r.md #156)。並び順は [`Self::ALL`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SettingsCategory {
+    /// 既定 (保存された値が無い / 読めないとき)。
+    #[default]
+    Audio,
+    Voicevox,
+    Theme,
+}
+
+impl SettingsCategory {
+    /// 左の一覧に出す順。
+    pub const ALL: [Self; 3] = [Self::Audio, Self::Voicevox, Self::Theme];
+
+    /// 一覧と、ページの見出しに出す名前。
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Audio => "オーディオ",
+            Self::Voicevox => "VOICEVOX",
+            Self::Theme => "テーマ",
+        }
+    }
+
+    /// `app_config.json` と script の口で使う名前。
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Voicevox => "voicevox",
+            Self::Theme => "theme",
+        }
+    }
+
+    /// [`Self::id`] の逆。知らない名前は `None` (保存値の読み込みは既定へ倒す)。
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.id() == id)
+    }
+}
+
 #[derive(Debug)]
 pub struct UiPrefs {
     /// docs/plan_video.md P4: video preview window の表示フラグ。 menu
@@ -34,6 +75,8 @@ pub struct UiPrefs {
     pub settings_open: bool,
     /// r.md #48: 設定 window の位置・サイズ (app_config で永続)。 `None` = 未配置。
     pub settings_rect: Option<daw_ui_renderer::Rect>,
+    /// r.md #156: 設定 window で選んでいるカテゴリ (app_config で永続)。
+    pub settings_category: SettingsCategory,
 
     /// r.md #50: 画面右端のマスターパネルを出すか (app_config で永続)。
     /// View メニュー / `Ctrl+Alt+M` で toggle。
