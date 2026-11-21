@@ -172,7 +172,7 @@ fn fallback_state(app: &mut AppData) {
     app.audio_device.config.asio_driver = Some(AudioDeviceRef { id: "{Z}".into(), name: "外した機材の ASIO".into() });
     app.audio_device.config.sample_rate = Some(96_000);
     if let Some(info) = &mut app.audio_device.info {
-        info.fallback_reason = Some("「外した機材の ASIO」が見つかりません".into());
+        info.fallback_reason = Some("ASIO ドライバー「外した機材の ASIO」が見つかりません".into());
     }
 }
 
@@ -464,8 +464,31 @@ fn the_rows_below_the_device_do_not_move_when_the_device_state_changes() {
     };
     let system = row_top(system_state);
     assert_eq!(row_top(asio_state), system, "ASIO");
-    assert_eq!(row_top(fallback_state), system, "開けずに戻したとき (知らせが 1 行出る)");
+    assert_eq!(row_top(fallback_state), system, "開けずに戻したとき (知らせが出る)");
     assert_eq!(row_top(|_| {}), system, "engine と繋がっていないとき");
+}
+
+/// 設定どおりに開けなかったときは、理由と、実際に開いているデバイスの名前がページに出る。
+/// うまく行っているときは出ない。
+#[test]
+fn a_failed_device_shows_the_reason_and_what_is_actually_open() {
+    let page_text = |prepare: fn(&mut AppData)| {
+        let (mut app, _rx) = build_app(None);
+        let mut host: UiHost<AppData> = UiHost::no_redraw();
+        prepare(&mut app);
+        app.ui_prefs.settings_rect = Some(Rect { x: 90.0, y: 60.0, w: 660.0, h: 520.0 });
+        app.handle_event(AppEvent::ToggleSettings);
+        // 折り返しで行に割れるので、描かれた順に繋いで読む。
+        settings_scene(&mut host, &app).iter_glyphs().map(|g| g.text.to_string()).collect::<String>()
+    };
+    let failed = page_text(fallback_state);
+    assert!(failed.contains("ASIO ドライバー「外した機材の ASIO」が見つかりません"), "{failed}");
+    assert!(failed.contains("「スピーカー (Realtek(R) Audio)」で動いています"), "{failed}");
+    // 選んだデバイスは選ばれたまま見える (設定は消さない)。
+    assert!(failed.contains("外した機材の ASIO (見つかりません)"), "{failed}");
+
+    assert!(!page_text(asio_state).contains("で動いています"));
+    assert!(page_text(|_| {}).contains("オーディオエンジンと繋がっていません"));
 }
 
 /// 設定 window を開いたルート view を GPU で描き、窓の矩形が一様塗りでないこと (= 中身が実際に

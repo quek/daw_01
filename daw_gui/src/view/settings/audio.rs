@@ -132,8 +132,9 @@ fn draw_synthetic_device(ui: &mut Ui<'_, AppData>, pg: &mut Page<'_>) {
     pg.row(ui, "synthetic_spacer", "");
 }
 
-/// うまく行っていないときの 1 行 (開けずに OS 標準の既定デバイスへ戻した、など)。
-/// デバイスの行のすぐ下 — 選んだ結果が、選んだ場所の近くに出る。
+/// うまく行っていないときの知らせ (開けずに OS 標準の既定デバイスへ戻した、など)。
+/// デバイスの行のすぐ下 — 選んだ結果が、選んだ場所の近くに出る。場所はいつも取ってあるので、
+/// 出たり消えたりしても下の項目は動かない。
 fn draw_notice(ui: &mut Ui<'_, AppData>, pg: &mut Page<'_>) {
     let dev = &pg.app.audio_device;
     let p = &pg.app.theme.core;
@@ -141,12 +142,11 @@ fn draw_notice(ui: &mut Ui<'_, AppData>, pg: &mut Page<'_>) {
         (Some(error), _) => (format!("オーディオデバイスを開けませんでした: {error}"), p.text_error),
         (None, None) => ("オーディオエンジンと繋がっていません".to_string(), p.text_error),
         (None, Some(info)) => match &info.fallback_reason {
-            // どのデバイスへ戻ったかは、すぐ下の行 (出力チャンネル以下) が実際の値で見せる。
-            // ここは 1 行に収まる長さにとどめる (既定の幅で折り返すと、下の項目が 1 行ずれる)。
-            Some(reason) => (
-                format!("{reason} — {}の既定デバイスで動いています", choices::system_driver_label()),
-                p.text_error,
-            ),
+            // 理由と、**実際に開いているデバイス** (`info`)。設定どおりに開けなかったときに何で動くか
+            // (OS 標準の既定デバイスへ戻した / 入力だけ無し / 音の出ないデバイス) は engine が決めるので、
+            // ここでは決め付けず、開いているものの名前をそのまま出す。
+            Some(reason) if info.output_name.is_empty() => (reason.clone(), p.text_error),
+            Some(reason) => (format!("{reason} — 「{}」で動いています", info.output_name), p.text_error),
             None if dev.listing && dev.devices.is_none() => {
                 ("デバイスの一覧を取得しています…".to_string(), p.text_faint)
             }

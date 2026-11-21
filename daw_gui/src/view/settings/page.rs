@@ -26,6 +26,9 @@ const HINT_LINE_H: f32 = 14.0;
 /// 知らせ ([`Page::notice`]) の文字サイズと行送り (px)。
 const NOTICE_FONT: f32 = 11.0;
 const NOTICE_LINE_H: f32 = 16.0;
+/// 知らせのためにいつも取っておく行数。「(理由) — 「(デバイス名)」で動いています」が、既定の幅で
+/// 収まる行数。
+const NOTICE_LINES: f32 = 2.0;
 /// 項目名・読むだけの値の文字サイズ (px)。
 const TEXT_FONT: f32 = 12.0;
 
@@ -147,14 +150,14 @@ impl Page<'_> {
         self.y += ROW_GAP;
     }
 
-    /// 状況の知らせ (失敗の理由など)。**文字が空でも 1 行ぶんの場所を取る** — 知らせが出たり消えたり
-    /// しても、下の項目が動かない (折り返して 2 行以上になったときだけ伸びる)。
+    /// 状況の知らせ (失敗の理由など)。**文字が空でも [`NOTICE_LINES`] 行ぶんの場所を取る** — 知らせが
+    /// 出たり消えたりしても、下の項目が動かない (折り返してそれより長くなったときだけ伸びる)。
     pub(super) fn notice(&mut self, ui: &mut Ui<'_, AppData>, id: &'static str, text: &str, color: Color) {
         let top = self.y;
         if !text.is_empty() {
             self.wrapped(ui, id, text, (NOTICE_FONT, NOTICE_LINE_H), color);
         }
-        self.y = self.y.max(top + NOTICE_LINE_H) + ROW_GAP;
+        self.y = self.y.max(top + NOTICE_LINE_H * NOTICE_LINES) + ROW_GAP;
     }
 
     /// `text` をページの幅で折り返して描き、`y` を描いた行数ぶん進める。
@@ -203,7 +206,8 @@ fn store_wrapped_lines(ui: &mut Ui<'_, AppData>, id: &'static str, lines: Vec<St
     cache.lines = lines;
 }
 
-/// `text` を、実測幅が `max_w` を超えない最長の接頭辞で順に切る (日本語の説明文なので文字単位)。
+/// `text` を、実測幅が `max_w` を超えない最長の接頭辞で順に切る (日本語の文なので文字単位。
+/// 英数字の語の途中だけは避ける — [`word_break`])。
 /// 1 文字も入らない幅でも 1 行に 1 文字は置く (無限ループにしない)。
 fn wrap(ui: &mut Ui<'_, AppData>, text: &str, font: f32, max_w: f32) -> Vec<String> {
     let mut lines = Vec::new();
@@ -225,9 +229,36 @@ fn wrap(ui: &mut Ui<'_, AppData>, text: &str, font: f32, max_w: f32) -> Vec<Stri
                 hi = mid;
             }
         }
-        let cut = ends[lo - 1];
+        let cut = ends[word_break(rest, lo) - 1];
         lines.push(rest[..cut].to_string());
         rest = rest[cut..].trim_start();
     }
     lines
+}
+
+/// `text` を先頭から `fit` 文字で切るとき、英数字の語の途中なら、その行の中で語の切れ目
+/// (空白や全角文字の隣) まで戻した文字数を返す (デバイス名の「Audio」が「Audi / o」に割れない)。
+/// 行の中に切れ目が無ければ `fit` のまま (長い 1 語は途中で切るしかない)。
+fn word_break(text: &str, fit: usize) -> usize {
+    let chars: Vec<char> = text.chars().take(fit + 1).collect();
+    let inside_word = |k: usize| chars[k - 1].is_ascii_alphanumeric() && chars[k].is_ascii_alphanumeric();
+    if fit >= chars.len() || !inside_word(fit) {
+        return fit;
+    }
+    (1..fit).rev().find(|&k| !inside_word(k)).unwrap_or(fit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::word_break;
+
+    #[test]
+    fn a_line_is_not_cut_inside_an_ascii_word() {
+        assert_eq!(word_break("ab cd efgh", 8), 6, "「ef|gh」→ 語の前 (空白の後) まで戻す");
+        assert_eq!(word_break("日本語abc", 4), 3, "全角文字の隣は切れ目");
+        assert_eq!(word_break("ab cd", 2), 2, "もともと語の切れ目");
+        assert_eq!(word_break("日本語の文", 3), 3, "全角の文はどこでも切れる");
+        assert_eq!(word_break("abcdefgh", 5), 5, "切れ目の無い長い 1 語は途中で切る");
+        assert_eq!(word_break("abc", 3), 3, "行末まで入る");
+    }
 }
