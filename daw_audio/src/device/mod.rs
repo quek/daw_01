@@ -14,8 +14,6 @@ pub mod callback;
 pub mod control;
 pub mod convert;
 pub mod enumerate;
-// 読み手 (録音の取り出し・描画の中のモニター) は別の branch (r.md #156 の録音) で入る。統合したら外す。
-#[allow(dead_code)]
 pub mod input;
 pub mod monitor;
 mod synthetic;

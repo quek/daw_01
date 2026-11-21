@@ -13,12 +13,14 @@
 //            保存して開き直して再生。入力は RAMP (ch ごとに振幅の違うのこぎり波)
 //   loop     ループ録音: 後の周が前の周を上書きする
 //   loopback 位置の補正: 鳴らしたクリックを LOOPBACK で録り、録れた位置が曲の位置と一致する
+//   ahead    入力をモニターしている間は先読みを使わず、やめたら先読みへ戻る
 //
 // 共通の引数: dir=<書いてよいフォルダ>、renderAhead=0|1 (先読み。省略 = 環境設定のまま)、
 // bufferFrames=<合成デバイスのバッファ長。省略 = 既定>、sampleRate=<合成デバイスのレート。省略 = 48000>
 
 // デバイスのレート (= engine のレート = 録音の WAV のレート)。曲は 120 BPM なので 1 拍 = SR / 2 フレーム。
-const SR = Number(daw.scriptArgs.sampleRate || 48000);
+// (`| 0` で整数にする — `Number("44100")` は小数の型になり、`setAudioDevice` が整数として読めず無視する。)
+const SR = Number(daw.scriptArgs.sampleRate || 48000) | 0;
 const FRAMES_PER_BEAT = SR / 2;
 
 function check(cond, msg) {
@@ -67,12 +69,16 @@ function openSynthetic(device) {
   }
   const spec = { driver: "synthetic", device: device, sampleRate: SR };
   if (daw.scriptArgs.bufferFrames !== undefined) {
-    spec.bufferFrames = Number(daw.scriptArgs.bufferFrames);
+    spec.bufferFrames = Number(daw.scriptArgs.bufferFrames) | 0;
   }
   const info = daw.setAudioDevice(spec);
   check(
     info !== null && info.driver === "synthetic" && info.fallbackReason === null && info.sampleRate === SR,
     "合成デバイスが開けていない: " + JSON.stringify(info),
+  );
+  check(
+    spec.bufferFrames === undefined || info.bufferFrames === spec.bufferFrames,
+    "バッファ長が替わっていない: " + JSON.stringify(info),
   );
   check(info.activeInputs.count === 4, "入力 4 ch が開いていない: " + JSON.stringify(info));
   daw.sleepMs(500);
@@ -116,12 +122,22 @@ function recordFor(ms) {
 }
 
 // トラック 1 のクリップを始まりの順に、素材と一緒に並べる。
+// 録音するトラック (先頭) のクリップ。空の `clips` は JSON に出ないので、無ければ空の配列。
+function firstTrackClips(s) {
+  return s.tracks[0].clips || [];
+}
+
+// 曲が持つオーディオ素材 (`Song.media.audio_sources`)。
+function audioSources(s) {
+  return (s.media && s.media.audio_sources) || {};
+}
+
 function recordedClips(s) {
-  return s.tracks[0].clips
+  return firstTrackClips(s)
     .map((clip) => {
       const events = s.clip_contents[String(clip.content_id)].events;
       check(events.length === 1, "クリップの中の event が 1 つでない: " + JSON.stringify(events));
-      return { clip: clip, event: events[0], source: s.audio_sources[String(events[0].source_id)] };
+      return { clip: clip, event: events[0], source: audioSources(s)[String(events[0].source_id)] };
     })
     .sort((a, b) => a.clip.start_beat - b.clip.start_beat);
 }
@@ -174,7 +190,7 @@ function stageRamp() {
   check(st.status.indexOf("入力がデバイスに無い") >= 0, "無い入力の理由が出ていない: " + JSON.stringify(st));
   daw.appStop();
   tickUntil(() => !rec().requested, 5000, "録音が閉じない");
-  check(song().tracks[0].clips.length === 0, "無い入力でクリップができた");
+  check(firstTrackClips(song()).length === 0, "無い入力でクリップができた");
   daw.toggleTrackArmed(1);
 
   const info = openSynthetic("ramp");
@@ -197,8 +213,10 @@ function stageRamp() {
   daw.sleepMs(300);
   check(daw.masterPeakDbfs(300) === null, "オフなのに入力が聞こえる");
   // 入力メーター: モニターがオフでも、録音待機のトラックのメーターには入力レベルが出る。
-  const meter = daw.trackPeak(1, 300);
-  check(Math.abs(meter - 0.5) < 0.02, "オフ・待機中の入力メーター: " + meter);
+  // メーターはバッファ 1 枚 (128 フレーム) ごとの山で、のこぎり波 (周期 1000 フレーム、ch 0 の振幅 0.5) の頂点を
+  // 含む 1 枚を読みに行けるとは限らない。ch 1 の振幅 (0.25) より上で、ch 0 の振幅を超えないことを見る。
+  const meter = daw.trackPeak(1, 600);
+  check(meter > 0.3 && meter <= 0.5 + 1e-4, "オフ・待機中の入力メーター: " + meter);
   daw.toggleTrackArmed(1);
   daw.setTrackMonitor(1, "on");
   daw.sleepMs(300);
@@ -276,10 +294,10 @@ function stageRamp() {
   // -- undo で消え、redo で戻る (録音 1 回 = 1 step) --
   daw.appUndo();
   s = song();
-  check(s.tracks[0].clips.length === 0, "undo でクリップが消えない");
-  check(s.audio_sources === undefined || Object.keys(s.audio_sources).length === 0, "undo で素材が残った");
+  check(firstTrackClips(s).length === 0, "undo でクリップが消えない");
+  check(Object.keys(audioSources(s)).length === 0, "undo で素材が残った");
   daw.appRedo();
-  check(song().tracks[0].clips.length === 1, "redo でクリップが戻らない");
+  check(firstTrackClips(song()).length === 1, "redo でクリップが戻らない");
 
   // -- 保存して開き直しても鳴る --
   const project = daw.scriptArgs.dir + "/proj/rec.daw";
@@ -345,7 +363,7 @@ function stageLoop() {
   const end = tail.clip.start_beat + tail.clip.length_beats;
   check(end >= 2.0 && end < 2.1, "前の周の終わり: " + end);
   check(head.event.source_id === tail.event.source_id, "2 つのクリップの素材が別");
-  check(Object.keys(s.audio_sources).length === 1, "素材が 1 つでない");
+  check(Object.keys(audioSources(s)).length === 1, "素材が 1 つでない");
   // 最後の周は WAV の 3 周目 (1 周 = 2 拍 = SR フレーム。2 周ぶんより後ろ)、残りは 2 周目。
   check(head.event.source_start_frames >= 2 * SR, "最後の周の素材位置: " + head.event.source_start_frames);
   check(
@@ -355,7 +373,7 @@ function stageLoop() {
   check(head.source.sample_rate === SR, "素材のレート: " + JSON.stringify(head.source));
   // undo 1 回で、録った全部の周が消える。
   daw.appUndo();
-  check(song().tracks[0].clips.length === 0, "undo で全部の周が消えない");
+  check(firstTrackClips(song()).length === 0, "undo で全部の周が消えない");
 }
 
 // ---- 段 "loopback": 位置の補正 ----------------------------------------------------
@@ -422,7 +440,32 @@ function stageLoopback() {
   check(tab.path !== null && !tab.dirty, "保存できていない: " + JSON.stringify(tab));
 }
 
-const stages = { old: stageOld, ramp: stageRamp, loop: stageLoop, loopback: stageLoopback };
+// ---- 段 "ahead": 入力をモニターしている間は先読みを使わない ------------------------
+// 引数: renderAhead=1 (先読み on で始める)。
+function stageAhead() {
+  const renderAhead = () => JSON.parse(daw.perfJson()).renderAhead;
+  daw.sleepMs(1000);
+  daw.appLoadSongJson(
+    JSON.stringify({ bpm: 120.0, time_sig: [4, 4], length_beats: 16.0, tracks: [track(1, "Rec", [])], next_track_id: 2 }),
+  );
+  openSynthetic("ramp");
+  check(renderAhead() === true, "前提: 先読みで描いている");
+  daw.setTrackInput(1, "stereo", 0);
+  daw.sleepMs(500);
+  check(renderAhead() === true, "モニターしていないのに先読みをやめた");
+  // 自動 + 録音待機 = モニターが効く → コールバックの中で描く (描き溜めのぶん遅らせない)。
+  daw.toggleTrackArmed(1);
+  daw.sleepMs(500);
+  check(renderAhead() === false, "モニター中も先読みで描いている");
+  const db = daw.masterPeakDbfs(300);
+  check(dbNear(db, RAMP_DB), "モニターの音が聞こえない: " + db);
+  // モニターをやめたら先読みへ戻る。
+  daw.setTrackMonitor(1, "off");
+  daw.sleepMs(500);
+  check(renderAhead() === true, "モニターをやめても先読みへ戻らない");
+}
+
+const stages = { old: stageOld, ramp: stageRamp, loop: stageLoop, loopback: stageLoopback, ahead: stageAhead };
 const stage = stages[daw.scriptArgs.stage];
 check(stage !== undefined, "unknown stage: " + daw.scriptArgs.stage);
 stage();

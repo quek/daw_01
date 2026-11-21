@@ -217,9 +217,11 @@ impl OutputRenderer {
         //
         // **描く処理の最後に置くこと** — publish を 0 に畳む処理が、上の meters / DSP load publish に
         // 上書きされてはならない。
+        // r.md #156: デバイス入力を使っているトラック (モニター / 入力メーター) がある間は「走っている」扱いにする
+        // (park するとコールバックが止まり、入力の音もメーターも止まる)。
         let idle = engine::buffer_is_idle(
             self.shared.app_active.load(Ordering::Acquire),
-            self.local.any_rolling(),
+            self.local.any_rolling() || self.local.any_input_live(),
             0,
             self.local.shared.export_running.load(Ordering::Acquire),
             peak_l,
@@ -282,6 +284,13 @@ struct Link {
 /// 停止中か (描き手を替えてよいか)。count-in も走っている扱い ([`DeviceRt::any_rolling`])。
 fn may_switch(r: &OutputRenderer) -> bool {
     !r.local.any_rolling()
+}
+
+/// 先読みで描くべきか。設定で望まれていて、かつデバイス入力をモニターしているトラックが無いとき
+/// (r.md #156: 先読みはモニターの音を描き溜めのぶん遅らせるので、モニターの間は使わない)。切り替え自体は
+/// これまでどおり停止中だけ ([`may_switch`]) — 再生中にモニターを入れたら、止めるまでは遅れたまま聞こえる。
+fn ahead_wanted(shared: &SharedState, r: &OutputRenderer) -> bool {
+    shared.render_ahead_wanted.load(Ordering::Acquire) && !r.local.any_input_monitoring()
 }
 
 /// デバイスのコールバック (`crate::device::callback::EngineCallback`) の持ち物: 描き手 (先読みしない間)・
@@ -396,7 +405,7 @@ impl OutputStage {
                 .not_from_ring
                 .fetch_add((data.len() / self.channels) as u64 - drained_frames, Ordering::Release);
         }
-        if self.shared.render_ahead_wanted.load(Ordering::Acquire) && may_switch(r) && self.cons.is_empty() {
+        if ahead_wanted(&self.shared, r) && may_switch(r) && self.cons.is_empty() {
             let Some(r) = self.inline.take() else { return };
             if let Err(rtrb::PushError::Full(r)) = self.to_thread.push(r) {
                 // 枠は 1 つで描き手も 1 つなので起きない。起きても手放さない。
@@ -477,7 +486,7 @@ impl RenderThread {
             self.held = self.rx.pop().ok();
         }
         let Some(r) = self.held.as_mut() else { return };
-        if !self.shared.render_ahead_wanted.load(Ordering::Acquire) && may_switch(r) {
+        if !ahead_wanted(&self.shared, r) && may_switch(r) {
             if let Some(r) = self.held.take()
                 && let Err(rtrb::PushError::Full(r)) = self.tx.push(r)
             {

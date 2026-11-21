@@ -13,7 +13,7 @@
 //! `D - 入力レイテンシ` に来た音。 だから入力のフレーム `D` は、出力のフレーム `D - 入力レイテンシ - 出力レイテンシ`
 //! と同時に鳴っていた音 (先読みは [`DeviceIo::out_frame`] に織り込み済み)。
 //!
-//! 書き出しは [`DeviceIo::NONE`] (入力なし) しか渡さない — 入力音は書き出しに入らない。
+//! 書き出しはこの口を通らない (`NativeIo::default()` = 入力なしで描く) — 入力音は書き出しに入らない。
 
 use common::audio_device::ChannelRange;
 
@@ -30,7 +30,8 @@ pub struct InputBlock<'a> {
 }
 
 impl<'a> InputBlock<'a> {
-    /// 入力なし (入力の無いデバイス・書き出し)。
+    /// 入力なし (検査用)。
+    #[cfg(test)]
     pub const EMPTY: InputBlock<'static> = InputBlock {
         data: &[],
         stride: 0,
@@ -78,12 +79,6 @@ impl<'a> InputBlock<'a> {
         self.data.get(start..start + self.frames)
     }
 
-    /// 使っている入力 ch (デバイスの ch 番号の範囲)。
-    #[must_use]
-    pub fn channels(&self) -> ChannelRange {
-        self.channels
-    }
-
     /// このブロックの先頭のフレームの通し番号 (module doc の時計)。[`InputTap::capture`] では連続する
     /// (前のブロックの `device_frame + frames` が次の `device_frame`)。
     #[must_use]
@@ -104,13 +99,6 @@ pub trait InputTap: Send + 'static {
     fn capture(&mut self, input: &InputBlock<'_>);
 }
 
-/// 何もしない tap。
-pub struct NoTap;
-
-impl InputTap for NoTap {
-    fn capture(&mut self, _input: &InputBlock<'_>) {}
-}
-
 /// 描く 1 回に渡すデバイスの入出力 (`engine::DeviceCtx::io`)。
 #[derive(Clone, Copy)]
 pub struct DeviceIo<'a> {
@@ -123,8 +111,9 @@ pub struct DeviceIo<'a> {
     pub output_latency_frames: u32,
 }
 
+#[cfg(test)]
 impl DeviceIo<'static> {
-    /// 入力もデバイスも無い描画 (書き出し・検査)。
+    /// 入力もデバイスも無い描画 (検査用)。
     pub const NONE: DeviceIo<'static> =
         DeviceIo { input: InputBlock::EMPTY, out_frame: 0, input_latency_frames: 0, output_latency_frames: 0 };
 }
