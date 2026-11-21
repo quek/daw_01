@@ -67,7 +67,10 @@ pub(crate) fn build(
         let Some(mt) = song.tracks.iter().find(|mt| mt.id == t.id) else {
             continue;
         };
-        let group = tracks.iter().any(|o| o.parent_id == Some(t.id));
+        // まとめセルを描くのは **純粋な group だけ**。パラアウトを展開した楽器兼バスは子を持つが
+        // 自分の楽器を鳴らすので、普通のトラックと同じく自分のセルを描く (`row_accepts_cells` と
+        // 同じ 1 本の判定)。その下に普通の子トラックを入れても、親行からのまとめ発火は無い。
+        let group = song.track_is_pure_group(t.id);
         let mut cells: HashMap<u32, LauncherCellView> = HashMap::new();
         for sc in &mt.session_clips {
             cells.insert(

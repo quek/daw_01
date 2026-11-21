@@ -910,8 +910,8 @@ fn draw_cell_curve(
 }
 
 /// グループトラック行の「まとめセル」。子行のセル色を縞にして重ね、シーン名を載せる。
-/// daw_01 のグループトラックは自分のクリップを鳴らさない (`process_track_owned` が
-/// `track_has_children` で pass 1 を抜ける) ので、行の意味が衝突しない。
+/// まとめセルを描くのは自分のクリップを鳴らさない group だけ
+/// ([`Song::track_is_pure_group`](common::model::Song::track_is_pure_group)) なので、行の意味が衝突しない。
 fn draw_group_cell(
     hctx: &mut HeavyCtx<'_, '_, AppData>,
     f: &ArrangementFrame<'_>,

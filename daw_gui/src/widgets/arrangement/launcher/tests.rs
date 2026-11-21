@@ -461,6 +461,49 @@ fn build_app() -> AppData {
     )
 }
 
+/// **パラアウトを展開したトラックの行は、子を持ってもまとめセルにならない。** engine はその
+/// 楽器を鳴らす (`Pass1Role::GroupWithInstrument`) ので、帯も自分のセルを描く。「子を持つ =
+/// グループ行」と読むと、展開した瞬間にそのトラックのセルが帯から消える。
+#[test]
+fn パラアウトを展開した行は自分のセルを描く() {
+    use common::model::{
+        AuxOutputRoute, Clip, Device, LaunchSettings, PluginInstance, Scene, SessionClip, Track,
+    };
+    let mut app = build_app();
+    let (src, scene_id) = app
+        .edit_song(|song| {
+            let scene_id = song.alloc_scene_id();
+            song.scenes.push(Scene::new(scene_id));
+            let src = song.alloc_track_id();
+            let child = song.alloc_track_id();
+            let mut track = Track { id: src, ..Track::default() };
+            let clip_id = track.alloc_clip_id();
+            track.session_clips.push(SessionClip {
+                scene_id,
+                clip: Clip { id: clip_id, length_beats: 4.0, ..Clip::default() },
+                launch: LaunchSettings::default(),
+            });
+            track.devices.push(Device::Plugin(PluginInstance {
+                aux_outputs: vec![Some(AuxOutputRoute::to_track(child))],
+                ..PluginInstance::with_ports(
+                    "test.inst".into(),
+                    common::plugin_format::PluginFormat::Clap,
+                    common::port_config::PortConfig::default(),
+                )
+            }));
+            song.tracks.push(track);
+            song.tracks.push(Track { id: child, parent_group_id: Some(src), ..Track::default() });
+            (src, scene_id)
+        })
+        .expect("編集できる");
+
+    let built = super::super::view_build::build(&app, Rect::new(0.0, 0.0, 1200.0, 600.0));
+    let row = &built.launcher.rows[&ArrangementRowKey::Track(src)];
+    assert!(!row.group, "まとめセルの行になった (自分のセルが描かれない)");
+    assert!(row.takes_cells);
+    assert!(row.cells.contains_key(&scene_id));
+}
+
 /// **セッションビューにしか居ない** 画像クリップのセルにも、アレンジのクリップと同じ
 /// サムネイルが載る (r.md #94 の欠陥そのもの — 旧実装はセルが波形 / MIDI しか描かず、
 /// video / image のセルは名前だけの無地だった)。

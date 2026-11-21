@@ -1147,8 +1147,8 @@ fn 隣り合うセルのリンクコピーは_2_つとも作られる() {
 
 /// **セルを置けない行**にはどの口からも置けない。
 ///
-/// グループトラックは自分のクリップを鳴らさない (`process_track_owned` が
-/// `track_has_children` で pass 1 を抜ける) ので、置いたセルは保存はされるのに
+/// 純粋なグループトラックは自分のクリップを鳴らさない (`Song::track_is_pure_group`)
+/// ので、置いたセルは保存はされるのに
 /// 永久に鳴らない。テンポ / 拍子レーンはランチャーが握ると量子化グリッドが
 /// 自己参照する (`AutomationTarget::accepts_launcher_cells`)。
 #[test]
@@ -1186,6 +1186,34 @@ fn セルを置けない行には作れない() {
         "テンポレーンの行にセルは置けない"
     );
     assert!(!app.cur.song_doc.is_dirty(), "置けないので `*` も立たない");
+}
+
+/// **パラアウトを展開した楽器兼バスは子を持つが、自分のセルを持てる。** engine は楽器の
+/// prefix を pass 1 で走らせて自分のクリップ / セルを鳴らす (`Pass1Role::GroupWithInstrument`)。
+/// 「子を持つ = グループ行」と読むと、展開した瞬間に元トラックのセルが帯から消える。
+#[test]
+fn パラアウトを展開したトラックはセルを持てる() {
+    use common::model::{AuxOutputRoute, Device, PluginInstance};
+    let (mut app, _a, _p) = build_app();
+    seed(&mut app, 2, 1);
+    app.edit_song(|song| {
+        // track 1 の楽器の出力を track 2 へ送り、track 2 を子にする (= 展開の結果)。
+        song.tracks[0].devices.push(Device::Plugin(PluginInstance {
+            aux_outputs: vec![Some(AuxOutputRoute::to_track(2))],
+            ..PluginInstance::with_ports(
+                "test.inst".into(),
+                common::plugin_format::PluginFormat::Clap,
+                common::port_config::PortConfig::default(),
+            )
+        }));
+        song.tracks[1].parent_group_id = Some(1);
+    });
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell {
+        row: LauncherRow::Track(1),
+        scene_index: 0,
+    }));
+    assert_eq!(app.cur.song_doc.song().tracks[0].session_clips.len(), 1);
 }
 
 /// **オートメーション追従**: MIDI クリップをセルへ運ぶと、その窓に完全に入るオートメーション

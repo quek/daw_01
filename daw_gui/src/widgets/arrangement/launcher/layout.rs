@@ -258,8 +258,8 @@ pub(crate) fn row_at_y(f: &ArrangementFrame<'_>, y: f32) -> Option<ArrangementRo
 /// この行が **自分のセルを所有できる**か (= 落とし先 / 作成 / 編集 / メニューの対象)。
 ///
 /// **「押せるか」とは別の問い。** グループ行のまとめセルは押せる (子行へ展開して一斉発火)
-/// が、グループトラックは自分のクリップを鳴らさない (`process_track_owned` が
-/// `track_has_children` で pass 1 を抜ける) ので、そこに作られたセルは
+/// が、純粋なグループトラックは自分のクリップを鳴らさない
+/// ([`Song::track_is_pure_group`](common::model::Song::track_is_pure_group)) ので、そこに作られたセルは
 /// **見えない・撃てない・鳴らない**。マスター行はそもそもクリップを持たない。
 ///
 /// 落とし先 ([`drop_cell_at`]) / caller へ返す rect (`draw::row_cells` の `cell_rects`) /

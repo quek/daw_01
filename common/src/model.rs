@@ -1182,6 +1182,17 @@ impl Song {
         self.tracks.iter().any(|t| t.parent_group_id == Some(track_id))
     }
 
+    /// 子を持ち、**自分のクリップを鳴らさない** group か (= 純粋な group / folder bus)。
+    ///
+    /// パラアウトを展開した楽器兼バス (子を持ち、かつ [`Track::paraout_split_device`] を持つ) は
+    /// 含めない — engine は楽器の prefix を pass 1 で走らせ、自分のクリップ / セルを鳴らす
+    /// (`daw_audio::graph::compile` の `gwi_split` → `Pass1Role::GroupWithInstrument`)。
+    /// 「子を持つ = クリップを鳴らさない」と読むと、展開した瞬間に元トラックのセルが帯から消える。
+    pub fn track_is_pure_group(&self, track_id: u32) -> bool {
+        self.track_has_children(track_id)
+            && self.track_by_id(track_id).is_some_and(|t| t.paraout_split_device().is_none())
+    }
+
     /// True if any track has an enabled aux send whose destination is
     /// `track_id` (= it acts as a return bus). RT-safe scan, no alloc.
     pub fn track_receives_send(&self, track_id: u32) -> bool {

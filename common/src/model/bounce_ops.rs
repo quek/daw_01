@@ -80,8 +80,11 @@ impl Song {
                 receives_paraout |= p.aux_outputs.iter().flatten().any(|r| r.dest_track == track_id);
             }
         }
-        let instrument_bus = is_group && self.track_by_id(track_id).is_some_and(|t| t.paraout_split_device().is_some());
-        !(is_group || receives_send || receives_paraout) || instrument_bus
+        if is_group {
+            // 楽器兼バスだけは自分の楽器を鳴らす (判定は 1 本: `track_is_pure_group`)。
+            return !self.track_is_pure_group(track_id);
+        }
+        !(receives_send || receives_paraout)
     }
 
     /// Bounce In Place の置き先: content `content_id` を、窓 `window` (content-local 拍) を見ていたクリップに

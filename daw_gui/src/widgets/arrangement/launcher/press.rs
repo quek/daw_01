@@ -136,9 +136,9 @@ pub(super) fn zone_at(f: &ArrangementFrame<'_>, x: f32, y: f32) -> Option<Zone> 
     // 「その行を止める」なので、**列の空きを掴もうとしただけで再生が止まる**。
     // 押せる場所を記号に限れば、止めたいときだけ止まる。
     //
-    // グループ行の「まとめセル」 (`clip_id == 0` なので `is_empty`) も同じ分割。グループ
-    // トラックは自分のクリップを鳴らさない (`process_track_owned` が `track_has_children`
-    // で pass 1 を抜ける) ので運ぶ中身は無いが、**本体ぜんぶをボタンにすると子が鳴る列を
+    // グループ行の「まとめセル」 (`clip_id == 0` なので `is_empty`) も同じ分割。純粋な
+    // グループトラックは自分のクリップを鳴らさない (`Song::track_is_pure_group`)
+    // ので運ぶ中身は無いが、**本体ぜんぶをボタンにすると子が鳴る列を
     // 掴もうとしただけで再生が始まる** (空セル / シーン見出しで潰したのと同じ症状)。
     if key.is_empty() {
         return Some(if layout::launch_hit_rect(rect, f.style).contains(x, y) {

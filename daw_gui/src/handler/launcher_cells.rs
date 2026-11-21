@@ -716,10 +716,11 @@ impl AppData {
 /// 行 `row` が **そもそもセルを持てるか**。列とは無関係な、行そのものの性質。
 ///
 /// - 行が実在すること
-/// - **グループトラックでないこと** — daw_01 のグループトラックは自分のクリップを
-///   鳴らさない (`process_track_owned` が `track_has_children` で pass 1 を抜ける)
-///   ので、置いたセルは保存はされるのに永久に鳴らない。帯はグループ行を「子の
-///   まとめセル」として描く (計画書 §0 / §3.2)
+/// - **純粋なグループトラックでないこと** ([`Song::track_is_pure_group`]) — daw_01 の
+///   グループトラックは自分のクリップを鳴らさない (pass 1 を抜ける) ので、置いたセルは
+///   保存はされるのに永久に鳴らない。帯はグループ行を「子のまとめセル」として描く
+///   (計画書 §0 / §3.2)。**パラアウトを展開した楽器兼バスは子を持つが自分の楽器を鳴らす**
+///   ので、普通のトラックと同じくセルを持てる
 /// - レーン行なら
 ///   [`AutomationTarget::accepts_launcher_cells`](common::model::AutomationTarget::accepts_launcher_cells)
 ///   が `true` であること (テンポ / 拍子レーンはランチャーが握れない — 量子化
@@ -730,7 +731,7 @@ impl AppData {
 pub(crate) fn row_accepts_cells(song: &Song, row: LauncherRow) -> bool {
     match row {
         LauncherRow::Track(id) => {
-            song.track_by_id(id).is_some() && !song.track_has_children(id)
+            song.track_by_id(id).is_some() && !song.track_is_pure_group(id)
         }
         LauncherRow::Lane(k) => song
             .automation_lane_by_key(k.track, k.lane)

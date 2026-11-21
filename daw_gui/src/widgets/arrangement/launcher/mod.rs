@@ -263,9 +263,10 @@ pub enum LauncherIntent {
     /// **空セル (`cell.clip_id == 0`) は「その行を止める」** (計画書 Q11)。アーム中の
     /// 行なら録音開始として解釈してよい (表示も ● になっている)。
     ///
-    /// **グループ行は widget 側で子行へ展開済み** — この列挙に
-    /// `row = Track(グループ id)` が来ることは無い (グループトラックは自分の
-    /// クリップを鳴らさないので、まとめセルは「子を一斉に」の意味しか持たない)。
+    /// **グループ行 (まとめセルの行) は widget 側で子行へ展開済み** — この列挙に
+    /// `row = Track(純粋な group の id)` が来ることは無い (自分のクリップを鳴らさないので、
+    /// まとめセルは「子を一斉に」の意味しか持たない)。パラアウトを展開した楽器兼バスは
+    /// 子を持つが自分のセルの行なので、その id はそのまま来る。
     /// `pressed` は
     /// [`LaunchMode`](common::model::LaunchMode) の 4 種 (Trigger / Gate / Toggle /
     /// Repeat) を engine が解釈するために要る。
@@ -409,7 +410,9 @@ pub(super) struct LauncherRowView {
     pub playback: RowPlayback,
     /// 録音アーム中か (空セルの記号を ● / ■ に分ける、Bitwig 流)。
     pub armed: bool,
-    /// 子を持つトラック行 (= グループ)。まとめセルを描く。
+    /// 自分のクリップを鳴らさないグループ行
+    /// ([`Song::track_is_pure_group`](common::model::Song::track_is_pure_group))。まとめセルを描く。
+    /// パラアウトを展開した楽器兼バスは子を持つが `false` (自分のセルを描く)。
     pub group: bool,
     /// この行を **ランチャーが握れるか** (= engine が行として登録するか)。
     ///
