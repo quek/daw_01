@@ -54,9 +54,12 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // 占有する予約を **背景 widget 描画より前** に行う (= window の上の click が
     // アレンジ等に漏れず、 window の外は通常操作できる true floating)。 本体描画は
     // build_root 末尾で `undo_history::draw`。
-    // r.md #54: 解析の走査中は他の floating window を出さない。これらは
-    // `with_floating_region` で raw pointer に戻すので、暗転の下でも押せてしまう
+    // r.md #54: 解析の走査中は他の floating window を出さない (暗転の下に窓を残さない)。
+    // 入力は、レポート窓が画面全体を「他の窓も全部遮る」予約で取るので、どの窓にも届かない
     // (編集履歴の行を click すると走査中に Song が飛ぶ)。
+    //
+    // **予約の順 = 窓の重なりの下から上** (daw-ui の `floating` module)。build_root 末尾の `draw` の順と
+    // 揃えること — ずれると、見えている窓と click を受ける窓が食い違う。
     let floating_ok = !app.loudness_in_progress();
     if floating_ok {
         undo_history::reserve(app, ui, Rect { x: 0.0, y: 0.0, w: sw, h: sh });

@@ -23,8 +23,9 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// `id` の dropdown の一覧 (popup) が開いているか。
     ///
     /// 一覧は本体を置いた領域の外へはみ出して描かれる。 floating window の中に dropdown を置く側は
-    /// これを見て、 一覧が開いている間は window の外の入力も背景へ渡さないようにする
-    /// (渡すと、 はみ出した項目の click が背景の widget にも届く)。
+    /// これを見て、 一覧が開いている間は window の外の入力も背景や他の floating window へ渡さない
+    /// ようにする (渡すと、 はみ出した項目の click がそちらの widget にも届く。
+    /// [`Ui::reserve_floating_region_exclusive`])。
     pub fn is_dropdown_open(&self, id: impl Hash) -> bool {
         self.is_popup_open(("dropdown_popup", dropdown_wid(&id)))
     }

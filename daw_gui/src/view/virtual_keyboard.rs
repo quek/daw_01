@@ -23,6 +23,8 @@ use crate::widgets::piano_roll::is_black_key;
 const MENU_H: f32 = 24.0;
 const TITLE_H: f32 = 24.0;
 const CLOSE_W: f32 = 26.0;
+/// floating window としての id (`reserve_floating_region` / `with_floating_region` の対)。
+const REGION_ID: &str = "virtual_keyboard";
 const PAD: f32 = 10.0;
 /// 上段 (Oct / Vel / 宛先) の行。
 const ROW_Y: f32 = TITLE_H + 8.0;
@@ -69,7 +71,7 @@ pub fn reserve(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     if !app.virtual_keyboard.open {
         return;
     }
-    ui.reserve_floating_region(window_rect(app, screen));
+    ui.reserve_floating_region(REGION_ID, window_rect(app, screen));
 }
 
 /// build_root の **末尾近く** (背景描画の後 = z-order 最前面) に呼ぶ。
@@ -87,7 +89,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
             }
         }));
     }
-    ui.with_floating_region(|ui| draw_window(app, ui, screen));
+    ui.with_floating_region(REGION_ID, |ui| draw_window(app, ui, screen));
 }
 
 fn draw_window(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {

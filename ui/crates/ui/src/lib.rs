@@ -16,6 +16,7 @@ pub mod color;
 pub mod dialog;
 pub mod drag_drop;
 pub mod edit;
+pub mod floating;
 pub mod hit_clip;
 pub mod id;
 pub mod input;

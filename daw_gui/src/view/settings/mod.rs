@@ -44,6 +44,8 @@ pub const MIN_W: f32 = 520.0;
 pub const MIN_H: f32 = 240.0;
 const TITLE_H: f32 = 24.0;
 const CLOSE_W: f32 = 26.0;
+/// floating window としての id (`reserve_floating_region` / `with_floating_region` の対)。
+const REGION_ID: &str = "settings";
 /// 左のカテゴリの列の幅 (px)。
 const SIDEBAR_W: f32 = 132.0;
 /// カテゴリ 1 行の高さ (px)。
@@ -126,8 +128,12 @@ pub fn reserve(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     if !app.ui_prefs.settings_open {
         return;
     }
-    let region = if page::any_dropdown_open(ui) { screen } else { window_rect(app, screen) };
-    ui.reserve_floating_region(region);
+    // 一覧が開いている間は他の floating window (上に重なる仮想鍵盤も含む) にも届かせない。
+    if page::any_dropdown_open(ui) {
+        ui.reserve_floating_region_exclusive(REGION_ID, screen);
+    } else {
+        ui.reserve_floating_region(REGION_ID, window_rect(app, screen));
+    }
 }
 
 /// build_root の **末尾近く** (背景描画の後) に呼ぶ: window 本体を inline 描画する
@@ -136,7 +142,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     if !app.ui_prefs.settings_open {
         return;
     }
-    ui.with_floating_region(|ui| draw_window(app, ui, screen));
+    ui.with_floating_region(REGION_ID, |ui| draw_window(app, ui, screen));
 }
 
 fn draw_window(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {

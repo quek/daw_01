@@ -38,6 +38,8 @@ const MIN_W: f32 = 560.0;
 const MIN_H: f32 = 420.0;
 const TITLE_H: f32 = 24.0;
 const CLOSE_W: f32 = 26.0;
+/// floating window としての id (`reserve_floating_region` / `with_floating_region` の対)。
+const REGION_ID: &str = "loudness_report";
 const PAD: f32 = 12.0;
 const ROW_H: f32 = 19.0;
 const BTN_H: f32 = 22.0;
@@ -119,9 +121,9 @@ pub fn reserve(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
         return;
     }
     if app.loudness_in_progress() {
-        ui.reserve_floating_region(screen);
+        ui.reserve_floating_region_exclusive(REGION_ID, screen);
     } else {
-        ui.reserve_floating_region(window_rect(app, screen));
+        ui.reserve_floating_region(REGION_ID, window_rect(app, screen));
     }
 }
 
@@ -130,7 +132,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     if !app.ui_prefs.loudness_report_open {
         return;
     }
-    ui.with_floating_region(|ui| {
+    ui.with_floating_region(REGION_ID, |ui| {
         if app.loudness_in_progress() {
             // 背景の暗転。入力は reserve が既に落としているので、これは
             // 「触れない」ことを見せるためだけの層。

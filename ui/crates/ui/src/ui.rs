@@ -899,6 +899,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             popup_primitives: Vec::new(),
             drawing_in_popup: false,
             current_popup: None,
+            floating: crate::floating::FloatingFrame::default(),
             redraw_requested: &mut redraw_requested,
             file_drop,
             file_hover,
@@ -1051,7 +1052,8 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// false`) では `masked_pointer` に差し替わり (pos = None / 全 button false / scroll 0)、
     /// `popup_layer` の body 内 (`drawing_in_popup == true`) では `pointer_raw` に戻る。
     /// fader 等 `self.pointer` を直読みする widget も、この 1 箇所の差し替えで自動的に inert
-    /// になる (SSoT、daw_01 #065)。
+    /// になる (SSoT、daw_01 #065)。 floating window の予約も同じ差し替えで背景と他の窓を
+    /// inert にする ([`crate::floating`])。
     pub(crate) pointer: PointerFrame,
     /// M14 Phase 94 (daw_01 #065): masking 前の生 pointer。`popup_layer` の outside-click /
     /// anchor 消費判定と、modal body へ raw を渡す swap で使う。`pointer` が masking されても
@@ -1117,6 +1119,8 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// 呼び出し側が別 popup の id を渡せてしまう = ずれの温床)。cascade は nest するので
     /// popup_layer が退避 / 復元する。
     pub(crate) current_popup: Option<WidgetId>,
+    /// このフレームに予約された floating window と pointer の配り先 ([`crate::floating`])。
+    pub(crate) floating: crate::floating::FloatingFrame,
     /// M7 後の改善: widget が `Ui::request_redraw()` を呼んだら true。
     /// `UiHost::frame` の末尾で `redraw_requested_in_last_frame` に commit され、
     /// 次のフレーム redraw の発火条件に含まれる。
@@ -1335,70 +1339,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     #[must_use]
     pub fn is_overlay_open(&self, id: impl std::hash::Hash) -> bool {
         self.is_popup_open(("overlay", &id))
-    }
-
-    /// 常駐 floating panel (daw_01 の編集履歴 window 等) が、 **自分の rect 分だけ**
-    /// 背後の pointer を占有するための予約。 `open_overlay` (= 開いている間、 背景
-    /// 全体の pointer を mask する capture_input modal) と違い、 pointer が `rect` の
-    /// **外** にある間は背景 widget を通常どおり操作できる (= 真の非ブロッキング
-    /// floating window)。
-    ///
-    /// 使い方 (2 段): build_root の **背景 widget 描画より前** に、 panel が開いて
-    /// いるとき panel rect で本メソッドを呼ぶ。 raw pointer が `rect` 内にある間だけ
-    /// `self.pointer` を mask し、 以降に描く背景 widget (arrangement 等) がその
-    /// click / hover / scroll に反応しないようにする (= panel 上のクリックが背後に
-    /// 漏れない)。 panel 自身の描画は末尾で [`Ui::with_floating_region`] に包む。
-    ///
-    /// 真のモーダル (`modal_capturing`) が開いている間は何もしない (モーダルが優先し、
-    /// panel はその背後で inert)。
-    pub fn reserve_floating_region(&mut self, rect: Rect) {
-        if !self.modal_capturing
-            && self
-                .pointer_raw
-                .pos
-                .is_some_and(|(x, y)| rect.contains(x, y))
-        {
-            self.pointer = masked_pointer(self.pointer_raw);
-            // `pending_secondary_click` / `pending_double_click` は **生 pointer 由来**
-            // (フレーム冒頭で `pointer_raw` から算出) なので、`self.pointer` を mask
-            // しただけでは素通りする。落とさないと予約領域の上で右クリックした瞬間に
-            // 背景 widget が context menu を開いてしまい、その popup は mask された
-            // pointer しか読めないので **item も outside-click も効かない**
-            // = 消せないメニューが居座る (daw_01 r.md #54 レビューで発覚。全画面を
-            // 予約する用途で初めて表面化した)。
-            if self
-                .pending_secondary_click
-                .is_some_and(|(x, y)| rect.contains(x, y))
-            {
-                *self.pending_secondary_click = None;
-            }
-            if self
-                .pending_double_click
-                .is_some_and(|(x, y)| rect.contains(x, y))
-            {
-                *self.pending_double_click = None;
-            }
-            if self
-                .pending_double_click_press
-                .is_some_and(|(x, y)| rect.contains(x, y))
-            {
-                *self.pending_double_click_press = None;
-            }
-        }
-    }
-
-    /// [`Ui::reserve_floating_region`] とペア。 floating panel 自身の描画をこの
-    /// closure 内で行う。 panel 内 widget は **raw pointer** を読む (背後 mask を
-    /// 一時解除) ので drag / click / scroll が効く。 真のモーダル中は解除しない
-    /// (panel はモーダルの背後で操作不可のまま)。
-    pub fn with_floating_region<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let saved = self.pointer;
-        if !self.modal_capturing {
-            self.pointer = self.pointer_raw;
-        }
-        let r = f(self);
-        self.pointer = saved;
-        r
     }
 
     /// M14 Phase 94 (daw_01 #065): `capture_input` を指定して popup を開く内部 API。
@@ -2639,11 +2579,12 @@ pub fn merge_clip(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
     }
 }
 
-/// M14 Phase 94 (daw_01 #065): 真のモーダル中、background widget が読む pointer。
+/// M14 Phase 94 (daw_01 #065): 真のモーダル中、background widget が読む pointer
+/// (floating window の下に隠れた背景と窓が読む pointer も同じ。[`crate::floating`])。
 /// pos = None / 全 button false / scroll 0 で「pointer が存在しない」状態に潰す。
 /// `modifiers` は keyboard 側の状態なので保持する (pos が None なので hover / drag は始まらず無害、
 /// modal body は `pointer_raw` を見るので影響しない)。
-fn masked_pointer(p: PointerFrame) -> PointerFrame {
+pub(crate) fn masked_pointer(p: PointerFrame) -> PointerFrame {
     PointerFrame {
         pos: None,
         primary_just_pressed: false,

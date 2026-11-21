@@ -40,6 +40,8 @@ const RESIZE_MARGIN: f32 = 6.0;
 /// 右下隅リサイズ grip の一辺 (px)。
 const CORNER: f32 = 14.0;
 const SCROLL_ID: &str = "undo_history_scroll";
+/// floating window としての id (`reserve_floating_region` / `with_floating_region` の対)。
+const REGION_ID: &str = "undo_history";
 
 /// 初回 (未配置) の既定 window rect: 画面右上。
 fn default_rect(screen: Rect) -> Rect {
@@ -73,7 +75,7 @@ pub fn reserve(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     if !app.ui_prefs.undo_history_open {
         return;
     }
-    ui.reserve_floating_region(window_rect(app, screen));
+    ui.reserve_floating_region(REGION_ID, window_rect(app, screen));
 }
 
 /// build_root の **末尾近く** (背景描画の後) に呼ぶ: window 本体を inline 描画する
@@ -82,7 +84,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     if !app.ui_prefs.undo_history_open {
         return;
     }
-    ui.with_floating_region(|ui| draw_window(app, ui, screen));
+    ui.with_floating_region(REGION_ID, |ui| draw_window(app, ui, screen));
 }
 
 fn draw_window(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {

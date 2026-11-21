@@ -121,7 +121,7 @@ FILE-BUDGET | daw_plugin_host/src/editor_window.rs    | 1462 | FFI/IPC 実装。
 # D. daw-ui (ui/crates)。immediate-mode の中核 (Ui 本体) と波形 widget。
 #    不変条件 8 でドメイン知識は入らないが、widget の実装量そのものが溜まっている。
 #    いつ消えるか: **未起票**。#76 の完了報告でユーザーへ起票を提案する。
-FILE-BUDGET | ui/crates/ui/src/ui.rs                  | 1602 | #71 で widget 跨ぎ drag payload の host 状態 +12 (UiHost の per-frame 状態なので外へ出せない)。未起票
+FILE-BUDGET | ui/crates/ui/src/ui.rs                  | 1567 | #71 で widget 跨ぎ drag payload の host 状態 +12 (UiHost の per-frame 状態なので外へ出せない)。未起票
 FILE-BUDGET | ui/crates/ui/src/widgets/waveform.rs    | 1023 | daw-ui core。未起票
 
 # --- FN-BUDGET (実コード 300 行) 8 件----------------------------------------
