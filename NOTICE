@@ -190,6 +190,25 @@ repository.
   and other countries.
 
 
+### ASIO — GNU General Public License, Version 3
+
+daw_01 talks to ASIO drivers directly through their COM interface and does not
+link, build or vendor the Steinberg ASIO SDK.  One source file,
+`daw_audio/src/asio/sys.rs`, declares the ASIO types, constants and the `IASIO`
+interface; those declarations were transcribed by hand from the SDK's public
+headers (`common/asio.h`, `common/iasiodrv.h`).
+
+  (c) 2025, Steinberg Media Technologies GmbH, All Rights Reserved
+
+The ASIO SDK is licensed under the Steinberg ASIO License or, alternatively,
+under the General Public License (GPL) Version 3.  daw_01 uses it under the GPL
+Version 3 option; because that option carries no "or any later version" clause,
+`daw_audio/src/asio/sys.rs` is declared GPL-3.0-only (REUSE.toml).
+Full text: LICENSES/GPL-3.0-only.txt
+
+  ASIO is a trademark and software of Steinberg Media Technologies GmbH.
+
+
 ### CLAP (CLever Audio Plug-in API) — MIT License
 
 daw_01 hosts CLAP plug-ins through the `clap-sys` crate (MIT OR Apache-2.0).
