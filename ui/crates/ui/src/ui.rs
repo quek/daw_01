@@ -1111,7 +1111,7 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// frame 末で `scene.popup_primitives` に move する。
     popup_primitives: Vec<Primitive>,
     /// `popup_layer` 内で描画中フラグ。push_* が popup_buffer に積むかを切替える。
-    drawing_in_popup: bool,
+    pub(crate) drawing_in_popup: bool,
     /// いま `popup_layer` の body を描いている popup の id。`Ui::popup_scroll` が
     /// 「自分自身の popup state」に scroll 量を書くために使う (id を引数で持ち回すと
     /// 呼び出し側が別 popup の id を渡せてしまう = ずれの温床)。cascade は nest するので
@@ -1667,42 +1667,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     /// body / 内部 internal traversal は別 API) では遮断しない。
     fn keyboard_blocked_by_modal(&self) -> bool {
         self.modal_capturing_keyboard && !self.drawing_in_popup
-    }
-
-    /// pointer が **modal popup の anchor 内** にあり、現在の widget が `drawing_in_popup`
-    /// でない (= popup_layer の外で動いている) とき `true`。
-    ///
-    /// daw_01 #015 の root cause: arrangement_view が plugin_picker (modal) より先に走り
-    /// `take_scroll_in_rect(lanes)` が pointer (modal panel 内) の scroll_delta を消費 →
-    /// list_view が呼ぶ頃には (0, 0)。modal の下に隠れている widget は pointer 入力を
-    /// 一切消費すべきでない (overlay の意味が失われる) ため、`take_scroll_in_rect` /
-    /// `take_drag_rect_in_rect` / `take_double_click_in_rect` 冒頭で早期 return する。
-    ///
-    /// popup_layer 内部 (= modal の body) では `drawing_in_popup == true` なので false を
-    /// 返し、通常通り消費可能。
-    pub(crate) fn pointer_blocked_by_modal_popup(&self) -> bool {
-        self.pointer_blocked_by_modal_popup_except(None)
-    }
-
-    /// [`Self::pointer_blocked_by_modal_popup`] の、 `own` の popup を数えない版。 自分の popup の
-    /// anchor に自分の本体が入っている widget (dropdown) が、 **他人の** popup の下かどうかを見る。
-    pub(crate) fn pointer_blocked_by_modal_popup_except(&self, own: Option<WidgetId>) -> bool {
-        if self.drawing_in_popup {
-            return false;
-        }
-        // M14 Phase 94 (daw_01 #065): 真のモーダル中は anchor 内外を問わず全 background を遮断。
-        // `self.pointer` は既に masking されているので大半の take_* は pos = None で自然に
-        // 何も返さないが、`take_double_click_in_rect` (pending_double_click は生 pointer 由来) /
-        // `take_file_drop_in_rect` (drop 位置で判定) はこの早期 return で確実に止める。
-        if self.modal_capturing {
-            return true;
-        }
-        let Some((px, py)) = self.pointer.pos else {
-            return false;
-        };
-        self.open_popups
-            .iter()
-            .any(|(wid, s)| Some(*wid) != own && s.modal && s.anchor.contains(px, py))
     }
 
     /// エディットを Scene に積む (外部 widget extension で利用可能)。
