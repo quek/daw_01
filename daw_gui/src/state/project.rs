@@ -894,6 +894,9 @@ impl ProjectState {
                 step_cursor_beat: 0.0,
                 step_size_beats: DEFAULT_NOTE_DURATION,
                 snap_live_input: false,
+                audio_takes: Vec::new(),
+                next_audio_take_id: 1,
+                audio_rec_region: None,
             },
             // r.md #87: ランチャーの一時状態 (フォーカス / hover / MIDI bind)。
             launcher: LauncherUiState::default(),

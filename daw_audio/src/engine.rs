@@ -1200,8 +1200,9 @@ impl ProjectRt {
             );
 
             // r.md #156: デバイス入力を project の受け皿へ写す (モニター / 入力メーターが要るトラックの分だけ)。
+            // 入力を聞くのはアクティブなタブ (= scope の対象) だけ。
             let input = ctx.io.input;
-            self.input_stage.fill(song, n, |ch| input.channel(ch));
+            self.input_stage.fill(song, n, ctx.scope.is_some(), |ch| input.channel(ch));
 
             // r.md #129: この buffer の「聴き方・見方」(SC Listen / device scope / デバイス入力)。scope の対象の
             // project だけが見出しを同期して scope へ書く。

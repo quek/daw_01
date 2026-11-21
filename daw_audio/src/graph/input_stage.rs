@@ -100,13 +100,16 @@ impl InputStage {
 
     /// この buffer のデバイス入力を写す。`channel(ch)` はデバイスの入力 ch 番号 `ch` の音 (無ければ `None`
     /// = 無音)。モニターも入力メーターも要らないトラックは写さない。確保・ロックなし。
-    pub fn fill<'a>(&mut self, song: &Song, frames: usize, channel: impl Fn(u16) -> Option<&'a [f32]>) {
+    ///
+    /// `listening` = この project が入力を聞く番か (アクティブなタブだけ。背景のタブは録音待機のトラックが
+    /// あっても入力を流さない — 見えていないタブのチェーンを通った入力音が混ざらない。MIDI 入力と同じ)。
+    pub fn fill<'a>(&mut self, song: &Song, frames: usize, listening: bool, channel: impl Fn(u16) -> Option<&'a [f32]>) {
         for slot in &mut self.slots {
             // 曲と受け皿は同じ便で届くが、食い違っていたら流さない (別のトラックへ入力を流さない)。
             let track = song
                 .tracks
                 .get(slot.track_idx as usize)
-                .filter(|t| t.input.audio_channels() == Some((slot.left, slot.right)));
+                .filter(|t| listening && t.input.audio_channels() == Some((slot.left, slot.right)));
             slot.monitor = track.is_some_and(|t| t.monitors_audio_input());
             slot.metered = track.is_some_and(|t| t.armed) && !slot.monitor;
             if !slot.monitor && !slot.metered {
@@ -129,9 +132,16 @@ impl InputStage {
         self.slots.get(i)
     }
 
-    /// 誰かが入力をモニターしているか (この buffer)。
+    /// 誰かが入力をモニターしているか (直近に写した buffer)。モニターの音は先読みに遅らせない。
     #[must_use]
     pub fn any_monitoring(&self) -> bool {
         self.slots.iter().any(|s| s.monitor)
+    }
+
+    /// 誰かがデバイス入力を使っているか (モニターか入力メーター。直近に写した buffer)。使っている間は
+    /// デバイスを止めない (止めると入力が来なくなり、音を入れても起きない)。
+    #[must_use]
+    pub fn any_live(&self) -> bool {
+        self.slots.iter().any(|s| s.monitor || s.metered)
     }
 }

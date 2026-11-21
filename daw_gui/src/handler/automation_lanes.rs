@@ -926,6 +926,8 @@ impl AppData {
         match kind {
             ChildKind::Audio => {
                 self.ipc.audio_tx = None;
+                // r.md #156: 結果待ちのオーディオ入力の録音はもう返ってこない。
+                self.for_each_tab(AppData::abort_pending_audio_takes);
                 // 音声 render 中の crash なら ExportWavComplete が永遠に来ない。
                 // export を強制終了して overlay / 入力 gate を解除する（解除しないと
                 // GUI が永久ロックする）。AudioRender 中でなければ no-op。中止した

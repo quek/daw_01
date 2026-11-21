@@ -104,8 +104,8 @@ impl AppData {
             // 消費するので、逆順だと 1 バッファぶん曲が進んでから count-in / 録音に
             // 入る)。 count-in 無し (`0`) でも必ず送る — engine はこれで
             // 「録音中」を知り、曲末 auto-stop の抑止と `recording_live` の
-            // publish を始める。
-            self.send_audio(AudioCommand::StartRecording { project: self.pk(), preroll_samples });
+            // publish を始める。オーディオ入力の録音の書き先も一緒に渡す (r.md #156)。
+            self.send_start_recording(preroll_samples);
         }
         // r.md #118: 停止位置からの再開はセッションのセルも頭出しせず続きから鳴らす
         // (engine は `PlayContinue` で launcher の再シードを飛ばす)。

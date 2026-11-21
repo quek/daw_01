@@ -677,7 +677,7 @@ impl AppData {
 
         if self.cur.transport.is_playing {
             // パンチイン: 走っているものに乗るだけ。
-            self.send_audio(AudioCommand::StartRecording { project: self.pk(), preroll_samples: 0 });
+            self.send_start_recording(0);
         } else {
             let preroll_samples = self.count_in_samples();
             if preroll_samples > 0 && !self.cur.transport.metronome_enabled {

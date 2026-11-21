@@ -99,6 +99,19 @@ impl DeviceRt {
         self.projects.iter().any(|p| p.playing)
     }
 
+    /// r.md #156: 「どれかのトラックがデバイス入力をモニターしている」 — その間は先読みを使わない
+    /// (モニターの音を描き溜めのぶん遅らせない)。
+    #[must_use]
+    pub fn any_input_monitoring(&self) -> bool {
+        self.projects.iter().any(|p| p.input_stage.any_monitoring())
+    }
+
+    /// r.md #156: 「どれかのトラックがデバイス入力を使っている (モニターか入力メーター)」 — idle park 判定用。
+    #[must_use]
+    pub fn any_input_live(&self) -> bool {
+        self.projects.iter().any(|p| p.input_stage.any_live())
+    }
+
     /// `key` の project。窓の間 (凍結中) の project は引けない — RT はそれに触らない (module doc)。
     fn project_mut(&mut self, key: ProjectKey) -> Option<&mut ProjectRt> {
         self.projects.iter_mut().find(|p| p.key == key && !p.in_window()).map(|b| &mut **b)

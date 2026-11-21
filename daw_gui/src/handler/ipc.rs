@@ -129,6 +129,8 @@ impl AppData {
                 }
                 self.handle_bounce_clip_fx_complete(path, source_track, source_clip, error, frames);
             }
+            // r.md #156: オーディオ入力の録音を engine が書き終えた (handler::audio_rec)。
+            AudioEvent::AudioTakesFinished { result, .. } => self.handle_audio_takes_finished(*result),
             AudioEvent::PluginUnresponsive { device: DeviceAddr { device_id, .. } } => {
                 // (v29 §4) dispatch timeout → 該当 device は quarantine 済み。
                 // どの plugin かを可視化する (解除は respawn / 再ロード)。

@@ -50,12 +50,6 @@ impl TrackInput {
         }
     }
 
-    /// この入力がデバイスの入力 ch 数 `device_inputs` に収まっているか (MIDI は常に真)。
-    #[must_use]
-    pub fn available_on(self, device_inputs: u16) -> bool {
-        self.audio_channels().is_none_or(|(_, r)| r < device_inputs)
-    }
-
     /// 表示名 (「入力 3」「入力 1+2」)。デバイスが ch に名前を付けていれば呼び側が添える。
     #[must_use]
     pub fn label(self) -> String {
@@ -105,20 +99,5 @@ impl MonitorMode {
             Self::Auto => "自動",
             Self::On => "オン",
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stereo_input_needs_both_channels_on_the_device() {
-        assert!(TrackInput::Midi.available_on(0));
-        assert!(TrackInput::AudioMono { channel: 1 }.available_on(2));
-        assert!(!TrackInput::AudioMono { channel: 2 }.available_on(2));
-        assert!(TrackInput::AudioStereo { left: 0 }.available_on(2));
-        assert!(!TrackInput::AudioStereo { left: 1 }.available_on(2), "R (ch 2) が無い");
-        assert!(!TrackInput::AudioStereo { left: u16::MAX }.available_on(u16::MAX));
     }
 }

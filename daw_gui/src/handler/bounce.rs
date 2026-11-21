@@ -24,16 +24,30 @@ impl AppData {
         clip_name: &str,
         infix: &str,
     ) -> Option<(PathBuf, common::model::AudioSourcePath)> {
+        self.reserve_wav_path(crate::media_dest::MediaPool::Bounce, "Bounce", clip_name, "bounce", infix)
+    }
+
+    /// engine に書かせる WAV の置き先を `pool` に 1 つ予約する ([`Self::bounce_output_path`] の本体。
+    /// 録音 (r.md #156) も使う)。名前は `<name をサニタイズ><infix>_<ts>.wav` で、`name` が空なら `fallback`。
+    /// `what` は失敗を status に出すときの見出し。
+    pub(crate) fn reserve_wav_path(
+        &mut self,
+        pool: crate::media_dest::MediaPool,
+        what: &str,
+        name: &str,
+        fallback: &str,
+        infix: &str,
+    ) -> Option<(PathBuf, common::model::AudioSourcePath)> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64 % 100_000_000)
             .unwrap_or(0);
-        let safe_name: String = clip_name
+        let safe_name: String = name
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
             .collect();
-        let safe_name = if safe_name.is_empty() { "bounce".into() } else { safe_name };
-        let dest = self.media_dest(crate::media_dest::MediaPool::Bounce, "Bounce")?;
+        let safe_name = if safe_name.is_empty() { fallback.to_string() } else { safe_name };
+        let dest = self.media_dest(pool, what)?;
         // **空ファイルを作って名前を予約する。** `exists()` を見るだけでは足りない —
         // Glue は render を 1 本も走らせる前に全 job の path を採番するので、
         // まだ誰もファイルを書いていない時点で同じ名前を 2 回返してしまう。
@@ -62,7 +76,7 @@ impl AppData {
         };
         let dir = dest.dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.ui_ephemeral.status_message = format!("Bounce: {} 作成失敗: {e}", dir.display());
+            self.ui_ephemeral.status_message = format!("{what}: {} 作成失敗: {e}", dir.display());
             return None;
         }
         let filename = unique_in(&dir);
