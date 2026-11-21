@@ -72,12 +72,16 @@ impl Rig {
     }
 
     fn finished(&mut self) -> AudioTakesFinished {
-        match self.done.blocking_recv() {
-            Some(AudioEvent::AudioTakesFinished { project, result }) => {
-                assert_eq!(project, ProjectKey(1));
-                *result
+        loop {
+            match self.done.blocking_recv() {
+                Some(AudioEvent::AudioTakesFinished { project, result }) => {
+                    assert_eq!(project, ProjectKey(1));
+                    return *result;
+                }
+                // 録音中の途中経過 (波形の山) は、間に合えば先に届く。
+                Some(AudioEvent::AudioTakeProgress { .. }) => {}
+                other => panic!("{other:?}"),
             }
-            other => panic!("{other:?}"),
         }
     }
 }
@@ -193,6 +197,35 @@ fn 始まる前に取り消した録音は空で終わる() {
     assert!(result.segments.is_empty());
     assert_eq!(result.takes[0].frames, 0);
     assert!(!wav.0.exists(), "何も録れなかったファイルは消す");
+}
+
+/// 録音中の波形の山は、WAV の先頭から `TAKE_PEAK_FRAMES` フレームごとの「全 ch の絶対値の最大」。ring を何回に
+/// 分けて読んでも山の境はずれず、作りかけの山は出さない。
+#[test]
+fn 波形の山は_ch_をまたいだ最大を決まったフレーム数ごとに出す() {
+    use common::audio_take::TAKE_PEAK_FRAMES;
+    let wav = TempWav::new("peaks");
+    let n = TAKE_PEAK_FRAMES as usize;
+    let (mut tx, rx) = rtrb::RingBuffer::new(n * 2 * 4);
+    let mut file = writer::TakeFile::new(3, wav.0.clone(), 2, rx, Arc::new(AtomicU64::new(0)));
+    file.open(SR);
+    // ステレオ 2 山半: 1 山目は R の途中に -0.5、2 山目は L の末尾に 0.25、残りの半分は 1.0 (まだ出ない)。
+    let mut frames = vec![[0.0_f32; 2]; n * 2 + n / 2];
+    frames[100][1] = -0.5;
+    frames[2 * n - 1][0] = 0.25;
+    frames[2 * n][0] = 1.0;
+    let mut written = 0;
+    // 山の境と揃わない大きさで分けて流す。
+    for part in frames.chunks(n - 7) {
+        for s in part.iter().flatten() {
+            tx.push(*s).unwrap();
+        }
+        written += file.drain();
+    }
+    assert_eq!(written, frames.len() as u64);
+    let peaks = file.take_peaks().unwrap();
+    assert_eq!((peaks.track_id, peaks.peaks.as_slice()), (3, [128, 64].as_slice()));
+    assert!(file.take_peaks().is_none(), "同じ山を 2 度送らない");
 }
 
 /// ring が溢れても位置はずれない: 入らなかった分は無音として後で書き、落とした数を数える。

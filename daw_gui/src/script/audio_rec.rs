@@ -109,8 +109,8 @@ pub(super) fn daw_app_tick(_this: &JsValue, _args: &[JsValue], _ctx: &mut Contex
     Ok(JsValue::undefined())
 }
 
-/// `daw.audioRecStateJson()` → `{ requested, live, pendingTakes, region: { trackIds, span } | null }`
-/// (GUI が持つ録音の状態。`span` は帯の `[始まり, 終わり]` の拍か `null`)。
+/// `daw.audioRecStateJson()` → `{ requested, live, pendingTakes, status, region: { trackIds, span, segment, peaks } | null }`
+/// (GUI が持つ録音の状態。`span` は帯の `[始まり, 終わり]` の拍か `null`、`peaks` は帯に描く波形の山)。
 pub(super) fn daw_audio_rec_state_json(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     let json = with_app(|app, _side, _io| {
         let rec = &app.cur.recording;
@@ -118,6 +118,13 @@ pub(super) fn daw_audio_rec_state_json(_this: &JsValue, _args: &[JsValue], _ctx:
             serde_json::json!({
                 "trackIds": r.track_ids,
                 "span": r.span.map(|(a, b)| [a, b]),
+                // 帯に描く波形: いまの区間の頭と、トラックごとに届いた山の数・最大。
+                "segment": r.wave.segment.map(|s| serde_json::json!({ "fileFrame": s.file_frame, "startBeat": s.start_beat })),
+                "peaks": r.wave.peaks.iter().map(|(id, p)| serde_json::json!({
+                    "trackId": id,
+                    "count": p.len(),
+                    "max": p.iter().copied().max().unwrap_or(0),
+                })).collect::<Vec<_>>(),
             })
         });
         serde_json::json!({

@@ -50,6 +50,29 @@ pub struct AudioTakeSegment {
     pub start_beat: f64,
 }
 
+/// 録音中の波形の山 1 つが覆うフレーム数 (WAV の先頭から数える)。
+pub const TAKE_PEAK_FRAMES: u32 = 512;
+
+/// 録音中の途中経過: レーンに伸びていく波形の材料。音は運ばない — 山の高さだけを、増えた分だけ小刻みに送る
+/// (1 トラック 1 秒あたり 100 byte 弱)。
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct AudioTakeProgress {
+    pub take_id: u64,
+    /// WAV のサンプルレート。
+    pub sample_rate: u32,
+    /// 前の便から増えた区間 ([`AudioTakesFinished::segments`] と同じ物)。
+    pub new_segments: Vec<AudioTakeSegment>,
+    pub tracks: Vec<AudioTakePeaks>,
+}
+
+/// トラック 1 本ぶんの、前の便から増えた山。
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct AudioTakePeaks {
+    pub track_id: u32,
+    /// [`TAKE_PEAK_FRAMES`] フレームごとの、全 ch の絶対値の最大 (`0..=1` を `0..=255` に刻んだもの)。
+    pub peaks: Vec<u8>,
+}
+
 /// 録音 1 回が終わった (停止 / パンチアウト / count-in の取り消し)。
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct AudioTakesFinished {

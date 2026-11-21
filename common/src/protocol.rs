@@ -986,6 +986,8 @@ pub enum AudioEvent {
     },
     /// r.md #156: オーディオ入力の録音 1 回が終わり、WAV を書き終えた (`AudioCommand::StartAudioTakes` の返事)。
     AudioTakesFinished { project: ProjectKey, result: Box<crate::audio_take::AudioTakesFinished> },
+    /// r.md #156: 録音中の途中経過 (レーンに伸びていく波形の山。録っている間、増えた分だけ届く)。
+    AudioTakeProgress { project: ProjectKey, progress: Box<crate::audio_take::AudioTakeProgress> },
     /// (v29, `docs/plan_arch_refactor.md` §4) worker dispatch が
     /// `DISPATCH_TIMEOUT_MS` 内に完了せず、該当 device を quarantine した
     /// (以後 mix から外して無音バイパス)。 GUI は該当デバイスを可視化し、
@@ -1008,7 +1010,8 @@ impl AudioEvent {
             | LoudnessAnalysisProgress { project, .. }
             | LoudnessAnalysisComplete { project, .. }
             | BounceClipFxComplete { project, .. }
-            | AudioTakesFinished { project, .. } => Some(*project),
+            | AudioTakesFinished { project, .. }
+            | AudioTakeProgress { project, .. } => Some(*project),
             PluginUnresponsive { device } => Some(device.project),
             Hello { .. }
             | DeviceInfo(_)

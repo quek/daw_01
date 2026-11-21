@@ -97,10 +97,10 @@ impl TakeCtl {
         self.n_segments.store(n as u32 + 1, Ordering::Release);
     }
 
-    /// 区間の表 (書き手が、取り込みが終わってから読む)。
-    fn segments(&self) -> Vec<AudioTakeSegment> {
+    /// 区間の表の `from` 番目から後ろ (書き手が読む。録音中も、書き終えた区間までは読める)。
+    fn segments_from(&self, from: usize) -> Vec<AudioTakeSegment> {
         let n = (self.n_segments.load(Ordering::Acquire) as usize).min(self.segments.len());
-        self.segments[..n]
+        self.segments[from.min(n)..n]
             .iter()
             .map(|c| AudioTakeSegment {
                 file_frame: c.file_frame.load(Ordering::Relaxed),

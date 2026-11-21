@@ -10,13 +10,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use common::audio_take::{AudioTakeResult, AudioTakesFinished};
+use common::audio_take::{AudioTakePeaks, AudioTakeProgress, AudioTakeResult, AudioTakesFinished, TAKE_PEAK_FRAMES};
 use common::protocol::AudioEvent;
 
 use super::TakeCtl;
 
 /// ring を読む間隔。
 const POLL: Duration = Duration::from_millis(10);
+/// 録音中の波形の山を GUI へ送る間隔。
+const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 /// WAV のヘッダを書き直す間隔 (途中で落ちても、ここまでは読めるファイルが残る)。
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
 /// 録音の終わりを頼まれてから、取り込みがこれだけ進まなければ待つのをやめる
@@ -33,6 +35,10 @@ pub struct TakeFile {
     wav: Option<hound::WavWriter<BufWriter<File>>>,
     frames: u64,
     error: Option<String>,
+    /// 録音中の波形: 作りかけの山 (ここまでの最大と、溜めたフレーム数) と、まだ GUI へ送っていない山。
+    peak: f32,
+    peak_frames: u32,
+    new_peaks: Vec<u8>,
 }
 
 impl TakeFile {
@@ -43,10 +49,22 @@ impl TakeFile {
         rx: rtrb::Consumer<f32>,
         dropped: Arc<AtomicU64>,
     ) -> Self {
-        Self { track_id, path, channels, rx, dropped, wav: None, frames: 0, error: None }
+        Self {
+            track_id,
+            path,
+            channels,
+            rx,
+            dropped,
+            wav: None,
+            frames: 0,
+            error: None,
+            peak: 0.0,
+            peak_frames: 0,
+            new_peaks: Vec::new(),
+        }
     }
 
-    fn open(&mut self, sample_rate: u32) {
+    pub(super) fn open(&mut self, sample_rate: u32) {
         let spec = hound::WavSpec {
             channels: self.channels,
             sample_rate,
@@ -73,17 +91,29 @@ impl TakeFile {
     }
 
     /// ring に溜まっている分を書く。書いたフレーム数を返す。
-    fn drain(&mut self) -> u64 {
+    pub(super) fn drain(&mut self) -> u64 {
         let ch = usize::from(self.channels.max(1));
         let n = self.rx.slots() / ch * ch;
         let Ok(chunk) = self.rx.read_chunk(n) else { return 0 };
         let mut failed = None;
         if let Some(wav) = self.wav.as_mut() {
             let (a, b) = chunk.as_slices();
-            for &s in a.iter().chain(b) {
+            // 読むのは必ずフレーム単位 (`n` は ch 数の倍数) なので、`i` を ch 数で割った余りがフレームの中の ch。
+            for (i, &s) in a.iter().chain(b).enumerate() {
                 if let Err(e) = wav.write_sample(s) {
                     failed = Some(e.to_string());
                     break;
+                }
+                self.peak = self.peak.max(s.abs());
+                if (i + 1) % ch != 0 {
+                    continue;
+                }
+                self.peak_frames += 1;
+                if self.peak_frames == TAKE_PEAK_FRAMES {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    self.new_peaks.push((self.peak.clamp(0.0, 1.0) * 255.0).round() as u8);
+                    self.peak = 0.0;
+                    self.peak_frames = 0;
                 }
             }
         }
@@ -97,6 +127,12 @@ impl TakeFile {
             self.frames += frames;
         }
         frames
+    }
+
+    /// 前に取り出してから増えた山 (無ければ `None`)。
+    pub(super) fn take_peaks(&mut self) -> Option<AudioTakePeaks> {
+        (!self.new_peaks.is_empty())
+            .then(|| AudioTakePeaks { track_id: self.track_id, peaks: std::mem::take(&mut self.new_peaks) })
     }
 
     fn flush(&mut self) {
@@ -137,7 +173,7 @@ pub(super) fn spawn(
         let ctl = Arc::clone(&ctl);
         let out_tx = out_tx.clone();
         move || {
-            let result = run(&ctl, files, sample_rate);
+            let result = run(&ctl, files, sample_rate, &out_tx);
             let _ = out_tx.send(AudioEvent::AudioTakesFinished { project: ctl.project, result: Box::new(result) });
         }
     });
@@ -155,13 +191,21 @@ pub(super) fn spawn(
     }
 }
 
-/// 取り込みが終わるまで ring を WAV へ書き続け、結果を組む。
-fn run(ctl: &TakeCtl, mut files: Vec<TakeFile>, sample_rate: u32) -> AudioTakesFinished {
+/// 取り込みが終わるまで ring を WAV へ書き続け、結果を組む。録っている間は、波形の山と区間を小刻みに
+/// `out_tx` へ送る (増えていなければ送らない)。
+fn run(
+    ctl: &TakeCtl,
+    mut files: Vec<TakeFile>,
+    sample_rate: u32,
+    out_tx: &tokio::sync::mpsc::UnboundedSender<AudioEvent>,
+) -> AudioTakesFinished {
     for f in &mut files {
         f.open(sample_rate);
     }
     let mut idle_since: Option<Instant> = None;
     let mut flushed = Instant::now();
+    let mut progressed = Instant::now();
+    let mut sent_segments = 0;
     loop {
         // 「終わった」を読んでから ring を空にする (逆順だと、最後の block を取りこぼす)。
         let done = ctl.captured.load(Ordering::Acquire) || ctl.abandoned.load(Ordering::Acquire);
@@ -180,12 +224,23 @@ fn run(ctl: &TakeCtl, mut files: Vec<TakeFile>, sample_rate: u32) -> AudioTakesF
             files.iter_mut().for_each(TakeFile::flush);
             flushed = Instant::now();
         }
+        if progressed.elapsed() > PROGRESS_EVERY {
+            progressed = Instant::now();
+            let new_segments = ctl.segments_from(sent_segments);
+            sent_segments += new_segments.len();
+            let tracks: Vec<AudioTakePeaks> = files.iter_mut().filter_map(TakeFile::take_peaks).collect();
+            if !new_segments.is_empty() || !tracks.is_empty() {
+                let progress = AudioTakeProgress { take_id: ctl.take_id, sample_rate, new_segments, tracks };
+                let _ = out_tx
+                    .send(AudioEvent::AudioTakeProgress { project: ctl.project, progress: Box::new(progress) });
+            }
+        }
         std::thread::sleep(POLL);
     }
     AudioTakesFinished {
         take_id: ctl.take_id,
         sample_rate,
-        segments: ctl.segments(),
+        segments: ctl.segments_from(0),
         segments_dropped: ctl.segments_dropped.load(Ordering::Relaxed),
         takes: files.into_iter().map(TakeFile::finish).collect(),
     }

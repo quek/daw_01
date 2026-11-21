@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use common::audio_take::{AudioTakeRequest, AudioTakeSpec, AudioTakesFinished};
+use common::audio_take::{AudioTakeProgress, AudioTakeRequest, AudioTakeSegment, AudioTakeSpec, AudioTakesFinished};
 use common::model::{AudioSourcePath, MASTER_TRACK_ID, MonitorMode, RecordedWav, TrackInput};
 use common::protocol::AudioCommand;
 
@@ -52,6 +52,19 @@ pub struct LiveTakeRegion {
     /// 帯の `[始まり, 終わり)` の拍。`None` = まだ録り始めていない (count-in 中)。始まりは録音が始まった位置
     /// (ループで折り返したら折り返し先)、終わりは直近の Tick のプレイヘッド。
     pub span: Option<(f64, f64)>,
+    /// 帯の中に描く波形 (engine の途中経過から積む)。
+    pub wave: LiveTakeWave,
+}
+
+/// 録音中の帯に描く波形の材料 (`AudioEvent::AudioTakeProgress` を積んだもの)。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LiveTakeWave {
+    /// WAV のサンプルレート (`0` = まだ何も届いていない)。
+    pub sample_rate: u32,
+    /// いま録っている区間 (届いた中で最後の区間): WAV のこのフレームから先が、曲のこの拍から。
+    pub segment: Option<AudioTakeSegment>,
+    /// トラックごとの山 (WAV の先頭から `TAKE_PEAK_FRAMES` フレームごと)。
+    pub peaks: Vec<(u32, Vec<u8>)>,
 }
 
 impl AppData {
@@ -168,8 +181,12 @@ impl AppData {
         let rec = &mut self.cur.recording;
         let take_id = rec.next_audio_take_id;
         rec.next_audio_take_id = take_id.wrapping_add(1);
-        rec.audio_rec_region =
-            Some(LiveTakeRegion { take_id, track_ids: tracks.iter().map(|t| t.track_id).collect(), span: None });
+        rec.audio_rec_region = Some(LiveTakeRegion {
+            take_id,
+            track_ids: tracks.iter().map(|t| t.track_id).collect(),
+            span: None,
+            wave: LiveTakeWave::default(),
+        });
         rec.audio_takes.push(PendingAudioTake { take_id, tracks });
         self.send_audio(AudioCommand::StartAudioTakes { project: self.pk(), request: AudioTakeRequest { take_id, takes } });
     }
@@ -193,6 +210,22 @@ impl AppData {
             // 戻った (ループの折り返し / seek) か、録り始め。
             _ => (playhead_beat, playhead_beat),
         });
+    }
+
+    /// `AudioEvent::AudioTakeProgress`: 録音中の波形の山と区間が増えた。帯に積む (もう別の録音に替わっていたら捨てる)。
+    pub(crate) fn handle_audio_take_progress(&mut self, progress: AudioTakeProgress) {
+        let region = self.cur.recording.audio_rec_region.as_mut().filter(|r| r.take_id == progress.take_id);
+        let Some(wave) = region.map(|r| &mut r.wave) else { return };
+        wave.sample_rate = progress.sample_rate;
+        if let Some(seg) = progress.new_segments.last() {
+            wave.segment = Some(*seg);
+        }
+        for t in progress.tracks {
+            match wave.peaks.iter_mut().find(|(id, _)| *id == t.track_id) {
+                Some((_, peaks)) => peaks.extend(t.peaks),
+                None => wave.peaks.push((t.track_id, t.peaks)),
+            }
+        }
     }
 
     /// `AudioEvent::AudioTakesFinished`: engine が録音を書き終えた。WAV を素材にして、録った区間にクリップを置く
