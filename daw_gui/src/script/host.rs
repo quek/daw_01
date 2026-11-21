@@ -79,9 +79,11 @@ fn eval_script(source: &str) -> Result<()> {
 
 /// script が触る IPC / shmem のハンドル。`Bootstrap` から抜いた clone で、headless でも
 /// GUI でも同じ形 (= API 実装がモードを意識しない)。
+///
+/// **daw_audio への送り口はここに持たない** — daw_audio はオーディオデバイスの切り替えで起こし直され
+/// (r.md #156)、送り口が差し替わる。`AppData::send_audio` (今の送り口の SSoT) を使う。
 #[derive(Clone)]
 pub struct ScriptIo {
-    pub audio_tx: tokio::sync::mpsc::UnboundedSender<AudioCommand>,
     pub plugin_tx: tokio::sync::mpsc::UnboundedSender<PluginCommand>,
     pub bridge: Arc<common::audio_bridge::AudioBridgeHandle>,
     pub metrics: Arc<common::metrics_bridge::MetricsBridgeHandle>,
@@ -92,7 +94,6 @@ pub struct ScriptIo {
 impl ScriptIo {
     pub fn from_bootstrap(b: &Bootstrap) -> Self {
         Self {
-            audio_tx: b.audio_tx.clone(),
             plugin_tx: b.plugin_tx.clone(),
             bridge: Arc::clone(&b.bridge),
             metrics: Arc::clone(&b.metrics),
@@ -410,7 +411,7 @@ impl ScriptHost {
     ///
     /// **この中で待ってはいけない** (`pump_until` / `sleepMs` を呼ぶと GUI の event loop を
     /// 塞ぐ)。送る → 待つ → 読む、は別々の手に分ける。
-    fn with_app<R, F>(&mut self, f: F) -> R
+    pub(super) fn with_app<R, F>(&mut self, f: F) -> R
     where
         R: Send + 'static,
         F: FnOnce(&mut AppData, &mut ScriptSide, &ScriptIo) -> R + Send + 'static,
@@ -499,7 +500,7 @@ impl ScriptHost {
                 match recv {
                     Ok(msg) => {
                         side.observe(&msg);
-                        dispatch_incoming_headless(app, &self.io, &msg);
+                        dispatch_incoming_headless(app, &msg);
                         // GUI の frame 末と同じ子プロセス sync (event の処理が Song を編集して
                         // いれば、次に送る命令より先に engine へ届く)。
                         app.flush_all_song_sync();
@@ -525,7 +526,7 @@ impl ScriptHost {
 /// これが無いと headless では**永久に完了しない** — script モードは実機と同じ経路を
 /// 通ってこそ検証になる。 走行中でない export の完了等は app 側が stale ガードで無視する
 /// (`handler::ipc`)。
-fn dispatch_incoming_headless(app: &mut AppData, io: &ScriptIo, msg: &ChildEvent) {
+fn dispatch_incoming_headless(app: &mut AppData, msg: &ChildEvent) {
     let msg = match msg {
         ChildEvent::Audio(ev) => {
             app.handle_event(AppEvent::Audio(ev.clone()));
@@ -550,7 +551,7 @@ fn dispatch_incoming_headless(app: &mut AppData, io: &ScriptIo, msg: &ChildEvent
             app.handle_event(AppEvent::Plugin(msg.clone()));
         }
         PluginEvent::SlotPluginUnloaded { device: DeviceAddr { device_id, .. } } => {
-            let _ = io.audio_tx.send(AudioCommand::SetDeviceLatency {
+            app.send_audio(AudioCommand::SetDeviceLatency {
                 project: app.pk(),
                 device_id: *device_id,
                 samples: 0,
@@ -559,7 +560,7 @@ fn dispatch_incoming_headless(app: &mut AppData, io: &ScriptIo, msg: &ChildEvent
         PluginEvent::PluginLatencyChanged { device: DeviceAddr { device_id, .. }, samples } => {
             // GUI mode と同じく **device 単位のまま** engine へ中継する
             // (track 合計は `compile_schedule` が導出する = 集計を二重に持たない)。
-            let _ = io.audio_tx.send(AudioCommand::SetDeviceLatency {
+            app.send_audio(AudioCommand::SetDeviceLatency {
                 project: app.pk(),
                 device_id: *device_id,
                 samples: *samples,

@@ -931,6 +931,13 @@ impl PluginHost {
                 tracing::info!(?mode, "render mode broadcast to all plugins");
             }
             PluginCommand::ReinitAllPlugins { project } => self.reinit_all_plugins(project),
+            // r.md #156: レートは activate のたびに `session` から読むので、書き換えてから全 plugin を
+            // activate し直せば全員が新しいレートになる。
+            PluginCommand::SetSessionSampleRate(sample_rate) => {
+                tracing::info!(old = self.session.sample_rate, new = sample_rate, "session sample rate changed");
+                self.session.sample_rate = sample_rate;
+                self.reinit_all_plugins(None);
+            }
             PluginCommand::SetSlotPlugin {
                 device,
                 format,

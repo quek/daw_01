@@ -1059,6 +1059,10 @@ pub enum PluginCommand {
     /// (書き出し前のクリーンスタート。他のタブの再生を乱さない)。
     /// 完了で `PluginEvent::PluginsReinitDone { project }` を返す。
     ReinitAllPlugins { project: Option<ProjectKey> },
+    /// r.md #156: session のサンプルレートが変わった (オーディオデバイスを開き直したらレートが違った)。
+    /// 以後の activate はこのレートで行い、ロード済みの全 plugin をこのレートで activate し直す
+    /// (`ReinitAllPlugins { project: None }` と同じ手順。完了で `PluginsReinitDone { project: None }`)。
+    SetSessionSampleRate(u32),
     /// 全 loaded plugin の CLAP render mode を切り替える (export bookend)。
     /// オフライン描画はエンジン全体で 1 本なので project を持たない。
     SetRenderMode(RenderMode),

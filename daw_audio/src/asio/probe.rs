@@ -10,6 +10,7 @@
 //! ASIO ドライバーの多くはデバイスを排他で握る。 **他のアプリが使っている最中のドライバーを
 //! 開くと、そのアプリの音が止まることがある**。
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -76,7 +77,7 @@ fn probe_driver(entry: &DriverEntry) -> Result<(), Error> {
     // `daw_audio` は窓を持たない。 `sysRef` には desktop 窓を渡す (PortAudio の既定と同じ)。
     // SAFETY: 引数なしの問い合わせ。
     let hwnd = unsafe { GetDesktopWindow() };
-    let driver = Driver::open(&entry.clsid, hwnd.0)?;
+    let driver = Rc::new(Driver::open(&entry.clsid, hwnd.0)?);
     println!("opened {:?} on thread {control_thread}", entry.name);
     println!("  driver name: {:?}  version: {}", driver.name(), driver.version());
     let (inputs, outputs) = driver.channels()?;
@@ -146,7 +147,7 @@ fn print_latencies(when: &str, driver: &Driver) {
 }
 
 fn run_stream(
-    driver: &Driver,
+    driver: &Rc<Driver>,
     outputs: u32,
     frames: u32,
     rate: f64,

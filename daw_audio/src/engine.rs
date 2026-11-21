@@ -2348,7 +2348,6 @@ mod multi_project_tests {
     fn run(r: &mut Rig, buffers: usize) {
         for _ in 0..buffers {
             r.dev.process_buffer(
-                &r.shared,
                 &r.bridge,
                 &r.scope,
                 &r.device_scope,

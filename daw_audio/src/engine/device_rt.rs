@@ -252,7 +252,6 @@ impl DeviceRt {
     /// 予約 `export_running` は立てた **後** に読む)。
     pub fn process_buffer(
         &mut self,
-        shared: &SharedState,
         bridge: &AudioBridgeHandle,
         scope: &common::scope_bridge::ScopeBridgeHandle,
         device_scope: &DeviceScopeBridgeHandle,
@@ -260,7 +259,6 @@ impl DeviceRt {
         frames: usize,
         io: crate::device::input::DeviceIo<'_>,
     ) {
-        let _ = shared;
         self.shared.live_rendering.store(true, Ordering::SeqCst);
         self.process_buffer_body(bridge, scope, device_scope, sample_rate, frames, io);
         self.shared.live_rendering.store(false, Ordering::SeqCst);

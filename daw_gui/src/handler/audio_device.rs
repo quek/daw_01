@@ -21,6 +21,14 @@ impl AppData {
             }
             AudioDeviceEvent::OpenControlPanel => {
                 if self.audio_device.info.as_ref().is_some_and(|i| i.has_control_panel) {
+                    // パネルの窓を出すのは daw_audio (の中のドライバー)。今はこちらが前面のプロセスなので、
+                    // 前面に出る権利を渡す (渡さないと Windows の focus-steal 保護で本体窓の裏に出る。
+                    // プラグインのエディタ窓と同じ — `handler::devices`)。
+                    #[cfg(windows)]
+                    unsafe {
+                        use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
+                        let _ = AllowSetForegroundWindow(ASFW_ANY);
+                    }
                     self.send_audio(AudioCommand::OpenDeviceControlPanel);
                 }
             }
@@ -57,6 +65,24 @@ impl AppData {
             },
             (None, None) => "オーディオデバイスを開けませんでした".to_string(),
         };
+    }
+
+    /// 起こし直した daw_audio が handshake で報告したデバイス。
+    pub(crate) fn on_audio_child_respawned(&mut self, info: AudioDeviceInfo) {
+        self.on_audio_device_info(info);
+        // 列挙の返事を待っている途中だったら聞き直す (古い daw_audio の返事はもう来ない)。
+        if self.audio_device.listing {
+            self.send_audio(AudioCommand::ListAudioDevices);
+        }
+    }
+
+    /// daw_audio が居なくなり、起こし直せなかった (= どのデバイスも開いていない)。`error` はその理由。
+    pub(crate) fn on_audio_child_gone(&mut self, error: Option<String>) {
+        self.audio_device.info = None;
+        self.audio_device.listing = false;
+        if error.is_some() {
+            self.audio_device.error = error;
+        }
     }
 
     /// daw_audio が開いている (開き直した) デバイスを報告してきた。
