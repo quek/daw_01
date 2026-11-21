@@ -339,6 +339,9 @@ impl DeviceRt {
                 // r.md #87: 書き出し中に届いたローンチ操作は捨てる。溜めておくと
                 // 書き出し明けに **全部同時に**発火し、64 件で溢れた分は無言で消える。
                 p.launcher.clear_requests();
+                // r.md #156: 録音中に書き出しが始まったら、進行中のオーディオ入力の録音をここで閉じる (描画を
+                // 通らないので、閉じないと書き出しの間ずっと入力を取り込み続ける)。
+                p.observe_take(false, 0, io, n);
                 // 停止中も現在の playhead をそのまま publish する。
                 p.transport_out.now.playhead = p.shared.playhead.load(Ordering::Acquire);
                 p.transport_out.now.beat = p.playhead_beats;
