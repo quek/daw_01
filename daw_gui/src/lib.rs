@@ -25,6 +25,8 @@ mod app_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod event;
+/// r.md #156: オーディオ入力の録音のイベント (`AppEvent::AudioRec` の中身)。
+pub mod event_audio_rec;
 /// 貼り付け / カット / コピーのイベント (`AppEvent::Clipboard` の中身)。
 pub mod event_clipboard;
 /// チェーン上のデバイス操作のイベント (`AppEvent::Device` の中身)。

@@ -1014,6 +1014,7 @@ impl AppData {
                     if self.cur.view.bottom_panel == Some(0) { None } else { Some(0) };
             }
             AppEvent::Sampler(ev) => self.handle_sampler_event(ev),
+            AppEvent::AudioRec(ev) => self.handle_audio_rec_event(ev),
             AppEvent::VirtualKeyboard(ev) => self.handle_virtual_keyboard_event(ev),
             AppEvent::SelectClip { target, additive } => {
                 self.select_clip(target, additive);

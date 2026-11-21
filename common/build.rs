@@ -26,6 +26,8 @@ const WIRE_SOURCES: &[&str] = &[
     // (Track.devices / master_fx_chain の要素として LoadSong の wire を渡る)。
     "src/model/plugin_instance.rs",
     "src/model/track.rs",
+    // r.md #156: TrackInput / MonitorMode (Track.input / Track.monitor として LoadSong の wire を渡る)。
+    "src/model/track_input.rs",
     // r.md #110: Device / Parallel / ParallelChain (Track.devices / master_fx_chain の要素として
     // LoadSong の wire を渡る)。
     "src/model/device.rs",

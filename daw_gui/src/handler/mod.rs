@@ -43,6 +43,8 @@ pub mod master_panel;
 pub mod media;
 pub mod midi;
 pub mod sampler;
+/// r.md #156: オーディオ入力の録音 (トラックの入力 / モニター、開始・終了とクリップ生成)。
+pub mod audio_rec;
 pub mod mixer;
 pub mod modulation;
 /// r.md #129: 内蔵 device / master Limiter の値編集と追加 (値 IPC の唯一の口)。

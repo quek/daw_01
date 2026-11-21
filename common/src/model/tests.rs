@@ -1491,7 +1491,8 @@ fn current_version_is_pinned() {
     // `NativeParams` の variant)。旧ファイルには存在しないので migration は要らない。
     // v45 (r.md #151 / #152): device の Mix と `DeviceMix` の target、映像 / 画像 event の `speed`
     // (serde default の 1.0 で読める)。
-    assert_eq!(CURRENT_VERSION, 45);
+    // v46 (r.md #156): `Track.input` / `Track.monitor` (serde default の MIDI / 自動で読める)。
+    assert_eq!(CURRENT_VERSION, 46);
 }
 
 #[test]
