@@ -349,7 +349,7 @@ impl ScriptHost {
         // BackgroundDispatcher として渡し、 background thread は
         // script では使わないので spawn されない (AppData の API を
         // 同期呼び出しするだけ)。
-        let app = AppData::new(
+        let mut app = AppData::new(
             bootstrap.audio_tx.clone(),
             bootstrap.plugin_tx.clone(),
             None,
@@ -362,15 +362,17 @@ impl ScriptHost {
             Arc::new(crate::dispatcher::Win32JobDispatcher::new(Arc::clone(
                 &bootstrap.job,
             ))),
-            // script mode は同 process 内の bootstrap が握る supervisor を
-            // 渡しても安全だが、 script 中に子プロセスが死ぬケースは
-            // テスト・録画用途では発生しない前提なので None で十分。
-            None,
+            // r.md #156: オーディオデバイスの切り替え (= daw_audio の起こし直し) を script からも通すために
+            // supervisor を渡す。**落ちた子は起こし直さない** (下の `respawn_crashed_children = false`) —
+            // 検証の途中で子が落ちたことを、起こし直しで隠さない。
+            Some(Arc::clone(&bootstrap.supervisor)),
             // テスト / 検証の起動なので、ユーザーの実データではなく隔離 root。
             app_dirs,
             // (A1 r.md #8) bootstrap が解決したデバイス実レート。
             bootstrap.sample_rate,
         );
+        app.ipc.respawn_crashed_children = false;
+        app.audio_device.info = Some(bootstrap.device_info.clone());
         let io = ScriptIo::from_bootstrap(&bootstrap);
         Self {
             script_args: ScriptArgs { output, extra },

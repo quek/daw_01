@@ -314,7 +314,15 @@ impl Live {
     }
 
     fn callback(&mut self) {
-        self.dev.process_buffer(&self.shared, &self.bridge, &self.scope, &self.device_scope, SR, FRAMES);
+        self.dev.process_buffer(
+            &self.shared,
+            &self.bridge,
+            &self.scope,
+            &self.device_scope,
+            SR,
+            FRAMES,
+            crate::device::input::DeviceIo::NONE,
+        );
     }
 
     /// recv loop の housekeeping と同じく、RT が返した物を off-thread で落とす。

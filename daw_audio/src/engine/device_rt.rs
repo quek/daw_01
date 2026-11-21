@@ -258,10 +258,11 @@ impl DeviceRt {
         device_scope: &DeviceScopeBridgeHandle,
         sample_rate: u32,
         frames: usize,
+        io: crate::device::input::DeviceIo<'_>,
     ) {
         let _ = shared;
         self.shared.live_rendering.store(true, Ordering::SeqCst);
-        self.process_buffer_body(bridge, scope, device_scope, sample_rate, frames);
+        self.process_buffer_body(bridge, scope, device_scope, sample_rate, frames, io);
         self.shared.live_rendering.store(false, Ordering::SeqCst);
     }
 
@@ -272,6 +273,7 @@ impl DeviceRt {
         device_scope: &DeviceScopeBridgeHandle,
         sample_rate: u32,
         frames: usize,
+        io: crate::device::input::DeviceIo<'_>,
     ) {
         self.settle_windows();
         self.refresh_projects();
@@ -344,6 +346,7 @@ impl DeviceRt {
                 device_scope: is_scope
                     .then_some(DeviceScopeCtx { bridge: device_scope, headers: &mut self.scope_headers }),
                 frames_rendered,
+                io,
             };
             let slot = bridge.project(p.telemetry_slot);
             p.render_buffer(ctx, slot, sample_rate, n);

@@ -2,6 +2,8 @@
 //! docs/plan_arch_refactor.md §7 に沿って分割したもの。 dispatch は
 //! app.rs の `handle_event`、 各 arm の本体がここのメソッド。
 pub mod activity;
+/// r.md #156: オーディオデバイスの設定変更 / 列挙 / daw_audio からの報告。
+pub mod audio_device;
 pub mod audio_editor;
 pub mod automation;
 pub mod automation_editor;

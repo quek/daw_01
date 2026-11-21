@@ -469,6 +469,9 @@ pub struct DeviceCtx<'a> {
     pub device_scope: Option<DeviceScopeCtx<'a>>,
     /// stream 開始からの累積 render フレーム数 (MIDI 試聴シーケンスの時計)。
     pub frames_rendered: u64,
+    /// r.md #156: この描画ブロックのデバイスの入出力 (入力 ch の音・出ていく時点・レイテンシ、
+    /// `crate::device::input`)。入力をトラックへ流すのは「聴き方」の側 — 書き出しには渡らない。
+    pub io: crate::device::input::DeviceIo<'a>,
 }
 
 /// r.md #129 §11.2: device scope の書き先と、slot の見出し表 (`DeviceRt` が持つ)。見出しの書き手は
@@ -2344,7 +2347,15 @@ mod multi_project_tests {
 
     fn run(r: &mut Rig, buffers: usize) {
         for _ in 0..buffers {
-            r.dev.process_buffer(&r.shared, &r.bridge, &r.scope, &r.device_scope, 48_000, 256);
+            r.dev.process_buffer(
+                &r.shared,
+                &r.bridge,
+                &r.scope,
+                &r.device_scope,
+                48_000,
+                256,
+                crate::device::input::DeviceIo::NONE,
+            );
         }
     }
 

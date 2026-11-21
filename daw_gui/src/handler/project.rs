@@ -243,7 +243,11 @@ impl AppData {
         // 組み立ては `AppConfig` の定義の隣 (= app_config.rs)。網羅 literal なので
         // field を 1 つ足すたびにここが太る (サイズ budget)、かつ「保存する / しない」の
         // 判断は AppConfig 側の関心。
-        let cfg = crate::app_config::AppConfig::from_prefs(&self.ui_prefs, self.theme.id.clone());
+        let cfg = crate::app_config::AppConfig::from_prefs(
+            &self.ui_prefs,
+            self.theme.id.clone(),
+            self.audio_device.config.clone(),
+        );
         if let Err(e) = crate::app_config::save(dirs.app_config(), &cfg) {
             tracing::warn!(error = ?e, "failed to save app_config");
         }

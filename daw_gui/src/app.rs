@@ -164,6 +164,7 @@ impl AppData {
                 next_plugin_load_generation: 0,
                 rescan_result: Arc::new(Mutex::new(None)),
                 supervisor,
+                respawn_crashed_children: true,
                 child_disconnect_log: Vec::new(),
                 is_rescanning: false,
                 event_proxy,
@@ -283,6 +284,9 @@ impl AppData {
             sampler: crate::state::SamplerState::new(),
             midi_capture: crate::state::MidiCaptureState::new(),
             virtual_keyboard: crate::state::VirtualKeyboardState::default(),
+            // r.md #156: 開きたいデバイスは app_config から。実際に開いたデバイス (`info`) は、子プロセスを
+            // 起こした側 (main / script host) が `Bootstrap::device_info` を入れる。
+            audio_device: crate::state::AudioDeviceState::new(app_config.audio_device.clone(), None),
         };
         // recent_files / recent_saved の path 列から filename label cache を
         // 1 回構築。 push_recent / push_recent_saved 経由の更新でも自動的に
@@ -1008,6 +1012,7 @@ impl AppData {
                     if self.cur.view.bottom_panel == Some(0) { None } else { Some(0) };
             }
             AppEvent::Sampler(ev) => self.handle_sampler_event(ev),
+            AppEvent::AudioDevice(ev) => self.handle_audio_device_event(ev),
             AppEvent::VirtualKeyboard(ev) => self.handle_virtual_keyboard_event(ev),
             AppEvent::SelectClip { target, additive } => {
                 self.select_clip(target, additive);
