@@ -4,6 +4,7 @@
 //! 各ページの中身 (先読み / VOICEVOX / テーマ / オーディオデバイス) は、それぞれの event と handler が持つ。
 
 use crate::app::AppData;
+use crate::event_audio_device::AudioDeviceEvent;
 use crate::state::SettingsCategory;
 
 impl AppData {
@@ -35,7 +36,9 @@ impl AppData {
         match self.ui_prefs.settings_category {
             // テーマ一覧の実体は `themes/` の read_dir + JSON パース。
             SettingsCategory::Theme => self.refresh_available_themes(),
-            SettingsCategory::Audio | SettingsCategory::Voicevox => {}
+            // 繋いだ / 外したデバイスが、ページを開き直すと一覧に出る。
+            SettingsCategory::Audio => self.handle_audio_device_event(AudioDeviceEvent::RefreshDevices),
+            SettingsCategory::Voicevox => {}
         }
     }
 }

@@ -17,6 +17,7 @@ use anyhow::{Result, anyhow};
 mod editing;
 mod host;
 mod native_device;
+mod settings;
 mod tabs;
 
 pub use host::{ScriptAttach, ScriptIo, ScriptStarter, prepare_gui, run_scripted};
@@ -63,6 +64,12 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("appStop", daw_app_stop, 0),
     ("appSetBpm", daw_app_set_bpm, 1),
     ("appSetRenderAhead", daw_app_set_render_ahead, 1),
+    // ----- r.md #156: 設定 window (開閉 / カテゴリ / ページの項目) -----
+    ("appSetSettingsOpen", settings::daw_app_set_settings_open, 1),
+    ("appSetSettingsCategory", settings::daw_app_set_settings_category, 1),
+    ("appSetTheme", settings::daw_app_set_theme, 1),
+    ("appSetVoicevoxChunkSecs", settings::daw_app_set_voicevox_chunk_secs, 1),
+    ("settingsJson", settings::daw_settings_json, 0),
     ("appRescanPlugins", daw_app_rescan_plugins, 0),
     ("play", daw_play, 0),
     ("stop", daw_stop, 0),

@@ -23,6 +23,50 @@ const HEADING_GAP: f32 = 4.0;
 /// 説明文の文字サイズと行送り (px)。
 const HINT_FONT: f32 = 10.0;
 const HINT_LINE_H: f32 = 14.0;
+/// 知らせ ([`Page::notice`]) の文字サイズと行送り (px)。
+const NOTICE_FONT: f32 = 11.0;
+const NOTICE_LINE_H: f32 = 16.0;
+/// 項目名・読むだけの値の文字サイズ (px)。
+const TEXT_FONT: f32 = 12.0;
+
+/// ページに置く dropdown の id。**ページの dropdown は必ずここに足して [`Page::dropdown`] で出す**
+/// — 一覧 (popup) は window の外へはみ出すので、window 側が「どれかが開いているか」を
+/// [`any_dropdown_open`] で見て、開いている間は背景へ入力を渡さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum DropdownId {
+    DriverKind,
+    SystemOutput,
+    SystemInput,
+    AsioDriver,
+    OutputPair,
+    InputFirst,
+    InputLast,
+    SampleRate,
+    BufferSize,
+}
+
+impl DropdownId {
+    const ALL: [Self; 9] = [
+        Self::DriverKind,
+        Self::SystemOutput,
+        Self::SystemInput,
+        Self::AsioDriver,
+        Self::OutputPair,
+        Self::InputFirst,
+        Self::InputLast,
+        Self::SampleRate,
+        Self::BufferSize,
+    ];
+}
+
+fn dropdown_key(id: DropdownId) -> (&'static str, DropdownId) {
+    ("settings_dropdown", id)
+}
+
+/// ページの dropdown のどれかの一覧が開いているか。
+pub(super) fn any_dropdown_open(ui: &Ui<'_, AppData>) -> bool {
+    DropdownId::ALL.iter().any(|id| ui.is_dropdown_open(dropdown_key(*id)))
+}
 
 /// ページを上から積むカーソル。`x` / `w` は中身の左端と幅 (余白と scrollbar を引いた後)。
 pub(super) struct Page<'a> {
@@ -50,8 +94,8 @@ impl Page<'_> {
         ui.label_at_clipped(
             ("settings_row_label", id),
             label,
-            Rect { x: self.x, y: self.y + (ROW_H - 12.0 * 1.2) * 0.5, w: LABEL_W - 8.0, h: ROW_H },
-            12.0,
+            Rect { x: self.x, y: self.y + (ROW_H - TEXT_FONT * 1.2) * 0.5, w: LABEL_W - 8.0, h: ROW_H },
+            TEXT_FONT,
             p.text,
         );
         let control = Rect {
@@ -71,19 +115,61 @@ impl Page<'_> {
         rect
     }
 
+    /// dropdown。選ばれたら、その項目の位置を返す。`selected` が `items` の外なら本体は空 (未選択)。
+    pub(super) fn dropdown(
+        &self,
+        ui: &mut Ui<'_, AppData>,
+        id: DropdownId,
+        rect: Rect,
+        items: &[String],
+        selected: usize,
+    ) -> Option<usize> {
+        let items: Vec<&str> = items.iter().map(String::as_str).collect();
+        ui.dropdown(dropdown_key(id), rect, &items, selected)
+    }
+
+    /// 読むだけの値 (操作部品の列に置く文字)。`dim` は「値が無い」ことを言う文字に使う。
+    pub(super) fn value(&self, ui: &mut Ui<'_, AppData>, id: &'static str, rect: Rect, text: &str, dim: bool) {
+        let p = &self.app.theme.core;
+        ui.label_at_clipped(
+            ("settings_value", id),
+            text,
+            Rect { y: rect.y + (ROW_H - TEXT_FONT * 1.2) * 0.5, ..rect },
+            TEXT_FONT,
+            if dim { p.text_faint } else { p.text },
+        );
+    }
+
     /// 説明文 (faint の小さい文字)。幅に合わせて折り返す。
     pub(super) fn hint(&mut self, ui: &mut Ui<'_, AppData>, id: &'static str, text: &str) {
         let color = self.app.theme.core.text_faint;
-        self.wrapped(ui, id, text, self.x, self.w, color);
+        self.wrapped(ui, id, text, (HINT_FONT, HINT_LINE_H), color);
         self.y += ROW_GAP;
     }
 
-    /// `text` を幅 `w` で折り返して描き、`y` を描いた行数ぶん進める。
-    fn wrapped(&mut self, ui: &mut Ui<'_, AppData>, id: &'static str, text: &str, x: f32, w: f32, color: Color) {
-        let lines = wrapped_lines(ui, id, text, HINT_FONT, w);
+    /// 状況の知らせ (失敗の理由など)。**文字が空でも 1 行ぶんの場所を取る** — 知らせが出たり消えたり
+    /// しても、下の項目が動かない (折り返して 2 行以上になったときだけ伸びる)。
+    pub(super) fn notice(&mut self, ui: &mut Ui<'_, AppData>, id: &'static str, text: &str, color: Color) {
+        let top = self.y;
+        if !text.is_empty() {
+            self.wrapped(ui, id, text, (NOTICE_FONT, NOTICE_LINE_H), color);
+        }
+        self.y = self.y.max(top + NOTICE_LINE_H) + ROW_GAP;
+    }
+
+    /// `text` をページの幅で折り返して描き、`y` を描いた行数ぶん進める。
+    fn wrapped(
+        &mut self,
+        ui: &mut Ui<'_, AppData>,
+        id: &'static str,
+        text: &str,
+        (font, line_h): (f32, f32),
+        color: Color,
+    ) {
+        let lines = wrapped_lines(ui, id, text, font, self.w);
         for (i, line) in lines.iter().enumerate() {
-            ui.label_at(("settings_wrapped", id, i), line, x, self.y, HINT_FONT, color);
-            self.y += HINT_LINE_H;
+            ui.label_at(("settings_wrapped", id, i), line, self.x, self.y, font, color);
+            self.y += line_h;
         }
         store_wrapped_lines(ui, id, lines);
     }

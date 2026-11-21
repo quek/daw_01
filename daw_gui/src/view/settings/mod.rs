@@ -16,6 +16,7 @@
 //! 高さは前フレームの実測を使う (immediate-mode の lag-by-one。インスペクタと同じ)。
 
 mod audio;
+mod audio_choices;
 mod page;
 mod theme;
 mod voicevox;
@@ -33,7 +34,8 @@ const MENU_H: f32 = 24.0;
 /// 初期表示位置の上端 (MENU_H + TRANSPORT_H(44) + 8)。
 const PANEL_TOP: f32 = 76.0;
 const DEFAULT_W: f32 = 660.0;
-const DEFAULT_H: f32 = 480.0;
+/// 既定の高さ。いちばん長い「オーディオ」のページがスクロール無しで全部見える値。
+const DEFAULT_H: f32 = 520.0;
 /// 最小の幅。カテゴリの列 ([`SIDEBAR_W`]) を引いた残りに、ページの「項目名 + 操作部品」の行が
 /// 潰れずに入る値 (項目名は省略されず、操作部品に 190px 前後が残る)。
 pub const MIN_W: f32 = 520.0;
@@ -116,11 +118,16 @@ pub fn category_row_rect(sidebar: Rect, index: usize) -> Rect {
 
 /// build_root の **背景 widget 描画より前** に呼ぶ: window が開いていれば、その rect 分だけ
 /// 背後の pointer を占有する (= window の上の click がアレンジ等に漏れない)。
+///
+/// ページの dropdown の一覧が開いている間は **画面全体** を占有する。一覧は window の外へはみ出して
+/// 描かれるので、window の rect だけだと、はみ出した項目の click が背景の widget にも届く。
+/// (一覧の外を click すると一覧が閉じるだけで、その click は背景へ行かない。)
 pub fn reserve(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
     if !app.ui_prefs.settings_open {
         return;
     }
-    ui.reserve_floating_region(window_rect(app, screen));
+    let region = if page::any_dropdown_open(ui) { screen } else { window_rect(app, screen) };
+    ui.reserve_floating_region(region);
 }
 
 /// build_root の **末尾近く** (背景描画の後) に呼ぶ: window 本体を inline 描画する
