@@ -64,7 +64,7 @@ impl Rig {
             latency: self.latency,
         });
         let chans: Vec<Vec<f32>> = (0..2u16).map(|c| (0..BLOCK as u64).map(|i| sample(c, d + i)).collect()).collect();
-        self.tap.capture(d, BLOCK, |ch| chans.get(usize::from(ch)).map(Vec::as_slice));
+        self.tap.capture_block(d, BLOCK, |ch| chans.get(usize::from(ch)).map(Vec::as_slice));
         self.device_frame += BLOCK as u64;
     }
 

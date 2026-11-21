@@ -484,27 +484,9 @@ pub struct DeviceCtx<'a> {
     pub device_scope: Option<DeviceScopeCtx<'a>>,
     /// stream 開始からの累積 render フレーム数 (MIDI 試聴シーケンスの時計)。
     pub frames_rendered: u64,
-    /// r.md #156: この block のデバイス入力と、出力がデバイスへ渡る時刻。
-    pub io: BlockIo<'a>,
-}
-
-/// r.md #156: 1 block の描画に渡すデバイスの入出力 (デバイス層が組む)。
-#[derive(Clone, Copy, Default)]
-pub struct BlockIo<'a> {
-    /// デバイスの入力 ch (index = ch 番号)。長さはこの block の frames。入力が無ければ空。
-    pub input: &'a [&'a [f32]],
-    /// この block の先頭フレームがデバイスへ渡る時刻 (デバイスの時計での通し番号。先読みぶんを含む)。
-    pub out_frame: u64,
-    /// 入力レイテンシ + 出力レイテンシ (frames)。
-    pub latency: u32,
-}
-
-impl<'a> BlockIo<'a> {
-    /// デバイスの入力 ch 番号 `ch` の音 (無い ch は `None`)。
-    #[must_use]
-    pub fn channel(&self, ch: u16) -> Option<&'a [f32]> {
-        self.input.get(usize::from(ch)).copied()
-    }
+    /// r.md #156: この描画ブロックのデバイスの入出力 (入力 ch の音・出ていく時点・レイテンシ、
+    /// `crate::device::input`)。入力をトラックへ流すのは「聴き方」の側 — 書き出しには渡らない。
+    pub io: crate::device::input::DeviceIo<'a>,
 }
 
 /// r.md #129 §11.2: device scope の書き先と、slot の見出し表 (`DeviceRt` が持つ)。見出しの書き手は
@@ -981,14 +963,14 @@ impl ProjectRt {
 
     /// r.md #156: オーディオ入力の録音に、この block を伝える ([`TakeDrive::observe`])。`live` = この block は
     /// 録音中か、`playhead` = block 先頭の曲の位置。拍は `playhead_beats` (呼ぶ前に block 頭の値にしておく)。
-    fn observe_take(&mut self, live: bool, playhead: u64, io: BlockIo<'_>, frames: usize) {
+    fn observe_take(&mut self, live: bool, playhead: u64, io: crate::device::input::DeviceIo<'_>, frames: usize) {
         self.take.observe(TakeBlock {
             live,
             playhead,
             beat: self.playhead_beats,
             out_frame: io.out_frame,
             frames: frames as u32,
-            latency: io.latency,
+            latency: io.input_latency_frames.saturating_add(io.output_latency_frames),
         });
     }
 
@@ -1218,8 +1200,8 @@ impl ProjectRt {
             );
 
             // r.md #156: デバイス入力を project の受け皿へ写す (モニター / 入力メーターが要るトラックの分だけ)。
-            let io = ctx.io;
-            self.input_stage.fill(song, n, |ch| io.channel(ch));
+            let input = ctx.io.input;
+            self.input_stage.fill(song, n, |ch| input.channel(ch));
 
             // r.md #129: この buffer の「聴き方・見方」(SC Listen / device scope / デバイス入力)。scope の対象の
             // project だけが見出しを同期して scope へ書く。
@@ -2418,7 +2400,15 @@ mod multi_project_tests {
 
     fn run(r: &mut Rig, buffers: usize) {
         for _ in 0..buffers {
-            r.dev.process_buffer(&r.shared, &r.bridge, &r.scope, &r.device_scope, 48_000, 256);
+            r.dev.process_buffer(
+                &r.shared,
+                &r.bridge,
+                &r.scope,
+                &r.device_scope,
+                48_000,
+                256,
+                crate::device::input::DeviceIo::NONE,
+            );
         }
     }
 

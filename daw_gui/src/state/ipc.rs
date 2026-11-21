@@ -50,6 +50,9 @@ pub struct IpcState {
     /// spawn + handshake + Session/OpenWorkerPool 再送し、 新 tx で
     /// `audio_tx` / `plugin_tx` を差し替える。
     pub supervisor: Option<Arc<crate::bootstrap::ChildSupervisor>>,
+    /// 落ちた子プロセスを自動で起こし直すか。headless の `--script` は false — 検証の途中で子が落ちたことを
+    /// 起こし直しで隠さない (オーディオデバイスの切り替えのように **こちらが頼む** 起こし直しは、false でも通る)。
+    pub respawn_crashed_children: bool,
     /// (A1 r.md #8) オーディオセッションの実サンプルレート (= daw_audio が報告した
     /// デバイス実レート、 `bootstrap.sample_rate`)。 拍↔sample 変換 (seek / export
     /// range / clip 尺) はこの値を使い、 engine と一致させる。 session-only。

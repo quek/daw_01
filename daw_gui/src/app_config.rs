@@ -80,6 +80,11 @@ pub struct AppConfig {
     /// 曲ではなく **この PC の処理能力への対処** なので app_config。default = true。
     #[serde(default = "default_true")]
     pub render_ahead: bool,
+    /// r.md #156: 開きたいオーディオデバイス (ドライバーの種類・デバイス・レート・バッファ・ch)。曲ではなく
+    /// **この PC の機材** なので app_config。default = OS 標準の既定デバイス。保存したデバイスが見つからない /
+    /// 開けないときは OS 標準の既定デバイスへ戻して動かすが、この値は変えない (つなぎ直せば元に戻る)。
+    #[serde(default)]
+    pub audio_device: common::audio_device::AudioDeviceConfig,
 }
 
 fn default_virtual_keyboard_base_pitch() -> u8 {
@@ -108,8 +113,14 @@ impl AppConfig {
     ///
     /// テーマは **id だけ**保存する (色を焼き込むとテーマファイルを編集しても
     /// 反映されず SSoT が二重化する。r.md #48)。
+    ///
+    /// オーディオデバイスの設定は `AppData::audio_device` が持つ (r.md #156) ので、同じく引数で受ける。
     #[must_use]
-    pub fn from_prefs(prefs: &crate::state::UiPrefs, theme_id: String) -> Self {
+    pub fn from_prefs(
+        prefs: &crate::state::UiPrefs,
+        theme_id: String,
+        audio_device: common::audio_device::AudioDeviceConfig,
+    ) -> Self {
         Self {
             resource_monitor_enabled: prefs.resource_monitor_enabled,
             automation_follows_clips: prefs.automation_follows_clips,
@@ -135,6 +146,7 @@ impl AppConfig {
             virtual_keyboard_base_pitch: prefs.virtual_keyboard_base_pitch,
             virtual_keyboard_velocity: prefs.virtual_keyboard_velocity,
             render_ahead: prefs.render_ahead,
+            audio_device,
         }
     }
 }
@@ -178,6 +190,7 @@ impl Default for AppConfig {
             virtual_keyboard_base_pitch: default_virtual_keyboard_base_pitch(),
             virtual_keyboard_velocity: default_virtual_keyboard_velocity(),
             render_ahead: true,
+            audio_device: common::audio_device::AudioDeviceConfig::default(),
         }
     }
 }
@@ -251,6 +264,15 @@ mod tests {
             virtual_keyboard_base_pitch: 60,
             virtual_keyboard_velocity: 80,
             render_ahead: false,
+            audio_device: common::audio_device::AudioDeviceConfig {
+                driver: common::audio_device::AudioDriverKind::Asio,
+                asio_driver: Some(common::audio_device::AudioDeviceRef {
+                    id: "{00000000-0000-0000-0000-000000000000}".into(),
+                    name: "Some ASIO".into(),
+                }),
+                buffer_frames: Some(256),
+                ..Default::default()
+            },
         };
         save(&path, &cfg).unwrap();
         let loaded = load(&path);
@@ -272,6 +294,7 @@ mod tests {
         assert_eq!(loaded.virtual_keyboard_base_pitch, 60);
         assert_eq!(loaded.virtual_keyboard_velocity, 80);
         assert!(!loaded.render_ahead);
+        assert_eq!(loaded.audio_device, cfg.audio_device);
     }
 
     /// r.md #113: 手書きの `app_config.json` で C 揃えでない / 範囲外の鍵盤設定が来ても

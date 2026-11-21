@@ -110,8 +110,15 @@ impl OutputRenderer {
         self.local.render_ahead = ahead;
         self.metrics.set_render_ahead(ahead);
 
-        self.local
-            .process_buffer(&self.shared, &self.bridge, &self.scope, &self.device_scope, sr, frames);
+        self.local.process_buffer(
+            &self.shared,
+            &self.bridge,
+            &self.scope,
+            &self.device_scope,
+            sr,
+            frames,
+            crate::device::input::DeviceIo::NONE,
+        );
 
         // consume the panic edge to (re)start the master
         // declick envelope at sample 0 of this buffer.

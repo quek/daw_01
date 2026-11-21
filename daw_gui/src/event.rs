@@ -672,6 +672,8 @@ pub enum AppEvent {
     /// r.md #156: オーディオ入力の録音 (トラックの入力 / モニター、録音の取り込み)。同じく
     /// 「1 arm = 1 サブ enum」。
     AudioRec(crate::event_audio_rec::AudioRecEvent),
+    /// r.md #156: オーディオデバイスの設定 (`docs/plan_audio_io.md`)。同じく「1 arm = 1 サブ enum」。
+    AudioDevice(crate::event_audio_device::AudioDeviceEvent),
     /// r.md #113: PC キーボードによる仮想鍵盤 (`docs/plan_virtual_keyboard.md`)。同じく
     /// 「1 arm = 1 サブ enum」。
     VirtualKeyboard(crate::event_virtual_keyboard::VirtualKeyboardEvent),
@@ -1897,6 +1899,7 @@ impl AppEvent {
             E::Launcher(ev) => ev.undo_label(),
             E::Sampler(ev) => ev.undo_label(),
             E::AudioRec(ev) => ev.undo_label(),
+            E::AudioDevice(ev) => ev.undo_label(),
 
             // ---- MIDI 入力 / 録音 ----
             // ノートは録音 (take の bracket) / ステップ入力 / ランチャーの Learn のどれか。

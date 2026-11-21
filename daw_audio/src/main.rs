@@ -24,10 +24,16 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tokio::io::ReadHalf;
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
+// r.md #156: ASIO ドライバーを SDK 無しで直接呼ぶ層 (64 bit Windows 専用、`asio` の module doc)。
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod asio;
 mod audio_clip_renderer;
 mod audio_rec;
 mod audio_worker;
 mod automation;
+// 契約 (型と口) を先に置いた段階。使い手は続く commit で入るので、それまで未使用の警告を止める。
+#[allow(dead_code)]
+mod device;
 #[cfg(test)]
 // r.md #129: 内蔵 device DSP の golden (`native_dsp/golden_v38.txt`) の刺激・統計・形式。
 // 比較は `native_dsp::tests`。
@@ -58,20 +64,6 @@ use engine::{
 use mod_plan_publish::ModPhaseTableBuilder;
 use project_ctl::{DecodeJob, ProjectCtl};
 
-/// A1 (r.md #8): 出力ストリームを開く前にデフォルト出力デバイスの実サンプルレートを
-/// 問い合わせる (stream は開かない)。 Hello で親へ報告し、 session.sample_rate の SSoT に
-/// する → engine / plugin / GUI / VOICEVOX が全てハードウェアのレートで揃う。 デバイス
-/// 無し / query 失敗時は `None` (親が `audio_bridge::DEFAULT_SAMPLE_RATE` へ fallback)。
-/// 後で `start_output_stream` が同じ `default_output_config` で stream を開くので、
-/// 報告値と実ストリームのレートは一致する。
-fn query_default_output_sample_rate() -> Option<u32> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let device = cpal::default_host().default_output_device()?;
-    let config = device.default_output_config().ok()?;
-    // cpal 0.17: `sample_rate()` は raw `u32` を返す (SampleRate newtype 廃止)。
-    Some(config.sample_rate())
-}
-
 /// project slot の生成 / 撤去便の ring 深さ (タブの開閉は人の速度)。
 const PROJECT_RING_CAP: usize = engine::MAX_PROJECTS;
 /// デバイス全体 snapshot (worker / sampler) の ring 深さ。
@@ -82,16 +74,24 @@ async fn main() -> Result<()> {
     let _log_guard = common::logging::init_tracing_for("daw_audio");
     tracing::info!("daw_audio started");
 
+    // `--asio-probe [名前]`: ASIO 層の実測だけして終わる (IPC を張らない、`asio::probe`)。
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    if let Some(code) = asio::probe::run_from_args() {
+        std::process::exit(code);
+    }
+
     let pipe_name = std::env::args()
         .nth(1)
         .context("expected pipe name as first argument")?;
 
-    // A1 (r.md #8): デバイス実レートを Hello で親へ報告 → session.sample_rate の SSoT。
     // Hello には PROTOCOL_FINGERPRINT が同梱され、親がビルド世代を検証する (§3)。
-    let device_sample_rate = query_default_output_sample_rate();
-    let mut pipe =
-        common::client::perform_audio_handshake(&pipe_name, device_sample_rate).await?;
-    tracing::info!(?device_sample_rate, "daw_audio handshake complete");
+    let mut pipe = common::client::perform_audio_handshake(&pipe_name).await?;
+    // r.md #156: 親が「開くデバイス」を渡してくる。開いたデバイスを報告し、その実レートが
+    // session.sample_rate の SSoT になる (A1 r.md #8: engine はハードウェアのレートで動く)。
+    let device_config = common::client::read_open_device(&mut pipe).await?;
+    let device_info = device::provisional_info(&device_config);
+    common::client::send_device_info(&mut pipe, &device_info).await?;
+    tracing::info!(?device_info, "daw_audio handshake complete");
 
     let session = common::client::read_audio_session(&mut pipe).await?;
     tracing::info!(?session, "audio session ready");
@@ -647,6 +647,21 @@ async fn recv_loop(mut pipe: ReadHalf<NamedPipeClient>, mut rl: RecvLoop) {
             // `read_audio_session` が消費済み — shmem 名と format はプロセス
             // 生存中不変)。
             AudioCommand::Ack | AudioCommand::Session(_) => {}
+            // r.md #156: 開くデバイスは起動時の handshake で受け取り済み (動いている daw_audio のデバイスは
+            // 替えない — 替えるときは daw_gui が daw_audio を起こし直す)。
+            AudioCommand::OpenDevice { .. } => {
+                tracing::warn!("OpenDevice after the handshake; ignored");
+            }
+            AudioCommand::ListAudioDevices => {
+                // 列挙は数十 ms かかりうる (全デバイスの問い合わせ) ので、受信ループの外で。
+                let out_tx = rl.out_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = out_tx.send(AudioEvent::AudioDevices(Box::new(device::enumerate::list())));
+                });
+            }
+            AudioCommand::OpenDeviceControlPanel => {
+                tracing::info!("OpenDeviceControlPanel: no control panel for the open device");
+            }
             // r.md #49: アプリの窓がアクティブかの報告。park してよいかの判断は
             // engine 側 (`buffer_is_idle`) が行うので、ここは事実の反映のみ。
             AudioCommand::SetAppActive(active) => {

@@ -38,6 +38,8 @@ pub mod event_launcher;
 /// 範囲選択の中身の移動 / 複製 / ミュート (`AppEvent::Range` の中身)。
 pub mod event_range;
 pub mod event_sampler;
+/// r.md #156: オーディオデバイスの設定のイベント (`AppEvent::AudioDevice` の中身)。
+pub mod event_audio_device;
 /// Arranger セクション帯の編集 (`AppEvent::Section` の中身)。
 pub mod event_section;
 /// r.md #132: 分割 / 結合キーのイベント (`AppEvent::SplitJoin` の中身)。

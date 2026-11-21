@@ -278,10 +278,17 @@ pub struct RecorderTap {
     last_end: u64,
 }
 
+/// デバイス層の取り出し口 (`crate::device::input::InputTap`) につなぐ。
+impl crate::device::input::InputTap for RecorderTap {
+    fn capture(&mut self, input: &crate::device::input::InputBlock<'_>) {
+        self.capture_block(input.device_frame(), input.frames(), |ch| input.channel(ch));
+    }
+}
+
 impl RecorderTap {
     /// コールバック 1 回ぶんの入力を取り込む。`channel(ch)` はデバイスの入力 ch 番号 `ch` の音
     /// (長さ `frames`。無い ch は `None` = 無音)。確保・ロック・I/O なし。
-    pub fn capture<'a>(&mut self, device_frame: u64, frames: usize, channel: impl Fn(u16) -> Option<&'a [f32]>) {
+    pub fn capture_block<'a>(&mut self, device_frame: u64, frames: usize, channel: impl Fn(u16) -> Option<&'a [f32]>) {
         while self.active.len() < self.active.capacity() {
             let Ok(set) = self.incoming.pop() else { break };
             self.active.push(set);

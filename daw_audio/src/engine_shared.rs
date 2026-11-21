@@ -66,6 +66,10 @@ pub struct SharedState {
     /// 描き手を持っているスレッドが **停止中に** 読んで描き手を替える (再生中は次の停止まで待つ)。
     /// 起動時は true (環境設定の既定と同じ) — daw_gui の最初の報告が届けば、それに従って停止中に替わる。
     pub render_ahead_wanted: AtomicBool,
+    /// r.md #156: 開いているデバイスの入力 / 出力レイテンシ (frames、`AudioDeviceInfo` と同じ値)。デバイスを
+    /// 開く側 (`crate::device`) が開いた・開き直したときに書き、描き手が毎 buffer 読んで `DeviceIo` に載せる。
+    pub input_latency_frames: AtomicU32,
+    pub output_latency_frames: AtomicU32,
 }
 
 /// r.md #49: 無音かつアイドルがこの秒数続いたら CPAL stream を pause する。
@@ -159,6 +163,8 @@ impl SharedState {
             idle_silent_samples: AtomicU64::new(0),
             park_requested: AtomicBool::new(false),
             render_ahead_wanted: AtomicBool::new(true),
+            input_latency_frames: AtomicU32::new(0),
+            output_latency_frames: AtomicU32::new(0),
         }
     }
 }
