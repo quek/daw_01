@@ -17,6 +17,10 @@ impl AppData {
     pub(crate) fn dispatch_audio_event(&mut self, ev: AudioEvent) {
         match ev {
             AudioEvent::Hello { .. } => {}
+            // r.md #156: オーディオデバイス (handler::audio_device)。
+            AudioEvent::DeviceInfo(info) => self.on_audio_device_info(*info),
+            AudioEvent::AudioDevices(list) => self.on_audio_devices_listed(*list),
+            AudioEvent::DeviceRestartRequired { reason } => self.on_audio_device_restart_required(reason),
             AudioEvent::ChildDisconnected => {
                 self.handle_child_disconnected(ChildKind::Audio);
             }

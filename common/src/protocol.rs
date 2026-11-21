@@ -654,6 +654,18 @@ pub enum AudioCommand {
     /// 出力の先読み (描画スレッドが 2 周期分を先に描く) をするか。環境設定 (PC ごと) の値で、daw_gui が起動時・
     /// daw_audio の再起動後・設定を変えたときに送る。engine は **停止中に** 描き手を替える (再生中は次の停止まで待つ)。
     SetRenderAhead(bool),
+    /// r.md #156: **開くオーディオデバイス**。handshake の一部で、`Ack` の直後・`Session` の前に必ず 1 回だけ送る。
+    /// daw_audio はこれでデバイスを開き (開けなければ OS 標準の既定デバイスへ戻し)、[`AudioEvent::DeviceInfo`] を
+    /// 返す。親はその `sample_rate` を `AudioSession::sample_rate` にする (engine はデバイスのレートで動く)。
+    ///
+    /// **動いている daw_audio のデバイスは替えない** — 設定を変えたら daw_gui が daw_audio を再起動し、新しい
+    /// プロセスにこれを送る (`docs/plan_audio_io.md`「切り替え」)。設定の所有者は daw_gui (`app_config.json`)。
+    OpenDevice { config: crate::audio_device::AudioDeviceConfig },
+    /// r.md #156: この PC のオーディオデバイスを列挙する。返事は [`AudioEvent::AudioDevices`]。
+    ListAudioDevices,
+    /// r.md #156: 開いているデバイスのコントロールパネル (ASIO ドライバーの設定画面) を開く。無ければ何もしない。
+    /// 画面は daw_audio のプロセスの窓として出る。
+    OpenDeviceControlPanel,
     /// 鍵盤レーン click のピッチプレビュー単発 note-on。 `track_id` は
     /// stable `Track::id`。 transport 状態に関係なく発音する。
     PreviewNoteOn {
@@ -859,6 +871,9 @@ impl AudioCommand {
             | CancelExport
             | SetAppActive(_)
             | SetRenderAhead(_)
+            | OpenDevice { .. }
+            | ListAudioDevices
+            | OpenDeviceControlPanel
             | OpenWorkerPool(_)
             | CloseWorkerPool
             | SamplerPreview { .. }
@@ -908,14 +923,22 @@ pub struct PreviewNote {
 pub enum AudioEvent {
     Hello {
         pid: u32,
-        /// daw_audio がオープン予定の出力デバイスの実サンプルレート (Hz)。
-        /// 親 (daw_gui) はこれを `AudioSession.sample_rate` の SSoT にする
-        /// (= エンジンはハードウェアのレートで動く)。 query 失敗時は `None`
-        /// (親は `audio_bridge::DEFAULT_SAMPLE_RATE` へ fallback)。
-        device_sample_rate: Option<u32>,
         /// ビルド世代検証 (module doc 参照)。
         protocol_fingerprint: u64,
     },
+    /// r.md #156: **今開いているオーディオデバイス**。[`AudioCommand::OpenDevice`] の返事 (handshake の一部) と、
+    /// その後デバイスの状態が変わるたび (ドライバー側の変更で開き直した・レイテンシが変わった) に送る。
+    ///
+    /// handshake では、親はこの `sample_rate` を `AudioSession::sample_rate` の SSoT にする (デバイスがどれも
+    /// 開けなかったときは `sample_rate == 0` — 親は `audio_bridge::DEFAULT_SAMPLE_RATE` で session を作り、
+    /// engine は音を出さずに動く)。
+    DeviceInfo(Box<crate::audio_device::AudioDeviceInfo>),
+    /// r.md #156: [`AudioCommand::ListAudioDevices`] の返事。
+    AudioDevices(Box<crate::audio_device::AudioDeviceList>),
+    /// r.md #156: ドライバー側の変更 (コントロールパネルでレートを変えた等) で、**今の session のまま続けられなく
+    /// なった**。daw_gui は daw_audio を再起動して開き直す (`reason` は人が読む 1 行)。同じレート・同じ ch の
+    /// ままで済む変更 (バッファサイズ・レイテンシ) は daw_audio が自分で開き直し、[`Self::DeviceInfo`] だけ送る。
+    DeviceRestartRequired { reason: String },
     /// IPC pipe が切断された (= 子 exit / panic / decode 失敗 / **writer
     /// task 死**)。 daw_gui 内部の pipe loop が合成する synthetic event。
     /// 受信で該当 child を re-spawn し Session / worker pool / LoadSong /
@@ -979,7 +1002,12 @@ impl AudioEvent {
             | LoudnessAnalysisComplete { project, .. }
             | BounceClipFxComplete { project, .. } => Some(*project),
             PluginUnresponsive { device } => Some(device.project),
-            Hello { .. } | ChildDisconnected | WorkerPoolStalled => None,
+            Hello { .. }
+            | DeviceInfo(_)
+            | AudioDevices(_)
+            | DeviceRestartRequired { .. }
+            | ChildDisconnected
+            | WorkerPoolStalled => None,
         }
     }
 }
@@ -1493,7 +1521,6 @@ mod tests {
     fn audio_hello_roundtrip() {
         let msg = AudioEvent::Hello {
             pid: 12345,
-            device_sample_rate: Some(44_100),
             protocol_fingerprint: PROTOCOL_FINGERPRINT,
         };
         assert_eq!(roundtrip(&msg), msg);

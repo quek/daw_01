@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use common::audio_bridge::{AudioBridgeHandle, CHANNELS, DEFAULT_SAMPLE_RATE, MAX_FRAMES, shmem_id};
+use common::audio_device::{AudioDeviceConfig, AudioDeviceInfo};
 use common::metrics_bridge::{MetricsBridgeHandle, metrics_shmem_id};
 use common::pipe::pipe_path;
 use common::plugin_db::PluginDatabase;
@@ -93,11 +94,13 @@ pub struct Bootstrap {
     /// Audio shmem ハンドル。 audio_bridge::AudioBridgeHandle は playhead /
     /// peak meter 等の state を保持する shared memory region を参照する。
     pub bridge: Arc<AudioBridgeHandle>,
-    /// (A1 r.md #8) 解決済みオーディオセッションのサンプルレート (= daw_audio が Hello で
-    /// 報告したデバイス実レート、 query 失敗時は `DEFAULT_SAMPLE_RATE`)。 GUI の拍↔sample
+    /// (A1 r.md #8) 解決済みオーディオセッションのサンプルレート (= daw_audio が開いた
+    /// デバイスの実レート、 どれも開けなかったら `DEFAULT_SAMPLE_RATE`)。 GUI の拍↔sample
     /// 変換 (seek / export range / clip 尺) はこの値を使い、 engine と一致させる。
     /// respawn で変わりうるので AppData 側の複製は respawn 結果で更新する。
     pub sample_rate: u32,
+    /// r.md #156: daw_audio が起動時に開いたオーディオデバイス (`AppData::audio_device.info` の初期値)。
+    pub device_info: AudioDeviceInfo,
     /// resource monitor (r.md #3) の MetricsBridge ハンドル。 DSP load / xrun /
     /// per-plugin CPU を daw_audio / daw_plugin_host が書き、 poller と AppData
     /// (per-plugin 直接読み) が読む。
@@ -174,10 +177,12 @@ impl Drop for PoolEventHandles {
 /// 載せ替える。
 pub struct RespawnedAudio {
     pub tx: UnboundedSender<AudioCommand>,
-    /// 新 Hello の `device_sample_rate` を採用した session の実レート
-    /// (報告なしなら旧値を維持)。
+    /// 新しい daw_audio が開いたデバイスのレートを採用した session の実レート
+    /// (デバイスを開けなかったら旧値を維持)。
     pub sample_rate: u32,
     pub pool: WorkerPoolSpec,
+    /// r.md #156: 新しい daw_audio が開いたデバイス。
+    pub device_info: AudioDeviceInfo,
 }
 
 /// `respawn_plugin` の結果。 呼び出し側 (AppData) は `tx` を差し替え、
@@ -213,10 +218,17 @@ pub struct ChildSupervisor {
     /// 「tx を drop して writer を先に終わらせる」作戦では塞げない
     /// (子が先に exit すると reader が勝つ) — **reader 側の抑止が本質**。
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
-    /// 現在の session。 audio respawn で新 Hello の `device_sample_rate` を
+    /// 現在の session。 audio respawn で新しい daw_audio が開いたデバイスのレートを
     /// 採用して更新される (= 以後の plugin respawn も新レートで Session を
     /// 受ける)。
     session: std::sync::Mutex<AudioSession>,
+    /// r.md #156: daw_audio に開かせるオーディオデバイス (handshake の `OpenDevice` で渡す)。所有者は
+    /// `AppData::audio_device.config` で、これは「次に起こす daw_audio へ渡す写し」
+    /// ([`Self::set_device_config`])。crash からの respawn も同じデバイスを開き直す。
+    device_config: std::sync::Mutex<AudioDeviceConfig>,
+    /// r.md #156: 今の audio pipe loop の「こちらが終わらせるところ」flag (`audio_pipe_loop` の `retiring`)。
+    /// respawn のたびに新しい loop 用の flag へ差し替える。
+    audio_retiring: std::sync::Mutex<Arc<std::sync::atomic::AtomicBool>>,
     n_runners: u32,
     worker_bridge_shmem_id: String,
     /// worker pool の現世代 (event 名 + HANDLE keep-alive)。
@@ -335,18 +347,33 @@ impl ChildSupervisor {
         Ok(spec)
     }
 
-    /// daw_audio を再起動する。 新 Hello の `device_sample_rate` を採用して
+    /// r.md #156: 次に起こす daw_audio に開かせるデバイスを替える (今の daw_audio には効かない —
+    /// 呼び出し側が続けて `respawn_audio` する)。
+    pub fn set_device_config(&self, config: AudioDeviceConfig) {
+        *self.device_config.lock().unwrap_or_else(|e| e.into_inner()) = config;
+    }
+
+    /// r.md #156: 今の daw_audio をこれからこちらが終わらせる (`AudioCommand::Shutdown` を送る直前に呼ぶ)。
+    /// 以後その pipe が切れても `ChildDisconnected` は合成されない (crash として拾い直さない)。
+    pub fn expect_audio_exit(&self) {
+        self.audio_retiring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// daw_audio を再起動する。 新しい daw_audio が開いたデバイスのレートを採用して
     /// session を再構築し (`docs/plan_arch_refactor.md` §3)、 新世代の
     /// worker pool を open した上で送信 channel を返す。
     pub fn respawn_audio(&self) -> Result<RespawnedAudio> {
-        let (server, child, device_sample_rate) =
-            self.spawn_and_handshake_one(ChildKind::Audio)?;
+        let (server, child, device_info) = self.spawn_and_handshake_one(ChildKind::Audio)?;
+        let device_info = device_info.context("audio handshake returned no device info")?;
 
-        // 新 Hello のデバイス実レートを session に採用 (報告なしなら維持)。
+        // 開いたデバイスの実レートを session に採用 (どのデバイスも開けなかったら維持)。
         let session = {
             let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(sr) = device_sample_rate.filter(|&s| s > 0) {
-                guard.sample_rate = sr;
+            if device_info.sample_rate > 0 {
+                guard.sample_rate = device_info.sample_rate;
             }
             guard.clone()
         };
@@ -363,11 +390,14 @@ impl ChildSupervisor {
 
         let (tx, rx) = unbounded_channel::<AudioCommand>();
         let incoming_tx = self.incoming_tx.clone();
+        let retiring = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *self.audio_retiring.lock().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&retiring);
         self.rt_handle.spawn(audio_pipe_loop(
             server,
             rx,
             incoming_tx,
             Arc::clone(&self.shutting_down),
+            retiring,
         ));
 
         if let Ok(mut guard) = self.audio_child.lock() {
@@ -378,6 +408,7 @@ impl ChildSupervisor {
             tx,
             sample_rate: session.sample_rate,
             pool,
+            device_info,
         })
     }
 
@@ -422,12 +453,12 @@ impl ChildSupervisor {
     /// respawn の共通前段: 旧 child kill → pipe server 再作成 → spawn →
     /// Hello handshake (fingerprint 検証込み)。 audio pipe は
     /// `AudioEvent::Hello`、 plugin pipe は `PluginEvent::Hello` を受けるが、
-    /// 呼び出し側が使うのは audio の `device_sample_rate` だけなので、
-    /// それだけ取り出して返す (plugin は常に `None`)。
+    /// audio は続けて「開くデバイスを渡す → 開いたデバイスの報告を受ける」まで済ませ、その報告を返す
+    /// (plugin は常に `None`)。
     fn spawn_and_handshake_one(
         &self,
         kind: ChildKind,
-    ) -> Result<(NamedPipeServer, Child, Option<u32>)> {
+    ) -> Result<(NamedPipeServer, Child, Option<AudioDeviceInfo>)> {
         // 1) 既存 child を kill / drop。 OS pipe の解放を待つ前提で、
         // 同 pipe_path を再利用する (= new ServerOptions.create を回す)。
         let child_slot = match kind {
@@ -437,8 +468,15 @@ impl ChildSupervisor {
         if let Ok(mut guard) = child_slot.lock()
             && let Some(c) = guard.take()
         {
-            retire_child(&self.rt_handle, kind, c);
+            match kind {
+                // r.md #156: 古い daw_audio が **デバイスを手放してから** 新しい方を起こす。ASIO ドライバーは
+                // 同時に 1 つのプロセスからしか開けないものが多く、並んで走ると新しい方が開けずに既定の
+                // デバイスへ戻ってしまう。待ちは有界 (落ちた子なら即座に返る)。
+                ChildKind::Audio => retire_child_and_wait(&self.rt_handle, c),
+                ChildKind::PluginHost => retire_child(&self.rt_handle, kind, c),
+            }
         }
+        let device_config = self.device_config.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         let pipe = pipe_path(self.pid, kind);
         let binary = match kind {
@@ -449,7 +487,12 @@ impl ChildSupervisor {
         // 2) 新 server を作成 → 子 spawn → handshake、 を tokio runtime 内で
         // 実行。 handshake に timeout を付ける: respawn は GUI main thread の
         // block_on で呼ばれるので、 新 child が Hello を送る前にハング/
-        // crash すると main thread が永久に固まる。 5s で諦めて Err を返す。
+        // crash すると main thread が永久に固まる。 有界に待って諦め、Err を返す
+        // (audio はデバイスを開くところまでが handshake なので長め — ASIO ドライバーの初期化は秒単位かかる)。
+        let timeout = match kind {
+            ChildKind::Audio => AUDIO_HANDSHAKE_TIMEOUT,
+            ChildKind::PluginHost => std::time::Duration::from_secs(5),
+        };
         let pipe_for_spawn = pipe.clone();
         let job = self.job.clone();
         self.rt_handle.block_on(async move {
@@ -459,17 +502,11 @@ impl ChildSupervisor {
                 .with_context(|| format!("failed to create pipe {pipe_for_spawn}"))?;
             let mut child = crate::subprocess::spawn_sibling(binary, [&pipe_for_spawn])?;
             job.assign(&child)?;
-            let handshake_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let handshake_result = tokio::time::timeout(timeout, async {
                 match kind {
                     ChildKind::Audio => {
-                        let (hello, server) = handshake_audio(server).await?;
-                        let AudioEvent::Hello {
-                            device_sample_rate, ..
-                        } = hello
-                        else {
-                            unreachable!("handshake_audio returns only Hello");
-                        };
-                        Ok((device_sample_rate, server))
+                        let (info, server) = handshake_audio(server, &device_config).await?;
+                        Ok((Some(info), server))
                     }
                     ChildKind::PluginHost => {
                         let (_hello, server) = handshake_plugin(server).await?;
@@ -479,7 +516,7 @@ impl ChildSupervisor {
             })
             .await
             .context("respawn handshake timed out (new child died before handshake?)");
-            let (device_sample_rate, server) = match handshake_result {
+            let (device_info, server) = match handshake_result {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) | Err(e) => {
                     // fingerprint 不一致 / handshake 失敗した子は生かして
@@ -489,9 +526,31 @@ impl ChildSupervisor {
                     return Err(e);
                 }
             };
-            anyhow::Ok((server, child, device_sample_rate))
+            anyhow::Ok((server, child, device_info))
         })
     }
+}
+
+/// daw_audio との handshake の期限。Hello / Ack に加えて **デバイスを開く** ところまでを含む (r.md #156)。
+/// 初回起動は AV スキャン等で遅くなり得るので、起動時と respawn で同じ余裕を持たせる。
+const AUDIO_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// r.md #156: 置き換える古い daw_audio の exit を **有界に待ってから** 返る (期限を過ぎたら強制終了)。
+///
+/// pipe の親側は呼び出し前に閉じてある (`AppData` が `audio_tx` を落とす / 子が落ちている) ので、子は EOF を見て
+/// stream を止め、デバイスを手放して exit する。GUI スレッドを止める待ちなので [`RETIRE_GRACE`] で打ち切る。
+fn retire_child_and_wait(rt: &tokio::runtime::Handle, mut child: Child) {
+    rt.block_on(async move {
+        match tokio::time::timeout(RETIRE_GRACE, child.wait()).await {
+            Ok(Ok(status)) => tracing::info!(?status, "retired daw_audio exited on its own"),
+            Ok(Err(e)) => tracing::warn!(error = ?e, "failed to wait for retired daw_audio"),
+            Err(_) => {
+                tracing::warn!("retired daw_audio did not exit in time; killing");
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        }
+    });
 }
 
 /// respawn で置き換えられた古い child に与える graceful exit の猶予。
@@ -539,13 +598,15 @@ fn retire_child(rt: &tokio::runtime::Handle, kind: ChildKind, mut child: Child) 
 /// 子プロセスを spawn → handshake → Session / OpenWorkerPool 配信 →
 /// pipe loop spawn まで一連の起動処理。 GUI mode と script mode の前段は
 /// 完全に同一なのでこの 1 関数でカバー。
-pub fn bootstrap_subprocess(mute_output: bool) -> Result<Bootstrap> {
+///
+/// `device_config`: daw_audio に開かせるオーディオデバイス (r.md #156。`app_config.json` の値)。
+pub fn bootstrap_subprocess(mute_output: bool, device_config: AudioDeviceConfig) -> Result<Bootstrap> {
     let job = Arc::new(JobHandle::new()?);
     let rt = Runtime::new().context("failed to create tokio runtime")?;
 
     let pid = std::process::id();
-    // A1 (r.md #8): sample_rate は暫定 (DEFAULT)。 daw_audio が Hello で報告する
-    // デバイス実レートで spawn_and_handshake 後に上書きする (= エンジンはハード
+    // A1 (r.md #8): sample_rate は暫定 (DEFAULT)。 daw_audio が handshake で報告する
+    // 「開いたデバイスの実レート」で spawn_and_handshake 後に上書きする (= エンジンはハード
     // ウェアのレートで動く)。 shmem_id 等は sample_rate 非依存なのでここで確定。
     let mut session = AudioSession {
         shmem_id: shmem_id(pid),
@@ -588,12 +649,12 @@ pub fn bootstrap_subprocess(mute_output: bool) -> Result<Bootstrap> {
     let pool_state = build_worker_pool_state(pid, 1, n_runners, &worker_bridge_shmem_id)?;
     tracing::info!(n_runners, n_pairs = pool_state.spec.n_pairs, "created plugin worker pool handles (generation 1)");
 
-    let (audio_child, plugin_child, mut audio_server, mut plugin_server, audio_device_sr) =
-        rt.block_on(spawn_and_handshake(&job))?;
-    // A1 (r.md #8): daw_audio が報告したデバイス実レートを session の SSoT にする。
-    // 報告無し (query 失敗) なら DEFAULT_SAMPLE_RATE のまま。
-    if let Some(sr) = audio_device_sr.filter(|&s| s > 0) {
-        session.sample_rate = sr;
+    let (audio_child, plugin_child, mut audio_server, mut plugin_server, device_info) =
+        rt.block_on(spawn_and_handshake(&job, &device_config))?;
+    // A1 (r.md #8): daw_audio が開いたデバイスの実レートを session の SSoT にする。
+    // どのデバイスも開けなかった (0) なら DEFAULT_SAMPLE_RATE のまま。
+    if device_info.sample_rate > 0 {
+        session.sample_rate = device_info.sample_rate;
     }
     tracing::info!(sample_rate = session.sample_rate, "resolved audio session sample rate");
 
@@ -616,11 +677,13 @@ pub fn bootstrap_subprocess(mute_output: bool) -> Result<Bootstrap> {
     let (incoming_tx, incoming_rx) = unbounded_channel::<ChildEvent>();
     // (r.md #61) 終了シーケンスの合図。pipe loop / supervisor が共有する。
     let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let audio_retiring = Arc::new(std::sync::atomic::AtomicBool::new(false));
     rt.spawn(audio_pipe_loop(
         audio_server,
         audio_rx,
         incoming_tx.clone(),
         Arc::clone(&shutting_down),
+        Arc::clone(&audio_retiring),
     ));
     rt.spawn(plugin_pipe_loop(
         plugin_server,
@@ -637,6 +700,8 @@ pub fn bootstrap_subprocess(mute_output: bool) -> Result<Bootstrap> {
         rt_handle: rt.handle().clone(),
         job: job.clone(),
         session: std::sync::Mutex::new(session.clone()),
+        device_config: std::sync::Mutex::new(device_config),
+        audio_retiring: std::sync::Mutex::new(audio_retiring),
         n_runners,
         worker_bridge_shmem_id: worker_bridge_shmem_id.clone(),
         pool: std::sync::Mutex::new(pool_state),
@@ -652,6 +717,7 @@ pub fn bootstrap_subprocess(mute_output: bool) -> Result<Bootstrap> {
         incoming_rx: Some(incoming_rx),
         bridge,
         sample_rate: session.sample_rate,
+        device_info,
         metrics,
         scope,
         device_scope,
@@ -706,6 +772,7 @@ impl Bootstrap {
             supervisor,
             _worker_bridge,
             sample_rate: _,
+            device_info: _,
         } = self;
 
         // (1) 親側の pipe half を閉じる。sender を落とすと writer task が
@@ -839,7 +906,8 @@ fn build_worker_pool_state(
 
 async fn spawn_and_handshake(
     job: &JobHandle,
-) -> Result<(Child, Child, NamedPipeServer, NamedPipeServer, Option<u32>)> {
+    device_config: &AudioDeviceConfig,
+) -> Result<(Child, Child, NamedPipeServer, NamedPipeServer, AudioDeviceInfo)> {
     let pid = std::process::id();
     let audio_pipe = pipe_path(pid, ChildKind::Audio);
     let plugin_pipe = pipe_path(pid, ChildKind::PluginHost);
@@ -864,34 +932,35 @@ async fn spawn_and_handshake(
     // fingerprint 不一致 (= 古い exe) もここで明示 fail する — decode が偶然
     // 通って silent misdecode のまま走り出すことを構造的に防ぐ。
     let (audio_result, plugin_result) = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        AUDIO_HANDSHAKE_TIMEOUT,
         async {
             tokio::try_join!(
-                handshake_audio(audio_server),
+                handshake_audio(audio_server, device_config),
                 handshake_plugin(plugin_server),
             )
         },
     )
     .await
     .context("initial handshake timed out (child process died before handshake?)")??;
-    let (audio_hello, audio_server) = audio_result;
+    // A1 (r.md #8) / r.md #156: daw_audio が開いたデバイス (その `sample_rate` が session.sample_rate の SSoT)。
+    let (device_info, audio_server) = audio_result;
     let (plugin_hello, plugin_server) = plugin_result;
-    tracing::info!(?audio_hello, "audio handshake complete");
+    tracing::info!(?device_info, "audio handshake complete");
     tracing::info!(?plugin_hello, "plugin_host handshake complete");
-    // A1 (r.md #8): daw_audio が Hello で報告したデバイス実レートを取り出す
-    // (= session.sample_rate の SSoT)。
-    let audio_device_sr = match &audio_hello {
-        AudioEvent::Hello { device_sample_rate, .. } => *device_sample_rate,
-        _ => None,
-    };
 
-    Ok((audio_child, plugin_child, audio_server, plugin_server, audio_device_sr))
+    Ok((audio_child, plugin_child, audio_server, plugin_server, device_info))
 }
 
 /// daw_audio との handshake: `AudioEvent::Hello` を受けて fingerprint を
 /// 検証し、 `AudioCommand::Ack` を返す。 不一致は [`FingerprintMismatch`]
 /// で明示 fail (呼び出し側が downcast して respawn loop を止める)。
-async fn handshake_audio(mut server: NamedPipeServer) -> Result<(AudioEvent, NamedPipeServer)> {
+///
+/// r.md #156: 続けて開くデバイス (`AudioCommand::OpenDevice`) を渡し、daw_audio が開いたデバイスの報告
+/// (`AudioEvent::DeviceInfo`) を受けて返す。
+async fn handshake_audio(
+    mut server: NamedPipeServer,
+    device_config: &AudioDeviceConfig,
+) -> Result<(AudioDeviceInfo, NamedPipeServer)> {
     server.connect().await.context("failed to accept client")?;
     let hello: AudioEvent = read_msg(&mut server).await?;
     let AudioEvent::Hello {
@@ -909,7 +978,11 @@ async fn handshake_audio(mut server: NamedPipeServer) -> Result<(AudioEvent, Nam
         .into());
     }
     write_msg(&mut server, &AudioCommand::Ack).await?;
-    Ok((hello, server))
+    write_msg(&mut server, &AudioCommand::OpenDevice { config: device_config.clone() }).await?;
+    match read_msg::<_, AudioEvent>(&mut server).await? {
+        AudioEvent::DeviceInfo(info) => Ok((*info, server)),
+        other => anyhow::bail!("expected DeviceInfo from daw_audio, got {:?}", other),
+    }
 }
 
 /// daw_plugin_host との handshake: `PluginEvent::Hello` + fingerprint 検証 +
@@ -946,11 +1019,16 @@ async fn handshake_plugin(mut server: NamedPipeServer) -> Result<(PluginEvent, N
 /// reader が EOF を拾って crash と同じ切断イベントを作り、respawn が走って
 /// しまう。`tokio::select!` は writer / reader のどちらが先に完了するか非決定
 /// なので、「tx を drop して writer を先に終わらせる」だけでは塞げない。
+///
+/// r.md #156: `retiring` はこの loop が相手にしている daw_audio を **こちらが終わらせるところ** か
+/// (オーディオデバイスの切り替え — [`ChildSupervisor::expect_audio_exit`])。立っていれば同じく合成しない。
+/// loop ごとに別の flag なので、起こし直した後の daw_audio の crash は今までどおり拾う。
 async fn audio_pipe_loop(
     pipe: NamedPipeServer,
     mut rx: UnboundedReceiver<AudioCommand>,
     incoming_tx: UnboundedSender<ChildEvent>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    retiring: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // read/write half を別タスクに分けて read を絶対 cancel しない
     // (詳細は plugin_pipe_loop / daw_plugin_host::pipe_loop)。旧 select! 構造は
@@ -992,7 +1070,10 @@ async fn audio_pipe_loop(
             r.unwrap_or(true)
         }
     };
-    if disconnected && !shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+    if disconnected
+        && !shutting_down.load(std::sync::atomic::Ordering::Acquire)
+        && !retiring.load(std::sync::atomic::Ordering::Acquire)
+    {
         // 子プロセス側 (or 自前 write) が die / decode 失敗で抜けたケース。
         // 上位 (AppData::handle_event) で respawn + state restore に拾ってもらう。
         let _ = incoming_tx.send(ChildEvent::Audio(AudioEvent::ChildDisconnected));
