@@ -73,10 +73,33 @@ pub(super) fn daw_set_audio_device(this: &JsValue, args: &[JsValue], ctx: &mut C
     daw_audio_device_info(this, &[], ctx)
 }
 
+/// 文字列の欄。無ければ `None`。文字列でない値は黙って既定へ落とさず、エラーにする。
+fn text_field(spec: &Value, key: &str) -> JsResult<Option<String>> {
+    match spec.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(js_native(format!("setAudioDevice: {key} = {other} は文字列ではありません"))),
+    }
+}
+
+/// 数値の欄。無ければ `None`。JS の数値は整数でも小数の型で届くことがある (`Number("44100")`) ので、値が整数なら
+/// 受ける。整数として読めない値 (文字列・小数・負・範囲外) は黙って既定へ落とさず、エラーにする。
+fn uint_field<T: TryFrom<u64>>(spec: &Value, key: &str) -> JsResult<Option<T>> {
+    let Some(value) = spec.get(key).filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let whole = |f: &f64| f.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(f);
+    value
+        .as_u64()
+        .or_else(|| value.as_f64().filter(whole).map(|f| f as u64))
+        .and_then(|n| T::try_from(n).ok())
+        .map(Some)
+        .ok_or_else(|| js_native(format!("setAudioDevice: {key} = {value} は範囲内の整数ではありません")))
+}
+
 fn config_from_spec(spec: &Value) -> JsResult<AudioDeviceConfig> {
-    let text = |key: &str| spec.get(key).and_then(Value::as_str).map(str::to_owned);
-    let number = |key: &str| spec.get(key).and_then(Value::as_u64);
-    let driver = match text("driver").as_deref() {
+    let text = |key: &str| text_field(spec, key);
+    let driver = match text("driver")?.as_deref() {
         None | Some("system") => AudioDriverKind::System,
         Some("asio") => AudioDriverKind::Asio,
         Some("synthetic") => AudioDriverKind::Synthetic,
@@ -89,8 +112,8 @@ fn config_from_spec(spec: &Value) -> JsResult<AudioDeviceConfig> {
     let mut config = AudioDeviceConfig { driver, ..Default::default() };
     match driver {
         AudioDriverKind::System => {
-            config.system_output = resolve(|l| &l.system_outputs, text("id"), text("device"))?;
-            config.system_input = match text("input").as_deref() {
+            config.system_output = resolve(|l| &l.system_outputs, text("id")?, text("device")?)?;
+            config.system_input = match text("input")?.as_deref() {
                 None | Some("none") => AudioInputDevice::None,
                 Some("default") => AudioInputDevice::Default,
                 Some(name) => AudioInputDevice::Device(find(|l| &l.system_inputs, name)?),
@@ -98,19 +121,18 @@ fn config_from_spec(spec: &Value) -> JsResult<AudioDeviceConfig> {
         }
         AudioDriverKind::Asio => {
             config.asio_driver = Some(
-                resolve(|l| &l.asio_drivers, text("id"), text("device"))?
+                resolve(|l| &l.asio_drivers, text("id")?, text("device")?)?
                     .ok_or_else(|| js_native("setAudioDevice: asio は device (ドライバーの名前) が要ります"))?,
             );
         }
-        AudioDriverKind::Synthetic => config.synthetic_device = text("device"),
+        AudioDriverKind::Synthetic => config.synthetic_device = text("device")?,
     }
-    config.sample_rate = number("sampleRate").and_then(|v| u32::try_from(v).ok());
-    config.buffer_frames = number("bufferFrames").and_then(|v| u32::try_from(v).ok());
-    config.output_first_channel = number("outputFirstChannel").and_then(|v| u16::try_from(v).ok());
-    config.input_channels = number("inputCount").and_then(|v| u16::try_from(v).ok()).map(|count| ChannelRange {
-        first: number("inputFirst").and_then(|v| u16::try_from(v).ok()).unwrap_or(0),
-        count,
-    });
+    config.sample_rate = uint_field(spec, "sampleRate")?;
+    config.buffer_frames = uint_field(spec, "bufferFrames")?;
+    config.output_first_channel = uint_field(spec, "outputFirstChannel")?;
+    let input_first: Option<u16> = uint_field(spec, "inputFirst")?;
+    config.input_channels = uint_field::<u16>(spec, "inputCount")?
+        .map(|count| ChannelRange { first: input_first.unwrap_or(0), count });
     Ok(config)
 }
 
