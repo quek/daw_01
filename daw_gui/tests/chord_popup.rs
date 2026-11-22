@@ -142,6 +142,22 @@ fn arrows_move_between_boxes_and_tab_appends() {
     assert_eq!(app.cur.view.launcher_layout, common::model::LauncherLayout::ArrangerOnly, "Tab がランチャー帯の巡回に食われない");
 }
 
+/// Instrument Input: 開く前に弾いた和音は拾わず、開いている間に弾き終えた和音 (通し番号が進む) は箱に入る。
+#[test]
+fn chord_played_on_the_keyboard_while_open_is_set() {
+    let (mut app, _a, _p) = build_app();
+    let id = place(&mut app, 0.0, 4.0, Chord::new(0, ChordKind::Major));
+    app.cur.chord_tools.played = Some((Chord::new(2, ChordKind::Minor), 1));
+    let mut h = host();
+    open_on(&mut h, &mut app, 1.0);
+    assert_eq!(chord_of(&app, id), Some(Chord::new(0, ChordKind::Major)), "開く前に弾いたものは拾わない");
+    app.cur.chord_tools.played = Some((Chord::new(7, ChordKind::Dominant7), 2));
+    idle(&mut h, &mut app);
+    assert_eq!(chord_of(&app, id), Some(Chord::new(7, ChordKind::Dominant7)));
+    idle(&mut h, &mut app);
+    assert!(app.cur.peph.chord_band.popup.is_some(), "弾いても開いたまま (続けて弾ける)");
+}
+
 /// ↓ で候補を巡回して箱に入れる (先頭から)。
 #[test]
 fn down_arrow_cycles_the_candidates() {

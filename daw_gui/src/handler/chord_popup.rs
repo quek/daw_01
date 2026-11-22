@@ -151,7 +151,20 @@ impl AppData {
         let Some(c) = self.cur.song_doc.song().chord_by_id(id).cloned() else { return };
         let text = self.chord_label(&c.chord, c.start_beat);
         let rev = self.cur.peph.chord_band.popup.as_ref().map_or(0, |p| p.rev.wrapping_add(1));
-        self.cur.peph.chord_band.popup = Some(ChordPopup { rev, ..ChordPopup::new(id, text) });
+        let played_seen = self.cur.chord_tools.played.map_or(0, |(_, seq)| seq);
+        self.cur.peph.chord_band.popup = Some(ChordPopup { rev, played_seen, ..ChordPopup::new(id, text) });
+    }
+
+    /// Instrument Input: ポップアップを開いている間に MIDI 鍵盤で弾き終えた和音を、編集中の箱に入れる
+    /// (`ChordToolsState::played` の通し番号が進んだときだけ。試聴も鳴らす)。
+    pub(crate) fn chord_popup_take_played(&mut self) {
+        let Some((chord, seq)) = self.cur.chord_tools.played else { return };
+        let Some(p) = self.cur.peph.chord_band.popup.as_mut() else { return };
+        if p.played_seen == seq {
+            return;
+        }
+        p.played_seen = seq;
+        self.chord_popup_set(chord);
     }
 
     pub(crate) fn close_chord_popup(&mut self) {

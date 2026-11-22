@@ -5,6 +5,9 @@
 //! - 次のコードの候補 (`AppData::chord_popup_candidates`)、↑↓ で巡回。
 //! - ←→ で隣の箱 (入力欄を打ち換えている間は caret 移動に譲る)、Tab で次の箱を追加、外クリック / Esc で閉じる。
 //!
+//! - 開いている間に MIDI 鍵盤で和音を弾くと、そのコードを箱に入れる (Studio One の Instrument Input、
+//!   和音のまとめは c157-tools の `ChordToolsState::played`)。
+//!
 //! 変更は即反映して試聴を鳴らす (`handler::chord_popup`)。`open_overlay` なので開いている間も
 //! 再生と shortcut は背景に通る (Space 等)、背景への click は通さない。状態は
 //! `ProjectEphemeral::chord_band.popup`、Inspector には編集面を作らない (Q4)。
@@ -52,6 +55,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>) {
         ui.open_overlay(OVERLAY_ID);
     }
     ui.update_popup_anchor(("overlay", OVERLAY_ID), rect);
+    // Instrument Input: 開いている間に鍵盤で弾き終えた和音 (通し番号が進んだ) を箱に入れる。
+    if app.cur.chord_tools.played.is_some_and(|(_, seq)| seq != popup.played_seen) {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| app.chord_popup_take_played()));
+    }
     let (id, rev, typed, text, candidate) = (popup.chord_id, popup.rev, popup.typed, popup.text.clone(), popup.candidate);
     let ev = ev.clone();
     ui.popup_layer(("overlay", OVERLAY_ID), |ui| {

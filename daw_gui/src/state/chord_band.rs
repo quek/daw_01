@@ -81,11 +81,14 @@ pub struct ChordPopup {
     pub typed: bool,
     /// 次のコードの候補のうち上下キーで選んでいるもの。
     pub candidate: Option<usize>,
+    /// MIDI 鍵盤で弾いた和音 (`ChordToolsState::played`) の通し番号のうち、もう拾ったもの。開いた時点の
+    /// 番号を入れておくので、開く前に弾いた和音は拾わない (Instrument Input)。
+    pub played_seen: u64,
 }
 
 impl ChordPopup {
     #[must_use]
     pub fn new(chord_id: u32, text: String) -> Self {
-        Self { chord_id, rev: 0, text, typed: false, candidate: None }
+        Self { chord_id, rev: 0, text, typed: false, candidate: None, played_seen: 0 }
     }
 }
