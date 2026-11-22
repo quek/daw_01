@@ -38,16 +38,26 @@ impl AppData {
     }
 
     /// `at` を基準に箱の列を置き (上書き規則)、置いた箱を選ぶ。貼り付け / プリセットの挿入が使う。
+    /// 置かなかったとき (上限超え / 全部不正) は選択を変えない (同じ位置にある既存の箱を選ばない)。
     pub(crate) fn place_chords_at(&mut self, at: f64, chords: Vec<ChordEvent>) {
-        let starts: Vec<f64> = chords.iter().map(|c| at + c.start_beat).collect();
+        let mut starts: Vec<f64> = chords.iter().map(|c| (at + c.start_beat).max(0.0)).collect();
+        starts.sort_by(f64::total_cmp);
+        let epoch = self.cur.song_doc.edit_epoch();
         self.handle_event(AppEvent::Chord(ChordTrackEvent::PlaceMany { at, chords }));
+        if self.cur.song_doc.edit_epoch() == epoch {
+            return;
+        }
+        // 置いた箱 = 頭が置いた位置にある箱 (貼った頭を並べておき二分探索 — 大量の貼り付けで O(n²) にしない)。
         let placed: Vec<u32> = self
             .cur
             .song_doc
             .song()
             .chords
             .iter()
-            .filter(|c| starts.iter().any(|s| (c.start_beat - s.max(0.0)).abs() < EPS))
+            .filter(|c| {
+                let i = starts.partition_point(|&s| s < c.start_beat - EPS);
+                starts.get(i).is_some_and(|&s| (s - c.start_beat).abs() < EPS)
+            })
             .map(|c| c.id)
             .collect();
         self.set_chord_selection(placed);

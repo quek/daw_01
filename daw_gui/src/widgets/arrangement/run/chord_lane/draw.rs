@@ -18,10 +18,11 @@ use crate::widgets::arrangement::draw::{push_filled_rect, push_section_border, p
 use crate::widgets::arrangement::frame::ArrangementFrame;
 
 /// `clip_over` = アレンジのクリップを帯の上へ運んでいる (離すとコードを抽出する) — 帯を縁取る。
-pub(super) fn draw(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>, live: &Live, clip_over: bool) {
+pub(super) fn draw(ui: &mut Ui<'_, AppData>, app: &AppData, f: &ArrangementFrame<'_>, live: &Live, clip_over: bool) {
     let s = Scale { beat_per_px: f.beat_per_px, snap: &f.view.snap, zoom: f.zoom_x_px_per_beat };
-    // レーンの上へ運んでいる箱は帯では動かさない (離すとクリップになる、ゴーストは `handoff`)。
-    let resolved = live.drag.as_ref().filter(|d| super::handoff::drop_track(f, d).is_none()).map(|d| d.resolve(s));
+    // レーンの上へ運んでいる箱は帯では動かさない (離すとクリップになる / 落とせない行なら何もしない、
+    // ゴーストは `handoff`)。
+    let resolved = live.drag.as_ref().filter(|d| !super::handoff::over_lanes(f, d)).map(|d| d.resolve(s));
     let range = live.range.filter(|r| !r.is_click()).map(|r| r.span(s));
     ui.heavy(("arrangement_chord_lane", &f.id), |hctx| {
         let style = f.style;
@@ -31,7 +32,7 @@ pub(super) fn draw(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>, live: &Li
         }
         push_filled_rect(hctx, f.chord_rect, style.arranger_lane_bg);
         hctx.with_clip_rect(f.chord_rect, |hctx| {
-            draw_boxes(hctx, f, resolved.as_ref());
+            draw_boxes(hctx, app, f, resolved.as_ref());
             if let Some((a, b)) = range {
                 preview(hctx, box_rect(a, b - a, f), style);
             }
@@ -44,25 +45,29 @@ pub(super) fn draw(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>, live: &Li
 }
 
 /// 箱を描く。動かしている箱は base から外して最後に描く (重なる相手に食われない — Arranger 帯の 2 パスと同じ)。
-/// 複製 (Ctrl) は元を残し、複製先に半透明のゴーストを出す。
-fn draw_boxes(hctx: &mut HeavyCtx<'_, '_, AppData>, f: &ArrangementFrame<'_>, resolved: Option<&Resolved>) {
+/// 複製 (Ctrl) は元を残し、複製先に半透明のゴーストを出す。帯の外に出る箱は描かない (`draw_box`)。
+fn draw_boxes(hctx: &mut HeavyCtx<'_, '_, AppData>, app: &AppData, f: &ArrangementFrame<'_>, resolved: Option<&Resolved>) {
+    use std::collections::{HashMap, HashSet};
     let style = f.style;
-    let moved: Vec<(u32, f64, f64)> = match resolved {
+    // 動かしている箱 `id → (start, len)` (毎フレームなので、箱数 × 動かしている数の線形探索にしない)。
+    let moved: HashMap<u32, (f64, f64)> = match resolved {
         Some(Resolved::Move { ids, delta, duplicate: false }) => {
-            f.chord.boxes.iter().filter(|b| ids.contains(&b.id)).map(|b| (b.id, b.start + delta, b.len)).collect()
+            let ids: HashSet<u32> = ids.iter().copied().collect();
+            f.chord.boxes.iter().filter(|b| ids.contains(&b.id)).map(|b| (b.id, (b.start + delta, b.len))).collect()
         }
-        Some(Resolved::Spans(spans)) => spans.clone(),
-        _ => Vec::new(),
+        Some(Resolved::Spans(spans)) => spans.iter().map(|&(id, s, l)| (id, (s, l))).collect(),
+        _ => HashMap::new(),
     };
-    for b in f.chord.boxes.iter().filter(|b| !moved.iter().any(|m| m.0 == b.id)) {
-        draw_box(hctx, b, box_rect(b.start, b.len, f), style);
+    for b in f.chord.boxes.iter().filter(|b| !moved.contains_key(&b.id)) {
+        draw_box(hctx, app, b, box_rect(b.start, b.len, f), f);
     }
-    for &(id, start, len) in &moved {
-        if let Some(b) = f.chord.boxes.iter().find(|b| b.id == id) {
-            draw_box(hctx, b, box_rect(start, len, f), style);
+    for b in &f.chord.boxes {
+        if let Some(&(start, len)) = moved.get(&b.id) {
+            draw_box(hctx, app, b, box_rect(start, len, f), f);
         }
     }
     if let Some(Resolved::Move { ids, delta, duplicate: true }) = resolved {
+        let ids: HashSet<u32> = ids.iter().copied().collect();
         for b in f.chord.boxes.iter().filter(|b| ids.contains(&b.id)) {
             preview(hctx, box_rect(b.start + delta, b.len, f), style);
         }
@@ -75,7 +80,13 @@ fn preview(hctx: &mut HeavyCtx<'_, '_, AppData>, r: Rect, style: &ArrangementSty
     push_section_border(hctx, r, style.clip_border, 1.0);
 }
 
-fn draw_box(hctx: &mut HeavyCtx<'_, '_, AppData>, b: &ChordBox, r: Rect, style: &ArrangementStyle) {
+/// 箱 1 つ。帯の横の範囲にかからない箱は何も積まない (コード名の文字列も作らない)。
+fn draw_box(hctx: &mut HeavyCtx<'_, '_, AppData>, app: &AppData, b: &ChordBox, r: Rect, f: &ArrangementFrame<'_>) {
+    let lane = f.chord_rect;
+    if r.x + r.w < lane.x || r.x > lane.x + lane.w {
+        return;
+    }
+    let style = f.style;
     push_filled_rect(hctx, r, b.fill);
     if b.selected {
         push_selection_ring(hctx, r, style, 0.0, Some(r));
@@ -84,8 +95,8 @@ fn draw_box(hctx: &mut HeavyCtx<'_, '_, AppData>, b: &ChordBox, r: Rect, style: 
     }
     if r.w > 8.0 {
         hctx.push_text(GlyphArea {
-            // 毎フレーム描くので Arc の refcount clone (帯の名前と同じ安価な経路)。
-            text: b.label.clone(),
+            // 表記の SSoT (`AppData::chord_label`) を、描く箱だけ毎フレーム引く。
+            text: Arc::from(app.chord_label(&b.chord, b.start)),
             left: r.x + 4.0,
             top: r.y + (r.h - style.clip_text_size) * 0.5,
             font_size: style.clip_text_size,

@@ -140,6 +140,78 @@ impl Song {
         Some(id)
     }
 
+    /// 箱の列をまとめて置く: [`Self::place_chord`] を列の順に呼んだのと同じ結果 (上書き規則。列の後ろの箱ほど勝ち、
+    /// 削られた箱の左側が元の id を残し、割れた右側は新しい id) を、正規化 1 回で出す (O(n log n)。
+    /// `place_chord` を n 回呼ぶと 1 回ごとに全体を正規化するので O(n² log n))。id は全部振り直す。
+    /// 置けた箱が 1 つでもあれば `true` (値域が不正な箱は `place_chord` と同じく飛ばす)。
+    pub fn place_chords(&mut self, evs: impl IntoIterator<Item = ChordEvent>) -> bool {
+        // 上塗りの順位 = 並びの位置 (既存の箱は互いに重ならないので先頭に並べるだけでよい)。
+        let mut items: Vec<ChordEvent> = std::mem::take(&mut self.chords);
+        let existing = items.len();
+        for mut ev in evs {
+            if !ev.start_beat.is_finite() || !ev.len_beats.is_finite() {
+                continue;
+            }
+            if ev.start_beat < 0.0 {
+                ev.len_beats += ev.start_beat;
+                ev.start_beat = 0.0;
+            }
+            if ev.len_beats <= MIN_CHORD_LEN_BEATS {
+                continue;
+            }
+            ev.id = self.alloc_chord_id();
+            ev.chord = ev.chord.sanitized();
+            items.push(ev);
+        }
+        if items.len() == existing {
+            self.chords = items;
+            return false;
+        }
+        // 境界を掃いて、各区間をそこにかかる箱のうち順位が最大のものに塗る (ヒープは遅延削除)。
+        let mut edges: Vec<(f64, usize)> = Vec::with_capacity(items.len() * 2);
+        for (i, c) in items.iter().enumerate() {
+            edges.push((c.start_beat, i));
+            edges.push((c.end_beat(), i));
+        }
+        edges.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut open = vec![false; items.len()];
+        let mut heap = std::collections::BinaryHeap::with_capacity(items.len());
+        let mut segs: Vec<(usize, f64, f64)> = Vec::new();
+        let mut k = 0;
+        while k < edges.len() {
+            let x = edges[k].0;
+            while k < edges.len() && edges[k].0 == x {
+                let i = edges[k].1;
+                open[i] = !open[i];
+                if open[i] {
+                    heap.push(i);
+                }
+                k += 1;
+            }
+            while heap.peek().is_some_and(|&i| !open[i]) {
+                heap.pop();
+            }
+            let (Some(&owner), Some(&(next, _))) = (heap.peek(), edges.get(k)) else { continue };
+            match segs.last_mut() {
+                Some(last) if last.0 == owner && last.2 == x => last.2 = next,
+                _ => segs.push((owner, x, next)),
+            }
+        }
+        // 箱ごとに最初の片が元の id を、2 つ目以降 (上に置いた箱で割れた右側) が新しい id を持つ。
+        let mut used = vec![false; items.len()];
+        let mut out = Vec::with_capacity(segs.len());
+        for (owner, a, b) in segs {
+            let src = &items[owner];
+            let id = if std::mem::replace(&mut used[owner], true) { self.alloc_chord_id() } else { src.id };
+            // 削られなかった箱は元の長さのまま (端の引き算で 1 ulp ずれない)。
+            let len = if a == src.start_beat && b == src.end_beat() { src.len_beats } else { b - a };
+            out.push(ChordEvent { id, start_beat: a, len_beats: len, ..src.clone() });
+        }
+        self.chords = out;
+        self.normalize_chords();
+        true
+    }
+
     /// 選んだ箱をまとめて `delta` 拍ずらす (相対位置を保つ)。左端が 0 を割らないよう `delta` を詰める。
     /// 動かした箱どうしは削り合わず、動かなかった箱だけが上書き規則で削られる。動いたら `true`。
     pub fn move_chords(&mut self, ids: &[u32], delta: f64) -> bool {
@@ -412,5 +484,38 @@ mod tests {
         let once = song.clone();
         song.normalize_chords();
         assert_eq!(song, once);
+    }
+
+    /// まとめて置く (`place_chords`) と、`place_chord` を列の順に呼んだのと同じ並びになる (後ろほど勝つ / 割れる /
+    /// 覆われて消える / 不正な箱は飛ばす)。削られなかった既存の箱は元の id と値のまま。
+    #[test]
+    fn placing_many_matches_placing_one_by_one() {
+        let base = song_with(&[(0.0, 4.0, 0), (4.0, 4.0, 5), (8.0, 8.0, 7), (20.0, 2.0, 9)]);
+        // 疑似乱数 (LCG) の列 + 端のケース (既存の内側 / 既存を覆う / 互いに重なる / 不正値)。
+        let mut seed = 12345u64;
+        // 0..n の整数を半拍単位にする (2 進で正確な値なので、1 つずつ置いた結果とビット単位で比べられる)。
+        let mut half_beats = |n: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            f64::from(u32::try_from((seed >> 33) % n).unwrap_or(0)) / 2.0
+        };
+        let mut incoming: Vec<ChordEvent> =
+            (0..40u8).map(|i| ev(half_beats(24), half_beats(7), i % 12)).collect();
+        incoming.extend([ev(1.0, 1.0, 2), ev(7.0, 10.0, 3), ev(-1.0, 2.0, 4), ev(3.0, 0.0, 5), ev(f64::NAN, 1.0, 6)]);
+        let mut one_by_one = base.clone();
+        for c in incoming.clone() {
+            one_by_one.place_chord(c);
+        }
+        let mut batch = base.clone();
+        assert!(batch.place_chords(incoming));
+        assert_eq!(layout(&batch), layout(&one_by_one));
+        let ids: std::collections::HashSet<u32> = batch.chords.iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), batch.chords.len(), "id は重ならない");
+
+        // 何もかからない既存の箱 (拍 20) は id も値もそのまま。
+        let mut far = base.clone();
+        assert!(far.place_chords([ev(30.0, 2.0, 1)]));
+        let keep = |s: &Song| s.chords.iter().find(|c| c.start_beat == 20.0).cloned();
+        assert_eq!(keep(&far), keep(&base));
+        assert!(!far.place_chords([ev(3.0, 0.0, 5)]), "置ける箱が無ければ false");
     }
 }

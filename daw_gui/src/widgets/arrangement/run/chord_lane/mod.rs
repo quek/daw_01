@@ -8,8 +8,6 @@
 //! 箱の色は `widgets::chord_colors` (ピアノロール上端の帯と共有する SSoT)、コード名は
 //! `AppData::chord_label` (表記の SSoT) を通す。
 
-use std::sync::Arc;
-
 use daw_ui_renderer::{Color, Rect};
 
 use crate::app::AppData;
@@ -31,13 +29,14 @@ pub(in crate::widgets::arrangement) fn lane_h(app: &AppData) -> f32 {
     if app.cur.view.chord_band.visible { CHORD_LANE_H } else { 0.0 }
 }
 
-/// 箱 1 つの 1 フレーム分のビュー。
+/// 箱 1 つの 1 フレーム分のビュー。コード名は描く箱だけ描画時に引く (`draw::draw_box` — 見えていない箱の
+/// 文字列を毎フレーム作らない)。
 #[derive(Clone, Debug)]
 pub(in crate::widgets::arrangement) struct ChordBox {
     pub id: u32,
     pub start: f64,
     pub len: f64,
-    pub label: Arc<str>,
+    pub chord: common::model::Chord,
     pub fill: Color,
     pub ink: Color,
     pub selected: bool,
@@ -54,7 +53,8 @@ pub(in crate::widgets::arrangement) struct ChordLaneView {
 pub(in crate::widgets::arrangement) fn build_view(app: &AppData) -> ChordLaneView {
     let p = &app.theme.core;
     let song = app.cur.song_doc.song();
-    let selected = &app.cur.selection.selected_chord_ids;
+    // 選択の引きは集合で (箱数 × 選択数にしない)。
+    let selected: std::collections::HashSet<u32> = app.cur.selection.selected_chord_ids.iter().copied().collect();
     let boxes = song
         .chords
         .iter()
@@ -64,7 +64,7 @@ pub(in crate::widgets::arrangement) fn build_view(app: &AppData) -> ChordLaneVie
                 id: c.id,
                 start: c.start_beat,
                 len: c.len_beats,
-                label: Arc::from(app.chord_label(&c.chord, c.start_beat)),
+                chord: c.chord,
                 fill,
                 ink: chord_box_ink(p, fill),
                 selected: selected.contains(&c.id),
@@ -111,7 +111,7 @@ pub(in crate::widgets::arrangement) fn run(
     input::advance(ui, f);
     input::edge_scroll(ui, f);
     let (live, chord_released) = input::take(ui, f);
-    draw::draw(ui, f, &live, clip_over);
+    draw::draw(ui, app, f, &live, clip_over);
     input::release(ui, app, f, chord_released);
     input::double_click(ui, app, f);
     input::secondary_click(ui, f);
@@ -134,7 +134,7 @@ pub(in crate::widgets::arrangement) fn after_render(
         s.drag.clone()
     };
     if let Some(d) = drag {
-        handoff::draw_drop_ghost(ui, f, &d);
+        handoff::draw_drop_ghost(ui, app, f, &d);
     }
 }
 
