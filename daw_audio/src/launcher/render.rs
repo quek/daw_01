@@ -79,12 +79,8 @@ pub fn collect_row_midi<'p>(
             0 => (track.clips.as_slice(), index.track_clips(track_idx as usize), pitch),
             id => match index.track_cell(song, track_idx as usize, id) {
                 // r.md #157: セルのノートのコードは曲の playhead の位置で引く (区間の中では実効拍と曲の拍が同じ速さで
-                // 進むので、区間の先頭の差を足せばノートの開始の曲の拍になる)。
-                Some(cell) => (
-                    std::slice::from_ref(&cell.clip),
-                    None,
-                    pitch.with_song_beat_offset(playhead_beats + f64::from(seg.start_frame) * bpf - seg.beat),
-                ),
+                // 進むので、区間の差を足せばノートの開始の曲の拍になる。差は発火拍からの閉じた式 — buffer ごとに揺れない)。
+                Some(cell) => (std::slice::from_ref(&cell.clip), None, pitch.with_song_beat_offset(segment_offset(src, seg, playhead_beats, bpf))),
                 None => return,
             },
         };
@@ -145,7 +141,7 @@ pub fn render_row_audio<'p>(
         // r.md #157: セルのコードは曲の playhead の位置で引く (`collect_row_midi` と同じ)。
         let seg_pitch = match seg.cell_clip_id {
             0 => pitch,
-            _ => pitch.with_song_beat_offset(playhead_beats + f64::from(seg.start_frame) * bpf - seg.beat),
+            _ => pitch.with_song_beat_offset(segment_offset(src, seg, playhead_beats, bpf)),
         };
         render_audio_events(
             renderer,
@@ -161,6 +157,11 @@ pub fn render_row_audio<'p>(
             state,
         );
     });
+}
+
+/// 区間 `seg` の「曲の拍 − 実効拍」([`super::RowPhase::song_beat_offset`])。
+fn segment_offset(src: RowTimeSource, seg: super::RowSegment, playhead_beats: f64, bpf: f64) -> f64 {
+    phase_at_frame(src, seg.start_frame).song_beat_offset(playhead_beats + f64::from(seg.start_frame) * bpf, seg.beat)
 }
 
 /// 鳴っている note を `at` frame で全部止める (区間の切れ目の始末)。
@@ -604,6 +605,49 @@ mod tests {
             beat += bpf;
         }
         assert_eq!(ons, vec![69, 65]);
+    }
+
+    /// r.md #157: 3 連符の量子化で撃ったセル (発火拍が 2/3 拍の端数を持つ) でも、コードの箱の境界ちょうどに始まる
+    /// ノートは 1 回だけ鳴る。コードを引く拍を buffer ごとの「曲の拍 − 実効拍」から作っていたときは、引き算の丸めで
+    /// 箱の境界の前後を行き来し、伸びている間に鳴り直していた (20 回のはずが 21 / 43 / 113 回)。
+    /// (境界ちょうどのノートが引く箱は、今も浮動小数の丸めで境界の手前の箱になることがある — `Song::chord_at` に
+    /// 許容幅が無いため。毎 buffer 同じ箱を引くので鳴り直しはしない。)
+    #[test]
+    fn 端数の拍で撃ったセルの境界ちょうどのノートは鳴り直さない() {
+        use common::model::{Chord, ChordEvent, ChordFollow, ChordKind};
+        let mut song = song_with_cell();
+        let cid = song.tracks[0].session_clips[0].clip.content_id;
+        let notes: Vec<Note> = (0..4)
+            .map(|j| Note { id: j + 1, start_beat: f64::from(j) + 1.0 / 3.0, duration_beats: 0.5, pitch: 60, ..Note::default() })
+            .collect();
+        song.clip_contents.insert(cid, ClipContent::Midi(MidiContent { notes, next_note_id: 5 }));
+        song.tracks[0].follow_chords = ChordFollow::Parallel;
+        for b in 0..160u32 {
+            let root = if b % 2 == 0 { 0 } else { 2 };
+            song.place_chord(ChordEvent { id: 0, start_beat: f64::from(b), len_beats: 1.0, chord: Chord::new(root, ChordKind::Major), color: None });
+        }
+        let index = SongIndex::build(&song);
+        let bpf = 512.0 * 120.0 / (60.0 * 48_000.0);
+        let mut report = Vec::new();
+        for launch in [2.0 / 3.0, 8.0 / 3.0, 14.0 / 3.0, 20.0 / 3.0, 26.0 / 3.0, 2.0 / 3.0 + 40.0, 2.0 / 3.0 + 100.0] {
+            let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(launch));
+            let mut active = NoteLedger::default();
+            let mut ons: Vec<u8> = Vec::new();
+            let mut beat = launch;
+            while beat < launch + 20.0 - 1e-9 {
+                let mut out = Vec::with_capacity(256);
+                let pitch = crate::pitch_map::PitchMap::for_track(&song, &index, 0, 0);
+                collect_row_midi(Some(&song), &index, 0, src, 48_000, beat, 120.0, 512, pitch, &mut out, &mut active);
+                ons.extend(out.iter().filter_map(|e| match e.event {
+                    crate::sequencer::NoteTransition::On { key, .. } => Some(key),
+                    crate::sequencer::NoteTransition::Off { .. } => None,
+                }));
+                beat += bpf;
+            }
+            // 20 個のノートが 1 回ずつ。鍵盤は箱のコード (C = 60 / D = 62) のどちらか。
+            report.push((launch, ons.len() == 20 && ons.iter().all(|k| matches!(k, 60 | 62)), ons));
+        }
+        assert!(report.iter().all(|r| r.1), "撃った拍ごとの鍵盤 (各ノート 1 回): {report:?}");
     }
 
     /// r.md #132 が引き継いだ欠陥 (ランチャー側): 撃ったセルで鳴っている note を再生中に E で割ると、前半の片の

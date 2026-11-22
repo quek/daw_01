@@ -261,6 +261,8 @@ pub fn process_track_owned(
         });
     }
     scratch.state.pending_offs.clear();
+    // r.md #157: 再生中のコードの試聴の止める予約 (一括消音 / 試聴トラックの差し替え)。積めない分は次の buffer へ。
+    crate::chord_audition::drain_release(&mut scratch.chord_audition, &mut scratch.midi_bus_a);
     // 鍵盤レーン click のプレビュー note (engine の pump_commands が該当 track の
     // pending_preview に積む)。 transport に関係なく frame 0 で 1 回注入する
     // (instrument dispatch は playing で gate されないので停止中でも発音する)。

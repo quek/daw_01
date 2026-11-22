@@ -620,6 +620,15 @@ impl ProjectRt {
         // 必ず足りた状態で始まる。既存の行の走行状態を保ち、RT で確保も解放もしない
         // (`ScratchGrowth::install_into`)。押し出した Vec は recycle へ (drop は off-thread)。
         let retired_scratch = new.scratch_growth.take().map(|g| g.install_into(&mut self.scratch));
+        // r.md #157: 試聴の計画が替わったら、前の試聴トラックで鳴っている和音を止める / 移った行へ移す
+        // (新しい索引と、伸ばした scratch の後。旧計画は swap で `new` 側に居る)。
+        crate::chord_audition::hand_over(
+            &new.chord_audition,
+            &self.chord_audition,
+            &self.song_index,
+            &mut self.scratch,
+            !new.reset_song_scoped_state,
+        );
         // ランチャーの行の器 / 伸びる telemetry 面。旧器・旧面は recycle へ。
         new.launcher_growth = new.launcher_growth.take().map(|g| self.launcher.install_growth(g));
         if let Some(plane) = new.plane.take() {
@@ -2032,22 +2041,37 @@ mod bundle_install_tests {
     #[cfg(feature = "rt-assert")]
     #[test]
     fn refresh_bundle_does_not_allocate_on_the_audio_thread() {
+        use crate::chord_audition::{ChordAuditionPlan, drain_release, emit};
+        use common::model::{Chord, ChordEvent, ChordKind, Voicing};
         let (mut local, mut bundle_tx, _recycle_rx) = harness();
+        // r.md #157: 再生中のコードの試聴の計画も同じ便で差し替わる (計画は off-thread で組む)。
+        let audition = |song: &Arc<Song>, mut b: RtBundle| {
+            b.chord_audition = Arc::new(ChordAuditionPlan::build(Some(song), Some(1), Voicing::Basic));
+            b
+        };
+        let chord = ChordEvent { id: 0, start_beat: 0.0, len_beats: 8.0, chord: Chord::new(0, ChordKind::Major), color: None };
 
         let mut s1 = Song::default();
         s1.tracks.push(track(1));
+        s1.place_chord(chord.clone());
         let s1 = Arc::new(s1);
-        bundle_tx.push(make_bundle(&s1)).unwrap();
+        bundle_tx.push(audition(&s1, make_bundle(&s1))).unwrap();
         local.refresh_bundle(); // warm up (first install)
+        let mut bus = Vec::with_capacity(common::process_data::MAX_EVENTS);
+        let plan = Arc::clone(&local.chord_audition);
+        emit(&plan, &mut local.scratch[0].chord_audition, 0.0, 24_000.0, 512, 0, &mut bus);
+        assert_eq!(bus.len(), 4, "前提: 試聴トラックで和音が鳴っている");
 
+        // 前にトラックを挿す (試聴トラックは行 1 へ移り、鳴っている状態も移る)。
         let mut s2 = Song::default();
-        s2.tracks.push(track(1));
         s2.tracks.push(track(2));
+        s2.tracks.push(track(1));
+        s2.place_chord(chord);
         let s2 = Arc::new(s2);
-        bundle_tx.push(make_bundle(&s2)).unwrap();
+        bundle_tx.push(audition(&s2, make_bundle(&s2))).unwrap();
         // 値のみ更新を重ねて coalescing の畳み込み (`supersede`) も同じ
         // install で通す (畳み込みは move / Vec ポインタ swap のみ)。
-        bundle_tx.push(value_only(&s2)).unwrap();
+        bundle_tx.push(audition(&s2, value_only(&s2))).unwrap();
 
         // Steady-state install: pop the newest, adopt + swap the cached
         // fields, push the old to the recycle ring — all wait-free, no alloc,
@@ -2055,6 +2079,17 @@ mod bundle_install_tests {
         assert_no_alloc::assert_no_alloc(|| {
             local.refresh_bundle();
         });
+
+        // 試聴を外す (移った行の和音を止める予約) → 次の buffer の頭で Off、試聴の発音も確保しない。
+        bundle_tx.push(value_only(&s2)).unwrap();
+        let plan = Arc::clone(&local.chord_audition);
+        bus.clear();
+        assert_no_alloc::assert_no_alloc(|| {
+            emit(&plan, &mut local.scratch[1].chord_audition, 512.0 / 24_000.0, 24_000.0, 512, 0, &mut bus);
+            local.refresh_bundle();
+            drain_release(&mut local.scratch[1].chord_audition, &mut bus);
+        });
+        assert_eq!(bus.len(), 4, "移った行で鳴り続け (On なし)、外したら Off を出す: {bus:?}");
     }
 
     /// r.md #131: 無効にしたトラックの行は誰も書かない (手も op も無い) ので、schedule を差し込む瞬間に
@@ -2122,6 +2157,73 @@ mod bundle_install_tests {
             assert_eq!(offs(&local), vec![(voice, 60)], "停止を挟む: {with_stop}");
             assert!(local.scratch[0].state.active_notes.is_empty());
         }
+    }
+
+    /// r.md #157: 再生中のコードの試聴の計画が差し替わったら、前の試聴トラックで鳴っている和音を始末する
+    /// (鳴っている状態は行 = 位置が持ち、止める口は試聴トラックの行の `emit` と一括消音だけなので、差し替えで
+    /// 誰も止めなくなっていた)。
+    /// - 試聴トラックを 1 → 2 に替える: トラック 1 の行の次の buffer の頭で Off を出す。
+    /// - 前にトラックを挿す: 試聴トラック 1 は行 1 へ移る。鳴っている状態も移り、同じ C を鳴らし直さない。
+    /// - 試聴トラックを消す: 元の行で止める予約にする (楽器は居ないはずだが、知らない voice への Off は無害)。
+    #[test]
+    fn 試聴の計画を差し替えると前の試聴トラックの和音を止めるか移った行へ移す() {
+        use crate::chord_audition::{ChordAuditionPlan, drain_release, emit};
+        use common::model::{Chord, ChordEvent, ChordKind, Voicing};
+        let with_chord = |tracks: Vec<Track>| {
+            let mut s = Song { tracks, ..Song::default() };
+            s.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 8.0, chord: Chord::new(0, ChordKind::Major), color: None });
+            Arc::new(s)
+        };
+        let bundle_for = |song: &Arc<Song>, audition: Option<u32>| {
+            let mut b = make_bundle(song);
+            b.chord_audition = Arc::new(ChordAuditionPlan::build(Some(song), audition, Voicing::Basic));
+            b
+        };
+        // 行 `row` の次の buffer の MIDI: 止める予約の Off (バスの頭) + 試聴の On / Off。(On か, voice id)。
+        let next_buffer = |local: &mut ProjectRt, row: usize, beat: f64| {
+            let mut out = Vec::with_capacity(common::process_data::MAX_EVENTS);
+            let plan = Arc::clone(&local.chord_audition);
+            let voices = &mut local.scratch[row].chord_audition;
+            drain_release(voices, &mut out);
+            if plan.track_idx == u32::try_from(row).ok() {
+                emit(&plan, voices, beat, 24_000.0, 512, 0, &mut out);
+            }
+            out.iter()
+                .map(|e| match e.event {
+                    NoteTransition::On { note_id, .. } => (true, note_id),
+                    NoteTransition::Off { note_id, .. } => (false, note_id),
+                })
+                .collect::<Vec<_>>()
+        };
+        let song = with_chord(vec![track(1), track(2)]);
+        let start = |audition| {
+            let (mut local, mut tx, recycle) = harness();
+            tx.push(bundle_for(&song, audition)).unwrap();
+            local.refresh_bundle();
+            let ons = next_buffer(&mut local, 0, 0.0);
+            assert!(ons.len() == 4 && ons.iter().all(|e| e.0), "{ons:?}");
+            (local, tx, recycle, ons)
+        };
+        let beat = 512.0 / 24_000.0;
+
+        let (mut local, mut tx, _r, ons) = start(Some(1));
+        tx.push(bundle_for(&song, Some(2))).unwrap();
+        local.refresh_bundle();
+        let offs = next_buffer(&mut local, 0, beat);
+        assert_eq!(offs, ons.iter().map(|&(_, id)| (false, id)).collect::<Vec<_>>(), "同じ voice id で止める");
+        assert_eq!(next_buffer(&mut local, 1, beat).len(), 4, "新しい試聴トラックで鳴らす");
+
+        let (mut local, mut tx, _r, _) = start(Some(1));
+        tx.push(bundle_for(&with_chord(vec![track(3), track(1), track(2)]), Some(1))).unwrap();
+        local.refresh_bundle();
+        assert!(next_buffer(&mut local, 1, beat).is_empty(), "移った行で鳴り続ける (鳴らし直さない)");
+        assert!(next_buffer(&mut local, 0, beat).is_empty(), "前の行 (今は別のトラック) には送らない");
+
+        let (mut local, mut tx, _r, _) = start(Some(1));
+        tx.push(bundle_for(&with_chord(vec![track(2)]), Some(1))).unwrap();
+        local.refresh_bundle();
+        let offs = next_buffer(&mut local, 0, beat);
+        assert!(offs.len() == 4 && offs.iter().all(|e| !e.0), "消えたトラックの和音は元の行で止める: {offs:?}");
     }
 
     /// 組み込み Comp / EQ を持つ 2 track + 組み込み Bus Comp / Tone EQ の master。track 1 には追加の Comp も。

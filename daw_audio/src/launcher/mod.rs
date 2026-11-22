@@ -161,6 +161,25 @@ impl RowPhase {
         }
     }
 
+    /// 区間の「曲の拍 − 実効拍」(セルの拍を曲の拍へ戻す差。r.md #157: セルのノートのコードは曲の拍で引く)。
+    /// `song_beat` / `eff` は区間の先頭の曲の拍と実効拍で、周回 (何周目か) を決めるのにだけ使う。値は発火拍からの
+    /// 閉じた式 `launch_beat − cell_start_beat + 周回 × loop_len` — `song_beat − eff` をそのまま使うと、端数のある
+    /// 発火拍 (3 連符の量子化) で引き算の丸めが buffer ごとに数 ulp 揺れ、ループ端の吸着 (`snap_to_cell_origin`) では
+    /// 1 frame 未満ずれ、箱の境界ちょうどに始まるノートが buffer ごとに別のコードを引いて鳴り直す
+    /// (sequencer は伸びているノートの鍵盤を毎 buffer 引き直す)。`Arranger` / `Silent` は 0。
+    #[must_use]
+    pub fn song_beat_offset(self, song_beat: f64, eff: f64) -> f64 {
+        let Self::Cell { launch_beat, loop_len, cell_start_beat, looping, .. } = self else {
+            return 0.0;
+        };
+        let base = launch_beat - cell_start_beat;
+        if !looping || !is_positive(loop_len) {
+            return base;
+        }
+        let laps = ((song_beat - eff - base) / loop_len).round();
+        if laps.is_finite() { base + laps * loop_len } else { base }
+    }
+
     /// song 拍 `beat` におけるこの行の実効拍。`None` = この瞬間は無音。
     ///
     /// ワンショット (`looping == false`) は終端を越えたら `None` — セル窓の外なので

@@ -15,6 +15,24 @@ pub use crate::model::Voicing;
 /// 基本形のルートを置くオクターブの C (MIDI 鍵盤、C3 = 48)。
 pub const DEFAULT_VOICING_BASE: u8 = 48;
 
+/// コード 1 つを鳴らす鍵盤の数の上限 (どの voicing もこれを超えない)。基本形の形 = ベース 1 + 種類の音 + テンション
+/// 全部、が最大 (ピアノ / 自動は 12 の pitch class + ベース、ギターは 6 弦)。再生中の試聴 (daw_audio) は固定長の
+/// 配列で鍵盤を持つので、ここを超えない保証が要る。
+pub const MAX_CHORD_KEYS: usize = 1 + max_kind_tones() + Tensions::ALL.len();
+
+const fn max_kind_tones() -> usize {
+    let kinds = crate::model::ChordKind::ALL;
+    let (mut i, mut max) = (0, 0);
+    while i < kinds.len() {
+        let n = kinds[i].intervals().len();
+        if n > max {
+            max = n;
+        }
+        i += 1;
+    }
+    max
+}
+
 /// コード 1 つを鳴らす鍵盤の列 (昇順、重複なし、0..=127 に入るものだけ)。直前のコードを見ない形
 /// ([`voice_chord`] の `prev = None`)。
 ///
@@ -305,6 +323,32 @@ mod tests {
         // C7(b5): 5 度が b5 に置き換わる
         let c7b5 = Chord { tensions: Tensions::FLAT5, ..Chord::new(0, ChordKind::Dominant7) };
         assert_eq!(chord_pitches(&c7b5, Voicing::Basic, 48), vec![36, 48, 52, 54, 58]);
+    }
+
+    /// どの種類 × テンションの組み × ベース × voicing でも鍵盤の数は [`MAX_CHORD_KEYS`] 以下で、上限は
+    /// 実際に使い切られうる (テンションを全部載せた 4 和音は 12 音を超える)。
+    #[test]
+    fn every_voicing_fits_in_max_chord_keys() {
+        let mut most = 0usize;
+        let prev = chord_pitches(&Chord::new(0, ChordKind::Major), Voicing::Piano, 48);
+        for &kind in ChordKind::ALL {
+            for bits in 0..(1u16 << Tensions::ALL.len()) {
+                for root in 0..12u8 {
+                    for bass in [None, Some((root + 1) % 12)] {
+                        let chord = Chord { tensions: Tensions(bits), bass, ..Chord::new(root, kind) };
+                        let n = [Voicing::Basic, Voicing::Piano, Voicing::Guitar]
+                            .into_iter()
+                            .map(|v| chord_pitches(&chord, v, DEFAULT_VOICING_BASE).len())
+                            .chain((root % 6 == 0).then(|| voice_chord(&chord, Voicing::Adaptive, DEFAULT_VOICING_BASE, Some(&prev)).len()))
+                            .max()
+                            .unwrap_or(0);
+                        assert!(n <= MAX_CHORD_KEYS, "{chord:?}: {n} 音 > {MAX_CHORD_KEYS}");
+                        most = most.max(n);
+                    }
+                }
+            }
+        }
+        assert!(most > 12, "テンションを全部載せると 12 音を超える: {most}");
     }
 
     /// ギターはローポジションの開放の形 (C = x32010, Am = x02210, G = 320003 系) を選ぶ。
