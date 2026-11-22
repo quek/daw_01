@@ -25,7 +25,11 @@ pub use launcher::{CellIndex, CellSlice, LauncherRow, SessionCells};
 pub use params::{LaneView, ParamStore, ParamStoreIndex, ParamSubject, TargetRoutings};
 pub use ranges::{CoverIndex, EndTree, RangeIndex, Reaching};
 
-use crate::model::{ContentId, Device, NativeDevice, Parallel, ParallelChain, ParamStoreAt, Send, SessionClip, Song};use params::position;
+use crate::model::{
+    ChordFollow, ContentId, Device, NativeDevice, Parallel, ParallelChain, ParamStoreAt, Send, SessionClip, Song,
+    SourceChord, Track,
+};
+use params::position;
 
 /// トラック 1 本の索引。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -37,6 +41,8 @@ struct TrackIndex {
     enabled: bool,
     /// r.md #130: 移調に実効的に追従する (`Song::track_follows_transpose`、祖先グループまで辿った値)。
     follows_transpose: bool,
+    /// r.md #157: コードトラックへの実効の追従モード (曲全体のスイッチ込み。鳴る音が変わりえない曲では全部 `Off`)。
+    chord_follow: ChordFollow,
     /// `(send id, 位置)` を id 順に (同じ id は先頭だけ)。
     sends: Vec<(u32, u32)>,
     /// アレンジの clip `[start_beat, start_beat + length_beats)`。
@@ -58,6 +64,9 @@ pub struct SongIndex {
     nodes: nodes::NodeIndex,
     /// content id → MIDI の note `[start, start + duration)` / 読み上げの event `[start, start]` (content-local 拍)。
     contents: HashMap<ContentId, RangeIndex>,
+    /// r.md #157: 平行移動 / ベースで追従するトラックが鳴らす MIDI の content の、素材のコード
+    /// (`chord_follow::note_source_chords`、content-local 拍)。RT がノートから検出し直さないため。
+    source_chords: HashMap<ContentId, Vec<SourceChord>>,
     launcher: launcher::LauncherIndex,
 }
 
@@ -78,6 +87,8 @@ impl SongIndex {
     /// off-RT で作る (曲の要素数に比例)。
     #[must_use]
     pub fn build(song: &Song) -> Self {
+        let follow_applies = song.chord_follow_can_apply();
+        let chord_follow = |t: &Track| if follow_applies { song.track_chord_follow(t.id) } else { ChordFollow::Off };
         let tracks = song
             .tracks
             .iter()
@@ -87,6 +98,7 @@ impl SongIndex {
                 voicevox_vocal: t.is_voicevox_vocal(),
                 enabled,
                 follows_transpose,
+                chord_follow: chord_follow(t),
                 sends: id_positions(t.sends.iter().map(|s| s.id)),
                 clips: RangeIndex::build(t.clips.iter().map(|c| (c.start_beat, c.start_beat + c.length_beats))),
                 cells: CellIndex::build(t.session_clips.iter().map(|c| (c.clip.id, c.scene_id))),
@@ -106,6 +118,10 @@ impl SongIndex {
                 Some((id, ranges))
             })
             .collect();
+        let mut source_chords: HashMap<ContentId, Vec<SourceChord>> = HashMap::new();
+        for t in song.tracks.iter().filter(|t| matches!(chord_follow(t), ChordFollow::Parallel | ChordFollow::Bass)) {
+            crate::chord_follow::collect_source_chords(song, t, &mut source_chords);
+        }
         let mut index = Self {
             song: ParamStoreIndex::build(&song.song_lanes, &song.song_mod_routings),
             tracks,
@@ -113,6 +129,7 @@ impl SongIndex {
             scene_pos: id_positions(song.scenes.iter().map(|s| s.id)),
             nodes: nodes::NodeIndex::build(song),
             contents,
+            source_chords,
             launcher: launcher::LauncherIndex::default(),
         };
         index.launcher = launcher::LauncherIndex::build(song, &index);
@@ -165,6 +182,19 @@ impl SongIndex {
     #[must_use]
     pub fn follows_transpose(&self, track_idx: usize) -> bool {
         self.tracks.get(track_idx).is_some_and(|t| t.follows_transpose)
+    }
+
+    /// `tracks[track_idx]` のコードトラックへの実効の追従モード (`Song::track_chord_follow`。追従で鳴る音が
+    /// 変わりえない曲では `Off`)。
+    #[must_use]
+    pub fn chord_follow(&self, track_idx: usize) -> ChordFollow {
+        self.tracks.get(track_idx).map_or(ChordFollow::Off, |t| t.chord_follow)
+    }
+
+    /// content の素材のコード (content-local 拍、平行移動 / ベースで追従するトラックの content だけ)。
+    #[must_use]
+    pub fn source_chords(&self, content_id: ContentId) -> &[SourceChord] {
+        self.source_chords.get(&content_id).map_or(&[], Vec::as_slice)
     }
 
     /// `tracks[track_idx]` の send id の send。

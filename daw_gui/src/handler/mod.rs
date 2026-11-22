@@ -15,6 +15,7 @@ pub mod bypass_target;
 /// r.md #157: コードトラックの入口 (`AppEvent::Chord` / `ChordFollow` / `ChordTool`)。
 pub mod chord_event;
 pub mod chord_follow_event;
+pub mod chord_follow_view;
 pub mod chord_tool_event;
 pub mod clip_events;
 /// r.md #132 残件: クリップへの編集が効く範囲 = 窓に見えている片 (ひと続きは 1 つとして)。

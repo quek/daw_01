@@ -11,6 +11,7 @@ use common::process_data::MAX_EVENTS;
 use common::song_index::{RangeIndex, SongIndex};
 
 use crate::note_ledger::{NoteLedger, SoundingNote};
+use crate::pitch_map::PitchMap;
 
 /// note-on / note-off。 `note_id` は **発音台帳 ([`NoteLedger`]) が note-on ごとに振った
 /// voice id** で、off は on と同じ id を運ぶ (CLAP / VST3 は id で voice を探す)。 既定値は
@@ -310,12 +311,12 @@ fn emit_note_events(
 /// ループ端で割った区間の開始 frame を渡す。`playhead_beats` はその区間の実効拍。
 /// 割り方は `crate::launcher::render` が唯一の口 (ここには分岐を持ち込まない)。
 ///
-/// r.md #130: 鍵盤は `note.pitch + transpose` (`common::transpose::sounding_key`、範囲外は鳴らさない)。
-/// `transpose` は呼び出し側が buffer 頭で解いた曲の移調量で、追従しないトラックは 0。値が変わった窓では、
+/// r.md #130 / #157: 鍵盤は `pitch` の写像 (コードトラックへの追従 → 曲の移調、[`PitchMap::note_key`]、範囲外は
+/// 鳴らさない)。コードはノートの開始位置で決まる。移調量は呼び出し側が buffer 頭で解いた値。値が変わった窓では、
 /// 鳴っている note を台帳の鍵盤で止めて新しい鍵盤で鳴らし直す ([`emit_note_events`])。窓の終わりに、鳴らすべき
 /// note が見つからなかった台帳の発音を窓の先頭で止める ([`NoteLedger::release_unseen`])。
 #[allow(clippy::too_many_arguments)]
-pub fn collect_events_for_buffer(
+pub fn collect_events_for_buffer<'p>(
     song: Option<&Song>,
     // `song` と同じ snapshot の索引 (窓に掛かる clip / note / event だけを見るため)。
     index: &SongIndex,
@@ -328,10 +329,12 @@ pub fn collect_events_for_buffer(
     current_bpm: f32,
     frames: u32,
     time_offset: u32,
-    transpose: i32,
+    // r.md #130 / #157: 書いた音 → 鳴らす鍵盤 (追従 → 移調、`crate::pitch_map`)。`i32` は移調だけ。
+    pitch: impl Into<PitchMap<'p>>,
     out: &mut Vec<TimedNoteEvent>,
     ledger: &mut NoteLedger,
 ) {
+    let pitch: PitchMap<'p> = pitch.into();
     let Some(song) = song else { return };
     if song.tracks.get(track_idx as usize).is_none() || current_bpm <= 0.0 {
         return;
@@ -390,7 +393,7 @@ pub fn collect_events_for_buffer(
             if !clip.window_has_onset(note.start_beat) {
                 return;
             }
-            let key = common::transpose::sounding_key(note.pitch, transpose);
+            let key = pitch.note_key(clip.content_id, note.pitch, note.start_beat, clip.content_to_song_beat(note.start_beat));
             emit_note_events(win, clip, clip_end_beats, note, key, out, ledger);
         });
     });

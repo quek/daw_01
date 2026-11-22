@@ -17,6 +17,7 @@ use common::song_index::{LaneView, SongIndex};
 use super::{RowPhase, RowTimeSource, for_each_segment};
 use crate::audio_clip_renderer::{AudioClipRenderer, ClipRenderState, render_audio_events};
 use crate::note_ledger::NoteLedger;
+use crate::pitch_map::PitchMap;
 use crate::sequencer::{TimedNoteEvent, collect_events_for_buffer};
 
 /// この行の MIDI イベントを 1 buffer 分集める。
@@ -25,7 +26,7 @@ use crate::sequencer::{TimedNoteEvent, collect_events_for_buffer};
 /// セルの `clip.start_beat` は 0 なので、区間の実効拍をそのまま渡せば既存の
 /// クリップ窓の算術 (`content_window` / `content_to_song_beat`) がそのまま通る。
 #[allow(clippy::too_many_arguments)]
-pub fn collect_row_midi(
+pub fn collect_row_midi<'p>(
     song: Option<&Song>,
     // `song` と同じ snapshot の索引 (セル / clip / note を引く)。
     index: &SongIndex,
@@ -35,12 +36,13 @@ pub fn collect_row_midi(
     playhead_beats: f64,
     current_bpm: f32,
     frames: u32,
-    // r.md #130: この行の移調量 (半音、追従しないトラックは 0)。アレンジ区間もセルの区間も同じ値
-    // (移調は曲のタイムラインのパラメーターで、セルの位相には依らない)。
-    transpose: i32,
+    // r.md #130 / #157: この行の鳴らす音の写像 (追従 → 移調)。移調量はアレンジ区間もセルの区間も同じ値
+    // (曲のタイムラインのパラメーターで、セルの位相には依らない)。コードはセルの区間では曲の playhead の位置で引く。
+    pitch: impl Into<PitchMap<'p>>,
     out: &mut Vec<TimedNoteEvent>,
     active_notes: &mut NoteLedger,
 ) {
+    let pitch: PitchMap<'p> = pitch.into();
     let Some(song) = song else { return };
     let Some(track) = song.tracks.get(track_idx as usize) else { return };
     let bpf = beats_per_frame(current_bpm, sample_rate);
@@ -73,10 +75,16 @@ pub fn collect_row_midi(
         }
         prev = Some((seg.beat, seg.cell_clip_id));
         covered_to = seg.end_frame.min(frames);
-        let (clips, clip_ranges) = match seg.cell_clip_id {
-            0 => (track.clips.as_slice(), index.track_clips(track_idx as usize)),
+        let (clips, clip_ranges, seg_pitch) = match seg.cell_clip_id {
+            0 => (track.clips.as_slice(), index.track_clips(track_idx as usize), pitch),
             id => match index.track_cell(song, track_idx as usize, id) {
-                Some(cell) => (std::slice::from_ref(&cell.clip), None),
+                // r.md #157: セルのノートのコードは曲の playhead の位置で引く (区間の中では実効拍と曲の拍が同じ速さで
+                // 進むので、区間の先頭の差を足せばノートの開始の曲の拍になる)。
+                Some(cell) => (
+                    std::slice::from_ref(&cell.clip),
+                    None,
+                    pitch.with_song_beat_offset(playhead_beats + f64::from(seg.start_frame) * bpf - seg.beat),
+                ),
                 None => return,
             },
         };
@@ -91,7 +99,7 @@ pub fn collect_row_midi(
             current_bpm,
             seg.frames(),
             seg.start_frame,
-            transpose,
+            seg_pitch,
             out,
             active_notes,
         );
@@ -110,7 +118,7 @@ pub fn collect_row_midi(
 /// `render_audio_events` は出力へ **加算**するので、区間ごとに部分スライスを
 /// 渡してよい (ゼロ化は呼び出し側が buffer 全体に 1 回だけ行う)。
 #[allow(clippy::too_many_arguments)]
-pub fn render_row_audio(
+pub fn render_row_audio<'p>(
     renderer: &AudioClipRenderer,
     track_idx: usize,
     src: RowTimeSource,
@@ -120,10 +128,11 @@ pub fn render_row_audio(
     current_bpm: f32,
     sample_rate: u32,
     frames: u32,
-    // r.md #130: この行の移調量 (半音、追従しないトラックは 0)。
-    transpose: i32,
+    // r.md #130 / #157: この行の鳴らす音の写像 (追従 → 移調)。
+    pitch: impl Into<PitchMap<'p>>,
     state: &mut ClipRenderState<'_>,
 ) {
+    let pitch: PitchMap<'p> = pitch.into();
     let bpf = beats_per_frame(current_bpm, sample_rate);
     let n = frames as usize;
     for_each_segment(src, playhead_beats, bpf, frames, |seg| {
@@ -133,6 +142,11 @@ pub fn render_row_audio(
         }
         #[allow(clippy::cast_possible_truncation)]
         let seg_frames = (b - a) as u32;
+        // r.md #157: セルのコードは曲の playhead の位置で引く (`collect_row_midi` と同じ)。
+        let seg_pitch = match seg.cell_clip_id {
+            0 => pitch,
+            _ => pitch.with_song_beat_offset(playhead_beats + f64::from(seg.start_frame) * bpf - seg.beat),
+        };
         render_audio_events(
             renderer,
             track_idx,
@@ -143,7 +157,7 @@ pub fn render_row_audio(
             current_bpm,
             sample_rate,
             seg_frames,
-            transpose,
+            seg_pitch,
             state,
         );
     });
@@ -557,6 +571,39 @@ mod tests {
             .collect();
         assert_eq!(offs.as_slice(), &[0], "切り替えの瞬間に Off が出ない: {out:?}");
         assert!(active.is_empty(), "鳴っている note が残った: {active:?}");
+    }
+
+    /// r.md #157: セルのノートは、撃ったときの **曲の playhead の位置** のコードに追従する (セルの拍ではない)。
+    /// 拍 8 で撃ったセルの頭の G は曲の拍 8 の Am で A に、セルの拍 2 の E は曲の拍 10 の F で F に寄る。
+    #[test]
+    fn セルのノートは曲の_playhead_の位置のコードに追従する() {
+        use common::model::{Chord, ChordEvent, ChordFollow, ChordKind};
+        let mut song = song_with_cell();
+        let cid = song.tracks[0].session_clips[0].clip.content_id;
+        if let Some(ClipContent::Midi(m)) = song.clip_contents.get_mut(&cid) {
+            m.notes[0].pitch = 67;
+        }
+        song.tracks[0].follow_chords = ChordFollow::Narrow;
+        for (start, root, kind) in [(8.0, 9, ChordKind::Minor), (10.0, 5, ChordKind::Major)] {
+            song.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: 2.0, chord: Chord::new(root, kind), color: None });
+        }
+        let index = SongIndex::build(&song);
+        let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(8.0));
+        let bpf = 512.0 * 120.0 / (60.0 * 48_000.0);
+        let mut active = NoteLedger::default();
+        let mut ons: Vec<u8> = Vec::new();
+        let mut beat = 8.0_f64;
+        while beat < 10.5 {
+            let mut out = Vec::with_capacity(256);
+            let pitch = crate::pitch_map::PitchMap::for_track(&song, &index, 0, 0);
+            collect_row_midi(Some(&song), &index, 0, src, 48_000, beat, 120.0, 512, pitch, &mut out, &mut active);
+            ons.extend(out.iter().filter_map(|e| match e.event {
+                crate::sequencer::NoteTransition::On { key, .. } => Some(key),
+                crate::sequencer::NoteTransition::Off { .. } => None,
+            }));
+            beat += bpf;
+        }
+        assert_eq!(ons, vec![69, 65]);
     }
 
     /// r.md #132 が引き継いだ欠陥 (ランチャー側): 撃ったセルで鳴っている note を再生中に E で割ると、前半の片の

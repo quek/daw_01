@@ -42,6 +42,8 @@ impl Song {
     /// - **移調 0 で焼く** (r.md #130 確定仕様 Q8): 焼いた音は元のトラック / 新しいトラックでもう一度移調に
     ///   追従するので、移調を焼き込むと二重に移調される。「外に出すもの (WAV / SMF) = 鳴る音、プロジェクトの
     ///   中に作るもの = 書いた音」。基準値を 0 にし、移調のレーンと変調も外す (深さの変調は下の掃除が連鎖で外す)。
+    /// - **コードトラックへの追従を切って焼く** (r.md #157、移調と同じ理由): 曲全体のスイッチを切る
+    ///   (トラックのモードは残す — 焼いた音を置くトラックへ写すのは呼び出し側)。
     #[must_use]
     pub fn isolated_track(&self, track_id: u32) -> Option<Song> {
         let mut kept = self.track_by_id(track_id)?.clone();
@@ -62,6 +64,7 @@ impl Song {
         isolated.transpose = 0;
         isolated.song_lanes.retain(|l| l.target != AutomationTarget::SongTranspose);
         isolated.song_mod_routings.retain(|r| r.target != AutomationTarget::SongTranspose);
+        isolated.chord_follow_enabled = false;
         isolated.prune_dangling_refs();
         Some(isolated)
     }
@@ -180,6 +183,7 @@ impl Song {
     /// - 行き先: 同じ親 group の、元トラックの subtree の直後に置く。
     /// - 移調への追従 (r.md #130 確定仕様 Q8): 元トラックの `follow_transpose` を写す。焼いた音は移調 0 なので、
     ///   元が追従しない (ドラム等) なら新しいトラックも追従しない — 写さないと既定の「追従」で焼いた音だけが移調される。
+    ///   コードトラックへの追従のモード (r.md #157 `follow_chords`) も同じく写す。
     /// - 元トラックを読む配線 (SC / follower) は付け替えない — 元トラックは鳴り続けるので、付け替えると残りの音を
     ///   失う。
     pub fn place_bounce_with_fx(&mut self, source: ClipKey, name: String, clip: Clip) -> Option<u32> {
@@ -203,6 +207,8 @@ impl Song {
             next_lane_id: src.next_lane_id,
             mod_routings,
             follow_transpose: src.follow_transpose,
+            // r.md #157: コードトラックへの追従も元と同じ (焼いた音は追従を切った書いた音)。
+            follow_chords: src.follow_chords,
             ..Track::default()
         };
         track.place_clip(clip);

@@ -15,7 +15,7 @@
 //!
 //! wire に載らないロジックだけを持つ (`common/build.rs` の `WIRE_SOURCES` 対象外)。RT 安全 (確保・ロックなし)。
 
-use crate::model::{Chord, ChordFollow, ChordKind, Song};
+use crate::model::{Chord, ChordFollow, ChordKind, Song, SourceChord};
 use crate::scale::{Scale, ScaleChange};
 
 /// pitch class `from` を `to` へ合わせる最短の移動量 (半音、`-6..=5`)。ちょうど 6 半音は下へ。
@@ -118,6 +118,39 @@ pub fn follow_pitch(
         }
         ChordFollow::Narrow => Some(snap_to_mask(pitch, target.pitch_class_mask())),
         ChordFollow::Scale => Some(snap_to_mask(pitch, chord_scale_mask(target, key))),
+    }
+}
+
+/// MIDI の content (ノート列) が **もともと鳴らしているコード** の区間 (content-local 拍)。平行移動 / ベースの
+/// 基準 ([`TrackChordFollow::key`] の `source`) を引く元で、engine の索引 (`SongIndex`) と off-RT の読み口
+/// (VOICEVOX / SMF / GUI) が同じこれを通す。ミュートしたノートは数えない。検出の設定は既定
+/// ([`crate::chord_detect::DetectOptions::default`]) に固定する (経路ごとに違う基準を引かないため)。
+#[must_use]
+pub fn note_source_chords(notes: &[crate::model::Note]) -> Vec<SourceChord> {
+    let detect: Vec<crate::chord_detect::DetectNote> = notes
+        .iter()
+        .filter(|n| !n.muted)
+        .map(|n| crate::chord_detect::DetectNote { start_beat: n.start_beat, len_beats: n.duration_beats, pitch: n.pitch })
+        .collect();
+    crate::chord_detect::detect_chords(&detect, &crate::chord_detect::DetectOptions::default())
+}
+
+/// トラック `track` が鳴らす MIDI の content (アレンジのクリップとランチャーのセル) の素材のコードを `out` へ足す
+/// (既にある content は検出し直さない)。engine の索引 (`SongIndex`) と off-RT の読み口
+/// (`crate::transpose::TrackTranspose`) が同じこれで集める。
+pub fn collect_source_chords(
+    song: &Song,
+    track: &crate::model::Track,
+    out: &mut std::collections::HashMap<crate::model::ContentId, Vec<SourceChord>>,
+) {
+    let clips = track.clips.iter().chain(track.session_clips.iter().map(|c| &c.clip));
+    for clip in clips {
+        if out.contains_key(&clip.content_id) {
+            continue;
+        }
+        if let Some(notes) = song.clip_contents.get(&clip.content_id).and_then(|c| c.notes()) {
+            out.insert(clip.content_id, note_source_chords(notes));
+        }
     }
 }
 

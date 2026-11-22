@@ -48,6 +48,7 @@ mod native_dsp;
 mod note_ledger;
 mod offline_jobs;
 mod output_render;
+mod pitch_map;
 mod project_ctl;
 mod sampler;
 mod sequencer;

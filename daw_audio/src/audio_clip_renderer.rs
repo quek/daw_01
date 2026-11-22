@@ -29,6 +29,7 @@ use common::model::{
     clamp_semitones, FORMANT_SEMITONES_LIMIT, PITCH_SEMITONES_LIMIT,
 };
 
+use crate::pitch_map::PitchMap;
 use crate::stretch_engine::StretchEngine;
 
 /// Decoded sample buffer for a single `AudioSource`. Planar storage
@@ -135,7 +136,8 @@ pub struct RenderedEvent {
     /// `0.0` かつ tape / slice mode なら DSP は完全バイパスされる。
     pub formant_semitones: f32,
     /// r.md #130: この event がグローバルトランスポーズで **0 以外に移調されうる**か (compile 時に確定:
-    /// トラックが追従し、かつ曲の移調が 0 以外になりうる `Song::transpose_can_be_nonzero`)。
+    /// トラックが追従し、かつ曲の移調が 0 以外になりうる `Song::transpose_can_be_nonzero`)。r.md #157: コードトラックに
+    /// 追従するトラックの event も立つ (`Song::chord_follow_can_apply` && トラックのモードが Off 以外)。
     /// tape / slice の event でもスペクトルエンジンを用意しておく条件で、実際に移調するかは render 時の
     /// 移調量で決まる (0 の間は従来どおり完全バイパス)。
     pub transposable: bool,
@@ -392,8 +394,11 @@ pub fn compile_audio_schedule(
     // r.md #130: 移調が 0 のままの曲はエンジンを 1 基も増やさない。
     let may_transpose = song.transpose_can_be_nonzero();
     let follows = song.follows_transpose_mask();
+    // r.md #157: コードトラックに追従するトラックも移動されうる (箱もスイッチも無い曲は 1 基も増やさない)。
+    let chords_apply = song.chord_follow_can_apply();
     for (track_idx, track) in song.tracks.iter().enumerate().filter(|&(i, _)| enabled[i]) {
-        let transposable = may_transpose && follows[track_idx];
+        let follows_chords = chords_apply && !song.track_chord_follow(track.id).is_off();
+        let transposable = (may_transpose && follows[track_idx]) || follows_chords;
         // 隣接の突き合わせ表は張り出しを要求するクリップがあるトラックだけ作る (要求ゼロが普通)。
         let neighbors = track
             .clips
@@ -879,7 +884,7 @@ pub struct ClipRenderState<'a> {
 /// audio clip output bypasses the instrument and joins the FX chain
 /// input alongside it, see §13 Q6).
 #[allow(clippy::too_many_arguments)]
-pub fn render_audio_events(
+pub fn render_audio_events<'p>(
     renderer: &AudioClipRenderer,
     track_idx: usize,
     // r.md #87: この行が今どこから鳴っているか。`0` = アレンジのクリップ列、
@@ -894,9 +899,11 @@ pub fn render_audio_events(
     // r.md #130: この行の移調量 (半音、追従しないトラックは 0)。**長さと位置を変えずに**音程だけを動かす —
     // Stretch はスペクトルエンジンの移調に足し、tape / slice は素の出力をエンジンで移調する (テープ式に
     // 読む速度を変えると鳴る長さが変わるため)。波形の描画 (`event_wave_spans`) は長さが変わらないので影響しない。
-    track_transpose: i32,
+    // r.md #157: コードトラックへの追従の移動量も同じ経路に足す (`PitchMap::audio_semitones`、buffer ごとの今の位置)。
+    pitch: impl Into<PitchMap<'p>>,
     state: &mut ClipRenderState<'_>,
 ) {
+    let pitch: PitchMap<'p> = pitch.into();
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
     }
@@ -1050,8 +1057,6 @@ pub fn render_audio_events(
         // 変わらない) か、pool 上限超過 / 配送待ちの degrade。 degrade した Stretch は
         // 下の tape 経路を **ピッチ比なし**の伸縮率で通るので、長さと拍同期は保たれ、
         // 伸縮率 1.0 近傍 (= 大多数) では正しい出力と一致する。
-        // compile 時に移調されうると決まった event だけが移調を受ける (容量計画と食い違う値は捨てる)。
-        let transpose = if event.transposable { track_transpose } else { 0 };
         // この buffer の先頭出力サンプルに対応する take-local beat。 playhead_beats は engine が
         // 積分した真の拍位置なので、buffer を跨いでも tempo が変わっても連続。
         let first_beat = playhead_beats + first_i as f64 / samples_per_beat - event.origin_beat;
@@ -1061,6 +1066,14 @@ pub fn render_audio_events(
             StreamAt { key: event.stream_key, el_start, du: time_stride, u: stretch_map(el_start) }
         } else {
             StreamAt { key: event.stream_key, el_start, du: 1.0, u: el_start as f64 }
+        };
+        // compile 時に移調されうると決まった event だけが移調 / 追従を受ける (容量計画と食い違う値は捨てる)。
+        let transpose = if event.transposable {
+            let pos = if event.stretch_mode == StretchMode::Stretch { at.u } else { el_start as f64 * effective_pitch_ratio };
+            let source_frame = crate::pitch_map::event_source_frame(event, pos);
+            pitch.audio_semitones(event.source_id, source_frame, first_beat + event.origin_beat)
+        } else {
+            0
         };
         let engine = if render_uses_engine(event, transpose) {
             acquire_engine(state.engines, at, render_seq)
