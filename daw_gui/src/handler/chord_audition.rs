@@ -65,8 +65,26 @@ impl AppData {
     /// `on_tick` から毎ティック: 試聴の期限、オーディオのコード検出の回収と自動発注。
     pub(crate) fn chord_tools_tick(&mut self) {
         self.expire_chord_audition(false);
+        self.sync_chord_playback_audition();
         self.poll_chord_detection();
         self.auto_detect_followed_audio();
+    }
+
+    /// 「再生中も鳴らす」を engine へ (値が変わったときだけ)。鳴らすトラックは ON で試聴トラックがある
+    /// ときだけ。鍵盤は engine が Song のコードから組むので、ここが送るのは設定だけ (Song に載せない)。
+    pub(crate) fn sync_chord_playback_audition(&mut self) {
+        let view = self.cur.chord_tools.view;
+        let track_id = if view.audition_while_playing { self.chord_audition_track() } else { None };
+        let want = (track_id, view.voicing);
+        if self.cur.chord_tools.sent_playback == Some(want) {
+            return;
+        }
+        self.cur.chord_tools.sent_playback = Some(want);
+        self.send_audio(common::protocol::AudioCommand::SetChordAudition {
+            project: self.pk(),
+            track_id,
+            voicing: view.voicing,
+        });
     }
 
     /// 曲を差し替えたとき: 試聴音を止め、旧 Song の音源 id 宛の検出を捨てる (音源 id は曲ごとに採番し直す)。

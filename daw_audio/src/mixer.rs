@@ -26,6 +26,8 @@ pub struct TrackScratch {
     pub midi_bus_b: Vec<TimedNoteEvent>,
     /// Stuck-note tracking + queued offs for next buffer.
     pub state: PerTrackState,
+    /// r.md #157: 試聴トラックの行で鳴らしているコード (`crate::chord_audition`、固定長)。
+    pub chord_audition: crate::chord_audition::ChordAuditionVoices,
     pub peak_l: f32,
     pub peak_r: f32,
     /// Set during dispatch: `muted || (any_solo && !solo)`. The reduce step
@@ -108,6 +110,7 @@ impl TrackScratch {
             // 一致させる。 `queue_all_notes_off` は台帳の全件を `pending_offs` へ積むので、
             // ここをそれ未満にすると RT realloc が起きる。
             state: PerTrackState::with_capacity(MAX_EVENTS),
+            chord_audition: crate::chord_audition::ChordAuditionVoices::default(),
             peak_l: 0.0,
             peak_r: 0.0,
             effective_mute: false,
@@ -375,6 +378,7 @@ fn queue_notes_off(s: &mut TrackScratch) {
         }
     }
     state.active_notes.clear();
+    crate::chord_audition::queue_off(&mut s.chord_audition, &mut state.pending_offs);
 }
 
 #[cfg(test)]

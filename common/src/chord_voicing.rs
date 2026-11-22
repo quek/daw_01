@@ -9,30 +9,8 @@
 use crate::chord_detect::{DetectNote, DetectOptions, detect_chords};
 use crate::model::{Chord, ChordEvent, Clip, ClipContent, MidiContent, Note, Song, Tensions};
 
-/// コードを鍵盤にする並べ方 (Cubase の Voicings: Piano / Guitar / Basic + Adaptive Voicings)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
-pub enum Voicing {
-    /// 基本形: ベース音を 1 オクターブ下に 1 つ、その上にルートから積む (Studio One のノート化と同じ形)。
-    #[default]
-    Basic,
-    /// ピアノ: 左手にベース音 1 つ、右手に構成音を密集位置で (`base` の 5 度上から) 積む。
-    Piano,
-    /// ギター: 標準調弦 (E A D G B E) の 6 弦で、ローポジションから押さえられる形を選ぶ。
-    Guitar,
-    /// 自動: 直前のコードからの声部の動きが最小になる転回形を選ぶ (Cubase の Adaptive Voicings)。
-    /// 直前が無ければピアノと同じ。
-    Adaptive,
-}
-
-impl Voicing {
-    /// 見出し側の選択肢の並び (全種類) と表示名。
-    pub const ALL: &'static [(Voicing, &'static str)] = &[
-        (Voicing::Basic, "基本形"),
-        (Voicing::Piano, "ピアノ"),
-        (Voicing::Guitar, "ギター"),
-        (Voicing::Adaptive, "自動 (声部を滑らかに)"),
-    ];
-}
+/// 型は「再生中も鳴らす」の設定として wire を渡るので `crate::model` (`chords.rs`、`WIRE_SOURCES`) に置く。
+pub use crate::model::Voicing;
 
 /// 基本形のルートを置くオクターブの C (MIDI 鍵盤、C3 = 48)。
 pub const DEFAULT_VOICING_BASE: u8 = 48;

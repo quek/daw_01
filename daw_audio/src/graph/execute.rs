@@ -280,6 +280,10 @@ pub fn process_track_owned(
             &mut scratch.midi_bus_a,
             &mut scratch.state.active_notes,
         );
+        // r.md #157: 再生中のコードの試聴 (live だけ計画がある。試聴トラックの行にコードの On / Off を足す)。
+        if let Some(plan) = native_io.chord_audition.filter(|p| p.track_idx == Some(track_idx)) {
+            crate::chord_audition::emit_into_bus(plan, scratch, playhead_beats, current_bpm, sample_rate, frames, transpose);
+        }
     }
     // r.md #117: この track の最新ノート (`Note` 起点のソースを global に落とす起点)。
     {

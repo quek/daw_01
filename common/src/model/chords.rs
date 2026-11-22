@@ -322,6 +322,33 @@ pub struct AudioChordSpan {
     pub chord: Chord,
 }
 
+/// コードを鍵盤にする並べ方 (Cubase の Voicings: Piano / Guitar / Basic + Adaptive Voicings)。
+/// 鍵盤の決め方は `crate::chord_voicing::voice_chord`。試聴の設定 (`AudioCommand::SetChordAudition`)
+/// として wire を渡るのでここに置く (Song には載らない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Encode, Decode)]
+pub enum Voicing {
+    /// 基本形: ベース音を 1 オクターブ下に 1 つ、その上にルートから積む (Studio One のノート化と同じ形)。
+    #[default]
+    Basic,
+    /// ピアノ: 左手にベース音 1 つ、右手に構成音を密集位置で (`base` の 5 度上から) 積む。
+    Piano,
+    /// ギター: 標準調弦 (E A D G B E) の 6 弦で、ローポジションから押さえられる形を選ぶ。
+    Guitar,
+    /// 自動: 直前のコードからの声部の動きが最小になる転回形を選ぶ (Cubase の Adaptive Voicings)。
+    /// 直前が無ければピアノと同じ。
+    Adaptive,
+}
+
+impl Voicing {
+    /// 見出し側の選択肢の並び (全種類) と表示名。
+    pub const ALL: &'static [(Voicing, &'static str)] = &[
+        (Voicing::Basic, "基本形"),
+        (Voicing::Piano, "ピアノ"),
+        (Voicing::Guitar, "ギター"),
+        (Voicing::Adaptive, "自動 (声部を滑らかに)"),
+    ];
+}
+
 /// トラックがコードトラックにどう追従するか (r.md #157 Q2 / Q6)。既定は追従しない。
 ///
 /// 非破壊 — ノートのデータは書き換えず、鳴らす音だけが変わる。評価は

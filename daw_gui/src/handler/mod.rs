@@ -28,6 +28,8 @@ pub mod chord_tool_event;
 pub mod chord_audition;
 /// r.md #157: オーディオ音源からのコード検出の発注と回収。
 pub mod chord_audio;
+/// r.md #157: MIDI 鍵盤で弾いた和音をコードに (帯の録音 / Instrument Input)。
+pub mod chord_capture;
 pub mod clip_events;
 /// r.md #132 残件: クリップへの編集が効く範囲 = 窓に見えている片 (ひと続きは 1 つとして)。
 pub mod clip_window;
