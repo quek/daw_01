@@ -9,7 +9,7 @@
 //!
 //! wire に載らないロジックだけを持つ (`common/build.rs` の `WIRE_SOURCES` 対象外)。
 
-use crate::model::{Chord, ChordKind, SourceChord, Spelling, Tensions};
+use crate::model::{AudioChordSpan, Chord, ChordKind, SourceChord, Spelling, Tensions};
 
 /// 検出の設定 (Cubase の Create Chord Events ダイアログに相当)。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -159,6 +159,16 @@ pub fn detect_chords(notes: &[DetectNote], opts: &DetectOptions) -> Vec<SourceCh
 #[must_use]
 pub fn source_chord_at(spans: &[SourceChord], beat: f64) -> Option<&Chord> {
     let i = spans.partition_point(|s| s.start_beat <= beat);
+    spans.get(i.saturating_sub(1)).map(|s| &s.chord)
+}
+
+/// 音源のフレーム `frame` でオーディオ素材が鳴らしているコード ([`source_chord_at`] のオーディオ版: 覆う区間、
+/// 無ければ直前、それも無ければ最初)。`spans` は `Song.audio_chords[source_id]` (`start_frame` 昇順)。
+///
+/// RT 安全 (二分探索、確保なし)。
+#[must_use]
+pub fn audio_chord_at(spans: &[AudioChordSpan], frame: u64) -> Option<&Chord> {
+    let i = spans.partition_point(|s| s.start_frame <= frame);
     spans.get(i.saturating_sub(1)).map(|s| &s.chord)
 }
 

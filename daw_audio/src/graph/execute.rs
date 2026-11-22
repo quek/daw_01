@@ -195,6 +195,11 @@ pub fn process_track_owned(
 ) {
     let n = frames as usize;
     let transpose = if index.follows_transpose(track_idx as usize) { song_transpose } else { 0 };
+    // r.md #157: 書いた音 → 鳴らす音 (コードトラックへの追従 → 移調)。追従の実効モードは索引に焼いてある。
+    let pitch = match song {
+        Some(song) => crate::pitch_map::PitchMap::for_track(song, index, track_idx as usize, transpose),
+        None => transpose.into(),
+    };
     // r.md #129: SC Listen の置換要求は program の実行開始時に消す (GWI は pass 1 の開始 = ここ。
     // pass 2 の `run_group_fx_chain` は prefix で立った要求を PostFx 点で消費する)。
     program.listen_pending = None;
@@ -276,7 +281,7 @@ pub fn process_track_owned(
             playhead_beats,
             current_bpm,
             frames,
-            transpose,
+            pitch,
             &mut scratch.midi_bus_a,
             &mut scratch.state.active_notes,
         );
@@ -317,7 +322,7 @@ pub fn process_track_owned(
             current_bpm,
             sample_rate,
             frames,
-            transpose,
+            pitch,
             &mut crate::audio_clip_renderer::ClipRenderState {
                 repitch_accum: &mut scratch.repitch_accum,
                 engines: &mut scratch.stretch_engines,
@@ -1599,5 +1604,76 @@ mod render_master_tests {
         assert_eq!(render(&song, &none)[0], vec![55]);
         let recording = std::collections::HashSet::from([(common::model::MASTER_TRACK_ID, AutomationTarget::SongTranspose)]);
         assert_eq!(render(&song, &recording)[0], vec![62]);
+    }
+
+    /// r.md #157: 共有の 1 buffer の描画で、コードトラックの Am の上の C の 3 和音は、トラックのモードどおりの鍵盤で
+    /// 鳴り、そのあと曲の移調 (+2) が足される (順序は 追従 → 移調)。平行移動の素材のコードはノートから検出した C。
+    /// 曲全体のスイッチを切ると、モードを残したまま書いた音 (+ 移調) に戻る。
+    #[test]
+    fn chord_follow_then_transpose_in_the_shared_render() {
+        use common::model::{Chord, ChordEvent, ChordFollow, ChordKind, Clip, ClipContent, MidiContent, Note};
+        let mut song = Song { transpose: 2, ..Song::default() };
+        let content_id = song.alloc_content_id();
+        let notes: Vec<Note> = [60u8, 64, 67]
+            .iter()
+            .zip(1u32..)
+            .map(|(&pitch, id)| Note { id, start_beat: 0.0, duration_beats: 2.0, pitch, velocity: 100, lyric: None, muted: false })
+            .collect();
+        song.clip_contents.insert(content_id, ClipContent::Midi(MidiContent { notes, next_note_id: 4 }));
+        let clip = Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id, ..Clip::default() };
+        let modes = [ChordFollow::Off, ChordFollow::Parallel, ChordFollow::Narrow];
+        song.tracks = modes
+            .iter()
+            .zip(1u32..)
+            .map(|(&mode, id)| {
+                track(|t| {
+                    t.id = id;
+                    t.follow_chords = mode;
+                    t.clips = vec![clip.clone()];
+                })
+            })
+            .collect();
+        song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: Chord::new(9, ChordKind::Minor), color: None });
+        let render = |song: &Song| {
+            let mut schedule = compile_schedule_for_test(song, 48_000, 0).unwrap();
+            let mut scratch: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();
+            let (mut l, mut r) = (vec![0.0f32; 64], vec![0.0f32; 64]);
+            let _ = render_master_buffer(
+                song,
+                &SongIndex::build(song),
+                &mut schedule,
+                &mut scratch,
+                &HashMap::new(),
+                None,
+                &crate::audio_clip_renderer::AudioClipRenderer::empty(),
+                &mut l,
+                &mut r,
+                48_000,
+                64,
+                true,
+                LoopRegion::default(),
+                &std::collections::HashSet::new(),
+                120.0,
+                0.0,
+                ModTickPlaneRef::default(),
+                FollowerDrive::default(),
+                &RowSourceTable::default(),
+                1.0,
+                &mut MasterLimiterState::new(),
+                NativeIo::default(),
+            );
+            scratch
+                .iter()
+                .map(|s| {
+                    let mut keys: Vec<u8> = s.state.active_notes.iter().map(|n| n.key).collect();
+                    keys.sort_unstable();
+                    keys
+                })
+                .collect::<Vec<Vec<u8>>>()
+        };
+        // Off: 書いた音 + 2。平行移動: C → A (-3) してから +2。最寄りのコード音: G → A、C / E はそのまま、それから +2。
+        assert_eq!(render(&song), vec![vec![62, 66, 69], vec![59, 63, 66], vec![62, 66, 71]]);
+        song.chord_follow_enabled = false;
+        assert_eq!(render(&song), vec![vec![62, 66, 69]; 3]);
     }
 }

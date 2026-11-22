@@ -17,6 +17,7 @@ use common::song_index::{LaneView, SongIndex};
 use super::{RowPhase, RowTimeSource, for_each_segment};
 use crate::audio_clip_renderer::{AudioClipRenderer, ClipRenderState, render_audio_events};
 use crate::note_ledger::NoteLedger;
+use crate::pitch_map::PitchMap;
 use crate::sequencer::{TimedNoteEvent, collect_events_for_buffer};
 
 /// この行の MIDI イベントを 1 buffer 分集める。
@@ -25,7 +26,7 @@ use crate::sequencer::{TimedNoteEvent, collect_events_for_buffer};
 /// セルの `clip.start_beat` は 0 なので、区間の実効拍をそのまま渡せば既存の
 /// クリップ窓の算術 (`content_window` / `content_to_song_beat`) がそのまま通る。
 #[allow(clippy::too_many_arguments)]
-pub fn collect_row_midi(
+pub fn collect_row_midi<'p>(
     song: Option<&Song>,
     // `song` と同じ snapshot の索引 (セル / clip / note を引く)。
     index: &SongIndex,
@@ -35,12 +36,13 @@ pub fn collect_row_midi(
     playhead_beats: f64,
     current_bpm: f32,
     frames: u32,
-    // r.md #130: この行の移調量 (半音、追従しないトラックは 0)。アレンジ区間もセルの区間も同じ値
-    // (移調は曲のタイムラインのパラメーターで、セルの位相には依らない)。
-    transpose: i32,
+    // r.md #130 / #157: この行の鳴らす音の写像 (追従 → 移調)。移調量はアレンジ区間もセルの区間も同じ値
+    // (曲のタイムラインのパラメーターで、セルの位相には依らない)。コードはセルの区間では曲の playhead の位置で引く。
+    pitch: impl Into<PitchMap<'p>>,
     out: &mut Vec<TimedNoteEvent>,
     active_notes: &mut NoteLedger,
 ) {
+    let pitch: PitchMap<'p> = pitch.into();
     let Some(song) = song else { return };
     let Some(track) = song.tracks.get(track_idx as usize) else { return };
     let bpf = beats_per_frame(current_bpm, sample_rate);
@@ -73,10 +75,16 @@ pub fn collect_row_midi(
         }
         prev = Some((seg.beat, seg.cell_clip_id));
         covered_to = seg.end_frame.min(frames);
-        let (clips, clip_ranges) = match seg.cell_clip_id {
-            0 => (track.clips.as_slice(), index.track_clips(track_idx as usize)),
+        let (clips, clip_ranges, seg_pitch) = match seg.cell_clip_id {
+            0 => (track.clips.as_slice(), index.track_clips(track_idx as usize), pitch),
             id => match index.track_cell(song, track_idx as usize, id) {
-                Some(cell) => (std::slice::from_ref(&cell.clip), None),
+                // r.md #157: セルのノートのコードは曲の playhead の位置で引く (区間の中では実効拍と曲の拍が同じ速さで
+                // 進むので、区間の先頭の差を足せばノートの開始の曲の拍になる)。
+                Some(cell) => (
+                    std::slice::from_ref(&cell.clip),
+                    None,
+                    pitch.with_song_beat_offset(playhead_beats + f64::from(seg.start_frame) * bpf - seg.beat),
+                ),
                 None => return,
             },
         };
@@ -91,7 +99,7 @@ pub fn collect_row_midi(
             current_bpm,
             seg.frames(),
             seg.start_frame,
-            transpose,
+            seg_pitch,
             out,
             active_notes,
         );
@@ -110,7 +118,7 @@ pub fn collect_row_midi(
 /// `render_audio_events` は出力へ **加算**するので、区間ごとに部分スライスを
 /// 渡してよい (ゼロ化は呼び出し側が buffer 全体に 1 回だけ行う)。
 #[allow(clippy::too_many_arguments)]
-pub fn render_row_audio(
+pub fn render_row_audio<'p>(
     renderer: &AudioClipRenderer,
     track_idx: usize,
     src: RowTimeSource,
@@ -120,10 +128,11 @@ pub fn render_row_audio(
     current_bpm: f32,
     sample_rate: u32,
     frames: u32,
-    // r.md #130: この行の移調量 (半音、追従しないトラックは 0)。
-    transpose: i32,
+    // r.md #130 / #157: この行の鳴らす音の写像 (追従 → 移調)。
+    pitch: impl Into<PitchMap<'p>>,
     state: &mut ClipRenderState<'_>,
 ) {
+    let pitch: PitchMap<'p> = pitch.into();
     let bpf = beats_per_frame(current_bpm, sample_rate);
     let n = frames as usize;
     for_each_segment(src, playhead_beats, bpf, frames, |seg| {
@@ -133,6 +142,11 @@ pub fn render_row_audio(
         }
         #[allow(clippy::cast_possible_truncation)]
         let seg_frames = (b - a) as u32;
+        // r.md #157: セルのコードは曲の playhead の位置で引く (`collect_row_midi` と同じ)。
+        let seg_pitch = match seg.cell_clip_id {
+            0 => pitch,
+            _ => pitch.with_song_beat_offset(playhead_beats + f64::from(seg.start_frame) * bpf - seg.beat),
+        };
         render_audio_events(
             renderer,
             track_idx,
@@ -143,7 +157,7 @@ pub fn render_row_audio(
             current_bpm,
             sample_rate,
             seg_frames,
-            transpose,
+            seg_pitch,
             state,
         );
     });
