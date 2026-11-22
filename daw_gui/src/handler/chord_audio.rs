@@ -4,7 +4,8 @@
 //!   [`AppData::auto_detect_followed_audio`] (追従を ON にしたオーディオトラックで、未検出の音源)。
 //! - 検出: `crate::chord_audio_detect::detect_audio_chords` を音源ごとに 1 本の thread で (重い FFT)。
 //! - 回収: `on_tick` → [`AppData::poll_chord_detection`] が終わった結果を
-//!   `ChordToolEvent::SetAudioChords` (保存 + 帯への配置を 1 undo step) で Song へ入れる。
+//!   `ChordToolEvent::SetAudioChords` で Song へ入れる。検出結果 (`Song.audio_chords`) は音源から決まる
+//!   派生データなので undo に積まない (`SongDoc::write_derived`)。帯に置く箱だけが undo step になる。
 //!
 //! 窓の格子はクリップの置き方から作る: 曲の拍 `window_beats` 刻みの境界を音源のフレームへ写す
 //! ([`audio_detect_grid`])。音源は複数のクリップから使われうるが、保存は音源ごと 1 つ
@@ -81,7 +82,8 @@ impl AppData {
         if self.cur.chord_tools.detect_jobs.is_empty() {
             return;
         }
-        let mut done: Vec<(AudioSourceId, Vec<AudioChordSpan>, Vec<(u32, u32)>)> = Vec::new();
+        // (音源, 区間, 帯にも置くクリップ)。
+        let mut done = Vec::new();
         self.cur.chord_tools.detect_jobs.retain(|job| match job.rx.try_recv() {
             Ok(spans) => {
                 done.push((job.source_id, spans, job.place_on.clone()));
@@ -159,26 +161,37 @@ impl AppData {
         let sr = self.cur.media.audio_source_cache.get(source_id).map(|b| b.sample_rate).or_else(|| {
             self.cur.song_doc.song().media.audio_sources.get(&source_id).map(|s| s.sample_rate)
         });
-        self.edit_song_checked(|song| {
+        // 検出結果は音源から決まる派生データ: 履歴の全 Song に書き、undo step も `*` も作らない
+        // (`SongDoc::write_derived` の doc — 履歴に積むと自動検出と undo が堂々巡りする)。
+        let stored = self.cur.song_doc.write_derived(|song| {
             if !song.media.audio_sources.contains_key(&source_id) {
                 return false;
             }
-            let mut changed = false;
-            let old = song.audio_chords.get(&source_id).map_or(&[][..], Vec::as_slice);
-            if old != spans.as_slice() {
-                if spans.is_empty() {
-                    song.audio_chords.remove(&source_id);
-                } else {
-                    song.audio_chords.insert(source_id, spans.clone());
-                }
-                changed = true;
+            if song.audio_chords.get(&source_id).map_or(&[][..], Vec::as_slice) == spans.as_slice() {
+                return false;
             }
+            if spans.is_empty() {
+                song.audio_chords.remove(&source_id);
+            } else {
+                song.audio_chords.insert(source_id, spans.clone());
+            }
+            true
+        });
+        if stored.is_none() {
+            return; // 書き出し中 (理由は status に出る)
+        }
+        // 帯に置く箱はユーザーの編集 (「コードを抽出」 / ドロップの 1 undo step)。
+        if place_on.is_empty() {
+            return;
+        }
+        self.edit_song_checked(|song| {
+            let mut placed = false;
             for &(track_id, clip_id) in place_on {
                 for c in chords_on_clip(song, track_id, clip_id, source_id, &spans, sr.unwrap_or(48_000)) {
-                    changed |= song.place_chord(c).is_some();
+                    placed |= song.place_chord(c).is_some();
                 }
             }
-            changed
+            placed
         });
     }
 }
@@ -245,4 +258,38 @@ fn chords_on_clip(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use common::model::{AudioChordSpan, AudioSource, AudioSourcePath, Chord, ChordKind};
+
+    /// 検出結果は undo に積まず `*` も立てない。後の編集を undo しても消えない (消えると自動検出し直して
+    /// redo が消え、手前へ戻れなくなる)。
+    #[test]
+    fn detected_chords_stay_out_of_the_undo_history() {
+        let mut app = crate::test_support::headless_app();
+        let source_id = 7;
+        app.edit_song(|song| {
+            song.media.audio_sources.insert(source_id, AudioSource {
+                path: AudioSourcePath::Absolute("x.wav".into()),
+                sample_rate: 48_000,
+                channels: 1,
+                frames: 96_000,
+                original_bpm: None,
+                root_key: None,
+            });
+        });
+        app.cur.song_doc.mark_saved();
+        let depth = app.cur.song_doc.undo_depth();
+        let spans = vec![AudioChordSpan { start_frame: 0, end_frame: 48_000, chord: Chord::new(9, ChordKind::Minor) }];
+        app.set_audio_chords(source_id, spans.clone(), &[]);
+        assert_eq!(app.cur.song_doc.undo_depth(), depth, "undo step を作らない");
+        assert!(!app.cur.song_doc.is_dirty(), "`*` を立てない");
+        // 検出より後の編集を undo すると、検出より前に積んだ snapshot に戻る — そこにも検出結果が入っている。
+        app.edit_song(|song| song.bpm = 90.0);
+        app.handle_event(crate::event::AppEvent::Undo);
+        assert_eq!(app.cur.song_doc.song().bpm, 120.0);
+        assert_eq!(app.cur.song_doc.song().audio_chords.get(&source_id), Some(&spans), "undo しても残る");
+    }
 }

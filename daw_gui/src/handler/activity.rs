@@ -47,6 +47,9 @@ impl AppData {
             // (OS のサインアウト / プラグインエディタにフォーカスがある状態の
             // Ctrl+Q) でも表示が凍らないよう、他の進捗表示と同じ扱いにする。
             || self.shutdown.is_draining()
+            // r.md #157: オーディオのコード検出中は status に「コードを検出中…」が出ていて、終わったら帯に
+            // 置く (回収は on_tick)。
+            || !self.cur.chord_tools.detect_jobs.is_empty()
     }
 
     /// transport が走っているか (再生 or 録音)。

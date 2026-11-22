@@ -67,7 +67,7 @@ impl AppData {
                 .and_then(|clip| song.clip_contents.get(&clip.content_id))
                 .is_some_and(|content| content.audio_events().is_some())
         };
-        let (audio, midi): (Vec<(u32, u32)>, Vec<(u32, u32)>) = clips.iter().copied().partition(is_audio);
+        let (audio, midi): (Vec<_>, Vec<_>) = clips.iter().copied().partition(is_audio);
         if !midi.is_empty() {
             self.extract_midi_chords(&midi, self.cur.chord_tools.view.detect.window_beats);
         }
