@@ -62,6 +62,7 @@ pub mod window_placement;
 pub mod track_inspector;
 pub mod track_picker;
 pub mod transport;
+mod transport_chord;
 pub mod voicevox_overlay;
 
 /// 右クリックメニューの排他選択項目に ✓ を付けたラベルを作る
