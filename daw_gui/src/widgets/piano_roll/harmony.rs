@@ -114,7 +114,7 @@ impl Harmony {
                 _ => Some(n.pitch),
             };
             let fit = enabled
-                .then(|| song.chord_at(n.start_beat))
+                .then(|| song.chord_at_onset(n.start_beat))
                 .flatten()
                 .zip(sounds)
                 .map(|(ev, p)| classify(song, &ev.chord, p, n.start_beat));

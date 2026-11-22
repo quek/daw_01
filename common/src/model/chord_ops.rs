@@ -12,6 +12,10 @@ use super::*;
 /// 箱として残す最小の長さ (拍)。これ未満に削られた箱は消す。
 const MIN_CHORD_LEN_BEATS: f64 = 1e-6;
 
+/// 発音の開始位置で箱を引くときの許容幅 (拍)。浮動小数の丸め (1e-13 程度) より十分大きく、箱の最小の長さより
+/// 小さい (最小の箱を飛び越さない)。48 kHz / 120 BPM の 1 sample は約 4e-5 拍なので、聞こえる差にはならない。
+const CHORD_ONSET_EPS_BEATS: f64 = MIN_CHORD_LEN_BEATS / 4.0;
+
 /// 箱の色を値域へ (`0.0..=1.0` の linear RGB)。非有限の成分があれば既定色 (`None`) に倒す。
 fn sanitize_chord_color(color: Option<[f32; 3]>) -> Option<[f32; 3]> {
     color.filter(|rgb| rgb.iter().all(|v| v.is_finite())).map(|rgb| rgb.map(|v| v.clamp(0.0, 1.0)))
@@ -97,6 +101,16 @@ impl Song {
         let i = self.chords.partition_point(|c| c.start_beat <= beat);
         let c = self.chords.get(i.checked_sub(1)?)?;
         (beat < c.end_beat()).then_some(c)
+    }
+
+    /// 拍 `beat` で **始まる発音** (ノート) が従う箱。箱の境界ちょうどに置いたノートの拍は、3 連符の位置や
+    /// clip の原点との足し引きで浮動小数の丸めが入り、境界の数 ulp 手前に出ることがある — そのまま
+    /// [`Self::chord_at`] で引くと前の箱のコードで鳴る。境界の直前 ([`CHORD_ONSET_EPS_BEATS`] 以内) は次の箱として引く。
+    /// 次の箱が無ければ (箱の終わりの直前で、後ろが空白) そのままの位置の箱。
+    /// 追従の評価 (`crate::chord_follow`) と「鳴る音」の表示が同じこれを通す (engine と GUI で引く箱を揃える)。
+    #[must_use]
+    pub fn chord_at_onset(&self, beat: f64) -> Option<&ChordEvent> {
+        self.chord_at(beat + CHORD_ONSET_EPS_BEATS).or_else(|| self.chord_at(beat))
     }
 
     /// `beat` より後に始まる最初の箱 (「次のコード」の表示用)。
@@ -450,6 +464,13 @@ mod tests {
         assert_eq!(song.chord_at(2.0).map(|c| c.chord.root), Some(9));
         assert_eq!(song.chord_at(16.0), None);
         assert_eq!(song.next_chord_after(12.5).map(|c| c.chord.root), Some(7));
+        // 発音の開始で引く: 境界の 1 ulp 手前 (3 連符の位置の丸め) は次の箱、後ろが空白なら今の箱。
+        let before = |b: f64| f64::from_bits(b.to_bits() - 1);
+        assert_eq!(song.chord_at(before(2.0)).map(|c| c.chord.root), Some(0));
+        assert_eq!(song.chord_at_onset(before(2.0)).map(|c| c.chord.root), Some(9));
+        assert_eq!(song.chord_at_onset(1.0).map(|c| c.chord.root), Some(0));
+        assert_eq!(song.chord_at_onset(before(16.0)).map(|c| c.chord.root), song.chord_at(before(16.0)).map(|c| c.chord.root));
+        assert_eq!(song.chord_at_onset(16.0), None);
     }
 
     /// まとめて動かすと相対位置を保ち、動かなかった箱だけが削られる。0 より左へは行かない。

@@ -206,7 +206,7 @@ impl<'a> TrackChordFollow<'a> {
         if self.mode.is_off() {
             return Some(pitch);
         }
-        let Some(ev) = self.song.chord_at(song_beat) else { return Some(pitch) };
+        let Some(ev) = self.song.chord_at_onset(song_beat) else { return Some(pitch) };
         follow_pitch(self.mode, pitch, &ev.chord, source, self.song.scale_at(song_beat))
     }
 
