@@ -31,40 +31,9 @@ pub(super) fn draw(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>, live: &Li
         }
         push_filled_rect(hctx, f.chord_rect, style.arranger_lane_bg);
         hctx.with_clip_rect(f.chord_rect, |hctx| {
-            // 動かしている箱は base から外して最後に描く (重なる相手に食われない — 帯の 2 パスと同じ)。
-            let moving: Vec<u32> = match &resolved {
-                Some(Resolved::Move { ids, duplicate: false, .. }) => ids.clone(),
-                Some(Resolved::Spans(spans)) => spans.iter().map(|s| s.0).collect(),
-                _ => Vec::new(),
-            };
-            for b in f.chord.boxes.iter().filter(|b| !moving.contains(&b.id)) {
-                draw_box(hctx, b, box_rect(b.start, b.len, f), style);
-            }
-            match &resolved {
-                Some(Resolved::Move { ids, delta, duplicate }) => {
-                    for b in f.chord.boxes.iter().filter(|b| ids.contains(&b.id)) {
-                        let r = box_rect(b.start + delta, b.len, f);
-                        if *duplicate {
-                            push_filled_rect(hctx, r, style.arranger_preview_fill);
-                            push_section_border(hctx, r, style.clip_border, 1.0);
-                        } else {
-                            draw_box(hctx, b, r, style);
-                        }
-                    }
-                }
-                Some(Resolved::Spans(spans)) => {
-                    for &(id, start, len) in spans {
-                        if let Some(b) = f.chord.boxes.iter().find(|b| b.id == id) {
-                            draw_box(hctx, b, box_rect(start, len, f), style);
-                        }
-                    }
-                }
-                None => {}
-            }
+            draw_boxes(hctx, f, resolved.as_ref());
             if let Some((a, b)) = range {
-                let r = box_rect(a, b - a, f);
-                push_filled_rect(hctx, r, style.arranger_preview_fill);
-                push_section_border(hctx, r, style.clip_border, 1.0);
+                preview(hctx, box_rect(a, b - a, f), style);
             }
             if clip_over {
                 push_filled_rect(hctx, f.chord_rect, style.arranger_preview_fill);
@@ -72,6 +41,38 @@ pub(super) fn draw(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>, live: &Li
             }
         });
     });
+}
+
+/// 箱を描く。動かしている箱は base から外して最後に描く (重なる相手に食われない — Arranger 帯の 2 パスと同じ)。
+/// 複製 (Ctrl) は元を残し、複製先に半透明のゴーストを出す。
+fn draw_boxes(hctx: &mut HeavyCtx<'_, '_, AppData>, f: &ArrangementFrame<'_>, resolved: Option<&Resolved>) {
+    let style = f.style;
+    let moved: Vec<(u32, f64, f64)> = match resolved {
+        Some(Resolved::Move { ids, delta, duplicate: false }) => {
+            f.chord.boxes.iter().filter(|b| ids.contains(&b.id)).map(|b| (b.id, b.start + delta, b.len)).collect()
+        }
+        Some(Resolved::Spans(spans)) => spans.clone(),
+        _ => Vec::new(),
+    };
+    for b in f.chord.boxes.iter().filter(|b| !moved.iter().any(|m| m.0 == b.id)) {
+        draw_box(hctx, b, box_rect(b.start, b.len, f), style);
+    }
+    for &(id, start, len) in &moved {
+        if let Some(b) = f.chord.boxes.iter().find(|b| b.id == id) {
+            draw_box(hctx, b, box_rect(start, len, f), style);
+        }
+    }
+    if let Some(Resolved::Move { ids, delta, duplicate: true }) = resolved {
+        for b in f.chord.boxes.iter().filter(|b| ids.contains(&b.id)) {
+            preview(hctx, box_rect(b.start + delta, b.len, f), style);
+        }
+    }
+}
+
+/// 半透明のゴースト (複製先 / 範囲)。
+fn preview(hctx: &mut HeavyCtx<'_, '_, AppData>, r: Rect, style: &ArrangementStyle) {
+    push_filled_rect(hctx, r, style.arranger_preview_fill);
+    push_section_border(hctx, r, style.clip_border, 1.0);
 }
 
 fn draw_box(hctx: &mut HeavyCtx<'_, '_, AppData>, b: &ChordBox, r: Rect, style: &ArrangementStyle) {
