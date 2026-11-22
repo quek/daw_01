@@ -378,7 +378,8 @@ fn queue_notes_off(s: &mut TrackScratch) {
         }
     }
     state.active_notes.clear();
-    crate::chord_audition::queue_off(&mut s.chord_audition, &mut state.pending_offs);
+    // 試聴の和音は自分の予約で持つ (台帳が満杯でも `pending_offs` の容量で捨てない。`chord_audition::drain_release`)。
+    s.chord_audition.release_all();
 }
 
 #[cfg(test)]
