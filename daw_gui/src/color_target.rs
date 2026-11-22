@@ -35,4 +35,7 @@ pub enum ColorPickerTarget {
     ParallelChain(u64),
     /// Parallel 自体の色 (`Parallel::id`、 括弧の帯)。 開始行の帯 click / 右クリックから。
     Parallel(u64),
+    /// r.md #157: コードトラックの箱 (`ChordEvent::id`)。帯の右クリックから開き、選んだ色は
+    /// その時点の選択 (右クリックした箱を含む) 全部に付く。
+    Chord(u32),
 }

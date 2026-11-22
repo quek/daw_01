@@ -18,6 +18,10 @@ pub mod chord_event;
 pub mod chord_band;
 /// r.md #157 Q4: コードのポップアップの操作。
 pub mod chord_popup;
+/// r.md #157: 帯の箱の Copy / Cut / Paste / 複製。
+pub mod chord_clipboard;
+/// r.md #157: コード進行プリセットと帯の右クリックメニューの口。
+pub mod chord_preset;
 pub mod chord_follow_event;
 pub mod chord_tool_event;
 pub mod clip_events;

@@ -1459,6 +1459,10 @@ pub enum FileDialogKind {
         clip: ClipKey,
         position_in_clip_beats: f64,
     },
+    /// r.md #157: コード進行プリセット (`.chords`) の保存先。保存する箱の id。
+    SaveChordPreset { ids: Vec<u32> },
+    /// r.md #157: 挿入するコード進行プリセット。置く位置 (拍)。
+    InsertChordPreset { at: f64 },
 }
 
 /// `spawn_file_dialog` が走らせる rfd dialog の呼び出し種別。

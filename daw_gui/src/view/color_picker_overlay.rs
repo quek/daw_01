@@ -77,6 +77,12 @@ pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
                 .map(|rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
                 .unwrap_or(app.theme.core.text_dim)
         }),
+        // r.md #157: 未設定の箱は帯と同じ既定色 (`chord_box_fill`) を初期値に見せる。
+        ColorPickerTarget::Chord(id) => app
+            .cur.song_doc
+            .song()
+            .chord_by_id(id)
+            .map(|c| crate::widgets::chord_colors::chord_box_fill(&app.theme.core, c)),
     };
 
     let Some(current) = current else {
@@ -115,6 +121,7 @@ pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
             ColorPickerTarget::Parallel(parallel_id) => {
                 app.handle_event(AppEvent::Device(DeviceEvent::SetParallelColor { parallel_id, color: Some(rgb) }));
             }
+            ColorPickerTarget::Chord(id) => app.set_selected_chord_color(id, Some(rgb)),
         }));
     }
     if r.dismissed {
@@ -139,5 +146,6 @@ fn target_id_hash(target: ColorPickerTarget) -> u64 {
         ColorPickerTarget::Scene(id) => (1u64 << 61) | id as u64,
         ColorPickerTarget::ParallelChain(id) => (1u64 << 58) ^ id,
         ColorPickerTarget::Parallel(id) => (1u64 << 57) ^ id,
+        ColorPickerTarget::Chord(id) => (1u64 << 56) | u64::from(id),
     }
 }
