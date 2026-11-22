@@ -573,6 +573,39 @@ mod tests {
         assert!(active.is_empty(), "鳴っている note が残った: {active:?}");
     }
 
+    /// r.md #157: セルのノートは、撃ったときの **曲の playhead の位置** のコードに追従する (セルの拍ではない)。
+    /// 拍 8 で撃ったセルの頭の G は曲の拍 8 の Am で A に、セルの拍 2 の E は曲の拍 10 の F で F に寄る。
+    #[test]
+    fn セルのノートは曲の_playhead_の位置のコードに追従する() {
+        use common::model::{Chord, ChordEvent, ChordFollow, ChordKind};
+        let mut song = song_with_cell();
+        let cid = song.tracks[0].session_clips[0].clip.content_id;
+        if let Some(ClipContent::Midi(m)) = song.clip_contents.get_mut(&cid) {
+            m.notes[0].pitch = 67;
+        }
+        song.tracks[0].follow_chords = ChordFollow::Narrow;
+        for (start, root, kind) in [(8.0, 9, ChordKind::Minor), (10.0, 5, ChordKind::Major)] {
+            song.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: 2.0, chord: Chord::new(root, kind), color: None });
+        }
+        let index = SongIndex::build(&song);
+        let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(8.0));
+        let bpf = 512.0 * 120.0 / (60.0 * 48_000.0);
+        let mut active = NoteLedger::default();
+        let mut ons: Vec<u8> = Vec::new();
+        let mut beat = 8.0_f64;
+        while beat < 10.5 {
+            let mut out = Vec::with_capacity(256);
+            let pitch = crate::pitch_map::PitchMap::for_track(&song, &index, 0, 0);
+            collect_row_midi(Some(&song), &index, 0, src, 48_000, beat, 120.0, 512, pitch, &mut out, &mut active);
+            ons.extend(out.iter().filter_map(|e| match e.event {
+                crate::sequencer::NoteTransition::On { key, .. } => Some(key),
+                crate::sequencer::NoteTransition::Off { .. } => None,
+            }));
+            beat += bpf;
+        }
+        assert_eq!(ons, vec![69, 65]);
+    }
+
     /// r.md #132 が引き継いだ欠陥 (ランチャー側): 撃ったセルで鳴っている note を再生中に E で割ると、前半の片の
     /// Off はもう窓を過ぎていて出ず、後ろの片は chase で同じ鍵盤をもう一度 On していた。今は割った次の区間の
     /// 先頭で前半の片を止めて後ろの片を鳴らし、セルのループ端を跨いでも鳴っている数と On / Off の差が合う。
