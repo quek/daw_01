@@ -50,6 +50,12 @@ impl AppData {
     /// 扱う)。移調量は playhead の位置のレーン値 + engine が publish した変調 — 再生と同じ
     /// `common::transpose::transpose_in_clip` を通る。追従しないトラックは弾いた鍵盤のまま、範囲外は `None`。
     pub(crate) fn preview_key(&self, track_id: u32, pitch: u8) -> Option<u8> {
+        self.transposed_preview_key(track_id, pitch)
+    }
+
+    /// [`Self::preview_key`] のうち **移調だけ** (コードへの追従を通さない)。コードの試聴
+    /// (`handler::chord_audition`) は書いた音のコードをそのまま鳴らすので、こちらを使う。
+    pub(crate) fn transposed_preview_key(&self, track_id: u32, pitch: u8) -> Option<u8> {
         let song = self.cur.song_doc.song();
         if !song.track_follows_transpose(track_id) {
             return Some(pitch);

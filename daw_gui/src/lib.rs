@@ -42,6 +42,8 @@ pub mod event_sampler;
 pub mod event_audio_device;
 /// r.md #157: コードトラックのイベント (`AppEvent::Chord` / `ChordFollow` / `ChordTool` の中身)。
 pub mod event_chord;
+/// r.md #157: オーディオ音源からのコード検出 (chroma → `match_chord`、off-thread で呼ぶ)。
+pub mod chord_audio_detect;
 /// Arranger セクション帯の編集 (`AppEvent::Section` の中身)。
 pub mod event_section;
 /// r.md #132: 分割 / 結合キーのイベント (`AppEvent::SplitJoin` の中身)。

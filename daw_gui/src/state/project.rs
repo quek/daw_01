@@ -770,7 +770,7 @@ pub struct ProjectEphemeral {
     /// modal が開いており、 宛先選択 or 閉じる操作で `None` に戻る。
     /// plugin picker の `is_plugin_picker_open` と同 idiom。
     pub send_picker: Option<SendPickerState>,
-    /// r.md #157: コードトラックの帯のポップアップ / 右クリックメニュー。
+    /// r.md #157: コードトラックの帯のポップアップ / 右クリックメニュー / 帯の位置の mirror。
     pub chord_band: crate::state::chord_band::ChordBandEphemeral,
 }
 
@@ -810,6 +810,8 @@ pub struct ProjectState {
     pub launcher: LauncherUiState,
     /// r.md #54: 範囲ラウドネス解析の進行とレポート (session-only)。
     pub loudness: LoudnessState,
+    /// r.md #157: コードの試聴 / voicing / 検出 / 録音 (`handler::chord_audition` ほか)。
+    pub chord_tools: super::chord_tools::ChordToolsState,
     /// 子プロセスとの帳簿 (device_id keyed)。
     pub pipc: ProjectIpc,
     /// VOICEVOX / 口パクの per-project 状態。
@@ -848,6 +850,7 @@ impl ProjectState {
             key,
             // r.md #54: 解析はセッション限りなので既定 (Idle / レポート無し)。
             loudness: LoudnessState::default(),
+            chord_tools: super::chord_tools::ChordToolsState::default(),
             song_doc: SongDoc::new(song),
             transport: TransportState::new(initial_peak_display),
             selection: SelectionState {

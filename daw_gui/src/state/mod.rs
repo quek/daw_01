@@ -37,6 +37,8 @@ pub mod virtual_keyboard;
 pub mod audio_device;
 /// r.md #157: コードトラックの帯の表示状態とポップアップ。
 pub mod chord_band;
+/// r.md #157: コードの試聴 / voicing / 検出 / 録音の、タブごとの状態。
+pub mod chord_tools;
 
 pub use loudness::{LoudnessPhase, LoudnessState};
 pub use project::{ProjectEphemeral, ProjectIpc, ProjectState, ProjectView, ProjectVoicevox};

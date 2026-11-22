@@ -148,6 +148,7 @@ impl AppData {
             open_rack_panels,
             chord_lane_hidden: !self.cur.view.chord_band.visible,
             chord_notation: self.cur.view.chord_band.notation,
+            chord_tools: self.cur.chord_tools.view,
         }
     }
 
@@ -235,6 +236,7 @@ impl AppData {
         self.cur.view.piano_roll_fold = v.piano_roll_fold;
         self.cur.view.snap_on_draw = v.snap_on_draw;
         self.cur.recording.snap_live_input = v.snap_live_input;
+        self.restore_chord_tools_view(v.chord_tools);
         self.cur.view.bottom_panel = v.bottom_panel;
         // r.md #87: ランチャー帯。負の値 / NaN は「未設定」へ潰し、widget の既定幅に任せる
         // (壊れた保存値で帯が消える / 画面外へ飛ぶのを防ぐ)。

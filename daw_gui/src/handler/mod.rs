@@ -24,6 +24,10 @@ pub mod chord_clipboard;
 pub mod chord_preset;
 pub mod chord_follow_event;
 pub mod chord_tool_event;
+/// r.md #157: コードの試聴 (試聴トラックへ voicing どおりのプレビュー音)。
+pub mod chord_audition;
+/// r.md #157: オーディオ音源からのコード検出の発注と回収。
+pub mod chord_audio;
 pub mod clip_events;
 /// r.md #132 残件: クリップへの編集が効く範囲 = 窓に見えている片 (ひと続きは 1 つとして)。
 pub mod clip_window;

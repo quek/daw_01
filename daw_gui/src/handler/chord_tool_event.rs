@@ -1,6 +1,5 @@
-//! handler::chord_tool_event — コードの検出 / 変換 / 取り込みの入口 (`AppEvent::ChordTool`、r.md #157)。
+//! handler::chord_tool_event — コードの検出 / 変換 / 取り込みと、試聴の設定の入口 (`AppEvent::ChordTool`、r.md #157)。
 
-use common::chord_detect::DetectOptions;
 use common::chord_voicing::Voicing;
 
 use crate::app_types::PREVIEW_VELOCITY;
@@ -11,40 +10,17 @@ impl AppData {
     /// [`ChordToolEvent`] の処理 (`AppEvent::ChordTool` の 1 arm)。
     pub(crate) fn handle_chord_tool_event(&mut self, ev: ChordToolEvent) {
         match ev {
-            ChordToolEvent::SetAudioChords { source_id, mut spans } => {
-                // 外 (検出スレッド / script) から来る値なので、昇順・非交差・長さ > 0 に揃えてから置く。
-                spans.retain(|s| s.end_frame > s.start_frame);
-                spans.sort_by_key(|s| s.start_frame);
-                let mut prev_end = 0u64;
-                for s in &mut spans {
-                    s.start_frame = s.start_frame.max(prev_end);
-                    s.chord = s.chord.sanitized();
-                    prev_end = prev_end.max(s.end_frame);
-                }
-                spans.retain(|s| s.end_frame > s.start_frame);
-                self.edit_song_checked(|song| {
-                    if !song.media.audio_sources.contains_key(&source_id) {
-                        return false;
-                    }
-                    let old = song.audio_chords.get(&source_id).map_or(&[][..], Vec::as_slice);
-                    if old == spans.as_slice() {
-                        return false;
-                    }
-                    if spans.is_empty() {
-                        song.audio_chords.remove(&source_id);
-                    } else {
-                        song.audio_chords.insert(source_id, spans);
-                    }
-                    true
-                });
+            ChordToolEvent::SetAudioChords { source_id, spans, place_on } => {
+                self.set_audio_chords(source_id, spans, &place_on);
             }
             ChordToolEvent::ChordsToClip { chord_ids, track_id } => {
+                let voicing: Voicing = self.cur.chord_tools.view.voicing;
                 self.edit_song_checked(|song| {
-                    song.chords_to_clip(&chord_ids, track_id, Voicing::Basic, PREVIEW_VELOCITY).is_some()
+                    song.chords_to_clip(&chord_ids, track_id, voicing, PREVIEW_VELOCITY).is_some()
                 });
             }
             ChordToolEvent::ExtractFromClips { clips, window_beats } => {
-                let opts = DetectOptions { window_beats, ..DetectOptions::default() };
+                let opts = common::chord_detect::DetectOptions { window_beats, ..self.cur.chord_tools.view.detect };
                 self.edit_song_checked(|song| {
                     let found = song.chords_from_clips(&clips, &opts);
                     let placed = !found.is_empty();
@@ -54,6 +30,38 @@ impl AppData {
                     placed
                 });
             }
+            ChordToolEvent::DetectAudioClips { clips, place } => self.detect_audio_clips(&clips, place),
+            ChordToolEvent::SetAuditionTrack(track) => {
+                self.release_chord_audition();
+                self.cur.chord_tools.view.audition_track = track;
+            }
+            ChordToolEvent::SetAuditionWhilePlaying(on) => self.cur.chord_tools.view.audition_while_playing = on,
+            ChordToolEvent::SetVoicing(v) => {
+                self.cur.chord_tools.view.voicing = v;
+                self.cur.chord_tools.last_voiced.clear();
+            }
+            ChordToolEvent::SetDetectOptions(o) => self.cur.chord_tools.view.detect = sanitize_detect(o),
+            ChordToolEvent::SetRecordArmed(on) => self.cur.chord_tools.record_armed = on,
         }
     }
+
+    /// 保存値 (`ViewState.chord_tools`) を流し込む (`restore_view_state` から)。
+    pub(crate) fn restore_chord_tools_view(&mut self, v: common::model::ChordToolsView) {
+        self.release_chord_audition();
+        self.cur.chord_tools.last_voiced.clear();
+        self.cur.chord_tools.view = common::model::ChordToolsView { detect: sanitize_detect(v.detect), ..v };
+    }
+}
+
+/// 検出の設定を有効域へ (disk / script から来た値)。
+fn sanitize_detect(mut o: common::chord_detect::DetectOptions) -> common::chord_detect::DetectOptions {
+    let d = common::chord_detect::DetectOptions::default();
+    if !(o.window_beats.is_finite() && o.window_beats > 0.0) {
+        o.window_beats = d.window_beats;
+    }
+    o.window_beats = o.window_beats.clamp(0.25, 64.0);
+    if !(o.ignore_shorter_than_beats.is_finite() && o.ignore_shorter_than_beats >= 0.0) {
+        o.ignore_shorter_than_beats = 0.0;
+    }
+    o
 }
