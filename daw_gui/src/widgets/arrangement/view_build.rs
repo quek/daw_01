@@ -224,7 +224,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             ),
             row_h: app.cur.view.track_row_overrides.get(&t.id).copied(),
             color: Some(track_color::to_renderer(track_color::effective_track_color(t))),
-            no_transpose_mark: app.track_shows_no_transpose_mark(t, follows[track_idx]),
+            marks: super::header::TrackMarks::of(app, t, follows[track_idx]),
         })
         .collect();
 

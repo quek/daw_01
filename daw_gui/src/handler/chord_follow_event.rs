@@ -2,9 +2,13 @@
 //!
 //! 追従の評価は `common::chord_follow` が SSoT。ここは設定 (`Song::chord_follow_enabled` /
 //! `Track::follow_chords`) を `edit_song` へ通すだけで、engine / VOICEVOX / 印はフレーム末の同期と描画が
-//! Song から読み直す。
+//! Song から読み直す。「鳴る音で確定」はピアノロールの薄い枠と同じ読み口 (`handler::chord_follow_view`) で
+//! 書き換える。
+
+use common::model::{ChordFollow, Song};
 
 use crate::event_chord::ChordFollowEvent;
+use crate::handler::chord_follow_view::ClipSoundingKeys;
 use crate::state::AppData;
 
 impl AppData {
@@ -16,14 +20,198 @@ impl AppData {
                 song.chord_follow_enabled = on;
                 changed
             }
-            ChordFollowEvent::SetTracks { track_ids, mode } => {
-                let mut changed = false;
-                for t in song.tracks.iter_mut().filter(|t| track_ids.contains(&t.id)) {
-                    changed |= t.follow_chords != mode;
-                    t.follow_chords = mode;
-                }
-                changed
+            ChordFollowEvent::SetTracks { track_ids, mode } => set_modes(song, &track_ids, mode),
+            ChordFollowEvent::FreezePitch { clips, note_ids } => freeze_clips(song, &clips, &note_ids),
+            ChordFollowEvent::FreezeTracks { track_ids } => {
+                let clips: Vec<(u32, u32)> = song
+                    .tracks
+                    .iter()
+                    .filter(|t| track_ids.contains(&t.id))
+                    .flat_map(|t| t.clips.iter().map(move |c| (t.id, c.id)))
+                    .collect();
+                // 確定してから追従を切る (切った後では鳴る音が書いた音になって確定するものが無い)。
+                let frozen = freeze_clips(song, &clips, &[]);
+                set_modes(song, &track_ids, ChordFollow::Off) | frozen
             }
         });
     }
+}
+
+fn set_modes(song: &mut Song, track_ids: &[u32], mode: ChordFollow) -> bool {
+    let mut changed = false;
+    for t in song.tracks.iter_mut().filter(|t| track_ids.contains(&t.id)) {
+        changed |= t.follow_chords != mode;
+        t.follow_chords = mode;
+    }
+    changed
+}
+
+/// クリップ `clips` のノート (`note_ids` が空なら全部) の書いた音を、今の追従結果で書き換える。変わったら `true`。
+///
+/// - 鳴る音は **確定前の Song で全部解いてから** 書き換える (素材のコードの検出が書き換えの途中の値を見ない)。
+/// - 他のクリップ (別の位置の linked clip / セル) と content を共有していれば、先に複製してから書き換える
+///   (鳴る音は位置のコードで決まるので、共有したまま書くと別の位置のクリップの音が変わる)。
+/// - 追従で 0..=127 を外れて鳴っていなかったノートは、音程を残してミュートする (確定しても鳴らないまま)。
+/// - トラックの追従モードは変えない。最寄りのコード音 / スケールは確定した音がそのまま鳴る。平行移動 / ベースは
+///   確定した音から素材のコードを検出し直すので、検出できないクリップ (単音) はもう一度動く — トラック全体を
+///   確定して追従を切るのは [`ChordFollowEvent::FreezeTracks`]。
+fn freeze_clips(song: &mut Song, clips: &[(u32, u32)], note_ids: &[u32]) -> bool {
+    type Plan = ((u32, u32), Vec<(u32, Option<u8>)>);
+    let plans: Vec<Plan> = clips
+        .iter()
+        .filter_map(|&(track_id, clip_id)| {
+            let clip = song.track_by_id(track_id)?.clip_by_id(clip_id)?;
+            let keys = ClipSoundingKeys::of(song, track_id, clip);
+            if !keys.is_active() {
+                return None;
+            }
+            let notes = song.clip_contents.get(&clip.content_id)?.notes()?;
+            let changes: Vec<(u32, Option<u8>)> = notes
+                .iter()
+                .filter(|n| note_ids.is_empty() || note_ids.contains(&n.id))
+                .filter_map(|n| {
+                    let key = keys.key(n);
+                    (key != Some(n.pitch) && !(key.is_none() && n.muted)).then_some((n.id, key))
+                })
+                .collect();
+            (!changes.is_empty()).then_some(((track_id, clip_id), changes))
+        })
+        .collect();
+    if plans.is_empty() {
+        return false;
+    }
+    for ((track_id, clip_id), changes) in plans {
+        let Some(content_id) = song.track_by_id(track_id).and_then(|t| t.clip_by_id(clip_id)).map(|c| c.content_id)
+        else {
+            continue;
+        };
+        let content_id = if content_users(song, content_id) > 1 {
+            let forked = song.fork_content(content_id);
+            if let Some(clip) = song.track_by_id_mut(track_id).and_then(|t| t.clip_by_id_mut(clip_id)) {
+                clip.content_id = forked;
+            }
+            forked
+        } else {
+            content_id
+        };
+        let Some(notes) = song.clip_contents.get_mut(&content_id).and_then(|c| c.notes_mut()) else { continue };
+        for n in notes.iter_mut() {
+            match changes.iter().find(|(id, _)| *id == n.id).map(|(_, key)| *key) {
+                Some(Some(key)) => n.pitch = key,
+                Some(None) => n.muted = true,
+                None => {}
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use common::model::{Chord, ChordEvent, ChordFollow, ChordKind, Clip, ClipContent, MidiContent, Note};
+
+    use crate::event::AppEvent;
+    use crate::event_chord::ChordFollowEvent;
+    use crate::state::AppData;
+
+    /// トラック 1 本目に、C の 3 和音の content を共有する linked clip 2 つ (拍 0 と 8) を置き、Am [0,4) / F [8,12)
+    /// の箱とモード `mode` を入れる。`(track id, [clip id; 2])`。
+    fn linked_triads(app: &mut AppData, mode: ChordFollow) -> (u32, [u32; 2]) {
+        let track_id = app.cur.song_doc.song().tracks[0].id;
+        app.edit_song(|song| {
+            let content_id = song.alloc_content_id();
+            let notes = [60u8, 64, 67]
+                .iter()
+                .zip(1u32..)
+                .map(|(&pitch, id)| Note { id, start_beat: 0.0, duration_beats: 2.0, pitch, velocity: 100, lyric: None, muted: false })
+                .collect();
+            song.clip_contents.insert(content_id, ClipContent::Midi(MidiContent { notes, next_note_id: 4 }));
+            let track = song.track_by_id_mut(track_id).expect("track");
+            track.follow_chords = mode;
+            for (id, start) in [(901, 0.0), (902, 8.0)] {
+                track.clips.push(Clip { id, start_beat: start, length_beats: 4.0, content_id, ..Clip::default() });
+            }
+            for (start, root, kind) in [(0.0, 9, ChordKind::Minor), (8.0, 5, ChordKind::Major)] {
+                song.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: 4.0, chord: Chord::new(root, kind), color: None });
+            }
+        });
+        (track_id, [901, 902])
+    }
+
+    /// クリップの、書いた音と鳴る音 (どちらも昇順)。
+    fn written_and_sounding(app: &AppData, track_id: u32, clip_id: u32) -> (Vec<u8>, Vec<u8>) {
+        let song = app.cur.song_doc.song();
+        let clip = song.track_by_id(track_id).and_then(|t| t.clip_by_id(clip_id)).expect("clip");
+        let notes = song.clip_contents[&clip.content_id].notes().expect("midi");
+        let keys = app.clip_sounding_keys(track_id, clip_id).expect("keys");
+        let mut written: Vec<u8> = notes.iter().map(|n| n.pitch).collect();
+        let mut sounding: Vec<u8> = notes.iter().filter_map(|n| keys.key(n)).collect();
+        written.sort_unstable();
+        sounding.sort_unstable();
+        (written, sounding)
+    }
+
+    /// トラックを鳴る音で確定すると、linked clip は位置ごとの鳴る音を別々の content に書き、追従が切れ、
+    /// **確定の前後で鳴る音が同じ**。undo 1 回で元に戻る。
+    #[test]
+    fn freezing_a_track_keeps_the_sound_and_unlinks_clips_heard_at_different_chords() {
+        let mut app = crate::test_support::headless_app();
+        let (track_id, clips) = linked_triads(&mut app, ChordFollow::Narrow);
+        let before = clips.map(|c| written_and_sounding(&app, track_id, c).1);
+        // 最寄りのコード音: Am の上は G → A、F の上は E → F / G → A。
+        assert_eq!(before, [vec![60, 64, 69], vec![60, 65, 69]]);
+        let depth = app.cur.song_doc.undo_depth();
+
+        app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezeTracks { track_ids: vec![track_id] }));
+        let song = app.cur.song_doc.song();
+        assert_eq!(song.track_by_id(track_id).expect("track").follow_chords, ChordFollow::Off);
+        let contents = clips.map(|c| song.track_by_id(track_id).and_then(|t| t.clip_by_id(c)).expect("clip").content_id);
+        assert_ne!(contents[0], contents[1], "位置ごとに鳴る音が違うので content を分ける");
+        assert_eq!(clips.map(|c| written_and_sounding(&app, track_id, c)), before.clone().map(|s| (s.clone(), s)));
+        assert_eq!(app.cur.song_doc.undo_depth(), depth + 1, "確定は 1 undo step");
+
+        app.handle_event(AppEvent::Undo);
+        let [a, b] = clips.map(|c| written_and_sounding(&app, track_id, c));
+        assert_eq!((a.0, b.0), (vec![60, 64, 67], vec![60, 64, 67]), "undo で書いた音に戻る");
+        assert_eq!([a.1, b.1], before, "undo で追従も戻る");
+    }
+
+    /// クリップの一部のノートだけを確定すると、そのノートだけが鳴る音に書き換わり、共有していた linked clip は
+    /// 元の書いた音のまま。トラックの追従は残る。
+    #[test]
+    fn freezing_selected_notes_rewrites_only_them() {
+        let mut app = crate::test_support::headless_app();
+        let (track_id, clips) = linked_triads(&mut app, ChordFollow::Narrow);
+        // note id 3 = G。
+        app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezePitch {
+            clips: vec![(track_id, clips[0])],
+            note_ids: vec![3],
+        }));
+        assert_eq!(written_and_sounding(&app, track_id, clips[0]), (vec![60, 64, 69], vec![60, 64, 69]));
+        assert_eq!(written_and_sounding(&app, track_id, clips[1]), (vec![60, 64, 67], vec![60, 65, 69]));
+        let song = app.cur.song_doc.song();
+        assert_eq!(song.track_by_id(track_id).expect("track").follow_chords, ChordFollow::Narrow);
+    }
+
+    /// 演奏入力のリアルタイム変換: 追従するトラックで弾いた音は playhead の位置のコードへ寄る。コードの試聴が使う
+    /// `transposed_preview_key` は寄せない。
+    #[test]
+    fn played_notes_follow_the_chord_at_the_playhead() {
+        let mut app = crate::test_support::headless_app();
+        let (track_id, _) = linked_triads(&mut app, ChordFollow::Narrow);
+        // playhead 0 = Am: D (62) は同距離の C / E のうち上の E へ。
+        assert_eq!(app.preview_key(track_id, 62), Some(64));
+        assert_eq!(app.transposed_preview_key(track_id, 62), Some(62));
+        app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::SetEnabled(false)));
+        assert_eq!(app.preview_key(track_id, 62), Some(62), "曲全体のスイッチを切ると弾いた音");
+    }
+}
+
+/// content `content_id` を指すクリップ (アレンジとランチャーのセル、全トラック) の数。
+fn content_users(song: &Song, content_id: common::model::ContentId) -> usize {
+    song.tracks
+        .iter()
+        .flat_map(|t| t.clips.iter().chain(t.session_clips.iter().map(|c| &c.clip)))
+        .filter(|c| c.content_id == content_id)
+        .count()
 }

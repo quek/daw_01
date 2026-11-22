@@ -135,6 +135,25 @@ pub fn note_source_chords(notes: &[crate::model::Note]) -> Vec<SourceChord> {
     crate::chord_detect::detect_chords(&detect, &crate::chord_detect::DetectOptions::default())
 }
 
+/// トラック `track` が鳴らす MIDI の content (アレンジのクリップとランチャーのセル) の素材のコードを `out` へ足す
+/// (既にある content は検出し直さない)。engine の索引 (`SongIndex`) と off-RT の読み口
+/// (`crate::transpose::TrackTranspose`) が同じこれで集める。
+pub fn collect_source_chords(
+    song: &Song,
+    track: &crate::model::Track,
+    out: &mut std::collections::HashMap<crate::model::ContentId, Vec<SourceChord>>,
+) {
+    let clips = track.clips.iter().chain(track.session_clips.iter().map(|c| &c.clip));
+    for clip in clips {
+        if out.contains_key(&clip.content_id) {
+            continue;
+        }
+        if let Some(notes) = song.clip_contents.get(&clip.content_id).and_then(|c| c.notes()) {
+            out.insert(clip.content_id, note_source_chords(notes));
+        }
+    }
+}
+
 /// トラック 1 本の追従の読み口 (off-RT と RT の両方)。箱の無い位置と追従しないトラックは書いた音のまま。
 ///
 /// engine は `SongIndex` に焼いた実効モードから [`TrackChordFollow::with_mode`] で作り、オフライン

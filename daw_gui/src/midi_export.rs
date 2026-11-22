@@ -135,6 +135,7 @@ fn tempo_breakpoints(song: &Song) -> Vec<(u32, f32)> {
 ///
 /// r.md #130 (確定仕様 Q7): **鳴る音で書き出す** — 追従するトラックはノート開始の拍の移調量
 /// (`common::transpose::TrackTranspose`、変調は焼かない) を足した鍵盤、追従しないトラックは書いた鍵盤。
+/// r.md #157: コードトラックへの追従も同じ読み口で先に掛かる (外に出すもの = 鳴る音)。
 /// 範囲外で鳴らないノートは書かない。
 fn build_midi_track(song: &Song, track: &common::model::Track) -> Option<Vec<TrackEvent<'static>>> {
     // (tick, MidiMessage) の (NoteOn + NoteOff) を集約。
@@ -167,7 +168,7 @@ fn build_midi_track(song: &Song, track: &common::model::Track) -> Option<Vec<Tra
             }
             // content-local beat → song-domain beat → tick。 Off は clip 末端 clamp。
             let on_beat = clip.content_to_song_beat(note.start_beat);
-            let Some(key) = transpose.key(note.pitch, Some(on_beat)) else {
+            let Some(key) = transpose.key(clip.content_id, note, Some(on_beat)) else {
                 continue;
             };
             let off_beat = (on_beat + note.duration_beats).min(clip_end_beats);

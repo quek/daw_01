@@ -120,15 +120,7 @@ impl SongIndex {
             .collect();
         let mut source_chords: HashMap<ContentId, Vec<SourceChord>> = HashMap::new();
         for t in song.tracks.iter().filter(|t| matches!(chord_follow(t), ChordFollow::Parallel | ChordFollow::Bass)) {
-            let clips = t.clips.iter().chain(t.session_clips.iter().map(|c| &c.clip));
-            for clip in clips {
-                if source_chords.contains_key(&clip.content_id) {
-                    continue;
-                }
-                if let Some(notes) = song.clip_contents.get(&clip.content_id).and_then(|c| c.notes()) {
-                    source_chords.insert(clip.content_id, crate::chord_follow::note_source_chords(notes));
-                }
-            }
+            crate::chord_follow::collect_source_chords(song, t, &mut source_chords);
         }
         let mut index = Self {
             song: ParamStoreIndex::build(&song.song_lanes, &song.song_mod_routings),

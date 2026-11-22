@@ -9,7 +9,10 @@ use crate::widgets::arrangement::ArrangementResponse;
 use daw_ui_core::{Edit, Ui};
 use daw_ui_renderer::Rect;
 
+use common::model::ChordFollow;
+
 use crate::app::{AppData, AppEvent, ColorPickerTarget};
+use crate::event_chord::ChordFollowEvent;
 use crate::view::checked;
 
 /// メニュー項目。**並び順は [`TrackMenuItem::ALL`] が SSoT** (ラベルと発行を index で割らない。
@@ -23,19 +26,30 @@ enum TrackMenuItem {
     ResetClipColors,
     /// r.md #130: チェック付きの「移調に追従」。
     FollowTranspose,
+    /// r.md #157 Q6: 「コードに追従: <モード>」(モードごとに 1 行、今のモードにチェック。メニューは平坦な文字列の
+    /// 列なので 2 段にせず並べる)。
+    FollowChords(ChordFollow),
+    /// r.md #157 Q5: 「鳴る音で確定」(トラックのクリップを今の追従結果で書き換え、追従を Off にする)。
+    FreezePitch,
     /// r.md #131: 「無効化」/「有効化」(右クリックしたトラックの状態で文言が変わる)。
     ToggleEnabled,
     Delete,
 }
 
 impl TrackMenuItem {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 14] = [
         Self::Rename,
         Self::DuplicateUnique,
         Self::DuplicateShared,
         Self::Color,
         Self::ResetClipColors,
         Self::FollowTranspose,
+        Self::FollowChords(ChordFollow::Off),
+        Self::FollowChords(ChordFollow::Parallel),
+        Self::FollowChords(ChordFollow::Narrow),
+        Self::FollowChords(ChordFollow::Bass),
+        Self::FollowChords(ChordFollow::Scale),
+        Self::FreezePitch,
         Self::ToggleEnabled,
         Self::Delete,
     ];
@@ -49,6 +63,8 @@ impl TrackMenuItem {
             Self::Color => "色...".into(),
             Self::ResetClipColors => "クリップ色をトラックに揃える".into(),
             Self::FollowTranspose => checked("移調に追従", state.follows),
+            Self::FollowChords(mode) => checked(&format!("コードに追従: {}", mode.label()), state.chord_follow == mode),
+            Self::FreezePitch => "鳴る音で確定".into(),
             Self::ToggleEnabled => if state.enabled { "無効化" } else { "有効化" }.into(),
             Self::Delete => "Delete".into(),
         }
@@ -60,11 +76,14 @@ impl TrackMenuItem {
 struct TrackMenuState {
     /// `Track::follow_transpose`。
     follows: bool,
+    /// `Track::follow_chords` (曲全体のスイッチを切っていても自分の値)。
+    chord_follow: ChordFollow,
     /// `Track::enabled`。
     enabled: bool,
 }
 
-/// track header の右クリックメニュー (Rename / 複製 / 色 / 移調に追従 / 無効化 / Delete) と改名 overlay。
+/// track header の右クリックメニュー (Rename / 複製 / 色 / 移調に追従 / コードに追従 / 鳴る音で確定 / 無効化 /
+/// Delete) と改名 overlay。
 ///
 /// rename 対象は安定 ID で直接持つ (index 経由の解決はしない = reorder/delete で
 /// 別 track にすり替わらない、 SSoT)。
@@ -77,6 +96,7 @@ pub(crate) fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, resp: &ArrangementRe
         let track = song.track_by_id(track_id);
         let state = TrackMenuState {
             follows: track.is_none_or(|t| t.follow_transpose),
+            chord_follow: track.map_or(ChordFollow::Off, |t| t.follow_chords),
             enabled: track.is_none_or(|t| t.enabled),
         };
         let labels = TrackMenuItem::ALL.map(|item| item.label(state));
@@ -119,6 +139,14 @@ fn apply(app: &mut AppData, item: TrackMenuItem, track_id: u32, rect: Rect, stat
         // 右クリックしたトラックのチェックを反転した値に、対象全部を揃える (混在していても 1 回で揃う)。
         TrackMenuItem::FollowTranspose => {
             app.handle_event(AppEvent::SetTracksFollowTranspose { track_ids: target_ids(app), follow: !state.follows });
+        }
+        // r.md #157: 対象全部を選んだモードに揃える / 鳴る音で確定して追従を切る。
+        TrackMenuItem::FollowChords(mode) => app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::SetTracks {
+            track_ids: target_ids(app),
+            mode,
+        })),
+        TrackMenuItem::FreezePitch => {
+            app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezeTracks { track_ids: target_ids(app) }));
         }
         // r.md #131: 対象全体を右クリック track の反対へ揃える。
         TrackMenuItem::ToggleEnabled => {
