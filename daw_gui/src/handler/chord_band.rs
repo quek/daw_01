@@ -137,3 +137,48 @@ impl AppData {
         self.audition_chord(&chord);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use common::model::{Chord, ChordEvent, ChordKind, LoopRegion};
+
+    use crate::event::AppEvent;
+    use crate::event_chord::ChordToolEvent;
+
+    fn ev(start: f64) -> ChordEvent {
+        ChordEvent { id: 0, start_beat: start, len_beats: 4.0, chord: Chord::new(0, ChordKind::Major), color: None }
+    }
+
+    /// 曲を差し替えると、箱の選択・ポップアップ・メニューは前の曲の id なので捨てる (id は曲ごとに 1 から振るので、
+    /// 残すと新しい曲の別の箱に当たる)。ViewState を持たない旧ファイルでは、試聴トラック (track id) と帯の表示も
+    /// 前のプロジェクトのものを持ち越さない。
+    #[test]
+    fn replacing_the_song_drops_chord_references_and_tools_view() {
+        let mut app = crate::test_support::headless_app();
+        let mut id = 0;
+        app.edit_song(|song| id = song.place_chord(ev(0.0)).expect("置ける"));
+        app.set_chord_selection(vec![id]);
+        app.cur.selection.chord_anchor = Some(id);
+        app.open_chord_popup(id);
+        app.open_chord_menu(Some(id), (0.0, 0.0));
+        let t1 = app.cur.song_doc.song().tracks[0].id;
+        app.handle_event(AppEvent::ChordTool(ChordToolEvent::SetAuditionTrack(Some(t1))));
+        app.cur.view.chord_band.visible = false;
+
+        // 新しい曲: 別の位置に、同じ id の箱がある。
+        let mut song = app.cur.song_doc.song().clone();
+        song.chords.clear();
+        song.ids.next_chord_id = 1;
+        assert_eq!(song.place_chord(ev(8.0)), Some(id));
+        app.cur.song_doc.replace_song(song);
+        app.after_song_replaced();
+        app.restore_view_state(None, LoopRegion::default(), Vec::new());
+
+        assert!(app.cur.selection.selected_chord_ids.is_empty());
+        assert_eq!(app.cur.selection.chord_anchor, None);
+        assert_eq!(app.chord_popup_id(), None);
+        assert_eq!(app.cur.peph.chord_band.menu, None);
+        assert_eq!(app.cur.chord_tools.view.audition_track, None, "旧ファイルは試聴トラックを持ち越さない");
+        assert!(app.cur.view.chord_band.visible, "旧ファイルは帯を既定 (表示) で出す");
+    }
+}

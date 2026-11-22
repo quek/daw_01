@@ -187,7 +187,13 @@ impl AppData {
             .into_iter()
             .filter(|k| self.cur.song_doc.song().automation_lane_by_key(k.track, k.lane).is_some())
             .collect();
-        let Some(v) = view else { return };
+        let Some(v) = view else {
+            // r.md #157: ViewState を持たない旧ファイル。コードの道具の設定 (試聴トラックは track id) と帯の表示は
+            // 前のプロジェクトのものを持ち越さず既定に戻す (`Some` の経路は下で保存値を入れる)。
+            self.restore_chord_tools_view(common::model::ChordToolsView::default());
+            self.cur.view.chord_band = crate::state::chord_band::ChordBandView::default();
+            return;
+        };
         let max_choice = (crate::view::snap::SNAP_LABELS.len() as u8).saturating_sub(1);
         self.cur.view.arrange_zoom_x = v.arrange_zoom_x.clamp(2.0, 400.0);
         // `0.0` / NaN は「未設定」 (旧ファイル)。view 側が既定比率へ倒すので

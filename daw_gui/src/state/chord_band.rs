@@ -66,6 +66,16 @@ pub struct ChordBandEphemeral {
     pub menu_open: bool,
 }
 
+impl ChordBandEphemeral {
+    /// 曲を差し替えたとき (`AppData::reset_song_scoped_state`): 箱の id を持つもの (ポップアップ / メニュー) を
+    /// 捨てる。箱の id は曲ごとに 1 から振るので、残すと新しい曲の別の箱に当たる。帯の位置は曲に依らない。
+    pub fn reset_song_scoped(&mut self) {
+        self.popup = None;
+        self.menu = None;
+        self.menu_open = false;
+    }
+}
+
 /// 開いているポップアップ 1 つ。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChordPopup {
