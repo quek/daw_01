@@ -39,14 +39,15 @@ impl AppData {
                 self.cur.chord_tools.view.voicing = v;
                 self.cur.chord_tools.last_voiced.clear();
             }
-            ChordToolEvent::SetDetectOptions(o) => self.cur.chord_tools.view.detect = sanitize_detect(o),
+            ChordToolEvent::SetDetectOptions(o) => self.cur.chord_tools.view.detect = o.sanitized(),
             ChordToolEvent::SetRecordArmed(on) => self.cur.chord_tools.record_armed = on,
         }
     }
 
     /// MIDI クリップ `clips` のノートから (窓 `window_beats`、ほかは検出の設定で) コードを検出して帯に置く。
+    /// 窓は外 (script / ドラッグ) から来る値なので、検出の設定と同じ有効域に揃える。
     fn extract_midi_chords(&mut self, clips: &[(u32, u32)], window_beats: f64) {
-        let opts = common::chord_detect::DetectOptions { window_beats, ..self.cur.chord_tools.view.detect };
+        let opts = common::chord_detect::DetectOptions { window_beats, ..self.cur.chord_tools.view.detect }.sanitized();
         self.edit_song_checked(|song| {
             let found = song.chords_from_clips(clips, &opts);
             let placed = !found.is_empty();
@@ -89,19 +90,6 @@ impl AppData {
     pub(crate) fn restore_chord_tools_view(&mut self, v: common::model::ChordToolsView) {
         self.release_chord_audition();
         self.cur.chord_tools.last_voiced.clear();
-        self.cur.chord_tools.view = common::model::ChordToolsView { detect: sanitize_detect(v.detect), ..v };
+        self.cur.chord_tools.view = common::model::ChordToolsView { detect: v.detect.sanitized(), ..v };
     }
-}
-
-/// 検出の設定を有効域へ (disk / script から来た値)。
-fn sanitize_detect(mut o: common::chord_detect::DetectOptions) -> common::chord_detect::DetectOptions {
-    let d = common::chord_detect::DetectOptions::default();
-    if !(o.window_beats.is_finite() && o.window_beats > 0.0) {
-        o.window_beats = d.window_beats;
-    }
-    o.window_beats = o.window_beats.clamp(0.25, 64.0);
-    if !(o.ignore_shorter_than_beats.is_finite() && o.ignore_shorter_than_beats >= 0.0) {
-        o.ignore_shorter_than_beats = 0.0;
-    }
-    o
 }

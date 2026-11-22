@@ -12,6 +12,28 @@ use super::*;
 /// 箱として残す最小の長さ (拍)。これ未満に削られた箱は消す。
 const MIN_CHORD_LEN_BEATS: f64 = 1e-6;
 
+/// 箱の色を値域へ (`0.0..=1.0` の linear RGB)。非有限の成分があれば既定色 (`None`) に倒す。
+fn sanitize_chord_color(color: Option<[f32; 3]>) -> Option<[f32; 3]> {
+    color.filter(|rgb| rgb.iter().all(|v| v.is_finite())).map(|rgb| rgb.map(|v| v.clamp(0.0, 1.0)))
+}
+
+impl AudioChordSpan {
+    /// `Song.audio_chords[source_id]` の不変条件を回復する: 長さ > 0、`start_frame` 昇順、互いに非交差
+    /// (先に始まる方を優先して後発の頭を削る)、コードの値域。外 (検出の thread / script / ファイル) から来た
+    /// 値はこれを通してから置く。idempotent。
+    pub fn normalize_spans(spans: &mut Vec<AudioChordSpan>) {
+        spans.retain(|s| s.end_frame > s.start_frame);
+        spans.sort_by_key(|s| s.start_frame);
+        let mut prev_end = 0u64;
+        for s in spans.iter_mut() {
+            s.start_frame = s.start_frame.max(prev_end);
+            s.chord = s.chord.sanitized();
+            prev_end = prev_end.max(s.end_frame);
+        }
+        spans.retain(|s| s.end_frame > s.start_frame);
+    }
+}
+
 impl Song {
     /// 新しい `ChordEvent` の安定 id を採番する。`0` は未採番 sentinel なので最低 `1`。
     pub fn alloc_chord_id(&mut self) -> u32 {
@@ -32,6 +54,7 @@ impl Song {
                 c.start_beat = 0.0;
             }
             c.chord = c.chord.sanitized();
+            c.color = sanitize_chord_color(c.color);
         }
         self.chords
             .sort_by(|a, b| a.start_beat.partial_cmp(&b.start_beat).unwrap_or(std::cmp::Ordering::Equal));
@@ -59,8 +82,12 @@ impl Song {
         }
         self.ids.next_chord_id = next;
         // 検出結果は音源に付く。音源が消えたら一緒に消す (保存前の GC と load の両方がここを通る)。
+        // 区間は二分探索で引く (`chord_detect::audio_chord_at`) ので、壊れたファイルの並びもここで揃える。
         let sources = &self.media.audio_sources;
-        self.audio_chords.retain(|id, spans| sources.contains_key(id) && !spans.is_empty());
+        self.audio_chords.retain(|id, spans| {
+            AudioChordSpan::normalize_spans(spans);
+            sources.contains_key(id) && !spans.is_empty()
+        });
     }
 
     /// `beat` を覆う箱 (無ければ `None` = その位置ではどのトラックも追従しない)。
@@ -243,6 +270,7 @@ impl Song {
 
     /// 選んだ箱の色を変える (`None` = テーマの既定色)。変わったら `true`。
     pub fn set_chord_color(&mut self, ids: &[u32], color: Option<[f32; 3]>) -> bool {
+        let color = sanitize_chord_color(color);
         let mut changed = false;
         for c in self.chords.iter_mut().filter(|c| ids.contains(&c.id)) {
             if c.color != color {
@@ -394,18 +422,33 @@ mod tests {
         );
     }
 
-    /// 読み込みの正規化は冪等で、壊れた値 (重なり / 負の位置 / 重複 id / 範囲外のルート) を直す。
+    /// 読み込みの正規化は冪等で、壊れた値 (重なり / 負の位置 / 重複 id / 範囲外のルート / 範囲外・非有限の色 /
+    /// 並びの崩れたオーディオの検出結果) を直す。
     #[test]
     fn normalize_repairs_broken_chords_and_is_idempotent() {
         let chords = vec![
-            ChordEvent { id: 3, start_beat: 4.0, len_beats: 4.0, chord: Chord::new(0, ChordKind::Major), color: None },
-            ChordEvent { id: 3, start_beat: 2.0, len_beats: 4.0, chord: Chord { root: 14, ..Chord::default() }, color: None },
+            ChordEvent { id: 3, start_beat: 4.0, len_beats: 4.0, chord: Chord::new(0, ChordKind::Major), color: Some([2.0, -1.0, 0.5]) },
+            ChordEvent { id: 3, start_beat: 2.0, len_beats: 4.0, chord: Chord { root: 14, ..Chord::default() }, color: Some([f32::NAN, 0.0, 0.0]) },
             ChordEvent { id: 0, start_beat: -1.0, len_beats: 2.0, chord: Chord::default(), color: None },
             ChordEvent { id: 9, start_beat: f64::NAN, len_beats: 1.0, chord: Chord::default(), color: None },
         ];
+        let span = |a: u64, b: u64, root: u8| AudioChordSpan { start_frame: a, end_frame: b, chord: Chord::new(root, ChordKind::Major) };
         let mut song = Song { chords, ..Song::default() };
+        song.media.audio_sources.insert(1, AudioSource {
+            path: AudioSourcePath::Absolute("x.wav".into()),
+            sample_rate: 48_000,
+            channels: 1,
+            frames: 96_000,
+            original_bpm: None,
+            root_key: None,
+        });
+        // 逆順・重なり・長さ 0・覆われて消えるもの。
+        song.audio_chords.insert(1, vec![span(500, 900, 7), span(0, 600, 0), span(300, 300, 5), span(100, 400, 2)]);
         song.normalize_chords();
         assert_eq!(layout(&song), vec![(0.0, 1.0, 0), (2.0, 4.0, 2), (6.0, 2.0, 0)]);
+        let colors: Vec<Option<[f32; 3]>> = song.chords.iter().map(|c| c.color).collect();
+        assert_eq!(colors, vec![None, None, Some([1.0, 0.0, 0.5])]);
+        assert_eq!(song.audio_chords[&1], vec![span(0, 600, 0), span(600, 900, 7)]);
         let ids: std::collections::HashSet<u32> = song.chords.iter().map(|c| c.id).collect();
         assert_eq!(ids.len(), 3);
         assert!(!ids.contains(&0));

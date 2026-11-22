@@ -93,6 +93,7 @@ impl AppData {
         let tools = &mut self.cur.chord_tools;
         tools.last_voiced.clear();
         tools.detect_jobs.clear();
+        tools.detected_without_chords.clear();
         tools.auto_detect_epoch = None;
         tools.extract_dialog = None;
     }

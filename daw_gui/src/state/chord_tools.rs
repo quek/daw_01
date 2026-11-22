@@ -4,8 +4,14 @@
 //! 「再生中も鳴らす」/ voicing / 検出の設定) は `ViewState.chord_tools` に、その場限りのもの
 //! (鳴らしている音・検出の進行・録音中の和音) はここだけに持つ。
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use common::chord_detect::DetectOptions;
 use common::model::{AudioChordSpan, AudioSourceId, ChordToolsView};
 
+use crate::audio_source_cache::AudioSourceBuffer;
+use crate::chord_audio_detect::DetectGrid;
 use crate::state::HeldPreview;
 
 /// コードの試聴で鳴らしている音 (1 コードぶん) と、消音する時刻。
@@ -15,13 +21,23 @@ pub struct ChordAuditionNotes {
     pub due: Option<std::time::Instant>,
 }
 
-/// 走っているオーディオのコード検出 1 本 (音源 1 つ)。
+/// 発注したオーディオのコード検出 1 本 (音源 1 つ)。同時に走らせる数は絞る (`handler::chord_audio`) ので、
+/// 順番待ちのものもある。
 #[derive(Debug)]
 pub struct AudioDetectJob {
     pub source_id: AudioSourceId,
     /// 終わったら帯にも置くクリップ (`(track id, clip id)`)。空なら保存だけ。
     pub place_on: Vec<(u32, u32)>,
-    pub rx: std::sync::mpsc::Receiver<Vec<AudioChordSpan>>,
+    pub run: DetectRun,
+}
+
+/// 検出 1 本の進み具合。
+#[derive(Debug)]
+pub enum DetectRun {
+    /// 順番待ち (走らせるのに要るもの一式。発注した時点の音源・格子・設定で測る)。
+    Queued { buf: Arc<AudioSourceBuffer>, grid: DetectGrid, opts: DetectOptions },
+    /// 走っている (終わると区間が届く)。
+    Running(std::sync::mpsc::Receiver<Vec<AudioChordSpan>>),
 }
 
 #[derive(Debug, Default)]
@@ -34,8 +50,12 @@ pub struct ChordToolsState {
     pub last_voiced: Vec<u8>,
     /// 帯の録音待機 (session-only。トラックの録音待機と同じく保存しない)。
     pub record_armed: bool,
-    /// 走っているオーディオのコード検出。
+    /// 発注したオーディオのコード検出 (走っているものと順番待ち)。
     pub detect_jobs: Vec<AudioDetectJob>,
+    /// 検出を済ませたのにコードが 1 つも残らなかった音源 (ドラム / 単音 / 検出の thread が落ちた)。
+    /// `Song.audio_chords` は空の結果を持たないので、ここで覚えて自動検出を走らせ直さない
+    /// (session-only: 開き直したら 1 回測り直す)。
+    pub detected_without_chords: HashSet<AudioSourceId>,
     /// 追従するオーディオトラックの未検出の音源を最後に探した Song の版 (`SongDoc::edit_epoch`)。
     pub auto_detect_epoch: Option<u64>,
     /// 直近 engine に送った「再生中も鳴らす」(`AudioCommand::SetChordAudition`) の値。差分送信用で、

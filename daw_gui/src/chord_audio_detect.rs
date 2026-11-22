@@ -106,7 +106,13 @@ fn chord_in(analysed: &[Frame], hop: usize, fft_len: usize, a: f64, b: f64, opts
     let mut bass = [0.0f64; 12];
     let mut rms_sum = 0.0f64;
     let mut n = 0u32;
-    for (i, f) in analysed.iter().enumerate() {
+    // フレーム i の中心は i × hop + fft_len / 2 (単調) なので、窓に入りうる番号だけを見る (前後 1 つ広く取り、
+    // 境界は下の判定で決める)。窓ごとに全フレームをなめると、窓の数 × フレーム数になる。
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let index_at = |frame: f64| ((frame - (fft_len / 2) as f64) / hop as f64).max(0.0) as usize;
+    let lo = index_at(a).saturating_sub(1).min(analysed.len());
+    let hi = index_at(b).saturating_add(2).min(analysed.len());
+    for (i, f) in analysed.iter().enumerate().take(hi).skip(lo) {
         #[allow(clippy::cast_precision_loss)]
         let center = (i * hop + fft_len / 2) as f64;
         if center < a || center >= b {

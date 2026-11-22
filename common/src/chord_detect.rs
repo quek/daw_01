@@ -31,6 +31,29 @@ impl Default for DetectOptions {
     }
 }
 
+/// 窓の長さ (拍) の有効域。下限は窓の数 (= 計算量) を抑え、上限は「1 コード」として意味のある長さ。
+pub const WINDOW_BEATS_RANGE: std::ops::RangeInclusive<f64> = 0.25..=64.0;
+
+impl DetectOptions {
+    /// 有効域へ揃えた設定 (disk / script / 呼び出し側から来た値)。非有限・0 以下の窓は既定、範囲外は
+    /// [`WINDOW_BEATS_RANGE`] に収める。[`detect_chords`] は必ずこれを通してから使う。
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        if !(self.window_beats.is_finite() && self.window_beats > 0.0) {
+            self.window_beats = Self::default().window_beats;
+        }
+        self.window_beats = self.window_beats.clamp(*WINDOW_BEATS_RANGE.start(), *WINDOW_BEATS_RANGE.end());
+        if !(self.ignore_shorter_than_beats.is_finite() && self.ignore_shorter_than_beats >= 0.0) {
+            self.ignore_shorter_than_beats = 0.0;
+        }
+        self
+    }
+}
+
+/// [`detect_chords`] が 1 回で見る窓の数の上限 (壊れた値で計算が終わらないための防御。既定の 2 拍で
+/// 約 26 万拍、最小の窓でも 3 万拍あり、実際の曲では届かない)。
+const MAX_WINDOWS: usize = 1 << 17;
+
 /// 検出に渡すノート 1 個 (位置は呼び出し側の拍: content-local でも song-absolute でもよい)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DetectNote {
@@ -42,6 +65,9 @@ pub struct DetectNote {
 /// コードとして認める最小の pitch class の数。1〜2 音 (単音のメロディ / ベースライン / 2 声) からは
 /// コードを決めない (決めると、メロディの 1 音ごとに別のコードが出る)。
 const MIN_PITCH_CLASSES: u32 = 3;
+
+/// コードの種類の数 ([`match_chord`] の表の大きさ)。
+const KIND_COUNT: usize = ChordKind::ALL.len();
 
 /// pitch class ごとの強さ `weights` (index 0 = C) と最低音の pitch class からコードを 1 つ決める。
 /// 鳴っている pitch class が [`MIN_PITCH_CLASSES`] 未満なら `None`。
@@ -61,31 +87,32 @@ pub fn match_chord(weights: &[f64; 12], lowest_pc: Option<u8>, opts: &DetectOpti
         return None;
     }
     let mean = total / f64::from(present.count_ones());
-    let mut best: Option<(f64, Chord)> = None;
+    // 「構成音の強さ − 構成音でない音の強さ − 欠けた構成音の罰」を、鳴っている構成音の強さ `hit` だけから出す:
+    // 2 × hit − (鳴っている音の強さの合計) − mean × 欠けた構成音の数 (12 音を毎回なめない — 窓ごとに呼ばれる)。
+    let present_sum: f64 = sum_bits(weights, present);
+    // 種類ごとの構成音 (ルート C) を 1 回だけ作り、ルートぶん回して使う。
+    let mut kind_masks = [0u16; KIND_COUNT];
+    for (m, &kind) in kind_masks.iter_mut().zip(ChordKind::ALL) {
+        *m = Chord::new(0, kind).pitch_class_mask();
+    }
+    let mut best: Option<(f64, u8, ChordKind)> = None;
     for root in 0..12u8 {
-        for &kind in ChordKind::ALL {
-            let chord = Chord::new(root, kind);
-            let tones = chord.pitch_class_mask();
-            let mut score = 0.0;
-            for (pc, &w) in weights.iter().enumerate() {
-                let in_chord = (tones >> pc) & 1 == 1;
-                match (in_chord, (present >> pc) & 1 == 1) {
-                    (true, true) => score += w,
-                    (true, false) => score -= mean,
-                    (false, true) => score -= w,
-                    (false, false) => {}
-                }
-            }
+        let r = u32::from(root);
+        for (&kind, &m) in ChordKind::ALL.iter().zip(&kind_masks) {
+            let tones = (((u32::from(m) << r) | (u32::from(m) >> (12 - r))) & 0x0FFF) as u16;
+            let missing = (tones & !present & 0x0FFF).count_ones();
+            let mut score = 2.0 * sum_bits(weights, tones & present) - present_sum - mean * f64::from(missing);
             // 最低音がルートのコードを少しだけ優先する (C6 と Am7 のように構成音が同じ組を決める)。
             if lowest_pc == Some(root) {
                 score += mean * 0.25;
             }
-            if best.as_ref().is_none_or(|(s, _)| score > *s + 1e-9) {
-                best = Some((score, chord));
+            if best.as_ref().is_none_or(|(s, _, _)| score > *s + 1e-9) {
+                best = Some((score, root, kind));
             }
         }
     }
-    let (_, mut chord) = best?;
+    let (_, root, kind) = best?;
+    let mut chord = Chord::new(root, kind);
     if opts.include_bass
         && let Some(low) = lowest_pc
         && low != chord.root
@@ -109,32 +136,68 @@ pub fn match_chord(weights: &[f64; 12], lowest_pc: Option<u8>, opts: &DetectOpti
     Some(chord.sanitized())
 }
 
+/// `mask` (12-bit) の立っている pitch class の強さの和 (低い pitch class から足す)。
+fn sum_bits(weights: &[f64; 12], mut mask: u16) -> f64 {
+    let mut sum = 0.0;
+    while mask != 0 {
+        sum += weights[mask.trailing_zeros() as usize];
+        mask &= mask - 1;
+    }
+    sum
+}
+
 /// ノート列からコードの区間の列を作る (`start_beat` 昇順・非交差、同じコードが続く窓は 1 つにまとめる)。
 ///
-/// 窓は `opts.window_beats` 刻み (拍 0 起点)。窓ごとに、ノートが窓と重なる長さを pitch class の強さとして
-/// [`match_chord`] に渡す。コードが決まらない窓 (無音・単音) は区間を作らない。
+/// 窓は `opts.window_beats` 刻み (拍 0 起点、設定は [`DetectOptions::sanitized`] を通す)。窓ごとに、ノートが
+/// 窓と重なる長さを pitch class の強さとして [`match_chord`] に渡す。コードが決まらない窓 (無音・単音) は
+/// 区間を作らない。
+///
+/// 開始順の sweep: ノートを開始順に並べ、窓ごとに「窓に掛かるノート」だけを足す (O(N log N + 窓 × 掛かるノート))。
+/// ノートの無い窓は飛ばす。窓の数は [`MAX_WINDOWS`] で打ち切る。
 #[must_use]
 pub fn detect_chords(notes: &[DetectNote], opts: &DetectOptions) -> Vec<SourceChord> {
-    let window = if opts.window_beats.is_finite() && opts.window_beats > 0.0 { opts.window_beats } else { 2.0 };
-    let usable = |n: &&DetectNote| {
-        n.start_beat.is_finite()
-            && n.len_beats.is_finite()
-            && n.len_beats > 0.0
-            && n.len_beats >= opts.ignore_shorter_than_beats
+    let opts = opts.sanitized();
+    let window = opts.window_beats;
+    let mut sorted: Vec<&DetectNote> = notes
+        .iter()
+        .filter(|n| {
+            n.start_beat.is_finite()
+                && n.len_beats.is_finite()
+                && n.len_beats > 0.0
+                && n.len_beats >= opts.ignore_shorter_than_beats
+        })
+        .collect();
+    sorted.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
+    let Some(first) = sorted.first() else { return Vec::new() };
+    let window_of = |beat: f64| -> u64 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let w = (beat / window).floor().max(0.0) as u64;
+        w
     };
-    let Some(end) = notes.iter().filter(usable).map(|n| n.start_beat + n.len_beats).reduce(f64::max) else {
-        return Vec::new();
-    };
-    let first = notes.iter().filter(usable).map(|n| n.start_beat).fold(f64::INFINITY, f64::min);
-    let mut out: Vec<SourceChord> = Vec::new();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let (w0, w1) = ((first / window).floor().max(0.0) as u64, (end / window).ceil().max(0.0) as u64);
-    for w in w0..w1 {
+    // (窓の番号の始め, 終わり (含まない), コード)。位置は最後に番号 × 窓で出す (足し合わせの誤差を溜めない)。
+    let mut runs: Vec<(u64, u64, Chord)> = Vec::new();
+    // 窓 `w` に掛かりうるノート (開始が窓の終わりより前で、まだ外していないもの)。
+    let mut active: Vec<&DetectNote> = Vec::new();
+    let mut next = 0usize;
+    let mut w = window_of(first.start_beat);
+    for _ in 0..MAX_WINDOWS {
+        let Some(w_end) = w.checked_add(1) else { break };
         #[allow(clippy::cast_precision_loss)]
-        let (a, b) = (w as f64 * window, (w + 1) as f64 * window);
+        let (a, b) = (w as f64 * window, w_end as f64 * window);
+        while let Some(n) = sorted.get(next).filter(|n| n.start_beat < b) {
+            active.push(n);
+            next += 1;
+        }
+        active.retain(|n| n.start_beat + n.len_beats > a);
+        if active.is_empty() {
+            // 次のノートが始まる窓へ飛ぶ (残りが無ければ終わり)。
+            let Some(n) = sorted.get(next) else { break };
+            w = window_of(n.start_beat).max(w_end);
+            continue;
+        }
         let mut weights = [0.0f64; 12];
         let mut lowest: Option<u8> = None;
-        for n in notes.iter().filter(usable) {
+        for n in &active {
             let overlap = (n.start_beat + n.len_beats).min(b) - n.start_beat.max(a);
             if overlap <= 0.0 {
                 continue;
@@ -142,15 +205,18 @@ pub fn detect_chords(notes: &[DetectNote], opts: &DetectOptions) -> Vec<SourceCh
             weights[usize::from(n.pitch % 12)] += overlap;
             lowest = Some(lowest.map_or(n.pitch, |l| l.min(n.pitch)));
         }
-        let Some(chord) = match_chord(&weights, lowest.map(|p| p % 12), opts) else { continue };
-        match out.last_mut() {
-            Some(last) if last.chord == chord && (last.start_beat + last.len_beats - a).abs() < 1e-9 => {
-                last.len_beats += window;
+        if let Some(chord) = match_chord(&weights, lowest.map(|p| p % 12), &opts) {
+            match runs.last_mut() {
+                Some(last) if last.2 == chord && last.1 == w => last.1 = w_end,
+                _ => runs.push((w, w_end, chord)),
             }
-            _ => out.push(SourceChord { start_beat: a, len_beats: window, chord }),
         }
+        w = w_end;
     }
-    out
+    #[allow(clippy::cast_precision_loss)]
+    runs.into_iter()
+        .map(|(w0, w1, chord)| SourceChord { start_beat: w0 as f64 * window, len_beats: (w1 - w0) as f64 * window, chord })
+        .collect()
 }
 
 /// 拍 `beat` で素材が鳴らしているコード: `beat` を覆う区間、無ければ直前の区間、それも無ければ最初の区間。
