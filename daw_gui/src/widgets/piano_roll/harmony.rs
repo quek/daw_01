@@ -16,12 +16,13 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use common::chord_follow::{TrackChordFollow, chord_scale_mask};
+use common::chord_follow::chord_scale_mask;
 use common::model::{Chord, Song};
 use daw_ui_core::widgets::heavy::HeavyCtx;
 use daw_ui_renderer::{Color, Rect, RectCommand};
 
 use crate::app::{AppData, ClipKey};
+use crate::handler::chord_follow_view::ClipSoundingKeys;
 
 use super::{Note, NoteId, PianoRollStyle, PianoRollView, RowGeometry, note_fill_color, note_geometry_to_rect, note_to_rect};
 
@@ -80,14 +81,6 @@ fn classify(song: &Song, chord: &Chord, pitch: u8, beat: f64) -> Fit {
     }
 }
 
-/// 追従するトラックのノート 1 つが鳴る鍵盤 (書いた音の空間、範囲外は `None` = 鳴らない)。
-///
-/// TODO(統合): `c157-follow` の読み口 (`handler/chord_follow_view.rs`、素材のコードの検出込み) に差し替える。
-/// それまでは素材のコードなし (`None` = キーのトニック基準) で評価の SSoT を直接引く。
-fn sounding_key(song: &Song, track_id: u32, pitch: u8, song_beat: f64) -> Option<u8> {
-    TrackChordFollow::of(song, track_id).key(pitch, song_beat, None)
-}
-
 impl Harmony {
     /// `notes` (song-absolute 拍、id は packed) と表示クリップ `shown` から作る。
     /// ランチャーのセルのノートは曲の時間軸に無いので判定しない。
@@ -97,13 +90,13 @@ impl Harmony {
             return Self::default();
         }
         let enabled = app.cur.view.piano_roll_chord_guide;
-        // 表示クリップ (clip_slot 順) ごとに 1 度だけ: 曲の時間軸か / 追従するか。
-        let slots: Vec<Option<(u32, bool)>> = shown
+        // 表示クリップ (clip_slot 順) ごとに 1 度だけ: 曲の時間軸のクリップなら、鳴る鍵盤の読み口
+        // (「鳴る音で確定」と同じ口。素材のコードの検出込み) と、その content のノート。
+        let slots: Vec<Option<(ClipSoundingKeys<'_>, &[common::model::Note])>> = shown
             .iter()
             .map(|k| {
-                let on_song_axis =
-                    song.track_by_id(k.track_id).is_some_and(|t| t.session_clip_by_id(k.clip_id).is_none());
-                on_song_axis.then(|| (k.track_id, TrackChordFollow::of(song, k.track_id).is_active()))
+                let clip = song.track_by_id(k.track_id)?.clip_by_id(k.clip_id)?;
+                Some((ClipSoundingKeys::of(song, k.track_id, clip), song.clip_notes(clip)))
             })
             .collect();
         let view_end = view.start_beat + view.len_beats;
@@ -114,8 +107,12 @@ impl Harmony {
             .take_while(|n| n.start_beat <= view_end)
             .filter(|n| n.start_beat + n.len_beats >= view.start_beat);
         for n in visible {
-            let Some(&Some((track_id, follows))) = slots.get(AppData::note_id_clip_slot(n.id)) else { continue };
-            let sounds = if follows { sounding_key(song, track_id, n.pitch, n.start_beat) } else { Some(n.pitch) };
+            let Some(Some((keys, written))) = slots.get(AppData::note_id_clip_slot(n.id)) else { continue };
+            // 追従するトラックは content のノート (content-local 拍) から鳴る鍵盤を引く。範囲外は `None` = 鳴らない。
+            let sounds = match written.get(AppData::note_id_local_index(n.id)) {
+                Some(note) if keys.is_active() => keys.key(note),
+                _ => Some(n.pitch),
+            };
             let fit = enabled
                 .then(|| song.chord_at(n.start_beat))
                 .flatten()
