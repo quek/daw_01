@@ -257,6 +257,9 @@ pub struct RtBundle {
     /// curve eval を bypass する。lane id でなく target で持つのは、GUI で lane を消してから届くまでの
     /// race を避けるため。
     pub recording_lanes: Arc<RecordingLanes>,
+    /// r.md #157: 再生中のコードの試聴の計画 (snapshot、`AudioCommand::SetChordAudition` + song から off-RT で組む)。
+    /// live の `NativeIo` にだけ載る (書き出しは既定値 = 鳴らさない)。
+    pub chord_audition: Arc<crate::chord_audition::ChordAuditionPlan>,
     /// audio clip renderer (snapshot)。`ProjectShared::audio_clip_renderer` のミラーと同じ `Arc`。
     pub audio_clip_renderer: Arc<AudioClipRenderer>,
     /// r.md #129 §11.2: device scope (EQ Par のスペクトラム) の対象 device id を slot 順に (`0` = 空き、
@@ -426,6 +429,8 @@ pub struct ProjectRt {
     pub loop_region: common::model::LoopRegion,
     /// 録音中の lane (bundle 由来)。
     pub recording_lanes: Arc<RecordingLanes>,
+    /// r.md #157: 再生中のコードの試聴の計画 (bundle 由来)。
+    pub chord_audition: Arc<crate::chord_audition::ChordAuditionPlan>,
     /// audio clip renderer (bundle 由来)。worker へは dispatch の間だけポインタで貸す。
     pub audio_clip_renderer: Arc<AudioClipRenderer>,
     /// device scope の対象 (bundle 由来)。
@@ -538,6 +543,7 @@ impl ProjectRt {
             preview_sequence: None,
             loop_region: common::model::LoopRegion::default(),
             recording_lanes: Arc::new(RecordingLanes::new()),
+            chord_audition: Arc::default(),
             audio_clip_renderer,
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             launcher: crate::launcher::LauncherRuntime::new(),
@@ -595,6 +601,7 @@ impl ProjectRt {
             std::mem::replace(&mut self.preview_sequence, new.preview_sequence.take());
         // 旧値は `new` 側に残し、下の recycled bundle に載せる (解放は off-thread)。
         std::mem::swap(&mut self.recording_lanes, &mut new.recording_lanes);
+        std::mem::swap(&mut self.chord_audition, &mut new.chord_audition);
         std::mem::swap(&mut self.audio_clip_renderer, &mut new.audio_clip_renderer);
         self.loop_region = new.loop_region;
         self.device_scope_watch = new.device_scope_watch;
@@ -692,6 +699,7 @@ impl ProjectRt {
             preview_sequence: old_preview_sequence,
             loop_region: new.loop_region,
             recording_lanes: new.recording_lanes,
+            chord_audition: new.chord_audition,
             audio_clip_renderer: new.audio_clip_renderer,
             device_scope_watch: new.device_scope_watch,
             mod_plan: retired_plan,
@@ -1209,6 +1217,7 @@ impl ProjectRt {
             // project だけが見出しを同期して scope へ書く。
             let native_io = NativeIo {
                 input: Some(&self.input_stage),
+                chord_audition: Some(&self.chord_audition),
                 ..native_io_for_buffer(
                     self.key,
                     self.shared.sc_listen_device.load(Ordering::Acquire),
@@ -1503,7 +1512,7 @@ fn native_io_for_buffer<'a>(
         }
         DeviceScopeTap { bridge: ds.bridge, watch }
     });
-    NativeIo { sc_listen, scopes, delta, input: None }
+    NativeIo { sc_listen, scopes, delta, input: None, chord_audition: None }
 }
 
 mod atomic_batch;
@@ -1641,6 +1650,7 @@ mod bundle_install_tests {
             preview_sequence: None,
             loop_region: common::model::LoopRegion::default(),
             recording_lanes: Arc::new(RecordingLanes::new()),
+            chord_audition: Arc::default(),
             audio_clip_renderer: Arc::new(AudioClipRenderer::empty()),
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,
@@ -1668,6 +1678,7 @@ mod bundle_install_tests {
             preview_sequence: None,
             loop_region: common::model::LoopRegion::default(),
             recording_lanes: Arc::new(RecordingLanes::new()),
+            chord_audition: Arc::default(),
             audio_clip_renderer: Arc::new(AudioClipRenderer::empty()),
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,
@@ -2391,6 +2402,7 @@ mod multi_project_tests {
             preview_sequence: None,
             loop_region: common::model::LoopRegion::default(),
             recording_lanes: Arc::new(RecordingLanes::new()),
+            chord_audition: Arc::default(),
             audio_clip_renderer: Arc::new(AudioClipRenderer::empty()),
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,

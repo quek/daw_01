@@ -135,6 +135,7 @@ fn bundle(song: &Arc<Song>) -> RtBundle {
         preview_sequence: None,
         loop_region: common::model::LoopRegion::default(),
         recording_lanes: Arc::new(RecordingLanes::new()),
+        chord_audition: Arc::default(),
         audio_clip_renderer: Arc::new(AudioClipRenderer::empty()),
         device_scope_watch: [0; MAX_DEVICE_SCOPES],
         mod_plan: None,

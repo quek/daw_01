@@ -38,4 +38,7 @@ pub struct ChordToolsState {
     pub detect_jobs: Vec<AudioDetectJob>,
     /// 追従するオーディオトラックの未検出の音源を最後に探した Song の版 (`SongDoc::edit_epoch`)。
     pub auto_detect_epoch: Option<u64>,
+    /// 直近 engine に送った「再生中も鳴らす」(`AudioCommand::SetChordAudition`) の値。差分送信用で、
+    /// `None` = 未送信 (起動直後 / daw_audio の起こし直しの後は必ず送る)。
+    pub sent_playback: Option<(Option<u32>, common::model::Voicing)>,
 }
