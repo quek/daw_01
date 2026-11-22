@@ -88,6 +88,10 @@ impl AppData {
     }
 
     /// 曲を差し替えたとき: 試聴音を止め、旧 Song の音源 id 宛の検出を捨てる (音源 id は曲ごとに採番し直す)。
+    ///
+    /// 鍵盤で弾いている途中の和音 (録音中なら頭の拍も) と「弾いたコード」も捨てる。録音を閉じる
+    /// (`close_recording_session` → `end_chord_recording`) より**先に**呼ぶこと — 残すと前の曲で弾いた和音が
+    /// 新しい曲に箱として置かれる (ノートの `midi_recording_active_notes` を先に捨てるのと同じ理由)。
     pub(crate) fn reset_chord_tools_for_new_song(&mut self) {
         self.expire_chord_audition(true);
         let tools = &mut self.cur.chord_tools;
@@ -96,6 +100,8 @@ impl AppData {
         tools.detected_without_chords.clear();
         tools.auto_detect_epoch = None;
         tools.extract_dialog = None;
+        tools.capture = crate::state::chord_tools::ChordCapture::default();
+        tools.played = None;
     }
 
     /// 期限が来た試聴音を止める。`force` は停止 / 曲差し替えの即時消音。

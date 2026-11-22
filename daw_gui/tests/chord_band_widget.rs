@@ -222,6 +222,28 @@ fn dragging_a_box_onto_a_track_makes_a_clip() {
     assert!((t.clips[0].start_beat - 2.0).abs() < 1e-9, "クリップは箱の位置: {}", t.clips[0].start_beat);
 }
 
+/// グループ (子を持つトラック = 自分のクリップを鳴らさない) の行は落とし先にならない: クリップはできず、
+/// レーンの上で離したので帯の箱も動かない。
+#[test]
+fn dropping_a_box_on_a_group_row_does_nothing() {
+    let (mut app, _a, _p) = build_app();
+    app.edit_song(|song| {
+        song.tracks.clear();
+        song.tracks.push(track_with(|t| t.id = 5));
+        song.tracks.push(track_with(|t| {
+            t.id = 6;
+            t.parent_group_id = Some(5);
+        }));
+    });
+    place(&mut app, 2.0, 4.0, 9);
+    // グループ 5 の行は master 行の下 y∈[108,158)。横にも 1 拍動かして離す。
+    drag(&mut app, (3.0 * ZOOM, UPPER_Y), (4.0 * ZOOM, 130.0), none());
+    assert_eq!(layout(&app), vec![(2.0, 4.0, 9)], "帯の箱は動かない");
+    let song = app.cur.song_doc.song();
+    assert!(song.track_by_id(5).unwrap().clips.is_empty(), "グループにはクリップを作らない");
+    assert!(song.track_by_id(6).unwrap().clips.is_empty());
+}
+
 /// MIDI クリップのヘッダを帯へ運んで離すと、クリップは動かずにコード (C) が帯に置かれる。
 #[test]
 fn dropping_a_midi_clip_on_the_band_extracts_chords() {

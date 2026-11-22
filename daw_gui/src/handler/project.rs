@@ -45,6 +45,8 @@ impl AppData {
         // 押しっぱなしノートの長さ確定は先に捨てる — 対象の Song はもう無く、
         // 同じ id が新 Song の別ノートに当たりうる。
         self.cur.recording.midi_recording_active_notes.clear();
+        // r.md #157: 鍵盤で弾いている途中の和音 (帯の録音の頭の拍) も同じ理由で先に捨てる。
+        self.reset_chord_tools_for_new_song();
         self.stop();
         // r.md #121: ホーム (Space が再生を始める位置) は旧 Song の拍なので捨てる。
         self.cur.transport.home_beat = None;
@@ -52,7 +54,6 @@ impl AppData {
         // r.md #67: カーソルキーの試聴音も止める (旧 Song の track id 宛の note-off が
         // 新 Song で宙に浮かないよう、モニター音と同じ扱いにする)。
         self.expire_nudge_audition(true);
-        self.reset_chord_tools_for_new_song();
 
         // ---- (A) Song を差し替えたら常に無効になるもの --------------------
         // 同じ project の別スナップショット (保存版に戻す / recovery 復元) でも
@@ -84,6 +85,20 @@ impl AppData {
         self.cur.selection.automation_point_anchor = None;
         self.cur.selection.automation_clip_anchor = None;
         self.cur.selection.last_edit_select = None;
+        // r.md #157: コードの箱の選択 / ポップアップ / メニュー (箱の id は曲ごとに 1 から振る)。
+        self.cur.selection.selected_chord_ids.clear();
+        self.cur.selection.chord_anchor = None;
+        self.cur.peph.chord_band.reset_song_scoped();
+        // 開いている色ピッカー / メニュー / 改名の宛先 (track / clip / section / chord / chain の id)。
+        // 残すと、選んだ色や名前が新しい曲の同じ id の別の対象に付く。
+        self.close_color_picker();
+        self.cur.peph.clip_create_menu = None;
+        self.cur.peph.section_menu = None;
+        self.cur.peph.send_picker = None;
+        self.cur.peph.renaming_chain = None;
+        self.cur.peph.track_rename_id = None;
+        self.cur.peph.section_rename_id = None;
+        self.cur.peph.clip_rename = None;
 
         // -- 開いているエディタ / インスペクタの対象 ------------------------
         // `audio_editor_clip` は positional `ClipKey` なので、開いたままだと

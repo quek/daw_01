@@ -113,24 +113,32 @@ impl ChordDrag {
         }
     }
 
+    /// 端の新しい位置。どの箱も「縮めて残す長さ」(`MIN_LEN`、もともとそれより短い箱はその長さ) を割らない —
+    /// 境界の可動域を `[lo, hi]` とし、今の位置 `cur` は必ず含める (`MIN_LEN` 未満の箱の端を掴んだだけで箱が
+    /// 伸び縮みしない / 連動の隣が長さ 0 以下になって `place_chord` に断られない)。
     fn resolve_edge(&self, s: Scale<'_>) -> Vec<(u32, f64, f64)> {
         let (start, len) = self.anchor;
         let end = start + len;
+        // 境界 `cur` を `[lo + keep(左の長さ), hi - keep(右の長さ)]` に収める (`cur` は常に可動域の中)。
+        let clamp = |b: f64, cur: f64, lo: f64, hi: f64| {
+            let (min, max) = ((lo + MIN_LEN.min(cur - lo)).min(cur), (hi - MIN_LEN.min(hi - cur)).max(cur));
+            b.clamp(min, max)
+        };
         match (self.edge, self.grab) {
             (EdgeMode::Proportional, grab) => proportional(&self.targets, grab, self.raw_delta(s)),
             (EdgeMode::Linked((nid, ns, nl)), Grab::Right) => {
-                let b = (end + self.snapped_delta(s)).clamp(start + MIN_LEN, (ns + nl - MIN_LEN).max(start + MIN_LEN));
+                let b = clamp(end + self.snapped_delta(s), end, start, ns + nl);
                 vec![(self.id, start, b - start), (nid, b, ns + nl - b)]
             }
             (EdgeMode::Linked((nid, ns, _)), Grab::Left) => {
-                let b = (start + self.snapped_delta(s)).clamp(ns + MIN_LEN, (end - MIN_LEN).max(ns + MIN_LEN));
+                let b = clamp(start + self.snapped_delta(s), start, ns, end);
                 vec![(nid, ns, b - ns), (self.id, b, end - b)]
             }
             (_, Grab::Left) => {
-                let ns = (start + self.snapped_delta(s)).clamp(0.0, (end - MIN_LEN).max(0.0));
+                let ns = clamp(start + self.snapped_delta(s), start, f64::NEG_INFINITY, end).max(0.0);
                 vec![(self.id, ns, end - ns)]
             }
-            (_, _) => vec![(self.id, start, (len + self.snapped_delta(s)).max(MIN_LEN))],
+            (_, _) => vec![(self.id, start, (len + self.snapped_delta(s)).max(MIN_LEN.min(len)))],
         }
     }
 }
@@ -198,4 +206,53 @@ pub(super) fn edge_mode(
         Grab::Move => None,
     };
     neighbor.map_or(EdgeMode::Single, |n| EdgeMode::Linked((n.id, n.start, n.len)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edge_drag(grab: Grab, id: u32, anchor: (f64, f64), edge: EdgeMode, dx_px: f32) -> ChordDrag {
+        ChordDrag {
+            grab,
+            id,
+            anchor,
+            targets: vec![(id, anchor.0, anchor.1)],
+            edge,
+            anchor_mouse: (100.0, 0.0),
+            last_mouse: (100.0 + dx_px, 0.0),
+            last_alt: false,
+            last_ctrl: false,
+            press_shift: false,
+            press_ctrl: false,
+        }
+    }
+
+    fn spans(d: &ChordDrag) -> Vec<(u32, f64, f64)> {
+        let s = Scale { beat_per_px: 0.01, snap: &SnapConfig::OFF, zoom: 100.0 };
+        match d.resolve(s) {
+            Resolved::Spans(v) => v,
+            other => panic!("端のドラッグなのに {other:?}"),
+        }
+    }
+
+    /// 最小の長さより短い箱どうしの境界を連動で動かしても、どちらの箱も長さ 0 以下にならない (`place_chord` に
+    /// 断られて箱が消えない)。動かさなければ範囲も変えない。
+    #[test]
+    fn linked_edges_never_shrink_a_short_box_to_nothing() {
+        // [0, 0.02) と [0.02, 0.04) (どちらも MIN_LEN = 1/16 未満)。
+        let (a, b) = ((1, 0.0, 0.02), (2, 0.02, 0.02));
+        for (grab, grabbed, neighbor) in [(Grab::Right, a, b), (Grab::Left, b, a)] {
+            for dx in [-40.0, 0.0, 40.0] {
+                let d = edge_drag(grab, grabbed.0, (grabbed.1, grabbed.2), EdgeMode::Linked(neighbor), dx);
+                let got = spans(&d);
+                assert!(got.iter().all(|s| s.2 > 0.0), "{grab:?} {dx}: {got:?}");
+                if dx == 0.0 {
+                    let mut got = got;
+                    got.sort_by_key(|s| s.0);
+                    assert_eq!(got, vec![a, b], "{grab:?}: 動かさなければ変えない");
+                }
+            }
+        }
+    }
 }

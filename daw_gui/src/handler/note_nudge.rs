@@ -206,9 +206,10 @@ impl AppData {
         let Some((visible_beats, visible_pitches)) = self.cur.peph.pianoroll_viewport else {
             return;
         };
-        let Some((_, r, start, dur, pitch)) = self.anchor_selected_note() else {
+        let Some((r, note)) = self.anchor_selected_note() else {
             return;
         };
+        let (start, dur, pitch) = (note.start_beat, note.duration_beats, note.pitch);
         // widget が note を描く位置は song-absolute (= content-local + content 原点)。
         let song_start = start + self.clip_start_beat_of(r);
         let song_end = song_start + dur;
@@ -255,8 +256,8 @@ impl AppData {
     }
 
     /// 選択のアンカー (= `selected_notes` の末尾、`SetNoteSelection` が anchor として扱う音) を
-    /// `(packed id, 所属 ClipKey, start_beat, duration_beats, pitch)` で返す。
-    fn anchor_selected_note(&self) -> Option<(u32, ClipKey, f64, f64, u8)> {
+    /// `(所属 ClipKey, ノート)` で返す (ノートの拍は content-local)。
+    fn anchor_selected_note(&self) -> Option<(ClipKey, common::model::Note)> {
         let &id = self.selected_note_ids().last()?;
         let shown = self.shown_pianoroll_clips();
         let (r, local) = Self::decode_note_id_in(&shown, id)?;
@@ -266,7 +267,7 @@ impl AppData {
             .track_by_id(r.track_id)
             .and_then(|t| t.clip_by_id(r.clip_id))?;
         let n = self.cur.song_doc.song().clip_notes(clip).get(local)?;
-        Some((id, r, n.start_beat, n.duration_beats, n.pitch))
+        Some((r, n.clone()))
     }
 
     /// 音程が変わったとき、アンカーの 1 音を短く鳴らす (Cubase の Acoustic Feedback 相当)。
@@ -278,9 +279,10 @@ impl AppData {
     /// 実際に pitch が変わったときだけ発音する = 端で止まっているときや、
     /// キーリピートで同じ音に留まるときは鳴らさない (「押しっぱなしで連打」 を防ぐ)。
     fn audition_anchor_note(&mut self) {
-        let Some((_, r, _, _, pitch)) = self.anchor_selected_note() else {
+        let Some((r, note)) = self.anchor_selected_note() else {
             return;
         };
+        let pitch = note.pitch;
         // 鳴らすのは **そのノート自身のトラック** の音源 (複数クリップ表示では対象クリップと
         // 別トラックのノートを掴んでいることがある)。
         let Some(track_id) = self
@@ -297,8 +299,12 @@ impl AppData {
             }
             self.release_held_preview(prev);
         }
-        // r.md #130: 鳴らすのは移調込みの鍵盤。消音用に送った鍵盤を控える。
-        let key = self.send_preview_on(track_id, pitch, PREVIEW_VELOCITY);
+        // r.md #130 / #157: 鳴らすのはノートの位置のコードへの追従 + 移調込みの鍵盤 (演奏入力と違い playhead の
+        // コードには寄せない)。消音用に送った鍵盤を控える。
+        let key = self.note_preview_key(track_id, r.clip_id, &note);
+        if let Some(k) = key {
+            self.send_preview_key_on(track_id, k, PREVIEW_VELOCITY);
+        }
         self.cur.recording.nudge_audition = Some((
             crate::state::HeldPreview { track_id, pitch, key },
             std::time::Instant::now() + NUDGE_AUDITION_LEN,

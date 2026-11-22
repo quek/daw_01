@@ -4,9 +4,10 @@
 //! engine が publish した変調の値面 / plugin DB) につなぐだけ:
 //!
 //! - 基準値の編集 ([`AppData::set_song_transpose`]) と トラックの追従の切替 ([`AppData::set_tracks_follow_transpose`])
-//! - 演奏プレビュー (MIDI 入力モニター / 仮想鍵盤 / 鍵盤レーン / ナッジ試聴 / MIDI Capture の試聴) が鳴らす鍵盤
-//!   ([`AppData::preview_key`])。**台帳には送った鍵盤を持つ** — 生の pitch を持って消音時に移調し直すと、
-//!   押している間に移調が変わったとき別の鍵盤を止めにいく。
+//! - 演奏プレビュー (MIDI 入力モニター / 仮想鍵盤 / 鍵盤レーン / MIDI Capture の試聴) が鳴らす鍵盤
+//!   ([`AppData::preview_key`]、playhead のコードへ寄せる) と、既にあるノートの試聴 (ナッジ) が鳴らす鍵盤
+//!   ([`AppData::note_preview_key`]、ノートの位置のコード)。**台帳には送った鍵盤を持つ** — 生の pitch を持って
+//!   消音時に移調し直すと、押している間に移調が変わったとき別の鍵盤を止めにいく。
 //! - ヘッダの「追従しない」印 ([`AppData::track_shows_no_transpose_mark`])
 
 use common::model::Track;
@@ -61,6 +62,20 @@ impl AppData {
         self.transposed_preview_key(track_id, followed)
     }
 
+    /// 既にあるノート (トラック `track_id` のクリップ `clip_id` の `note`) の試聴で **いま鳴らす鍵盤**: ノートの位置の
+    /// コードへの追従 (ピアノロールの薄い枠と同じ [`ClipSoundingKeys`]) + 移調。演奏入力の [`Self::preview_key`]
+    /// (playhead のコードへ寄せる) とは別の口 — 書いてあるノートはその位置で鳴る音を聴かせる。ランチャーのセルの
+    /// ノートは曲の位置を持たないので書いた音 (+ 移調)。
+    ///
+    /// [`ClipSoundingKeys`]: crate::handler::chord_follow_view::ClipSoundingKeys
+    pub(crate) fn note_preview_key(&self, track_id: u32, clip_id: u32, note: &common::model::Note) -> Option<u8> {
+        let followed = match self.clip_sounding_keys(track_id, clip_id) {
+            Some(keys) => keys.key(note)?,
+            None => note.pitch,
+        };
+        self.transposed_preview_key(track_id, followed)
+    }
+
     /// [`Self::preview_key`] の **移調だけ** (コードへの追従なし)。コードの試聴 (r.md #157 Q7) は書いた音で鳴らすので
     /// こちらを使う。
     pub(crate) fn transposed_preview_key(&self, track_id: u32, pitch: u8) -> Option<u8> {
@@ -84,8 +99,13 @@ impl AppData {
     /// (呼び出し側の台帳はこれを持ち、消音は [`Self::send_preview_off`] にこの鍵盤を渡す)。範囲外なら送らない。
     pub(crate) fn send_preview_on(&self, track_id: u32, pitch: u8, velocity: u8) -> Option<u8> {
         let key = self.preview_key(track_id, pitch)?;
-        self.send_audio(AudioCommand::PreviewNoteOn { project: self.pk(), track_id, pitch: key, velocity });
+        self.send_preview_key_on(track_id, key, velocity);
         Some(key)
+    }
+
+    /// 解いた鍵盤 `key` をそのまま鳴らす ([`Self::send_preview_on`] / 既にあるノートの試聴 [`Self::note_preview_key`])。
+    pub(crate) fn send_preview_key_on(&self, track_id: u32, key: u8, velocity: u8) {
+        self.send_audio(AudioCommand::PreviewNoteOn { project: self.pk(), track_id, pitch: key, velocity });
     }
 
     /// [`Self::send_preview_on`] が送った鍵盤 `key` を止める。

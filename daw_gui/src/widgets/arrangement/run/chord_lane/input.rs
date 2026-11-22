@@ -228,10 +228,10 @@ pub(super) fn take(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) -> (Live,
     (live, released)
 }
 
-pub(super) fn release(ui: &mut Ui<'_, AppData>, _app: &AppData, f: &ArrangementFrame<'_>, r: Released) {
+pub(super) fn release(ui: &mut Ui<'_, AppData>, app: &AppData, f: &ArrangementFrame<'_>, r: Released) {
     if let Some(d) = r.drag {
-        if super::handoff::release_chord_drag(ui, f, &d) {
-            // レーンの上で離した = クリップにした (帯の箱は動かさない)。
+        if super::handoff::release_chord_drag(ui, app, f, &d) {
+            // レーンの上で離した = クリップにした / 落とせない行だった (どちらも帯の箱は動かさない)。
         } else if d.is_click() {
             let modifier = SelectModifier::from_modifiers(d.press_shift, d.press_ctrl);
             let id = d.id;

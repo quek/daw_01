@@ -164,4 +164,30 @@ mod tests {
             app.cur.song_doc.song().chords.iter().map(|c| (c.start_beat, c.len_beats, c.chord.root, c.chord.kind)).collect();
         assert_eq!(got, vec![(0.0, 4.0, 9, ChordKind::Minor), (4.0, 2.0, 5, ChordKind::Major)]);
     }
+
+    /// 帯の録音中に曲を差し替えると、弾きかけの和音は前の曲のものなので捨てる (差し替えの後の停止で新しい曲に
+    /// 箱を置かない)。離しても新しい曲には何も起きない。
+    #[test]
+    fn replacing_the_song_while_recording_drops_the_chord_being_played() {
+        let mut app = crate::test_support::headless_app();
+        app.handle_event(AppEvent::ChordTool(ChordToolEvent::SetRecordArmed(true)));
+        app.cur.recording.requested = true;
+        app.cur.recording.live = true;
+        app.cur.view.arrange_snap_enabled = false;
+        app.cur.transport.playhead_beat = Some(1.0);
+        for k in [57, 60, 64] {
+            app.chord_capture_note_on(k);
+        }
+        app.cur.transport.playhead_beat = Some(3.0);
+        let mut song = app.cur.song_doc.song().clone();
+        song.chords.clear();
+        app.cur.song_doc.replace_song(song);
+        app.after_song_replaced();
+        assert!(app.cur.song_doc.song().chords.is_empty(), "新しい曲に箱を置かない");
+        assert!(!app.cur.song_doc.is_dirty(), "開いた直後の曲を * にしない");
+        for k in [57, 60, 64] {
+            app.chord_capture_note_off(k);
+        }
+        assert!(app.cur.song_doc.song().chords.is_empty());
+    }
 }

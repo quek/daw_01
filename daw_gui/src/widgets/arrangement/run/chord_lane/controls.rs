@@ -91,6 +91,11 @@ enum Item {
 }
 
 fn settings_menu(ui: &mut Ui<'_, AppData>, app: &AppData, open_at: Option<(f32, f32)>) {
+    const MENU_ID: &str = "chord_band_settings";
+    // 閉じている間は項目 (全トラック分の `format!`) を組まない。開く 1-shot か、開いている間だけ描く。
+    if open_at.is_none() && !ui.is_context_menu_open(MENU_ID) {
+        return;
+    }
     let check = |on: bool| if on { "✓ " } else { "　 " };
     let mut items: Vec<(String, Item)> = Vec::new();
     let notation = app.chord_notation();
@@ -110,7 +115,7 @@ fn settings_menu(ui: &mut Ui<'_, AppData>, app: &AppData, open_at: Option<(f32, 
     }
     let labels: Vec<&str> = items.iter().map(|(s, _)| s.as_str()).collect();
     let actions: Vec<Item> = items.iter().map(|(_, a)| *a).collect();
-    ui.context_menu_at("chord_band_settings", open_at, &labels, move |idx, ui| {
+    ui.context_menu_at(MENU_ID, open_at, &labels, move |idx, ui| {
         let Some(&item) = actions.get(idx) else { return };
         ui.push_edit(Edit::mutate(move |app: &mut AppData| match item {
             Item::Notation(n) => app.cur.view.chord_band.notation = n,

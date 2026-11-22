@@ -43,10 +43,11 @@ pub struct TrackMarks {
 impl TrackMarks {
     /// `t` の印。`follows_transpose` は `Song::follows_transpose_mask` の値 (全トラックを 1 回で引く caller から)。
     pub fn of(app: &AppData, t: &common::model::Track, follows_transpose: bool) -> Self {
-        Self {
-            no_transpose: app.track_shows_no_transpose_mark(t, follows_transpose),
-            chord_follow: app.cur.song_doc.song().track_chord_follow(t.id).mark(),
-        }
+        // 実効モード (`Song::track_chord_follow` と同じ: 曲全体のスイッチが切れていれば Off)。`t` は手元にあるので
+        // id で引き直さない (全トラックの行を組むたびに線形探索すると O(トラック数²))。
+        let chord_follow =
+            if app.cur.song_doc.song().chord_follow_enabled { t.follow_chords } else { common::model::ChordFollow::Off };
+        Self { no_transpose: app.track_shows_no_transpose_mark(t, follows_transpose), chord_follow: chord_follow.mark() }
     }
 }
 

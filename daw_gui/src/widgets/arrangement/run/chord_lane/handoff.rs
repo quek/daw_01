@@ -20,20 +20,35 @@ use crate::widgets::arrangement::geometry::track_index_from_y;
 use crate::widgets::arrangement::sessions::ReleasedSessions;
 use crate::widgets::arrangement::{ArrangementState, ClipDragKind, MASTER_TRACK_ID, effective_track_row_h};
 
-/// 箱のドラッグがレーンの上にあるなら、落ちるトラック `(id, 行の top, 行の高さ)`。マスター行は落とし先にしない。
-pub(super) fn drop_track(f: &ArrangementFrame<'_>, d: &ChordDrag) -> Option<(u32, f32, f32)> {
-    let (x, y) = d.last_mouse;
-    if d.grab != Grab::Move || !f.lanes.contains(x, y) {
+/// 箱を掴んで (移動で) レーンの上へ運んでいるか。この間は帯の箱を動かさない (離してもクリップにするか、
+/// 落とせない行なら何もしない)。
+pub(super) fn over_lanes(f: &ArrangementFrame<'_>, d: &ChordDrag) -> bool {
+    d.grab == Grab::Move && f.lanes.contains(d.last_mouse.0, d.last_mouse.1)
+}
+
+/// 箱のドラッグがレーンの上にあるなら、落ちるトラック `(id, 行の top, 行の高さ)`。落とし先は **MIDI クリップを
+/// 置いて鳴る行** だけ — マスター行と、グループ (子を持ち自分のクリップを鳴らさない) の行は除く
+/// (ランチャーのセルを置ける行と同じ規則、`launcher_cells::row_accepts_cells`)。
+pub(super) fn drop_track(app: &AppData, f: &ArrangementFrame<'_>, d: &ChordDrag) -> Option<(u32, f32, f32)> {
+    if !over_lanes(f, d) {
         return None;
     }
-    let i = track_index_from_y(y, f.lanes.y, &f.tops)?;
+    let i = track_index_from_y(d.last_mouse.1, f.lanes.y, &f.tops)?;
     let t = f.visible_tracks.get(i).filter(|t| t.id != MASTER_TRACK_ID)?;
+    let row = crate::event_launcher::LauncherRow::Track(t.id);
+    if !crate::handler::launcher_cells::row_accepts_cells(app.cur.song_doc.song(), row) {
+        return None;
+    }
     Some((t.id, f.tops[i], effective_track_row_h(t, f.view.track_row_h)))
 }
 
-/// 箱のドラッグをレーンの上で離した → クリップにする。帯の箱の移動は確定しない (`true` を返す)。
-pub(super) fn release_chord_drag(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>, d: &ChordDrag) -> bool {
-    let Some((track_id, _, _)) = drop_track(f, d) else { return false };
+/// 箱のドラッグをレーンの上で離した → 落とせる行ならクリップにする。どちらでも帯の箱の移動は確定しない
+/// (`true` を返す)。レーンの外なら `false` (帯の上の移動として確定する)。
+pub(super) fn release_chord_drag(ui: &mut Ui<'_, AppData>, app: &AppData, f: &ArrangementFrame<'_>, d: &ChordDrag) -> bool {
+    if !over_lanes(f, d) {
+        return false;
+    }
+    let Some((track_id, _, _)) = drop_track(app, f, d) else { return true };
     let chord_ids: Vec<u32> = d.targets.iter().map(|t| t.0).collect();
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
         app.handle_event(AppEvent::ChordTool(ChordToolEvent::ChordsToClip { chord_ids, track_id }));
@@ -102,8 +117,8 @@ pub(super) fn take_file_drop(ui: &mut Ui<'_, AppData>, app: &AppData, f: &Arrang
 }
 
 /// レーンの上の落とし先のゴースト (帯の描画より後、レーンの上に乗せる)。
-pub(super) fn draw_drop_ghost(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>, d: &ChordDrag) {
-    let Some((_, top, h)) = drop_track(f, d) else { return };
+pub(super) fn draw_drop_ghost(ui: &mut Ui<'_, AppData>, app: &AppData, f: &ArrangementFrame<'_>, d: &ChordDrag) {
+    let Some((_, top, h)) = drop_track(app, f, d) else { return };
     let lo = d.targets.iter().map(|t| t.1).fold(f64::INFINITY, f64::min);
     let hi = d.targets.iter().map(|t| t.1 + t.2).fold(f64::NEG_INFINITY, f64::max);
     if hi <= lo {
