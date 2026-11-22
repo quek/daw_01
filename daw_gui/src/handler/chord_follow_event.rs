@@ -106,6 +106,15 @@ fn freeze_clips(song: &mut Song, clips: &[(u32, u32)], note_ids: &[u32]) -> bool
     true
 }
 
+/// content `content_id` を指すクリップ (アレンジとランチャーのセル、全トラック) の数。
+fn content_users(song: &Song, content_id: common::model::ContentId) -> usize {
+    song.tracks
+        .iter()
+        .flat_map(|t| t.clips.iter().chain(t.session_clips.iter().map(|c| &c.clip)))
+        .filter(|c| c.content_id == content_id)
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use common::model::{Chord, ChordEvent, ChordFollow, ChordKind, Clip, ClipContent, MidiContent, Note};
@@ -205,13 +214,4 @@ mod tests {
         app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::SetEnabled(false)));
         assert_eq!(app.preview_key(track_id, 62), Some(62), "曲全体のスイッチを切ると弾いた音");
     }
-}
-
-/// content `content_id` を指すクリップ (アレンジとランチャーのセル、全トラック) の数。
-fn content_users(song: &Song, content_id: common::model::ContentId) -> usize {
-    song.tracks
-        .iter()
-        .flat_map(|t| t.clips.iter().chain(t.session_clips.iter().map(|c| &c.clip)))
-        .filter(|c| c.content_id == content_id)
-        .count()
 }
