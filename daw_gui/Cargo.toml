@@ -74,6 +74,10 @@ name = "audio_device_smoke"
 required-features = ["script"]
 
 [[test]]
+name = "chord_follow_audio"
+required-features = ["script"]
+
+[[test]]
 name = "chord_smoke"
 required-features = ["script"]
 
