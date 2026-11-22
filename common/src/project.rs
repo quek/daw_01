@@ -1041,6 +1041,11 @@ mod tests {
                 crate::model::RackPanelKey::Device(7),
                 crate::model::RackPanelKey::MasterLimiter,
             ],
+            chord_tools: crate::model::ChordToolsView {
+                audition_track: Some(3),
+                audition_while_playing: true,
+                ..crate::model::ChordToolsView::default()
+            },
         }
     }
 

@@ -52,6 +52,7 @@ impl AppData {
         // r.md #67: カーソルキーの試聴音も止める (旧 Song の track id 宛の note-off が
         // 新 Song で宙に浮かないよう、モニター音と同じ扱いにする)。
         self.expire_nudge_audition(true);
+        self.reset_chord_tools_for_new_song();
 
         // ---- (A) Song を差し替えたら常に無効になるもの --------------------
         // 同じ project の別スナップショット (保存版に戻す / recovery 復元) でも

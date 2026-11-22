@@ -8,6 +8,8 @@
 //! variant を足せば script からも撃てる)。適用は `handler::chord_event` / `chord_follow_event` /
 //! `chord_tool_event`。
 
+use common::chord_detect::DetectOptions;
+use common::chord_voicing::Voicing;
 use common::model::{AudioChordSpan, AudioSourceId, Chord, ChordEvent, ChordFollow};
 use serde::{Deserialize, Serialize};
 
@@ -76,23 +78,49 @@ impl ChordFollowEvent {
 /// 検出 / 変換 / 取り込み。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChordToolEvent {
-    /// オーディオ音源から検出したコードを保存する (空なら消す)。
-    SetAudioChords { source_id: AudioSourceId, spans: Vec<AudioChordSpan> },
+    /// オーディオ音源から検出したコードを保存する (空なら消す)。`place_on` のクリップ (`(track id, clip id)`)
+    /// があれば、そのクリップが鳴らす位置で帯にも置く (保存と帯への配置は 1 undo step)。
+    SetAudioChords {
+        source_id: AudioSourceId,
+        spans: Vec<AudioChordSpan>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        place_on: Vec<(u32, u32)>,
+    },
     /// コードトラックの箱 `chord_ids` (空なら全部) をトラック `track_id` の MIDI クリップにする
     /// (帯 → トラックのドラッグ / Chords to MIDI)。
     ChordsToClip { chord_ids: Vec<u32>, track_id: u32 },
     /// MIDI クリップ `clips` (`(track id, clip id)`) のノートからコードを検出して帯に置く
     /// (クリップ → 帯のドラッグ / コードを抽出)。`window_beats` は 1 コードとして見る長さ。
     ExtractFromClips { clips: Vec<(u32, u32)>, window_beats: f64 },
+    /// オーディオクリップ `clips` (`(track id, clip id)`) の音源からコードを検出する (off-thread)。
+    /// 結果は `SetAudioChords` で保存し、`place` なら帯にも置く (クリップ → 帯のドロップ /
+    /// 「コードを抽出…」)。MIDI クリップは無視する (MIDI は `ExtractFromClips`)。
+    DetectAudioClips { clips: Vec<(u32, u32)>, place: bool },
+    // ---- 以下は聴き方 / 道具の設定 (`ViewState.chord_tools`、Song を変えない = undo / `*` なし) ----
+    /// 試聴を鳴らすトラック (`None` = 無音)。
+    SetAuditionTrack(Option<u32>),
+    /// 再生中もコードトラックを試聴トラックで鳴らす。
+    SetAuditionWhilePlaying(bool),
+    /// 試聴・再生中の試聴・ノート化の voicing。
+    SetVoicing(Voicing),
+    /// 「コードを抽出…」の設定。
+    SetDetectOptions(DetectOptions),
+    /// 帯の録音待機 (録音中に MIDI 鍵盤で弾いた和音をコードの箱にする)。
+    SetRecordArmed(bool),
 }
 
 impl ChordToolEvent {
     #[must_use]
     pub fn undo_label(&self) -> &'static str {
         match self {
-            Self::SetAudioChords { .. } => "オーディオのコード検出",
+            Self::SetAudioChords { .. } | Self::DetectAudioClips { .. } => "オーディオのコード検出",
             Self::ChordsToClip { .. } => "コードをノートに変換",
             Self::ExtractFromClips { .. } => "コードを抽出",
+            Self::SetAuditionTrack(_)
+            | Self::SetAuditionWhilePlaying(_)
+            | Self::SetVoicing(_)
+            | Self::SetDetectOptions(_)
+            | Self::SetRecordArmed(_) => "コードの試聴の設定",
         }
     }
 }
