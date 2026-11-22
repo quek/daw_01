@@ -21,7 +21,8 @@ use daw_ui_renderer::Rect;
 use crate::app::AppData;
 
 const OVERLAY_ID: &str = "chord_popup";
-const W: f32 = 468.0;
+/// 幅は種類の一番長いラベル (`augMaj7`) が 6 列で省略されない幅。
+const W: f32 = 500.0;
 const H: f32 = 268.0;
 const PAD: f32 = 8.0;
 const ROW_H: f32 = 22.0;
@@ -43,8 +44,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>) {
         }
         return;
     };
-    let max_x = (lane.rect.x + lane.rect.w - W).max(lane.rect.x);
-    let rect = Rect { x: lane.x_of(ev.start_beat).clamp(lane.rect.x, max_x), y: lane.rect.y + lane.rect.h + 2.0, w: W, h: H };
+    // 箱の左端の直下。窓の右端からはみ出すなら左へ寄せる (帯が狭いと帯の幅には収まらない)。
+    let screen_w = ui.screen().width as f32;
+    let x = lane.x_of(ev.start_beat).max(lane.rect.x).min(screen_w - W - 4.0).max(0.0);
+    let rect = Rect { x, y: lane.rect.y + lane.rect.h + 2.0, w: W, h: H };
     if !ui.is_overlay_open(OVERLAY_ID) {
         ui.open_overlay(OVERLAY_ID);
     }

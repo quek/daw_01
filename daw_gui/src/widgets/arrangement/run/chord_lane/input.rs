@@ -8,6 +8,7 @@
 //! - 箱のダブルクリックでポップアップ、右クリックでメニュー。
 
 use daw_ui_core::{CursorIcon, Edit, Ui, WidgetId};
+use daw_ui_renderer::Rect;
 
 use super::gesture::{ChordDrag, EdgeMode, Grab, RangeDrag, Resolved, Scale};
 use super::{ChordBox, ChordLaneState, Live, box_rect};
@@ -169,6 +170,44 @@ pub(super) fn advance(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
     {
         r.last_mouse = (px, py);
     }
+}
+
+/// ドラッグ中にポインタが左右の端へ寄ったら横へ送る (Arranger 帯のドラッグと同じ横だけの端オートスクロール、
+/// `drag::edge_auto_scroll` と同じ量と起動条件)。送った分だけ session の起点を逆へずらし、掴んだ箱を
+/// ポインタに付いてこさせる。範囲は帯からレーンの下端まで (箱をレーンへ運んでいる間も送る)。
+pub(super) fn edge_scroll(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {
+    use daw_ui_core::widgets::edge_scroll::{ACTIVATE_PX, EdgeScrollCfg, edge_scroll_delta};
+    let Some((px, py)) = f.pointer.pos else { return };
+    if f.pointer.primary_just_released || f.beat_per_px <= 1e-6 {
+        return;
+    }
+    let anchor = {
+        let s: &mut ChordLaneState = ui.widget_state(state_id(f));
+        s.drag.as_ref().map(|d| d.anchor_mouse).or(s.range.map(|r| r.anchor_mouse))
+    };
+    let Some(anchor) = anchor else { return };
+    if (px - anchor.0).hypot(py - anchor.1) < ACTIVATE_PX {
+        return;
+    }
+    let zone = Rect { x: f.lanes.x, y: f.chord_rect.y, w: f.lanes.w, h: f.lanes.y + f.lanes.h - f.chord_rect.y };
+    let (dx, _) = edge_scroll_delta(f.pointer.pos, zone, EdgeScrollCfg::default(), true, false);
+    if dx == 0.0 {
+        return;
+    }
+    let new_start = (f.view.scroll_beat_raw + f64::from(dx) * f.beat_per_px).max(0.0);
+    let applied = ((new_start - f.view.scroll_beat_raw) / f.beat_per_px) as f32;
+    if applied == 0.0 {
+        return;
+    }
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| app.handle_event(AppEvent::AutoScrollArrange(new_start as f32))));
+    let s: &mut ChordLaneState = ui.widget_state(state_id(f));
+    if let Some(d) = s.drag.as_mut() {
+        d.anchor_mouse.0 -= applied;
+    }
+    if let Some(r) = s.range.as_mut() {
+        r.anchor_mouse.0 -= applied;
+    }
+    ui.request_redraw();
 }
 
 /// release フレームで取り出した session。

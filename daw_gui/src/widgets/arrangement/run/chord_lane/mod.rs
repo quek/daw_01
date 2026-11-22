@@ -108,6 +108,7 @@ pub(in crate::widgets::arrangement) fn run(
     input::escape(ui, f);
     input::press(ui, app, f);
     input::advance(ui, f);
+    input::edge_scroll(ui, f);
     let (live, chord_released) = input::take(ui, f);
     draw::draw(ui, f, &live, clip_over);
     input::release(ui, app, f, chord_released);
