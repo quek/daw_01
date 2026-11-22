@@ -28,6 +28,13 @@ impl AppData {
         format_chord(chord, self.chord_notation(), self.cur.song_doc.song().scale_at(song_beat))
     }
 
+    /// 文字入力欄に入れるコード名: 表記の設定によらず音名 (`parse_chord` が読めるのは音名だけ — 度数表記の
+    /// `vi7` を欄に入れると、少し書き足して確定しただけで「読めない」になる)。
+    #[must_use]
+    pub(crate) fn chord_entry_text(&self, chord: &Chord, song_beat: f64) -> String {
+        format_chord(chord, ChordNotation::Regular, self.cur.song_doc.song().scale_at(song_beat))
+    }
+
     /// [`ChordTrackEvent`] の処理 (`AppEvent::Chord` の 1 arm)。変化が無ければ undo を積まない。
     pub(crate) fn handle_chord_event(&mut self, ev: ChordTrackEvent) {
         if let ChordTrackEvent::PlaceMany { chords, .. } = &ev

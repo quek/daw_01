@@ -188,6 +188,29 @@ fn header_buttons_toggle_follow_and_visibility() {
     assert_eq!(app.cur.peph.chord_band.lane.rect.h, 0.0, "隠した帯は高さ 0");
 }
 
+/// 見出しの `▾` → 「表記: ローマ数字」で表記が切り替わり、帯のコード名が度数になる (キーが無い曲でも)。
+#[test]
+fn settings_menu_switches_the_notation() {
+    use common::chord_name::ChordNotation;
+    let (mut app, _a, _p) = build_app();
+    app.cur.view.arrange_header_w = 160.0;
+    place(&mut app, 0.0, 4.0, 9);
+    let mut host = UiHost::no_redraw();
+    let click = |host: &mut UiHost<AppData>, app: &mut AppData, x: f32, y: f32| {
+        drive(host, app, press(x, y, none()));
+        drive(host, app, release(x, y, none()));
+    };
+    drive(&mut host, &mut app, hold(700.0, 500.0, none()));
+    // `▾` (x∈[128,146)) を押すとメニューがその下に開く。項目は 24px / 行で 3 行目が「ローマ数字」。
+    click(&mut host, &mut app, 137.0, 48.0);
+    click(&mut host, &mut app, 150.0, 58.0 + 24.0 * 2.0 + 12.0);
+    assert_eq!(app.cur.view.chord_band.notation, ChordNotation::Roman, "メニューの項目で表記が切り替わる");
+    let chord = app.cur.song_doc.song().chords[0].chord;
+    let key = app.cur.song_doc.song().scale_at(0.0);
+    assert_eq!(key, None);
+    assert_eq!(common::chord_name::format_chord(&chord, ChordNotation::Roman, key), "VI", "キーが無い曲は C を主音にする");
+}
+
 /// master 行 (y∈[58,108)) の下の 1 本目のトラックに、C メジャーの和音を鳴らす 4 拍の MIDI クリップを置く。
 fn add_triad_clip(app: &mut AppData, track_id: u32, clip_id: u32, start: f64) {
     app.edit_song(|song| {

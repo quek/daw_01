@@ -138,7 +138,7 @@ impl AppData {
     fn refresh_chord_popup_text(&mut self) {
         let Some(id) = self.chord_popup_id() else { return };
         let Some(c) = self.cur.song_doc.song().chord_by_id(id).cloned() else { return };
-        let text = self.chord_label(&c.chord, c.start_beat);
+        let text = self.chord_entry_text(&c.chord, c.start_beat);
         if let Some(p) = self.cur.peph.chord_band.popup.as_mut() {
             p.text = text;
             p.typed = false;
@@ -149,8 +149,8 @@ impl AppData {
     /// 箱のポップアップを開く (開いていれば箱を差し替え、入力欄を作り直す)。
     pub(crate) fn open_chord_popup(&mut self, id: u32) {
         let Some(c) = self.cur.song_doc.song().chord_by_id(id).cloned() else { return };
-        let text = self.chord_label(&c.chord, c.start_beat);
-        let rev = self.cur.peph.chord_band.popup.as_ref().map_or(0, |p| p.rev.wrapping_add(1));
+        let text = self.chord_entry_text(&c.chord, c.start_beat);
+        let rev =self.cur.peph.chord_band.popup.as_ref().map_or(0, |p| p.rev.wrapping_add(1));
         let played_seen = self.cur.chord_tools.played.map_or(0, |(_, seq)| seq);
         self.cur.peph.chord_band.popup = Some(ChordPopup { rev, played_seen, ..ChordPopup::new(id, text) });
     }

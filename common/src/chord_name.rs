@@ -15,9 +15,9 @@ pub enum ChordNotation {
     /// 音名 (`Am7`)。
     #[default]
     Regular,
-    /// キーからの度数を数字で (`6m7`、Nashville)。キーが無い位置では `Regular` に倒す。
+    /// キーからの度数を数字で (`6m7`、Nashville)。キーが無い位置は C を主音にする。
     Number,
-    /// キーからの度数をローマ数字で (`vi7`)。キーが無い位置では `Regular` に倒す。
+    /// キーからの度数をローマ数字で (`vi7`)。キーが無い位置は C を主音にする。
     Roman,
 }
 
@@ -163,11 +163,12 @@ fn tension_suffix(kind: ChordKind, tensions: Tensions) -> String {
 }
 
 /// [`Chord`] の表示名。`key` はその位置のキー (綴りと度数表記に使う)。
+/// 度数表記でキーが無い位置は C を主音にする (表記を選んだのに何も変わらない、にしない)。
 #[must_use]
 pub fn format_chord(chord: &Chord, notation: ChordNotation, key: Option<&ScaleChange>) -> String {
     let tensions = tension_suffix(chord.kind, chord.tensions);
     let bass = chord.bass.filter(|b| b % 12 != chord.root % 12);
-    let (ChordNotation::Number | ChordNotation::Roman, Some(k)) = (notation, key) else {
+    if notation == ChordNotation::Regular {
         let root_name = note_name(chord.root, chord.spelling, key);
         let mut out = String::from(root_name);
         out.push_str(kind_suffix(chord.kind));
@@ -177,8 +178,9 @@ pub fn format_chord(chord: &Chord, notation: ChordNotation, key: Option<&ScaleCh
             out.push_str(bass_name(chord, b, root_name, key));
         }
         return out;
-    };
-    let degree = |pc: u8| DEGREES[usize::from((pc % 12 + 12 - k.root % 12) % 12)];
+    }
+    let key_root = key.map_or(0, |k| k.root % 12);
+    let degree = |pc: u8| DEGREES[usize::from((pc % 12 + 12 - key_root) % 12)];
     let (acc, num, roman) = degree(chord.root);
     let mut out = String::from(acc);
     if notation == ChordNotation::Number {
@@ -468,7 +470,8 @@ mod tests {
         assert_eq!(format_chord(&am7, ChordNotation::Roman, Some(&key)), "vi7");
         let bb = Chord::new(10, ChordKind::Major);
         assert_eq!(format_chord(&bb, ChordNotation::Roman, Some(&key)), "bVII");
-        // キーが無い位置では音名に倒す。
-        assert_eq!(format_chord(&am7, ChordNotation::Roman, None), "Am7");
+        // キーが無い位置は C を主音にする (音名に戻さない)。
+        assert_eq!(format_chord(&am7, ChordNotation::Roman, None), "vi7");
+        assert_eq!(format_chord(&am7, ChordNotation::Number, None), "6m7");
     }
 }
