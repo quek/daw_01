@@ -158,6 +158,19 @@ fn chord_played_on_the_keyboard_while_open_is_set() {
     assert!(app.cur.peph.chord_band.popup.is_some(), "弾いても開いたまま (続けて弾ける)");
 }
 
+/// Esc で閉じる (箱は変わらない)。
+#[test]
+fn escape_closes_the_popup() {
+    let (mut app, _a, _p) = build_app();
+    let id = place(&mut app, 0.0, 4.0, Chord::new(0, ChordKind::Major));
+    let mut h = host();
+    open_on(&mut h, &mut app, 1.0);
+    run(&mut h, &mut app, PointerFrame::default(), vec![key(PhysicalKey::Escape)]);
+    idle(&mut h, &mut app);
+    assert!(app.cur.peph.chord_band.popup.is_none(), "Esc で閉じる");
+    assert_eq!(chord_of(&app, id), Some(Chord::new(0, ChordKind::Major)));
+}
+
 /// ↓ で候補を巡回して箱に入れる (先頭から)。
 #[test]
 fn down_arrow_cycles_the_candidates() {

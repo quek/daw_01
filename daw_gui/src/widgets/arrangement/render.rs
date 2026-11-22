@@ -95,7 +95,8 @@ pub(super) fn dispatch(
         // 位置 (rect.x/y) と arranger lane 高さ (lanes.y のオフセット成分) も
         // key に含める — 「サイズ不変で位置 / lane 高さだけ変わる」 layout
         // 変化で旧座標に描かれるのを correct-by-construction で防ぐ。
-        (f.rect.x.to_bits(), f.rect.y.to_bits(), f.view.arranger_lane_h.to_bits()),
+        // r.md #157: コードトラックの帯も lanes.y を下げるので head の帯の高さの和を入れる。
+        (f.rect.x.to_bits(), f.rect.y.to_bits(), (f.view.arranger_lane_h + f.chord_rect.h).to_bits()),
         bend_skip_hash,
         grid_lines.cache_key(),
     );

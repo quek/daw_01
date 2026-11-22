@@ -1215,6 +1215,8 @@ fn dispatch_escape_key(app: &AppData, ui: &mut Ui<'_, AppData>) {
         && !app.ui_ephemeral.is_font_picker_open
         && app.cur.peph.send_picker.is_none()
         && !pianoroll_lyric_editing
+        // r.md #157: コードのポップアップは自分で Esc を取って閉じる (`view::chord_popup`)。
+        && app.cur.peph.chord_band.popup.is_none()
         && ui.take_shortcut("escape")
     {
         if app.cur.peph.track_rename_id.is_some() {

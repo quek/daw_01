@@ -75,6 +75,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>) {
         candidates(app, ui, Rect { x: rect.x + PAD, y: cand_y, w: W - PAD * 2.0, h: ROW_H }, candidate);
         ui.label_at("chord_popup_hint", "←→ 隣のコード  Tab 次を追加  ↑↓ 候補  Enter 確定  Esc 閉じる", rect.x + PAD, cand_y + ROW_H + 6.0, 10.0, p.text_dim);
     });
+    // Esc は root の Esc の連鎖が譲ってくれる (ポップアップが開いている間は消費しない) ので、ここで取って閉じる。
+    if ui.take_shortcut("escape") {
+        ui.close_overlay(OVERLAY_ID);
+    }
     // 外クリック / Esc で閉じた → 状態も閉じる。
     if !ui.is_overlay_open(OVERLAY_ID) {
         ui.push_edit(Edit::mutate(|app: &mut AppData| app.close_chord_popup()));
