@@ -11,13 +11,17 @@ use crate::theme::Palette;
 use crate::view::track_color;
 
 /// 箱の塗り。`ChordEvent.color` があればその色 (トラック色と同じ linear 値)、無ければ
-/// テーマの accent を面 (`panel_raised`) に薄く重ねた色 (ダーク / ライトのどちらでも面から浮き、
-/// 文字が `chord_box_ink` で読める明度に収まる)。
+/// テーマの accent を面 (`panel_raised`) に薄く重ねた色。
+///
+/// 既定色の濃さ (alpha 0.12) は「文字が本文の 4.5:1 で読める」側に寄せた値: 白黒どちらのインクとも
+/// 拮抗する中間の明度 (相対輝度 ≈ 0.18) を避け、ダークでは暗い箱 + 明インク、ライトでは明るい箱 +
+/// 暗インクになる (0.25 / 0.35 だとダークで中間に入り 3:1 しか出なかった)。ユーザー色は中間の明度も
+/// 取りうるので、そちらで保証できるのは `ink_for` の 3:1 まで。
 #[must_use]
 pub(crate) fn chord_box_fill(p: &Palette, ev: &ChordEvent) -> Color {
     match ev.color {
         Some(rgb) => track_color::to_renderer(rgb),
-        None => composite_over(p.accent.with_alpha(0.35), p.panel_raised),
+        None => composite_over(p.accent.with_alpha(0.12), p.panel_raised),
     }
 }
 
