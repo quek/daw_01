@@ -97,16 +97,25 @@ impl Harmony {
             return Self::default();
         }
         let enabled = app.cur.view.piano_roll_chord_guide;
-        let on_song_axis: Vec<bool> = shown
+        // 表示クリップ (clip_slot 順) ごとに 1 度だけ: 曲の時間軸か / 追従するか。
+        let slots: Vec<Option<(u32, bool)>> = shown
             .iter()
-            .map(|k| song.track_by_id(k.track_id).is_some_and(|t| t.session_clip_by_id(k.clip_id).is_none()))
+            .map(|k| {
+                let on_song_axis =
+                    song.track_by_id(k.track_id).is_some_and(|t| t.session_clip_by_id(k.clip_id).is_none());
+                on_song_axis.then(|| (k.track_id, TrackChordFollow::of(song, k.track_id).is_active()))
+            })
             .collect();
+        let view_end = view.start_beat + view.len_beats;
         let mut marks = HashMap::new();
-        for n in notes {
-            let slot = AppData::note_id_clip_slot(n.id);
-            let (Some(&true), Some(k)) = (on_song_axis.get(slot), shown.get(slot)) else { continue };
-            let follow = TrackChordFollow::of(song, k.track_id);
-            let sounds = if follow.is_active() { sounding_key(song, k.track_id, n.pitch, n.start_beat) } else { Some(n.pitch) };
+        // 描くのは見えているノートだけ (`notes` は start_beat 昇順)。
+        let visible = notes
+            .iter()
+            .take_while(|n| n.start_beat <= view_end)
+            .filter(|n| n.start_beat + n.len_beats >= view.start_beat);
+        for n in visible {
+            let Some(&Some((track_id, follows))) = slots.get(AppData::note_id_clip_slot(n.id)) else { continue };
+            let sounds = if follows { sounding_key(song, track_id, n.pitch, n.start_beat) } else { Some(n.pitch) };
             let fit = enabled
                 .then(|| song.chord_at(n.start_beat))
                 .flatten()
@@ -117,8 +126,7 @@ impl Harmony {
                 marks.insert(n.id, mark);
             }
         }
-        let view_end = view.start_beat + view.len_beats;
-        let guide: Vec<GuideSpan> = if enabled && on_song_axis.iter().any(|b| *b) {
+        let guide: Vec<GuideSpan> = if enabled && slots.iter().any(Option::is_some) {
             let first = song.chords.partition_point(|c| c.end_beat() <= view.start_beat);
             song.chords[first..]
                 .iter()
