@@ -104,9 +104,10 @@
 - **オフライン**: VOICEVOX (`handler/voicevox.rs` の `sung_pitch` / 口パクの fingerprint — 開いただけで `*` にならない冪等性)、
   SMF 書き出し (`midi_export.rs`)、バウンス (`bounce_ops.rs` の `isolated_track` で追従を切る)。`TrackTranspose::key` に
   相乗りできるならそこへ (読み口を 1 本に保つ)。
-- **GUI**: 演奏プレビュー (`handler/transpose.rs` の `preview_key` と呼び出し元 6 か所) = **演奏入力のリアルタイム変換**
-  (Cubase の Live Input)。追従するトラックで弾いた音は playhead の位置のコードへ寄る (録音されるのは弾いた音 — #130 Q2 と
-  同じ移調楽器の扱い)。
+- **GUI**: 演奏プレビュー (`handler/transpose.rs` の `preview_key`: MIDI 入力モニター / 仮想鍵盤 / 鍵盤レーン /
+  MIDI Capture の試聴) = **演奏入力のリアルタイム変換** (Cubase の Live Input)。追従するトラックで弾いた音は playhead の
+  位置のコードへ寄る (録音されるのは弾いた音 — #130 Q2 と同じ移調楽器の扱い)。**既にあるノートの試聴** (ナッジ) は
+  playhead ではなくノートの位置のコードで鳴らす (`note_preview_key` = ピアノロールの薄い枠と同じ鍵盤 + 移調)。
 - **ヘッダ** (Q6): `view/track_header_menu.rs` に「コードに追従」(メニューは平坦な文字列リストなので、選ぶとモードの
   メニューを開く 2 段、または `コードに追従: <モード>` を 5 行並べる — 既存の `context_menu` の形で実現できる方)。
   印は `widgets/arrangement/header.rs` の `♮` の隣 (`ChordFollow::mark()`)。

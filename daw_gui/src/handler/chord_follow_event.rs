@@ -22,9 +22,13 @@ impl AppData {
                 song.chord_follow_enabled = on;
                 changed
             }
-            ChordFollowEvent::SetTracks { track_ids, mode } => set_modes(song, &track_ids, mode),
+            ChordFollowEvent::SetTracks { track_ids, mode } => {
+                let track_ids = follow_targets(song, &track_ids);
+                set_modes(song, &track_ids, mode)
+            }
             ChordFollowEvent::FreezePitch { targets } => freeze_clips(song, &targets),
             ChordFollowEvent::FreezeTracks { track_ids } => {
+                let track_ids = follow_targets(song, &track_ids);
                 let targets: Vec<FreezeTarget> = song
                     .tracks
                     .iter()
@@ -33,7 +37,9 @@ impl AppData {
                         t.clips.iter().map(move |c| FreezeTarget { track_id: t.id, clip_id: c.id, note_ids: Vec::new() })
                     })
                     .collect();
-                // 確定してから追従を切る (切った後では鳴る音が書いた音になって確定するものが無い)。
+                // 確定してから追従を切る (切った後では鳴る音が書いた音になって確定するものが無い)。確定するのは
+                // アレンジの MIDI クリップだけ — セル / オーディオは確定できず、追従が切れて書いた音に戻る
+                // (`ChordFollowEvent::FreezeTracks` の doc)。
                 let frozen = freeze_clips(song, &targets);
                 set_modes(song, &track_ids, ChordFollow::Off) | frozen
             }
@@ -85,6 +91,27 @@ impl AppData {
                 && !song.track_chord_follow(k.track_id).is_off()
         })
     }
+}
+
+/// 追従の設定 / 確定を入れるトラック: `track_ids` のうち **グループ (子を持ち自分のクリップを鳴らさない
+/// [`Song::track_is_pure_group`]) は子孫に展開**し、グループ自身には入れない (追従はクリップのノート / 音源に
+/// 効くので、グループに入れても子の音は変わらず印だけが出る)。入れ子は `parent_group_id` を下へ辿る (#130 の
+/// 移調の lineage と同じ親子の向き。循環しても各トラックを 1 回しか見ないので止まる)。順は `song.tracks` の並び。
+fn follow_targets(song: &Song, track_ids: &[u32]) -> Vec<u32> {
+    let mut picked: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut stack: Vec<u32> = track_ids.to_vec();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if song.track_is_pure_group(id) {
+            stack.extend(song.tracks.iter().filter(|t| t.parent_group_id == Some(id)).map(|t| t.id));
+        } else {
+            picked.insert(id);
+        }
+    }
+    song.tracks.iter().map(|t| t.id).filter(|id| picked.contains(id)).collect()
 }
 
 fn set_modes(song: &mut Song, track_ids: &[u32], mode: ChordFollow) -> bool {
@@ -263,5 +290,55 @@ mod tests {
         assert_eq!(app.transposed_preview_key(track_id, 62), Some(62));
         app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::SetEnabled(false)));
         assert_eq!(app.preview_key(track_id, 62), Some(62), "曲全体のスイッチを切ると弾いた音");
+    }
+
+    /// 既にあるノートの試聴 (↑↓ で音程を動かしたとき) は playhead ではなく **そのノートの位置のコード** で鳴る
+    /// (ピアノロールの薄い枠と同じ鍵盤)。演奏入力 (`preview_key`) は playhead のコードのまま。
+    #[test]
+    fn nudge_audition_sounds_the_chord_at_the_note_not_at_the_playhead() {
+        let mut app = crate::test_support::headless_app();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.ipc.audio_tx = Some(tx);
+        let (track_id, clips) = linked_triads(&mut app, ChordFollow::Narrow);
+        app.cur.transport.playhead_beat = Some(0.0); // Am の上
+        // F の位置のクリップの E (content の 2 音目) を半音上げて F にする。
+        app.set_clip_selection(vec![crate::app::ClipKey { track_id, clip_id: clips[1] }]);
+        app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 1)]));
+        app.handle_event(AppEvent::NudgeSelectedNotePitch { octave: false, steps: 1 });
+        let on: Vec<u8> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|c| match c {
+                common::protocol::AudioCommand::PreviewNoteOn { pitch, .. } => Some(pitch),
+                _ => None,
+            })
+            .collect();
+        // F の上の F はコード音 (65)。playhead の Am で寄せると最寄りの E (64) になる。
+        assert_eq!(on, vec![65]);
+        assert_eq!(app.preview_key(track_id, 65), Some(64), "演奏入力は playhead の Am へ寄る");
+    }
+
+    /// グループに追従を設定すると、グループ自身ではなく子孫のトラックに入る (グループはクリップを鳴らさないので
+    /// 自分に設定しても子の音は変わらない)。「鳴る音で確定」も子孫へ展開する。
+    #[test]
+    fn follow_settings_on_a_group_go_to_its_descendants() {
+        let mut app = crate::test_support::headless_app();
+        // 1 (group) ─┬ 2
+        //            └ 3 (group) ─ 4        5 は無関係
+        app.edit_song(|song| {
+            song.tracks.clear();
+            for (id, parent) in [(1, None), (2, Some(1)), (3, Some(1)), (4, Some(3)), (5, None)] {
+                song.tracks.push(crate::app::track_with(|t| {
+                    t.id = id;
+                    t.parent_group_id = parent;
+                }));
+            }
+        });
+        let modes = |app: &AppData| -> Vec<ChordFollow> {
+            [1, 2, 3, 4, 5].map(|id| app.cur.song_doc.song().track_by_id(id).expect("track").follow_chords).to_vec()
+        };
+        app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::SetTracks { track_ids: vec![1], mode: ChordFollow::Narrow }));
+        let (off, n) = (ChordFollow::Off, ChordFollow::Narrow);
+        assert_eq!(modes(&app), vec![off, n, off, n, off]);
+        app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezeTracks { track_ids: vec![3] }));
+        assert_eq!(modes(&app), vec![off, n, off, off, off], "確定もグループ 3 の子 (4) へ");
     }
 }

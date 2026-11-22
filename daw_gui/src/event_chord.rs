@@ -73,13 +73,17 @@ pub struct FreezeTarget {
 pub enum ChordFollowEvent {
     /// 曲全体のスイッチ (`Song::chord_follow_enabled`)。
     SetEnabled(bool),
-    /// トラック `track_ids` の追従モード。
+    /// トラック `track_ids` の追従モード。グループ (自分のクリップを鳴らさない) は子孫のトラックに展開し、
+    /// グループ自身には設定しない。
     SetTracks { track_ids: Vec<u32>, mode: ChordFollow },
     /// 鳴る音で確定 (Q5、Studio One の Freeze Pitch): `targets` のクリップのノートの書いた音を、
     /// 今の追従結果 (`handler::chord_follow_view`) で書き換える。
     FreezePitch { targets: Vec<FreezeTarget> },
-    /// トラック `track_ids` のアレンジのクリップを全部、鳴る音で確定し、追従モードを Off にする
-    /// (ヘッダの右クリックメニュー。トラック全体を確定するので、確定後も同じ音で鳴る)。
+    /// トラック `track_ids` (グループは [`Self::SetTracks`] と同じく子孫に展開) の **アレンジの MIDI クリップ** を
+    /// 全部、鳴る音で確定し、追従モードを Off にする (ヘッダの右クリックメニュー)。アレンジの MIDI クリップは
+    /// 確定後も同じ音で鳴る。確定できないもの — **ランチャーのセル** (曲の位置を持たず、撃った瞬間の playhead の
+    /// コードで鳴る = 鳴る音を先に決められない) と **オーディオクリップ** (書き換えるノートが無い) — は、追従が
+    /// 切れるので書いた音 / 元の音程に戻る。
     FreezeTracks { track_ids: Vec<u32> },
 }
 
