@@ -22,6 +22,9 @@ const WIRE_SOURCES: &[&str] = &[
     // model.rs から切り出した `Section` (Song.sections として LoadSong の wire を渡る)。
     // 帯を動かすロジック (section_ops.rs) は wire に載らないので登録しない。
     "src/model/sections.rs",
+    // r.md #157: コードトラックの型 (Song.chords / Song.audio_chords / Track.follow_chords として
+    // LoadSong の wire を渡る)。編集ロジック (chord_ops.rs) と評価 (chord_follow.rs) は登録しない。
+    "src/model/chords.rs",
     // model.rs から切り出した `PluginInstance` と blob を除外する手書き bincode
     // (Track.devices / master_fx_chain の要素として LoadSong の wire を渡る)。
     "src/model/plugin_instance.rs",

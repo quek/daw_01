@@ -12,6 +12,10 @@ pub mod automation_points_clipboard;
 pub mod bounce;
 /// r.md #129: `Q` の宛先 (Mixer 帯 / マスターパネルの hover → device / Limiter)。
 pub mod bypass_target;
+/// r.md #157: コードトラックの入口 (`AppEvent::Chord` / `ChordFollow` / `ChordTool`)。
+pub mod chord_event;
+pub mod chord_follow_event;
+pub mod chord_tool_event;
 pub mod clip_events;
 /// r.md #132 残件: クリップへの編集が効く範囲 = 窓に見えている片 (ひと続きは 1 つとして)。
 pub mod clip_window;

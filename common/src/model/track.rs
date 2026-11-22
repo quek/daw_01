@@ -226,6 +226,10 @@ pub struct Track {
     /// 書き出す音が変わるので Song に置く (undo / `*`)。旧 file は `true` で読む。
     #[serde(default = "default_follow_transpose", skip_serializing_if = "is_default_follow_transpose")]
     pub follow_transpose: bool,
+    /// v47 (r.md #157): コードトラックへの追従モード (既定 `Off`)。実効値は曲全体のスイッチを掛けた
+    /// [`Song::track_chord_follow`] — 評価はそこ 1 本を通す。書き出す音が変わるので Song に置く (undo / `*`)。
+    #[serde(default, skip_serializing_if = "ChordFollow::is_off")]
+    pub follow_chords: ChordFollow,
 }
 
 /// v40 以前の `.daw` にはフィールドが無い = 全トラックが移調に追従する。
@@ -334,6 +338,7 @@ impl Default for Track {
             session_clips: Vec::new(),
             launcher: RowPlayback::Arranger,
             follow_transpose: default_follow_transpose(),
+            follow_chords: ChordFollow::Off,
         }
     }
 }

@@ -37,6 +37,9 @@ pub struct TimeRangeCopy {
     pub scale_changes: Vec<ScaleChange>,
     /// 範囲に完全に入っていたセクション帯 (`id` は貼り先で採番し直す)。
     pub sections: Vec<Section>,
+    /// 範囲に詰めたコードトラックの箱 (`id` は貼り先で採番し直す)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chords: Vec<ChordEvent>,
 }
 
 impl TimeRangeCopy {
@@ -57,6 +60,10 @@ impl TimeRangeCopy {
             .retain(|(_, _, c)| ok(c.start_beat, c.length_beats, c.content_offset_beats));
         self.scale_changes.retain(|sc| sc.beat.is_finite() && sc.beat >= 0.0);
         self.sections.retain(|s| ok(s.start_beat, s.len_beats, 0.0));
+        self.chords.retain(|c| ok(c.start_beat, c.len_beats, 0.0));
+        for c in &mut self.chords {
+            c.chord = c.chord.sanitized();
+        }
         Some(self)
     }
 }
@@ -128,6 +135,7 @@ impl Song {
             .filter(|s| s.start_beat >= a - f64::EPSILON && s.start_beat + s.len_beats <= b + f64::EPSILON)
             .map(|s| Section { start_beat: (s.start_beat - a).max(0.0), ..s.clone() })
             .collect();
+        out.chords = self.chords_cropped(a, b);
         Some(out)
     }
 
@@ -142,7 +150,10 @@ impl Song {
         let len = b - a;
         self.split_clips_at(a);
         self.split_clips_at(b);
+        self.split_chords_at(a);
+        self.split_chords_at(b);
         let in_range = |s: f64| s >= a && s < b;
+        self.chords.retain(|c| !in_range(c.start_beat));
         for t in &mut self.tracks {
             t.clips.retain(|c| !in_range(c.start_beat));
             for lane in &mut t.automation_lanes {
@@ -182,6 +193,7 @@ impl Song {
             return None;
         }
         self.split_clips_at(at);
+        self.split_chords_at(at);
         for s in &mut self.sections {
             if s.start_beat < at && at < s.start_beat + s.len_beats {
                 s.len_beats += len;
@@ -256,9 +268,11 @@ impl Song {
             section_ids.push(id);
             self.sections.push(Section { id, start_beat: s.start_beat + at, ..s.clone() });
         }
+        self.push_chords_at(at, &copy.chords);
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
         self.normalize_sections();
+        self.normalize_chords();
         Some(PastedTime { ripple, section_ids })
     }
 

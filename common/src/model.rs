@@ -16,6 +16,8 @@ use crate::scale::ScaleChange;
 mod audio_take;
 mod automation;
 mod bounce_ops;
+mod chord_ops;
+mod chords;
 mod clip_window;
 mod master_limiter;
 mod media_manifest;
@@ -48,6 +50,7 @@ mod window_edit;
 pub use audio_take::TAKE_ORIGIN_DEPTH;
 pub use automation::*;
 pub use bounce_ops::*;
+pub use chords::*;
 pub use record_ops::RecordedWav;
 pub use clip_window::*;
 pub use master_limiter::*;
@@ -344,7 +347,12 @@ pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, ru
 /// v46 (r.md #156): トラックの「入力」と「モニター」(`Track::input` / `Track::monitor`、[`TrackInput`] /
 /// [`MonitorMode`])。旧ファイルは `serde(default)` の MIDI / 自動で読める (migration 不要)。新ファイルを
 /// 旧ビルドで開くとオーディオ入力の設定が黙って捨てられる (保存し直すと消える) ので、版を上げて gate で弾く。
-pub const CURRENT_VERSION: u32 = 46;
+///
+/// v47 (r.md #157): コードトラック (`Song::chords` / `Song::chord_follow_enabled` / `Song::audio_chords`、
+/// [`ChordEvent`]) とトラックの追従モード (`Track::follow_chords`、[`ChordFollow`])。旧ファイルは
+/// `serde(default)` の「箱なし / 追従しない」で読める (migration 不要)。新ファイルを旧ビルドで開くとコードと
+/// 追従が黙って捨てられ、追従していたトラックが書いた音で鳴る (保存し直すと消える) ので、版を上げて gate で弾く。
+pub const CURRENT_VERSION: u32 = 47;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -743,6 +751,29 @@ pub struct Song {
     /// [`Song::track_follows_transpose`]。書き出す音が変わるので曲の一部 (undo / `*`)。旧 file は 0。
     #[serde(default, skip_serializing_if = "is_zero_i8")]
     pub transpose: i8,
+    /// v47 (r.md #157): **コードトラック**の箱。`start_beat` 昇順・互いに非交差 (隙間は許容) を
+    /// [`Song::normalize_chords`] で保つ。箱の無い区間ではどのトラックも追従しない。編集は
+    /// `chord_ops.rs`、追従の評価は [`crate::chord_follow`] 1 本。書き出す音が変わるので曲の一部
+    /// (undo / `*`)。旧 file は空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chords: Vec<ChordEvent>,
+    /// v47 (r.md #157): コードトラックへの追従の**曲全体のスイッチ** (既定 ON)。切ると全トラックが
+    /// 書いた音で鳴る (トラックごとのモード [`Track::follow_chords`] は保ったまま)。実効値は
+    /// [`Song::track_chord_follow`]。
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub chord_follow_enabled: bool,
+    /// v47 (r.md #157): オーディオ音源から検出したコード (音源 id → 区間の列)。平行移動 / ベースの追従が
+    /// 「素材のコード → 今のコード」の差を出すのに使う。音源が消えたら [`Song::normalize_chords`] が落とす。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub audio_chords: HashMap<AudioSourceId, Vec<AudioChordSpan>>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 /// v34 以前の `.daw` に無いので 1 小節へ forward-migrate (Live / Bitwig / Studio One と同じ既定)。
@@ -782,6 +813,7 @@ impl Default for Song {
                 next_mod_source_id: 1,
                 next_mod_routing_id: 1,
                 next_scene_id: 1,
+                next_chord_id: 1,
             },
             clip_contents: HashMap::new(),
             clip_content_names: HashMap::new(),
@@ -802,6 +834,9 @@ impl Default for Song {
             global_launch_quantize: DEFAULT_GLOBAL_LAUNCH_QUANTIZE,
             last_launched_scene_id: 0,
             transpose: 0,
+            chords: Vec::new(),
+            chord_follow_enabled: true,
+            audio_chords: HashMap::new(),
         }
     }
 }

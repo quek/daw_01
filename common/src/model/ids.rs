@@ -41,6 +41,9 @@ pub struct IdAllocators {
     /// v35 (r.md #87): ランチャーの列 [`Scene`] の採番。`0` は未採番 sentinel。
     #[serde(default)]
     pub next_scene_id: u32,
+    /// v47 (r.md #157): コードトラックの箱 [`crate::model::ChordEvent`] の採番。`0` は未採番 sentinel。
+    #[serde(default)]
+    pub next_chord_id: u32,
 }
 
 impl IdAllocators {
@@ -75,6 +78,7 @@ impl IdAllocators {
             next_mod_source_id,
             next_mod_routing_id,
             next_scene_id,
+            next_chord_id,
         } = other;
         self.next_track_id = self.next_track_id.max(*next_track_id);
         self.next_device_id = self.next_device_id.max(*next_device_id);
@@ -87,6 +91,7 @@ impl IdAllocators {
         self.next_mod_source_id = self.next_mod_source_id.max(*next_mod_source_id);
         self.next_mod_routing_id = self.next_mod_routing_id.max(*next_mod_routing_id);
         self.next_scene_id = self.next_scene_id.max(*next_scene_id);
+        self.next_chord_id = self.next_chord_id.max(*next_chord_id);
     }
 }
 

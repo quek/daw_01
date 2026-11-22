@@ -40,6 +40,8 @@ pub mod event_range;
 pub mod event_sampler;
 /// r.md #156: オーディオデバイスの設定のイベント (`AppEvent::AudioDevice` の中身)。
 pub mod event_audio_device;
+/// r.md #157: コードトラックのイベント (`AppEvent::Chord` / `ChordFollow` / `ChordTool` の中身)。
+pub mod event_chord;
 /// Arranger セクション帯の編集 (`AppEvent::Section` の中身)。
 pub mod event_section;
 /// r.md #132: 分割 / 結合キーのイベント (`AppEvent::SplitJoin` の中身)。
