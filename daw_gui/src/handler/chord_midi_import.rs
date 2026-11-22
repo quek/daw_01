@@ -41,9 +41,13 @@ impl AppData {
         let at = if at.is_finite() { at.max(0.0) } else { 0.0 };
         let n = found.len();
         self.edit_song(|song| {
-            for s in found {
-                song.place_chord(ChordEvent { id: 0, start_beat: at + s.start_beat, len_beats: s.len_beats, chord: s.chord, color: None });
-            }
+            song.place_chords(found.into_iter().map(|s| ChordEvent {
+                id: 0,
+                start_beat: at + s.start_beat,
+                len_beats: s.len_beats,
+                chord: s.chord,
+                color: None,
+            }));
         });
         self.ui_ephemeral.status_message = format!("MIDI からコードを {n} 個置きました");
         n

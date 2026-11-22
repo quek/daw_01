@@ -267,13 +267,14 @@ impl AppData {
             return;
         }
         self.edit_song_checked(|song| {
-            let mut placed = false;
-            for &(track_id, clip_id) in place_on {
-                for c in chords_on_clip(song, track_id, clip_id, source_id, &spans, sr.unwrap_or(48_000)) {
-                    placed |= song.place_chord(c).is_some();
-                }
-            }
-            placed
+            // まとめて置く (正規化 1 回。1 つずつ置くと箱の数の 2 乗で遅くなる)。
+            let found: Vec<_> = place_on
+                .iter()
+                .flat_map(|&(track_id, clip_id)| {
+                    chords_on_clip(song, track_id, clip_id, source_id, &spans, sr.unwrap_or(48_000))
+                })
+                .collect();
+            song.place_chords(found)
         });
     }
 }

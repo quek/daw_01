@@ -15,8 +15,11 @@ impl AppData {
             }
             ChordToolEvent::ChordsToClip { chord_ids, track_id } => {
                 let voicing: Voicing = self.cur.chord_tools.view.voicing;
+                // クリップを置けるのは自分のクリップを鳴らす行だけ (グループには置かない — 帯の widget と同じ判定を
+                // ここでも引く。script からも通る口なので widget の絞り込みに頼らない)。
                 self.edit_song_checked(|song| {
-                    song.chords_to_clip(&chord_ids, track_id, voicing, PREVIEW_VELOCITY).is_some()
+                    !song.track_is_pure_group(track_id)
+                        && song.chords_to_clip(&chord_ids, track_id, voicing, PREVIEW_VELOCITY).is_some()
                 });
             }
             ChordToolEvent::ExtractFromClips { clips, window_beats } => self.extract_midi_chords(&clips, window_beats),
@@ -50,11 +53,7 @@ impl AppData {
         let opts = common::chord_detect::DetectOptions { window_beats, ..self.cur.chord_tools.view.detect }.sanitized();
         self.edit_song_checked(|song| {
             let found = song.chords_from_clips(clips, &opts);
-            let placed = !found.is_empty();
-            for c in found {
-                song.place_chord(c);
-            }
-            placed
+            song.place_chords(found)
         });
     }
 

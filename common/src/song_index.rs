@@ -88,7 +88,9 @@ impl SongIndex {
     #[must_use]
     pub fn build(song: &Song) -> Self {
         let follow_applies = song.chord_follow_can_apply();
-        let chord_follow = |t: &Track| if follow_applies { song.track_chord_follow(t.id) } else { ChordFollow::Off };
+        // `follow_applies` は曲全体のスイッチを含むので、実効モード (`Song::track_chord_follow`) は手元の `t` の値
+        // (id からトラックを引き直すと全トラックで O(T²))。
+        let chord_follow = |t: &Track| if follow_applies { t.follow_chords } else { ChordFollow::Off };
         let tracks = song
             .tracks
             .iter()
