@@ -1041,6 +1041,8 @@ mod tests {
                 crate::model::RackPanelKey::Device(7),
                 crate::model::RackPanelKey::MasterLimiter,
             ],
+            chord_lane_hidden: true,
+            chord_notation: crate::chord_name::ChordNotation::Roman,
         }
     }
 

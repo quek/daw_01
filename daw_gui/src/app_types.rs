@@ -939,6 +939,9 @@ pub enum EditSurface {
     /// `edit_surface` の非空優先順 fallback には入れない (タグ経由の
     /// last-wins だけで足りる)。
     Devices,
+    /// r.md #157: コードトラックの帯の箱 (`SelectionState::selected_chord_ids`)。帯で明示的に
+    /// 選んだときだけ立つ (fallback には入れない)。
+    Chords,
 }
 
 /// gui_01 #028: `MoveAutomationPoints` 用の 1 point delta。`value_norm`

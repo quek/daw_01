@@ -22,6 +22,8 @@ pub enum ChordTrackEvent {
     Move { ids: Vec<u32>, delta: f64 },
     /// 箱 1 つの範囲を変える (端のドラッグ)。
     Resize { id: u32, start: f64, len: f64 },
+    /// 箱の範囲をまとめて変える `(id, start, len)` (境界の連動ドラッグ / Alt の比例伸縮)。1 undo step。
+    SetSpans { spans: Vec<(u32, f64, f64)> },
     /// 選んだ箱を `delta` 拍ずらした位置に複製する。
     Duplicate { ids: Vec<u32>, delta: f64 },
     Delete { ids: Vec<u32> },
@@ -43,7 +45,7 @@ impl ChordTrackEvent {
             Self::Place { .. } => "コード作成",
             Self::PlaceMany { .. } => "コード貼り付け",
             Self::Move { .. } => "コード移動",
-            Self::Resize { .. } => "コード長さ変更",
+            Self::Resize { .. } | Self::SetSpans { .. } => "コード長さ変更",
             Self::Duplicate { .. } => "コード複製",
             Self::Delete { .. } => "コード削除",
             Self::SetChord { .. } => "コード変更",

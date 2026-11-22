@@ -11,6 +11,8 @@ use super::*;
 
 /// r.md #156: 録音中の区間の帯 (この file の描画の 1 段)。
 mod rec_region;
+/// r.md #157: コードトラックの帯 (`mod.rs` はサイズ budget の天井なので、ここに宣言する)。
+pub(super) mod chord_lane;
 
 pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> ArrangementResponse {
     // 入力ビューは `arrangement()` のスタックに置いたまま、 `frame` がそこから借りる。
@@ -57,6 +59,9 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     };
     cursor::apply(ui, &f, &live, &response);
     launcher::press::cursor(ui, &f);
+    // 5b. r.md #157: コードトラックの帯 (入力 → 描画 → 確定 → カーソル)。帯は他のゾーンと y が排他。
+    //     描画はプレイヘッド / ループ帯 (`render::dispatch`) より奥、カーソルは上の 2 つより後勝ち。
+    chord_lane::run(ui, app, &f);
     // 6. heavy 描画 → release commit → track header 描画 (この 3 つの順が z 順)。
     render::dispatch(ui, app, &f, &overlays, &response);
     release::commit_releases(ui, &f, &mut response, released);

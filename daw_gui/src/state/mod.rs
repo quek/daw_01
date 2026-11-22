@@ -35,6 +35,8 @@ pub mod ring_axis;
 pub mod virtual_keyboard;
 /// r.md #156: オーディオデバイスの設定 / 一覧 / 開いているデバイス。
 pub mod audio_device;
+/// r.md #157: コードトラックの帯の表示状態とポップアップ。
+pub mod chord_band;
 
 pub use loudness::{LoudnessPhase, LoudnessState};
 pub use project::{ProjectEphemeral, ProjectIpc, ProjectState, ProjectView, ProjectVoicevox};

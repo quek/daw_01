@@ -14,6 +14,8 @@ pub mod bounce;
 pub mod bypass_target;
 /// r.md #157: コードトラックの入口 (`AppEvent::Chord` / `ChordFollow` / `ChordTool`)。
 pub mod chord_event;
+/// r.md #157 §3.1: 帯の選択 / 作成 / ポップアップ / メニューの口。
+pub mod chord_band;
 pub mod chord_follow_event;
 pub mod chord_tool_event;
 pub mod clip_events;

@@ -133,6 +133,12 @@ pub struct ViewState {
     /// Limiter)。「見方の都合」なので dirty は立てないが保存する。save 時に sort、存在しない device は落とす。
     #[serde(default)]
     pub open_rack_panels: Vec<RackPanelKey>,
+    /// r.md #157: コードトラックの帯を隠しているか (既定は表示)。「見方の都合」。
+    #[serde(default)]
+    pub chord_lane_hidden: bool,
+    /// r.md #157: コード名の表記 (音名 / 数字 / ローマ数字)。「見方の都合」。
+    #[serde(default)]
+    pub chord_notation: crate::chord_name::ChordNotation,
 }
 
 /// Rack の Par パネル 1 枚の鍵 (r.md #129 Q18)。serde 専用で IPC を渡らない。

@@ -58,7 +58,8 @@ pub(crate) fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface:
         EditSurface::Tracks
         | EditSurface::Sections
         | EditSurface::Scenes
-        | EditSurface::Devices => None,
+        | EditSurface::Devices
+        | EditSurface::Chords => None,
     };
     if let Some((json, count, label)) = synced {
         finish_copy(ui, json, count, label);
@@ -128,7 +129,8 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
         EditSurface::Tracks
         | EditSurface::Sections
         | EditSurface::Scenes
-        | EditSurface::Devices => None,
+        | EditSurface::Devices
+        | EditSurface::Chords => None,
     };
     if let Some((json, count, label)) = synced {
         ui.set_clipboard_text(json.clone());

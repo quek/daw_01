@@ -90,6 +90,9 @@ fn build_app_with_header(
     app.cur.view.arrange_snap_enabled = false;
     // r.md #87: 帯は畳んだ状態で回す (このファイルはアレンジ側の回帰網)。
     app.cur.view.launcher_layout = common::model::LauncherLayout::ArrangerOnly;
+    // r.md #157: コードトラックの帯も隠す (帯の interaction は `chord_band_widget.rs`)。
+    // 出したままだと lanes が帯の高さ 20px ぶん下がり、このファイルの y 定数が全部ずれる。
+    app.cur.view.chord_band.visible = false;
     (app, audio_rx, plugin_rx)
 }
 

@@ -146,6 +146,8 @@ impl AppData {
             launcher_scene_col_w: self.cur.view.launcher_scene_col_w,
             launcher_scroll_scene: self.cur.view.launcher_scroll_scene,
             open_rack_panels,
+            chord_lane_hidden: !self.cur.view.chord_band.visible,
+            chord_notation: self.cur.view.chord_band.notation,
         }
     }
 
@@ -237,6 +239,8 @@ impl AppData {
         // r.md #87: ランチャー帯。負の値 / NaN は「未設定」へ潰し、widget の既定幅に任せる
         // (壊れた保存値で帯が消える / 画面外へ飛ぶのを防ぐ)。
         self.cur.view.launcher_layout = v.launcher_layout;
+        self.cur.view.chord_band.visible = !v.chord_lane_hidden;
+        self.cur.view.chord_band.notation = v.chord_notation;
         self.cur.view.launcher_width = sanitize_launcher_px(v.launcher_width);
         self.cur.view.launcher_scene_col_w = sanitize_launcher_px(v.launcher_scene_col_w);
         self.cur.view.launcher_scroll_scene =
