@@ -90,6 +90,7 @@ impl AppData {
             S::Tracks => tracks,
             S::Sections => sections,
             S::Devices => devices,
+            S::Chords => !self.live_chord_ids().is_empty(),
         };
         // 1. **最後に選んだ面**がまだ非空ならそれ ([[feedback_selection_action_last_wins]])。
         //
@@ -193,6 +194,7 @@ impl AppData {
             EditSurface::Devices => AppEvent::Device(DeviceEvent::RemoveDevices {
                 device_ids: self.live_device_ids(),
             }),
+            EditSurface::Chords => AppEvent::Chord(crate::event_chord::ChordTrackEvent::Delete { ids: self.live_chord_ids() }),
         };
         self.handle_event(event);
     }

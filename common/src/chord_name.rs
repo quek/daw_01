@@ -9,8 +9,8 @@
 use crate::model::{Chord, ChordKind, Spelling, Tensions};
 use crate::scale::{ScaleChange, pitch_class_name_in_key};
 
-/// コード名の表記。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// コード名の表記。GUI の `ViewState` に保存する (serde、wire には載らない)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum ChordNotation {
     /// 音名 (`Am7`)。
     #[default]

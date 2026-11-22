@@ -581,6 +581,10 @@ pub enum AudioCommand {
     /// engine は `SetScListen` と `CloseProject` 以外で値を変えない (LoadSong / project 切替でも解除しない)。
     /// Comp 以外の id は engine が無視する。
     SetScListen { project: ProjectKey, device_id: Option<u64> },
+    /// r.md #157: 再生中にコードトラックを鳴らすトラック (`None` = 鳴らさない) と voicing。**聴き方の都合**で
+    /// Song には書かない (`SetScListen` と同じ扱い: 書き出しに入らず、engine は LoadSong / project 切替でも
+    /// 解除しない)。鍵盤は engine が Song のコードから off-RT で組む (`daw_audio::chord_audition`)。
+    SetChordAudition { project: ProjectKey, track_id: Option<u32>, voicing: crate::model::Voicing },
     /// r.md #151: device (plugin / 内蔵 / Parallel) の Mix (原音との混ぜ具合 `0..=1`) の値のみ更新。
     /// `device_id` は song 全体で一意なので track を持たない。
     SetDeviceMix { project: ProjectKey, device_id: u64, mix: f32 },
@@ -831,6 +835,7 @@ impl AudioCommand {
             | SetNativeDevice { project, .. }
             | SetMasterLimiter { project, .. }
             | SetScListen { project, .. }
+            | SetChordAudition { project, .. }
             | SetDeviceMix { project, .. }
             | SetDeltaDevices { project, .. }
             | SetDeviceScopes { project, .. }

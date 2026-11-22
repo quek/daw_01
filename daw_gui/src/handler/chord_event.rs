@@ -12,9 +12,10 @@ use crate::state::AppData;
 impl AppData {
     /// コード名の表記 (音名 / 数字 / ローマ数字)。**コード名を出す全ての表示面がこれを引く**
     /// (帯 / ポップアップ / ピアノロール上端 / 今と次のコード)。
+    /// 中身は帯の見出しで選ぶ表記 (`ProjectView::chord_band`、`ViewState` に保存)。
     #[must_use]
     pub(crate) fn chord_notation(&self) -> ChordNotation {
-        ChordNotation::Regular
+        self.cur.view.chord_band.notation
     }
 
     /// 表示名 1 つ (`chord_notation` と、その位置のキーの綴り)。表示面はこれを呼ぶ。
@@ -40,6 +41,7 @@ impl AppData {
             }
             ChordTrackEvent::Move { ids, delta } => song.move_chords(&ids, delta),
             ChordTrackEvent::Resize { id, start, len } => song.resize_chord(id, start, len),
+            ChordTrackEvent::SetSpans { spans } => set_chord_spans(song, &spans),
             ChordTrackEvent::Duplicate { ids, delta } => !song.duplicate_chords(&ids, delta).is_empty(),
             ChordTrackEvent::Delete { ids } => song.delete_chords(&ids),
             ChordTrackEvent::SetChord { ids, chord } => song.set_chord(&ids, chord),
@@ -52,4 +54,24 @@ impl AppData {
             }
         });
     }
+}
+
+/// 箱の範囲をまとめて変える (境界の連動 / 比例伸縮)。対象を先に全部外してから置き直すので、
+/// 新しい範囲どうしが互いを削らない (外さずに 1 つずつ置くと、先に伸ばした箱が後の箱を覆って消す)。
+/// かかった他の箱は上書き規則で削られる。変わったら `true`。
+fn set_chord_spans(song: &mut common::model::Song, spans: &[(u32, f64, f64)]) -> bool {
+    let old: Vec<ChordEvent> = spans.iter().filter_map(|(id, _, _)| song.chord_by_id(*id).cloned()).collect();
+    let unchanged = old.iter().all(|c| {
+        spans.iter().any(|&(id, s, l)| id == c.id && s == c.start_beat && l == c.len_beats)
+    });
+    if old.is_empty() || unchanged {
+        return false;
+    }
+    let ids: Vec<u32> = old.iter().map(|c| c.id).collect();
+    song.delete_chords(&ids);
+    for c in old {
+        let Some(&(_, start, len)) = spans.iter().find(|(id, _, _)| *id == c.id) else { continue };
+        song.place_chord(ChordEvent { start_beat: start, len_beats: len, ..c });
+    }
+    true
 }

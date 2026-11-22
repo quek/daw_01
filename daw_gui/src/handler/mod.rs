@@ -14,9 +14,25 @@ pub mod bounce;
 pub mod bypass_target;
 /// r.md #157: コードトラックの入口 (`AppEvent::Chord` / `ChordFollow` / `ChordTool`)。
 pub mod chord_event;
+/// r.md #157 §3.1: 帯の選択 / 作成 / ポップアップ / メニューの口。
+pub mod chord_band;
+/// r.md #157 Q4: コードのポップアップの操作。
+pub mod chord_popup;
+/// r.md #157: 帯の箱の Copy / Cut / Paste / 複製。
+pub mod chord_clipboard;
+/// r.md #157: コード進行プリセットと帯の右クリックメニューの口。
+pub mod chord_preset;
 pub mod chord_follow_event;
 pub mod chord_follow_view;
 pub mod chord_tool_event;
+/// r.md #157: コードの試聴 (試聴トラックへ voicing どおりのプレビュー音)。
+pub mod chord_audition;
+/// r.md #157: オーディオ音源からのコード検出の発注と回収。
+pub mod chord_audio;
+/// r.md #157: MIDI 鍵盤で弾いた和音をコードに (帯の録音 / Instrument Input)。
+pub mod chord_capture;
+/// r.md #157: MIDI ファイル → コードトラック (帯へのドロップ)。
+pub mod chord_midi_import;
 pub mod clip_events;
 /// r.md #132 残件: クリップへの編集が効く範囲 = 窓に見えている片 (ひと続きは 1 つとして)。
 pub mod clip_window;

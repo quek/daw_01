@@ -137,6 +137,33 @@ pub struct ViewState {
     /// Limiter)。「見方の都合」なので dirty は立てないが保存する。save 時に sort、存在しない device は落とす。
     #[serde(default)]
     pub open_rack_panels: Vec<RackPanelKey>,
+    /// r.md #157: コードトラックの帯を隠しているか (既定は表示)。「見方の都合」。
+    #[serde(default)]
+    pub chord_lane_hidden: bool,
+    /// r.md #157: コード名の表記 (音名 / 数字 / ローマ数字)。「見方の都合」。
+    #[serde(default)]
+    pub chord_notation: crate::chord_name::ChordNotation,
+    /// r.md #157: コードの試聴 / voicing / 検出の設定 (聴き方 / 道具の都合なので Song に載せない)。
+    #[serde(default)]
+    pub chord_tools: ChordToolsView,
+}
+
+/// コードトラックの試聴・voicing・検出の設定 (r.md #157 §3.4)。「聴き方 / 道具の都合」なので
+/// dirty は立てないが保存する。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct ChordToolsView {
+    /// コードの試聴を鳴らすトラック (Q7: 既存の音源トラックを 1 本)。`None` = 無音。
+    #[serde(default)]
+    pub audition_track: Option<u32>,
+    /// 再生中もコードトラックを試聴トラックで鳴らす。
+    #[serde(default)]
+    pub audition_while_playing: bool,
+    /// 試聴とノート化の並べ方。
+    #[serde(default)]
+    pub voicing: crate::chord_voicing::Voicing,
+    /// 「コードを抽出…」の設定 (MIDI / オーディオ共通)。
+    #[serde(default)]
+    pub detect: crate::chord_detect::DetectOptions,
 }
 
 /// Rack の Par パネル 1 枚の鍵 (r.md #129 Q18)。serde 専用で IPC を渡らない。

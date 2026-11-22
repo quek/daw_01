@@ -12,7 +12,8 @@
 use crate::model::{AudioChordSpan, Chord, ChordKind, SourceChord, Spelling, Tensions};
 
 /// 検出の設定 (Cubase の Create Chord Events ダイアログに相当)。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DetectOptions {
     /// 1 コードとして見る窓の長さ (拍)。分散和音 (アルペジオ) は窓を長く取ると 1 つのコードにまとまる。
     pub window_beats: f64,

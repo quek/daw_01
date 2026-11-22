@@ -66,6 +66,8 @@ impl AppData {
         // r.md #67: カーソルキーの音程変更で鳴らした試聴音を期限で消音する
         // (鍵盤レーンの held preview と違い、 離すイベントが無いので時間で切る)。
         self.expire_nudge_audition(false);
+        // r.md #157: コードの試聴の期限 / オーディオのコード検出の回収と自動発注。
+        self.chord_tools_tick();
         // Global Sampler / MIDI Capture: 試聴の期限と古いノートの回収。
         self.sampler_housekeeping();
         // 値だけを出すプラグインに補った gesture は、離した通知が来ないのでボタンを離したら閉じる。

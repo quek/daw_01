@@ -100,4 +100,9 @@ pub struct SelectionState {
     pub device_anchor: Option<u64>,
     /// r.md #87: 選択中の列 (シーン) 選択のアンカー。
     pub scene_anchor: Option<u32>,
+    /// r.md #157: 選択中のコードトラックの箱 (`ChordEvent::id`)。帯のハイライト + Delete / Cut / Copy /
+    /// 移調の対象。session-only。
+    pub selected_chord_ids: Vec<u32>,
+    /// 上の選択のアンカー (Shift+click 範囲選択の基点)。
+    pub chord_anchor: Option<u32>,
 }

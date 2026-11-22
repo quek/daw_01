@@ -85,12 +85,28 @@ fn content_bottom_and_lanes_bottom(resp: &ArrangementResponse, track_top: f32) -
     (content_bottom, resp.lanes_rect.y + resp.lanes_rect.h)
 }
 
-/// widget が分割する縦の並びは ruler → Arranger 帯 → lanes で、隙間も重なりも無い。
-/// (Arranger 帯が実在し lanes がその下から始まる = 「帯を引き忘れると 18px ずれる」の前提)
+/// widget が分割する縦の並びは ruler → Arranger 帯 → コードトラックの帯 (r.md #157) → lanes で、
+/// 隙間も重なりも無い。(帯が実在し lanes がその下から始まる = 「帯を引き忘れると帯の高さぶんずれる」の前提)
 #[test]
-fn lanes_は_arranger_帯の直下から始まる() {
+fn lanes_は_arranger_帯とコードの帯の直下から始まる() {
     let (mut app, _a, _p) = build_app();
     let mut host = UiHost::no_redraw();
+    let resp = drive(&mut host, &mut app);
+    // コードの帯の位置は widget が `peph.chord_band.lane` へ mirror する (1 フレーム目の Edit で入る)。
+    let chord = app.cur.peph.chord_band.lane.rect;
+    assert!(chord.h > 0.0, "コードの帯は既定で出ている");
+    assert!(
+        (chord.y - (resp.arranger_rect.y + resp.arranger_rect.h)).abs() < 1e-3,
+        "コードの帯は Arranger 帯の直下 (arranger={:?} chord={chord:?})",
+        resp.arranger_rect,
+    );
+    assert!(
+        (resp.lanes_rect.y - (chord.y + chord.h)).abs() < 1e-3,
+        "lanes はコードの帯の直下 (chord={chord:?} lanes={:?})",
+        resp.lanes_rect,
+    );
+    // 帯を隠すと lanes は Arranger 帯の直下へ詰まる。
+    app.cur.view.chord_band.visible = false;
     let resp = drive(&mut host, &mut app);
 
     assert!(resp.arranger_rect.h > 0.0, "Arranger 帯は常に確保される");

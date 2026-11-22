@@ -316,6 +316,8 @@ impl AppData {
                         app.set_delta_devices(app.cur.peph.delta_devices.clone());
                     }
                     app.cur.peph.device_scopes_sent.clear();
+                    // r.md #157: 再生中のコードの試聴も session state (次の tick の差分送信に任せる)。
+                    app.cur.chord_tools.sent_playback = None;
                 }
             });
         }

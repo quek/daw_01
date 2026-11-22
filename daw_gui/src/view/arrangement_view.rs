@@ -281,6 +281,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 "Bounce In Place",
                 "Bounce (with FX)",
                 "色...",
+                "コードを抽出…",
             ],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -316,6 +317,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         // 「トラック色に戻す」 (継承へ) は Ableton と同様に track 側
                         // context menu (= 全 clip 一括) に置く。
                         7 => app.open_color_picker(ColorPickerTarget::Clip(target), menu_rect),
+                        // r.md #157: 選択に入っていれば選択のクリップ全部、でなければこのクリップ。
+                        8 => app.open_chord_extract_dialog(target),
                         _ => {}
                     }
                 }));
@@ -638,6 +641,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // gui_01 #071: 空きレーン右クリック (`SecondaryClickEmpty`) → clip 生成 context menu。
     render_clip_create_menu_overlay(app, ui);
     render_section_menu_overlay(app, ui);
+    // r.md #157: コードトラックの帯のポップアップ (箱の直下)。
+    crate::view::chord_popup::draw(app, ui);
+    crate::view::chord_menu::draw(app, ui);
     // r.md #54: ルーラー / ループ帯の右クリック → ラウドネス解析。範囲に対する
     // 操作なので「範囲の上で右クリック」 が第一導線 (Ardour の Range メニューと同じ)。
     render_ruler_menu_overlay(ui, resp.ruler_rect);

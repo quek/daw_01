@@ -1042,6 +1042,13 @@ mod tests {
                 crate::model::RackPanelKey::Device(7),
                 crate::model::RackPanelKey::MasterLimiter,
             ],
+            chord_lane_hidden: true,
+            chord_notation: crate::chord_name::ChordNotation::Roman,
+            chord_tools: crate::model::ChordToolsView {
+                audition_track: Some(3),
+                audition_while_playing: true,
+                ..crate::model::ChordToolsView::default()
+            },
         }
     }
 

@@ -75,7 +75,7 @@ pub use time_ops::*;
 pub use time_selection::*;
 pub use track::*;
 pub use track_input::*;
-pub use view_state::{RackPanelKey, ViewState};
+pub use view_state::{ChordToolsView, RackPanelKey, ViewState};
 pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, run_fade, shown_in, shown_indices};
 
 /// `28` ビュー状態の保存: `ProjectFile.view: Option<ViewState>` 追加。

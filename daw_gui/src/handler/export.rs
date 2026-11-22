@@ -590,6 +590,9 @@ impl AppData {
                     });
                 }
             }
+            // r.md #157: コード進行プリセット。
+            FileDialogKind::SaveChordPreset { ids } => paths.first().into_iter().for_each(|p| self.save_chord_preset(p, &ids)),
+            FileDialogKind::InsertChordPreset { at } => paths.first().into_iter().for_each(|p| self.insert_chord_preset(p, at)),
         }
     }
 

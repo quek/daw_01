@@ -55,6 +55,12 @@ impl AppData {
     /// コードは無いので、平行移動 / ベースの基準はその位置のキーのトニック (キーも無ければ C)。録音されるのは
     /// 弾いた音 (#130 Q2 と同じ移調楽器の扱い)。
     pub(crate) fn preview_key(&self, track_id: u32, pitch: u8) -> Option<u8> {
+        self.transposed_preview_key(track_id, pitch)
+    }
+
+    /// [`Self::preview_key`] のうち **移調だけ** (コードへの追従を通さない)。コードの試聴
+    /// (`handler::chord_audition`) は書いた音のコードをそのまま鳴らすので、こちらを使う。
+    pub(crate) fn transposed_preview_key(&self, track_id: u32, pitch: u8) -> Option<u8> {
         let song = self.cur.song_doc.song();
         let beat = self.preview_beat();
         let followed = common::chord_follow::TrackChordFollow::of(song, track_id).key(pitch, beat, None)?;

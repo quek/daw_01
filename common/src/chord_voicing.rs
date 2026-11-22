@@ -9,23 +9,190 @@
 use crate::chord_detect::{DetectNote, DetectOptions, detect_chords};
 use crate::model::{Chord, ChordEvent, Clip, ClipContent, MidiContent, Note, Song, Tensions};
 
-/// コードを鍵盤にする並べ方。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
-pub enum Voicing {
-    /// 基本形: ベース音を 1 オクターブ下に 1 つ、その上にルートから積む (Studio One のノート化と同じ形)。
-    #[default]
-    Basic,
-}
+/// 型は「再生中も鳴らす」の設定として wire を渡るので `crate::model` (`chords.rs`、`WIRE_SOURCES`) に置く。
+pub use crate::model::Voicing;
 
 /// 基本形のルートを置くオクターブの C (MIDI 鍵盤、C3 = 48)。
 pub const DEFAULT_VOICING_BASE: u8 = 48;
 
-/// コード 1 つを鳴らす鍵盤の列 (昇順、重複なし、0..=127 に入るものだけ)。
+/// コード 1 つを鳴らす鍵盤の列 (昇順、重複なし、0..=127 に入るものだけ)。直前のコードを見ない形
+/// ([`voice_chord`] の `prev = None`)。
 ///
 /// `base` はルートを探し始める鍵盤 (その鍵盤以上で最初のルート)。テンションは 1 オクターブ上に積む。
 #[must_use]
 pub fn chord_pitches(chord: &Chord, voicing: Voicing, base: u8) -> Vec<u8> {
-    let Voicing::Basic = voicing;
+    voice_chord(chord, voicing, base, None)
+}
+
+/// コード 1 つを鳴らす鍵盤の列 (昇順、重複なし)。`prev` は直前に鳴らした鍵盤 (最低音 = ベース) で、
+/// [`Voicing::Adaptive`] だけが見る。**試聴・再生中の試聴・ノート化はみなこれを通す**。
+#[must_use]
+pub fn voice_chord(chord: &Chord, voicing: Voicing, base: u8, prev: Option<&[u8]>) -> Vec<u8> {
+    match voicing {
+        Voicing::Basic => basic_pitches(chord, base),
+        Voicing::Piano => piano_pitches(chord, base),
+        Voicing::Guitar => guitar_pitches(chord).unwrap_or_else(|| piano_pitches(chord, base)),
+        Voicing::Adaptive => match prev.filter(|p| p.len() >= 2) {
+            Some(prev) => adaptive_pitches(chord, base, prev),
+            None => piano_pitches(chord, base),
+        },
+    }
+}
+
+/// コード列を順に voicing する (自動は直前の結果を引き継ぐ)。`chords` と同じ長さの列を返す。
+#[must_use]
+pub fn voice_progression<'a>(
+    chords: impl IntoIterator<Item = &'a Chord>,
+    voicing: Voicing,
+    base: u8,
+) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for c in chords {
+        let v = voice_chord(c, voicing, base, out.last().map(Vec::as_slice));
+        out.push(v);
+    }
+    out
+}
+
+/// 上声部に積む pitch class (ルートからの半音、昇順)。変化した 5 度とテンションを含む。
+fn upper_intervals(chord: &Chord) -> Vec<u8> {
+    let m = chord.interval_mask();
+    (0..12u8).filter(|i| (m >> i) & 1 == 1).collect()
+}
+
+fn to_keys(v: impl IntoIterator<Item = i32>) -> Vec<u8> {
+    let mut out: Vec<u8> = v.into_iter().filter_map(|p| u8::try_from(p).ok().filter(|p| *p <= 127)).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// `lo` 以上で最初の pitch class `pc` の鍵盤。
+fn at_or_above(lo: i32, pc: u8) -> i32 {
+    lo + (i32::from(pc % 12) - lo).rem_euclid(12)
+}
+
+/// 密集位置: `lo` 以上で最初の構成音から、構成音を 1 つずつ上へ積む。
+fn close_position(chord: &Chord, lo: i32, start_index: usize) -> Vec<i32> {
+    let ivs = upper_intervals(chord);
+    let n = ivs.len();
+    let mut out = Vec::with_capacity(n);
+    let mut cur = lo - 1;
+    for k in 0..n {
+        let pc = (chord.root % 12 + ivs[(start_index + k) % n]) % 12;
+        cur = at_or_above(cur + 1, pc);
+        out.push(cur);
+    }
+    out
+}
+
+fn piano_pitches(chord: &Chord, base: u8) -> Vec<u8> {
+    let base = i32::from(base);
+    let bass = at_or_above(base - 12, chord.bass_pc());
+    // 右手は `base` の 5 度上 (C3 基準なら G3) 以上で最初の構成音から。
+    let lo = base + 7;
+    let ivs = upper_intervals(chord);
+    let first = (0..ivs.len())
+        .min_by_key(|&k| at_or_above(lo, (chord.root % 12 + ivs[k]) % 12))
+        .unwrap_or(0);
+    let mut v = close_position(chord, lo, first);
+    v.push(bass);
+    to_keys(v)
+}
+
+fn adaptive_pitches(chord: &Chord, base: u8, prev: &[u8]) -> Vec<u8> {
+    let base = i32::from(base);
+    let prev_bass = i32::from(prev[0]);
+    let prev_upper: Vec<i32> = prev[1..].iter().map(|&p| i32::from(p)).collect();
+    // ベースは直前のベースに最も近い位置 (ただし base-17 ..= base+4 の帯の中、低すぎ / 高すぎを避ける)。
+    let bass_pc = chord.bass_pc();
+    let bass = (base - 17..=base + 4)
+        .filter(|p| p.rem_euclid(12) == i32::from(bass_pc))
+        .min_by_key(|p| (p - prev_bass).abs())
+        .unwrap_or_else(|| at_or_above(base - 12, bass_pc));
+    // 上声部は全転回形 × 近いオクターブから、直前の声部との距離 (各音の最寄りの距離の和、両方向) が最小のもの。
+    let n = upper_intervals(chord).len();
+    let dist = |cand: &[i32]| -> i32 {
+        let one = |a: &[i32], b: &[i32]| a.iter().map(|x| b.iter().map(|y| (x - y).abs()).min().unwrap_or(0)).sum::<i32>();
+        one(cand, &prev_upper) + one(&prev_upper, cand)
+    };
+    let mut best: Option<(i32, Vec<i32>)> = None;
+    for lo in base + 2..=base + 19 {
+        for k in 0..n {
+            let cand = close_position(chord, lo, k);
+            if cand.first() != Some(&lo) {
+                continue; // 同じ形を別の lo で重複して数えない
+            }
+            let d = dist(&cand);
+            if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                best = Some((d, cand));
+            }
+        }
+    }
+    let mut v = best.map(|(_, v)| v).unwrap_or_else(|| close_position(chord, base + 7, 0));
+    // ベースは上声部より下 (上声部が下がってベースと交差したら、ベースを 1 オクターブ下げる)。
+    let mut bass = bass;
+    while v.first().is_some_and(|&lo| bass >= lo) {
+        bass -= 12;
+    }
+    v.push(bass);
+    to_keys(v)
+}
+
+/// 標準調弦の開放弦 (6 弦 → 1 弦)。
+const GUITAR_STRINGS: [i32; 6] = [40, 45, 50, 55, 59, 64];
+
+/// ギターの形: 最低音の弦でベース音を押さえ、それより高い弦は全部鳴らす (内側の弦はミュートしない)。
+/// ポジション 0..=9 で、4 フレットの幅 (+ 開放弦) に収まる形のうち、必要な構成音 (完全 5 度以外) を
+/// 全部含み、鳴る弦が多く、ポジションが低いものを選ぶ。押さえられる形が無ければ `None`。
+fn guitar_pitches(chord: &Chord) -> Option<Vec<u8>> {
+    let tones = chord.pitch_class_mask();
+    let allowed = tones | (1 << chord.bass_pc());
+    let fifth = (chord.root % 12 + 7) % 12;
+    let required = tones & !(1 << fifth) | (1 << chord.bass_pc());
+    let mut best: Option<(i32, Vec<i32>)> = None;
+    for pos in 0..=9 {
+        let frets: Vec<i32> = std::iter::once(0).chain((pos.max(1))..=pos + 3).collect();
+        for low in 0..3 {
+            let Some(bass_fret) = frets.iter().find(|&&f| (GUITAR_STRINGS[low] + f).rem_euclid(12) == i32::from(chord.bass_pc())) else {
+                continue;
+            };
+            // 上の弦は「構成音のうち、まだ鳴っていない音を優先、次に低いフレット」で 1 つずつ決める。
+            let mut notes = vec![GUITAR_STRINGS[low] + bass_fret];
+            let mut covered: u16 = 1 << chord.bass_pc();
+            let mut ok = true;
+            for &open in &GUITAR_STRINGS[low + 1..] {
+                let pick = frets
+                    .iter()
+                    .map(|f| open + f)
+                    .filter(|p| (allowed >> p.rem_euclid(12)) & 1 == 1)
+                    .min_by_key(|p| ((covered >> p.rem_euclid(12)) & 1, *p));
+                match pick {
+                    Some(p) => {
+                        covered |= 1 << p.rem_euclid(12);
+                        notes.push(p);
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || covered & required != required {
+                continue;
+            }
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            // 鳴る弦 1 本 = 4、ポジション 1 つ = 3 (開放の形を、開放弦を混ぜた高いポジションより優先する)。
+            let score = notes.len() as i32 * 4 - pos * 3 - low as i32;
+            if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                best = Some((score, notes));
+            }
+        }
+    }
+    best.map(|(_, v)| to_keys(v))
+}
+
+fn basic_pitches(chord: &Chord, base: u8) -> Vec<u8> {
     let root = i32::from(base) + (i32::from(chord.root % 12) - i32::from(base % 12)).rem_euclid(12);
     let altered_fifth = chord.tensions.contains(Tensions::FLAT5) || chord.tensions.contains(Tensions::SHARP5);
     let mut out: Vec<i32> = Vec::new();
@@ -73,8 +240,9 @@ impl Song {
         let end = picked.iter().map(ChordEvent::end_beat).fold(start, f64::max);
         self.track_by_id(track_id)?;
         let mut content = MidiContent::default();
-        for c in &picked {
-            for pitch in chord_pitches(&c.chord, voicing, DEFAULT_VOICING_BASE) {
+        let voiced = voice_progression(picked.iter().map(|c| &c.chord), voicing, DEFAULT_VOICING_BASE);
+        for (c, pitches) in picked.iter().zip(voiced) {
+            for pitch in pitches {
                 let id = content.alloc_note_id();
                 content.notes.push(Note {
                     id,
@@ -137,6 +305,42 @@ mod tests {
         // C7(b5): 5 度が b5 に置き換わる
         let c7b5 = Chord { tensions: Tensions::FLAT5, ..Chord::new(0, ChordKind::Dominant7) };
         assert_eq!(chord_pitches(&c7b5, Voicing::Basic, 48), vec![36, 48, 52, 54, 58]);
+    }
+
+    /// ギターはローポジションの開放の形 (C = x32010, Am = x02210, G = 320003 系) を選ぶ。
+    #[test]
+    fn guitar_voicing_picks_open_shapes() {
+        let c = chord_pitches(&Chord::new(0, ChordKind::Major), Voicing::Guitar, 48);
+        assert_eq!(c, vec![48, 52, 55, 60, 64]);
+        let am = chord_pitches(&Chord::new(9, ChordKind::Minor), Voicing::Guitar, 48);
+        assert_eq!(am, vec![45, 52, 57, 60, 64]);
+        let g = chord_pitches(&Chord::new(7, ChordKind::Major), Voicing::Guitar, 48);
+        assert_eq!(g[0], 43, "6 弦 3 フレットの G がベース");
+    }
+
+    /// 自動の voicing は、ピアノの固定形より声部の動きが小さく、ベースは常に最低音。
+    #[test]
+    fn adaptive_voicing_moves_less_than_fixed_piano() {
+        // ピアノの固定形 (G3 以上の最初の構成音から) は F# と G の間で 3 音とも跳ぶ。
+        let prog: Vec<Chord> = [(6, ChordKind::Major), (7, ChordKind::Major), (6, ChordKind::Major), (0, ChordKind::Major7)]
+            .into_iter()
+            .map(|(r, k)| Chord::new(r, k))
+            .collect();
+        let movement = |vs: &[Vec<u8>]| -> i32 {
+            vs.windows(2)
+                .map(|w| {
+                    let (a, b) = (&w[0][1..], &w[1][1..]);
+                    b.iter().map(|x| a.iter().map(|y| (i32::from(*x) - i32::from(*y)).abs()).min().unwrap()).sum::<i32>()
+                })
+                .sum()
+        };
+        let piano = voice_progression(&prog, Voicing::Piano, 48);
+        let adaptive = voice_progression(&prog, Voicing::Adaptive, 48);
+        assert!(movement(&adaptive) < movement(&piano), "adaptive {adaptive:?} / piano {piano:?}");
+        for (v, c) in adaptive.iter().zip(&prog) {
+            assert_eq!(v[0] % 12, c.bass_pc(), "最低音はベース音: {v:?}");
+            assert!(v[1..].iter().all(|p| c.contains(*p)), "上声部は構成音: {v:?}");
+        }
     }
 
     /// 箱 → クリップ → 検出で、元の進行に戻る (ノート化と検出が同じコードの定義を見ている)。
