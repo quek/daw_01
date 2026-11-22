@@ -40,7 +40,7 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     drag::advance(ui, &f);
     launcher::drag::advance(ui, &f);
     // 4. session の overlay 用スナップショットと release take。
-    let (live, released) = sessions::take(ui, app, &f, &mut response);
+    let (live, mut released) = sessions::take(ui, app, &f, &mut response);
     let launcher_sessions = launcher::drag::take(ui, &f);
     let overlays = sessions::overlays(app, &f, &live, &released);
     // 5. hover 判定 → cursor 決定 (cursor は hover が書いた response を読む)。
@@ -61,15 +61,15 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     launcher::press::cursor(ui, &f);
     // 5b. r.md #157: コードトラックの帯 (入力 → 描画 → 確定 → カーソル)。帯は他のゾーンと y が排他。
     //     描画はプレイヘッド / ループ帯 (`render::dispatch`) より奥、カーソルは上の 2 つより後勝ち。
-    chord_lane::run(ui, app, &f);
+    chord_lane::run(ui, app, &f, &mut released);
     // 6. heavy 描画 → release commit → track header 描画 (この 3 つの順が z 順)。
     render::dispatch(ui, app, &f, &overlays, &response);
     release::commit_releases(ui, &f, &mut response, released);
     let clicks = header::draw_rows(ui, &f, &live, &mut response);
     header::commit_clicks(ui, &f, clicks, &mut response);
-    // 6a. r.md #157: コードの帯の見出しのボタンと、Arranger 帯の見出しの表示トグル
-    //     (Arranger 帯の見出しは `render::dispatch` が塗るので、その後)。
-    chord_lane::controls::draw(ui, app, &f);
+    // 6a. r.md #157: コードの帯の見出しのボタン・Arranger 帯の見出しの表示トグル・箱をレーンへ
+    //     運んでいる間の落とし先 (Arranger 帯の見出しとレーンは `render::dispatch` が塗るので、その後)。
+    chord_lane::after_render(ui, app, &f);
     // 6b. ランチャー帯 (r.md #87)。 帯はヘッダ / レーンと x が排他なので z の競合は無いが、
     //     ランチャー主導の行の減光だけはアレンジのクリップの上に乗るので **この位置**。
     launcher::draw::dispatch(

@@ -11,11 +11,11 @@
 
 use std::sync::Arc;
 
-use common::model::{Chord, ChordEvent, ChordKind};
+use common::model::{Chord, ChordEvent, ChordKind, Clip, ClipContent, MidiContent, Note};
 use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
-use daw_gui::app::AppData;
+use daw_gui::app::{AppData, track_with};
 use daw_gui::dispatcher::{BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher};
 use daw_gui::widgets::arrangement::arrangement;
 use daw_ui_core::{FrameInput, PointerFrame, UiHost};
@@ -186,6 +186,56 @@ fn header_buttons_toggle_follow_and_visibility() {
     assert!(!app.cur.view.chord_band.visible, "帯が隠れる");
     drive(&mut host, &mut app, hold(700.0, 500.0, none()));
     assert_eq!(app.cur.peph.chord_band.lane.rect.h, 0.0, "隠した帯は高さ 0");
+}
+
+/// master 行 (y∈[58,108)) の下の 1 本目のトラックに、C メジャーの和音を鳴らす 4 拍の MIDI クリップを置く。
+fn add_triad_clip(app: &mut AppData, track_id: u32, clip_id: u32, start: f64) {
+    app.edit_song(|song| {
+        song.tracks.clear();
+        let cid = song.alloc_content_id();
+        let notes = [60u8, 64, 67]
+            .into_iter()
+            .map(|pitch| Note { pitch, start_beat: 0.0, duration_beats: 4.0, velocity: 100, ..Note::default() })
+            .collect();
+        song.clip_contents.insert(cid, ClipContent::Midi(MidiContent { notes, ..MidiContent::default() }));
+        song.tracks.push(track_with(|t| {
+            t.id = track_id;
+            t.clips = vec![Clip { id: clip_id, content_id: cid, start_beat: start, length_beats: 4.0, ..Clip::default() }];
+        }));
+    });
+}
+
+/// 箱をトラックのレーンへ運んで離すと、そのトラックの MIDI クリップになる (帯の箱は動かない)。
+#[test]
+fn dragging_a_box_onto_a_track_makes_a_clip() {
+    let (mut app, _a, _p) = build_app();
+    app.edit_song(|song| {
+        song.tracks.clear();
+        song.tracks.push(track_with(|t| t.id = 5));
+    });
+    place(&mut app, 2.0, 4.0, 9);
+    // トラック 5 の行は master 行の下 y∈[108,158)。
+    drag(&mut app, (3.0 * ZOOM, UPPER_Y), (3.0 * ZOOM, 130.0), none());
+    assert_eq!(layout(&app), vec![(2.0, 4.0, 9)], "帯の箱は動かない");
+    let t = app.cur.song_doc.song().track_by_id(5).unwrap();
+    assert_eq!(t.clips.len(), 1, "落としたトラックにクリップができる");
+    assert!((t.clips[0].start_beat - 2.0).abs() < 1e-9, "クリップは箱の位置: {}", t.clips[0].start_beat);
+}
+
+/// MIDI クリップのヘッダを帯へ運んで離すと、クリップは動かずにコード (C) が帯に置かれる。
+#[test]
+fn dropping_a_midi_clip_on_the_band_extracts_chords() {
+    let (mut app, _a, _p) = build_app();
+    add_triad_clip(&mut app, 1, 10, 2.0);
+    // クリップのヘッダ帯 (行の上端 +2px) を掴んで帯の上へ。
+    let header_y = 108.0 + 2.0;
+    drag(&mut app, (3.0 * ZOOM, header_y), (3.0 * ZOOM, UPPER_Y), none());
+    let song = app.cur.song_doc.song();
+    let clip = &song.track_by_id(1).unwrap().clips[0];
+    assert!((clip.start_beat - 2.0).abs() < 1e-9, "クリップは動かない: {}", clip.start_beat);
+    let roots: Vec<(u8, ChordKind)> = song.chords.iter().map(|c| (c.chord.root, c.chord.kind)).collect();
+    assert_eq!(roots, vec![(0, ChordKind::Major)], "C が抽出される: {:?}", song.chords);
+    assert!((song.chords[0].start_beat - 2.0).abs() < 1e-9);
 }
 
 /// Alt+端のドラッグ (複数選択) は選択全体を比例伸縮する (右端を掴めば左端が軸)。

@@ -21,7 +21,7 @@ use crate::widgets::arrangement::geometry::{
 use crate::widgets::arrangement::ClipDragKind;
 use crate::widgets::select_modifier::SelectModifier;
 
-fn state_id(f: &ArrangementFrame<'_>) -> WidgetId {
+pub(super) fn state_id(f: &ArrangementFrame<'_>) -> WidgetId {
     f.wid.child(b"chord_lane")
 }
 
@@ -191,7 +191,9 @@ pub(super) fn take(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) -> (Live,
 
 pub(super) fn release(ui: &mut Ui<'_, AppData>, _app: &AppData, f: &ArrangementFrame<'_>, r: Released) {
     if let Some(d) = r.drag {
-        if d.is_click() {
+        if super::handoff::release_chord_drag(ui, f, &d) {
+            // レーンの上で離した = クリップにした (帯の箱は動かさない)。
+        } else if d.is_click() {
             let modifier = SelectModifier::from_modifiers(d.press_shift, d.press_ctrl);
             let id = d.id;
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {

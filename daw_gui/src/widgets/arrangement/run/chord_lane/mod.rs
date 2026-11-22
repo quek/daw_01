@@ -16,9 +16,10 @@ use crate::app::AppData;
 use crate::state::chord_band::ChordLaneGeom;
 use crate::widgets::chord_colors::{chord_box_fill, chord_box_ink};
 
-pub(in crate::widgets::arrangement) mod controls;
+mod controls;
 mod draw;
 mod gesture;
+mod handoff;
 mod input;
 
 /// 帯の高さ (px)。Arranger 帯 (18px) よりわずかに高く、コード名を 11px で読める高さ。
@@ -89,24 +90,50 @@ struct Live {
 /// 帯の 1 フレーム (press → 継続 → 描画 → release → dblclick / 右クリック → カーソル)。
 /// `run.rs` が `cursor::apply` の後・`render::dispatch` の前に呼ぶ (カーソルは後勝ち、帯の描画は
 /// プレイヘッド / ループ帯より奥)。
+///
+/// `released` はアレンジの release フレームに取り出した session — 帯の上で離したクリップの
+/// ドラッグはここで取り上げる (`release::commit_releases` にクリップを動かさせない)。
 pub(in crate::widgets::arrangement) fn run(
     ui: &mut daw_ui_core::Ui<'_, AppData>,
     app: &AppData,
     f: &super::super::frame::ArrangementFrame<'_>,
+    released: &mut super::super::sessions::ReleasedSessions,
 ) {
     mirror(ui, app, f);
     if f.chord_rect.h <= 0.0 {
         return;
     }
+    let clip_over = handoff::clip_over_band(ui, f);
+    handoff::take_clip_drop(ui, app, f, released);
     input::escape(ui, f);
     input::press(ui, app, f);
     input::advance(ui, f);
-    let (live, released) = input::take(ui, f);
-    draw::draw(ui, f, &live);
-    input::release(ui, app, f, released);
+    let (live, chord_released) = input::take(ui, f);
+    draw::draw(ui, f, &live, clip_over);
+    input::release(ui, app, f, chord_released);
     input::double_click(ui, app, f);
     input::secondary_click(ui, f);
     input::cursor(ui, f, &live);
+}
+
+/// `render::dispatch` の後に描くもの: 見出しのボタン (Arranger 帯の見出しの上に乗る) と、
+/// 箱をレーンへ運んでいる間の落とし先のゴースト (レーンの上に乗る)。
+pub(in crate::widgets::arrangement) fn after_render(
+    ui: &mut daw_ui_core::Ui<'_, AppData>,
+    app: &AppData,
+    f: &super::super::frame::ArrangementFrame<'_>,
+) {
+    controls::draw(ui, app, f);
+    if f.chord_rect.h <= 0.0 {
+        return;
+    }
+    let drag = {
+        let s: &mut ChordLaneState = ui.widget_state(input::state_id(f));
+        s.drag.clone()
+    };
+    if let Some(d) = drag {
+        handoff::draw_drop_ghost(ui, f, &d);
+    }
 }
 
 /// 帯の位置を `ProjectEphemeral::chord_band.lane` へ写す (変わったフレームだけ)。

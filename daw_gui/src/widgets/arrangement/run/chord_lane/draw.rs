@@ -17,9 +17,11 @@ use crate::widgets::arrangement::ArrangementStyle;
 use crate::widgets::arrangement::draw::{push_filled_rect, push_section_border, push_selection_ring};
 use crate::widgets::arrangement::frame::ArrangementFrame;
 
-pub(super) fn draw(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>, live: &Live) {
+/// `clip_over` = アレンジのクリップを帯の上へ運んでいる (離すとコードを抽出する) — 帯を縁取る。
+pub(super) fn draw(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>, live: &Live, clip_over: bool) {
     let s = Scale { beat_per_px: f.beat_per_px, snap: &f.view.snap, zoom: f.zoom_x_px_per_beat };
-    let resolved = live.drag.as_ref().map(|d| d.resolve(s));
+    // レーンの上へ運んでいる箱は帯では動かさない (離すとクリップになる、ゴーストは `handoff`)。
+    let resolved = live.drag.as_ref().filter(|d| super::handoff::drop_track(f, d).is_none()).map(|d| d.resolve(s));
     let range = live.range.filter(|r| !r.is_click()).map(|r| r.span(s));
     ui.heavy(("arrangement_chord_lane", &f.id), |hctx| {
         let style = f.style;
@@ -63,6 +65,10 @@ pub(super) fn draw(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>, live: &Li
                 let r = box_rect(a, b - a, f);
                 push_filled_rect(hctx, r, style.arranger_preview_fill);
                 push_section_border(hctx, r, style.clip_border, 1.0);
+            }
+            if clip_over {
+                push_filled_rect(hctx, f.chord_rect, style.arranger_preview_fill);
+                push_section_border(hctx, f.chord_rect, super::handoff::band_drop_border(f), 2.0);
             }
         });
     });
