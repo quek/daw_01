@@ -115,12 +115,16 @@ fn pointer_input(p: PointerFrame) -> FrameInput {
 }
 
 /// 1 フレーム走らせ、widget が発行した `Edit<AppData>` を `app` に自動 apply する。
-fn drive(host: &mut UiHost<AppData>, app: &mut AppData, input: FrameInput) {
+/// 描いた scene を返す (描画の検査用)。
+fn drive(host: &mut UiHost<AppData>, app: &mut AppData, input: FrameInput) -> Scene {
     let mut scene = Scene::new();
     let screen = PhysicalSize { width: WIDGET_RECT.w as u32, height: WIDGET_RECT.h as u32 };
+    // 本番の runner と同じく、毎フレームのパレットを host に渡す (heavy 内の描画が読む)。
+    host.set_palette(app.theme.core.clone());
     host.frame(app, &mut scene, screen, input, |app, ui| {
         let _ = piano_roll(app, ui, WIDGET_RECT);
     });
+    scene
 }
 fn drive_pointer(host: &mut UiHost<AppData>, app: &mut AppData, p: PointerFrame) {
     drive(host, app, pointer_input(p));
@@ -536,4 +540,83 @@ fn edge_autoscroll_horizontal_on_note_drag() {
         app.pianoroll_scroll_beat()
     );
     drive_pointer(&mut host, &mut app, release(796.0, y, no_mods()));
+}
+
+// ============================================================
+// r.md #157: コード帯 (ルーラー直下) / 色分け / 鳴る音の枠
+// ============================================================
+
+/// コード帯の高さ (`view_build::CHORD_LANE_H`)。コードがあるとき grid はこの分だけ下がる。
+const CHORD_LANE_H: f32 = 18.0;
+
+fn place_chord(app: &mut AppData, start: f64, len: f64, chord: common::model::Chord, color: Option<[f32; 3]>) {
+    app.edit_song(|s| {
+        s.place_chord(common::model::ChordEvent { id: 0, start_beat: start, len_beats: len, chord, color });
+    });
+}
+
+/// scene の中から `text` を描いた glyph と、それより前に描かれた「glyph の位置を含む最後の不透明な塗り」
+/// (= 文字の実際の背景) を返す。
+fn glyph_and_backdrop(scene: &Scene, text: &str) -> (daw_ui_renderer::GlyphArea, daw_ui_renderer::Color) {
+    use daw_ui_renderer::Primitive;
+    let at = scene
+        .primitives
+        .iter()
+        .position(|p| matches!(p, Primitive::Glyph(g) if &*g.text == text))
+        .unwrap_or_else(|| panic!("glyph {text:?} が描かれていない"));
+    let Primitive::Glyph(g) = &scene.primitives[at] else { unreachable!() };
+    let fill = scene.primitives[..at]
+        .iter()
+        .filter_map(|p| match p {
+            Primitive::Rect(r) if r.fill.a > 0.99 && r.rect.contains(g.left + 1.0, g.top + 4.0) => Some(r.fill),
+            _ => None,
+        })
+        .last()
+        .expect("glyph の下に塗りがある");
+    (g.clone(), fill)
+}
+
+/// コード帯はルーラーの直下に出て、箱の名前は塗り (既定色 / 明るいユーザー色 / 暗いユーザー色) の上で
+/// ダーク・ライトどちらのテーマでも読める。コードが 1 つも無ければ帯は出ない (grid は動かない)。
+#[test]
+fn chord_lane_shows_readable_chord_names_under_the_ruler() {
+    use common::model::{Chord, ChordKind};
+    for theme in ["dark", "light"] {
+        for color in [None, Some([0.95, 0.92, 0.55]), Some([0.06, 0.06, 0.10])] {
+            let (mut app, _a, _p) = build_app();
+            app.handle_event(daw_gui::app::AppEvent::SetTheme(theme.to_string()));
+            setup_clip(&mut app, 1, 10, vec![mk_note(60, 2.0, 1.0, 100)]);
+            place_chord(&mut app, 0.0, 4.0, Chord::new(9, ChordKind::Minor), color);
+            let mut host = UiHost::<AppData>::no_redraw();
+            let scene = drive(&mut host, &mut app, FrameInput::default());
+            let (g, fill) = glyph_and_backdrop(&scene, "Am");
+            assert!(
+                g.top >= GRID_Y && g.top < GRID_Y + CHORD_LANE_H,
+                "{theme}/{color:?}: 名前はルーラー直下の帯に出る: top={}",
+                g.top
+            );
+            // 既定色は本文の 4.5:1、ユーザー色 (中間の明度もありうる) は可変背景の標識の 3:1 (`ink_for`)。
+            let need = if color.is_none() { 4.5 } else { 3.0 };
+            let ratio = daw_ui_core::theme::contrast_ratio(g.color, fill);
+            assert!(ratio >= need, "{theme}/{color:?}: 名前と箱のコントラスト {ratio:.2} >= {need}");
+        }
+    }
+
+    // コードが無ければ帯は出ず、grid は従来位置 (y = 44) のまま: 既存のノートを掴める。
+    let (mut app, _a, _p) = build_app();
+    setup_clip(&mut app, 1, 10, vec![mk_note(60, 2.0, 1.0, 100)]);
+    let mut host = UiHost::<AppData>::no_redraw();
+    drive_pointer(&mut host, &mut app, press(216.0, pitch_y(60), no_mods()));
+    drive_pointer(&mut host, &mut app, release(217.0, pitch_y(60), no_mods()));
+    assert_eq!(app.selected_note_ids(), vec![AppData::pack_note_id(0, 0)]);
+
+    // コードがあれば grid は帯の分だけ下がり、ノートの当たり判定も一緒に下がる。
+    let (mut app, _a, _p) = build_app();
+    setup_clip(&mut app, 1, 10, vec![mk_note(60, 2.0, 1.0, 100)]);
+    place_chord(&mut app, 0.0, 4.0, Chord::new(0, ChordKind::Major), None);
+    let mut host = UiHost::<AppData>::no_redraw();
+    let y = pitch_y(60) + CHORD_LANE_H;
+    drive_pointer(&mut host, &mut app, press(216.0, y, no_mods()));
+    drive_pointer(&mut host, &mut app, release(217.0, y, no_mods()));
+    assert_eq!(app.selected_note_ids(), vec![AppData::pack_note_id(0, 0)]);
 }

@@ -71,6 +71,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             grid,
             kbd,
             ruler,
+            chord_lane,
             vel_area,
             zoom_x,
             zoom_y,
@@ -1252,6 +1253,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                 );
             }
         });
+        chord_strip::draw(app, ui, chord_lane, kbd.x, view);
 
         // ----- shortcut: Insert (note 追加) / Delete (selected 削除) -----
         // M14 Phase 59: editing_mode 中は global shortcut が typing_focus で抑制される

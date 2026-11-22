@@ -13,14 +13,12 @@ impl AppData {
     /// コード名の表記 (音名 / 数字 / ローマ数字)。**コード名を出す全ての表示面がこれを引く**
     /// (帯 / ポップアップ / ピアノロール上端 / 今と次のコード)。
     #[must_use]
-    #[allow(dead_code)] // 表示面 (帯 / ピアノロール) が載るまで script からしか呼ばれない。載ったら外す。
     pub(crate) fn chord_notation(&self) -> ChordNotation {
         ChordNotation::Regular
     }
 
     /// 表示名 1 つ (`chord_notation` と、その位置のキーの綴り)。表示面はこれを呼ぶ。
     #[must_use]
-    #[allow(dead_code)] // 同上
     pub(crate) fn chord_label(&self, chord: &Chord, song_beat: f64) -> String {
         format_chord(chord, self.chord_notation(), self.cur.song_doc.song().scale_at(song_beat))
     }

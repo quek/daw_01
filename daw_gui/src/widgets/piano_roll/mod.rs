@@ -45,6 +45,7 @@ use crate::widgets::time_grid::{BarBeatGridStyle, GridLines, TimeGridExt, TimeRu
 
 pub(crate) mod view_build;
 mod cancel;
+mod chord_strip;
 mod draw;
 mod key_names;
 pub use key_names::KeyNames;

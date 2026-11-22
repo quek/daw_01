@@ -28,6 +28,8 @@ pub(super) const VEL_LANE_H: f32 = 60.0;
 pub(super) const RULER_H: f32 = 20.0;
 /// 上部 Snap toolbar の高さ (px)。
 pub(super) const TOOLBAR_H: f32 = 24.0;
+/// r.md #157: ルーラー直下のコード帯の高さ (px)。曲にコードが 1 つも無ければ 0 (帯を出さない)。
+pub(super) const CHORD_LANE_H: f32 = 18.0;
 /// 複数クリップ同時表示時に右側へ出す legend パネルの幅 (px)。
 pub(super) const LEGEND_W: f32 = 152.0;
 
@@ -64,6 +66,8 @@ pub(super) struct PrContent {
     pub grid: Rect,
     pub kbd: Rect,
     pub ruler: Rect,
+    /// r.md #157: ルーラー直下のコード帯 (grid と同じ x 範囲)。出さないときは `h == 0`。
+    pub chord_lane: Rect,
     pub vel_area: Rect,
     /// 横ズーム (px/beat)。wheel handler が anchor 保持ズームに使う。
     pub zoom_x: f32,
@@ -125,14 +129,23 @@ pub(super) fn build(
         k.keyboard_w(KEYBOARD_W, |k| measure_names(k, style.c_label_font_px))
     });
     let ruler_h = RULER_H.max(0.0).min(body.h * 0.5);
-    let vel_h = VEL_LANE_H.max(0.0).min((body.h - ruler_h) * 0.5);
-    let main_h = (body.h - ruler_h - vel_h).max(1.0);
+    // r.md #157: コード帯は曲にコードがあり、曲の時間軸のクリップ (アレンジ) を開いているときだけ。
+    let chord_h = if super::chord_strip::shown(app, target) {
+        CHORD_LANE_H.min((body.h - ruler_h) * 0.25).max(0.0)
+    } else {
+        0.0
+    };
+    let top_h = ruler_h + chord_h;
+    let vel_h = VEL_LANE_H.max(0.0).min((body.h - top_h) * 0.5);
+    let main_h = (body.h - top_h - vel_h).max(1.0);
     let ruler = Rect { x: body.x + kbd_w, y: body.y, w: (body.w - kbd_w).max(1.0), h: ruler_h };
-    let grid = Rect { x: body.x + kbd_w, y: body.y + ruler_h, w: (body.w - kbd_w).max(1.0), h: main_h };
-    let kbd = Rect { x: body.x, y: body.y + ruler_h, w: kbd_w, h: main_h };
+    let chord_lane =
+        Rect { x: body.x + kbd_w, y: body.y + ruler_h, w: (body.w - kbd_w).max(1.0), h: chord_h };
+    let grid = Rect { x: body.x + kbd_w, y: body.y + top_h, w: (body.w - kbd_w).max(1.0), h: main_h };
+    let kbd = Rect { x: body.x, y: body.y + top_h, w: kbd_w, h: main_h };
     let vel_area = Rect {
         x: body.x + kbd_w,
-        y: body.y + ruler_h + main_h,
+        y: body.y + top_h + main_h,
         w: (body.w - kbd_w).max(1.0),
         h: vel_h,
     };
@@ -240,6 +253,7 @@ pub(super) fn build(
             grid,
             kbd,
             ruler,
+            chord_lane,
             vel_area,
             zoom_x,
             zoom_y,
