@@ -3,6 +3,8 @@
 pub mod about;
 pub mod arrangement_view;
 pub mod color_picker_overlay;
+/// r.md #157: コードのポップアップと帯の右クリックメニュー。
+pub mod chord_popup;
 pub mod audio_editor;
 pub mod automation_editor;
 pub(crate) mod automation_value_input;

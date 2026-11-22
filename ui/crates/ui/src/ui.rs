@@ -2481,6 +2481,25 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         }
     }
 
+    /// `wid` (フレーム開始時の focus) 宛てのキー入力のうち、 `keys` の **押下** だけを先に取り出す
+    /// (順序は保つ)。 取り出さなかったキーは `wid` の widget にそのまま届く。
+    ///
+    /// 入力欄に focus を置いたまま、 欄が使わない / 譲ってよい意味をキーに持たせたい caller
+    /// (欄の外の候補を巡回する・隣の項目へ移る) が、 欄を描くより **前に** 呼ぶ。 key grab
+    /// ([`UiHost::set_key_grab`]) は入力中に押下を横取りしない (文字として欄へ届ける) ので、
+    /// 欄の上で使うキーの横取りはこちら。 真のモーダルの背後からは取り出さない
+    /// ([`Self::take_keyboard_events_if_focused`] と同じ)。
+    pub fn take_focused_key_presses(&mut self, wid: WidgetId, keys: &[PhysicalKey]) -> Vec<KeyEvent> {
+        if self.keyboard_blocked_by_modal() || self.focused != Some(wid) || keys.is_empty() {
+            return Vec::new();
+        }
+        let (taken, rest): (Vec<KeyEvent>, Vec<KeyEvent>) = std::mem::take(self.keyboard_events)
+            .into_iter()
+            .partition(|e| e.state == daw_ui_platform::ElementState::Pressed && keys.contains(&e.physical_key));
+        *self.keyboard_events = rest;
+        taken
+    }
+
     /// `wid` がフォーカスを持っているならフレームに溜まった IME イベントを取り出す。
     /// `take_keyboard_events_if_focused` と同じく、フレーム開始時 focus でチェックする。
     pub fn take_ime_events_if_focused(&mut self, wid: WidgetId) -> Vec<ImeEvent> {

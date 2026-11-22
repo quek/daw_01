@@ -9,7 +9,6 @@ use common::model::{Chord, ChordKind};
 use crate::app::{AppEvent, EditSurface};
 use crate::event_chord::ChordTrackEvent;
 use crate::state::AppData;
-use crate::state::chord_band::ChordPopup;
 use crate::widgets::select_modifier::{SelectModifier, range_ordered};
 
 /// 空きのドラッグで選ぶときの合わせ方。
@@ -117,17 +116,6 @@ impl AppData {
             let minor = mask & (1 << 3) != 0 && mask & (1 << 4) == 0;
             Chord::new(k.root, if minor { ChordKind::Minor } else { ChordKind::Major })
         })
-    }
-
-    /// 箱のポップアップを開く (開いていれば箱を差し替える)。
-    pub(crate) fn open_chord_popup(&mut self, id: u32) {
-        let Some(c) = self.cur.song_doc.song().chord_by_id(id).cloned() else { return };
-        let text = self.chord_label(&c.chord, c.start_beat);
-        self.cur.peph.chord_band.popup = Some(ChordPopup::new(id, text));
-    }
-
-    pub(crate) fn close_chord_popup(&mut self) {
-        self.cur.peph.chord_band.popup = None;
     }
 
     /// 帯の右クリック: 箱の上なら (選択の外なら) その箱を選んでからメニューを開く。

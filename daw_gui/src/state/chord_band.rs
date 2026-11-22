@@ -71,20 +71,21 @@ pub struct ChordBandEphemeral {
 pub struct ChordPopup {
     /// 編集中の箱。
     pub chord_id: u32,
-    /// 文字入力欄の編集中の文字列 (`parse_chord` で読めたときだけ確定する)。
+    /// 入力欄の世代。ボタン / 候補でコードを変えるたびに進め、入力欄を作り直して今の名前を
+    /// 全選択で出し直す (入力欄は focus 中は自分の buffer を正とするので、値を差し替えるには作り直す)。
+    pub rev: u32,
+    /// 入力欄の編集中の文字列 (`parse_chord` で読めたときだけ確定する)。
     pub text: String,
-    /// 文字入力欄の中身が箱の今のコードから書き換わったか。書き換わっている間だけ ←→ を
-    /// 入力欄の caret 移動に譲る (触っていなければ ←→ は隣の箱へ移る)。
+    /// 入力欄を打ち換えたか。打ち換えている間だけ ←→ を入力欄の caret 移動に譲る
+    /// (触っていなければ ←→ は隣の箱へ移る)。
     pub typed: bool,
     /// 次のコードの候補のうち上下キーで選んでいるもの。
     pub candidate: Option<usize>,
-    /// 開いた直後 / 隣へ移った直後に入力欄へフォーカスを入れ、全選択するための 1-shot。
-    pub focus_pending: bool,
 }
 
 impl ChordPopup {
     #[must_use]
     pub fn new(chord_id: u32, text: String) -> Self {
-        Self { chord_id, text, typed: false, candidate: None, focus_pending: true }
+        Self { chord_id, rev: 0, text, typed: false, candidate: None }
     }
 }

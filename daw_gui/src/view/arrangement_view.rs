@@ -638,6 +638,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // gui_01 #071: 空きレーン右クリック (`SecondaryClickEmpty`) → clip 生成 context menu。
     render_clip_create_menu_overlay(app, ui);
     render_section_menu_overlay(app, ui);
+    // r.md #157: コードトラックの帯のポップアップ (箱の直下)。
+    crate::view::chord_popup::draw(app, ui);
     // r.md #54: ルーラー / ループ帯の右クリック → ラウドネス解析。範囲に対する
     // 操作なので「範囲の上で右クリック」 が第一導線 (Ardour の Range メニューと同じ)。
     render_ruler_menu_overlay(ui, resp.ruler_rect);

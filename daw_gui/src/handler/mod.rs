@@ -16,6 +16,8 @@ pub mod bypass_target;
 pub mod chord_event;
 /// r.md #157 §3.1: 帯の選択 / 作成 / ポップアップ / メニューの口。
 pub mod chord_band;
+/// r.md #157 Q4: コードのポップアップの操作。
+pub mod chord_popup;
 pub mod chord_follow_event;
 pub mod chord_tool_event;
 pub mod clip_events;
