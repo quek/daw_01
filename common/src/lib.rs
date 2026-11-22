@@ -8,6 +8,11 @@ pub mod audio_render;
 /// r.md #156: オーディオ入力の録音の wire 型。
 pub mod audio_take;
 pub mod automation;
+pub mod chord_detect;
+pub mod chord_follow;
+pub mod chord_name;
+pub mod chord_suggest;
+pub mod chord_voicing;
 pub mod cpu_topology;
 pub mod device_scope_bridge;
 pub mod dsp;

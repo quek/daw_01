@@ -71,10 +71,12 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             grid,
             kbd,
             ruler,
+            chord_lane,
             vel_area,
             zoom_x,
             zoom_y,
             key_names,
+            harmony,
         } = content;
         let notes: &[Note] = &widget_notes;
         let selected: &[NoteId] = &selected;
@@ -975,7 +977,8 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     key_names.as_ref().map(|k| k.cache_key()),
                 ),
             ),
-            internal_note_hash,
+            // r.md #157: コード適合 (ガイド / 色分け / 鳴る音の枠) も cached 層が描く。
+            (internal_note_hash, harmony.cache_key()),
             // cached primitives は絶対座標で再生されるため widget 位置も key に
             // 含める — 「サイズ不変で位置だけ動く」 layout 変化で旧座標に描かれる
             // のを防ぐ (arrangement viewport_key と同 class の同件)。
@@ -1096,6 +1099,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
             // === cached(): viewport_key 一致時に skip される背景レイヤ ===
             hctx.cached(viewport_key, |hctx| {
                 draw_grid_background(hctx, grid, kbd, view_copy, &style_copy, key_names.as_deref());
+                harmony.draw_guide(hctx, view_copy, grid, &style_copy);
                 hctx.ui_mut().bar_beat_grid(
                     ("pr_grid", id_for_inner),
                     grid,
@@ -1114,6 +1118,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                     );
                 }
                 draw_notes(hctx, &visible_owned, view_copy, grid, &style_copy);
+                harmony.draw_marks(hctx, &visible_owned, view_copy, grid, &style_copy);
             });
 
             // === cached の外: 動的 overlay (selection / velocity lane / drag preview / lyric / cursor / playhead) ===
@@ -1252,6 +1257,7 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                 );
             }
         });
+        chord_strip::draw(app, ui, chord_lane, kbd.x, view);
 
         // ----- shortcut: Insert (note 追加) / Delete (selected 削除) -----
         // M14 Phase 59: editing_mode 中は global shortcut が typing_focus で抑制される
@@ -1990,6 +1996,8 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
             })
         },
     );
+    x += snap_draw_w + pad;
+    harmony::draw_toggle(app, ui, Rect { x, y, w: 60.0, h }, &toggle_style);
 }
 
 /// 複数表示時に右側へ出す凡例パネル。各行 = **1 トラック** = [色 swatch][トラック名][L ロック]。

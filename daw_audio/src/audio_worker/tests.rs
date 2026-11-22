@@ -364,6 +364,7 @@ fn bundle(song: &Arc<Song>, refs: &Arc<PluginRefs>) -> RtBundle {
         preview_sequence: None,
         loop_region: common::model::LoopRegion::default(),
         recording_lanes: Arc::new(RecordingLanes::new()),
+        chord_audition: Arc::default(),
         audio_clip_renderer: Arc::new(AudioClipRenderer::empty()),
         device_scope_watch: [0; MAX_DEVICE_SCOPES],
         mod_plan: None,
@@ -740,9 +741,9 @@ fn live_の窓の間に_callback_のスタックを使い回しても_生き残�
 
 /// 窓の規則の口 (`in_flight`) そのもの: 器の referent が呼び側のスレッドのスタックに居る文脈で InFlight を返したら
 /// 止め、スタックに居る物を残らず名指しする (debug build)。スタックの範囲の取り方や比較が崩れて口が黙って素通り
-/// する形と、`RenderCtx::referents` の列の項目が 0 や heap の番地にすり替わる形を捕まえる。referent 31 個のうち
+/// する形と、`RenderCtx::referents` の列の項目が 0 や heap の番地にすり替わる形を捕まえる。referent 32 個のうち
 /// `Schedule` の `Vec` の中身 5 個 (track の program / delay line / follower / node / 入力遅延) は型の上で heap なので
-/// 置けず、残り 26 個を全部スタックに置く。
+/// 置けず、残り 27 個を全部スタックに置く。
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "[\"song\", \"index\", \"scratch\", \"master_program\", \"master_l\", \"master_r\", \"solo\", \
@@ -750,7 +751,7 @@ fn live_の窓の間に_callback_のスタックを使い回しても_生き残�
                            \"mod_plane.col_of\", \"mod_plane.values\", \"mod_plane.depth_ids\", \"mod_plane.depth_col_of\", \
                            \"mod_plane.depths\", \"mod_plane.nodes\", \"follower_drive.spans\", \
                            \"follower_drive.col_of_slot\", \"follower_drive.eff\", \"rows\", \"native_io.scopes.bridge\", \
-                           \"native_io.scopes.watch\", \"native_io.input\"] が呼び側のスレッドのスタック")]
+                           \"native_io.scopes.watch\", \"native_io.input\", \"native_io.chord_audition\"] が呼び側のスレッドのスタック")]
 fn 器が呼び側のスタックを指したまま_in_flight_を返すと_スタックに居る物を全部名指しして止める() {
     let mut song = chain_song(1);
     song.mod_sources = vec![common::model::ModSource {
@@ -788,6 +789,7 @@ fn 器が呼び側のスタックを指したまま_in_flight_を返すと_ス�
     let scope_bridge = DeviceScopeBridgeHandle::create(&format!("daw01_test_stall_ds_onstack_{pid}")).unwrap();
     let scope_watch = [0u64; MAX_DEVICE_SCOPES];
     let input_stage = crate::graph::input_stage::InputStage::default();
+    let chord_audition = crate::chord_audition::ChordAuditionPlan::default();
     let params = crate::graph::step::BufferParams {
         sample_rate: SR,
         frames: FRAMES as u32,
@@ -814,6 +816,7 @@ fn 器が呼び側のスタックを指したまま_in_flight_を返すと_ス�
             sc_listen: 0,
             scopes: Some(crate::graph::DeviceScopeTap { bridge: &scope_bridge, watch: &scope_watch }),
             input: Some(&input_stage),
+            chord_audition: Some(&chord_audition),
             ..Default::default()
         },
         transpose: 0,

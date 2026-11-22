@@ -170,6 +170,10 @@ impl Song {
         for sc in &mut self.scale_changes {
             r.shift(&mut sc.beat);
         }
+        // コードトラックの箱もクリップの窓と同じく始点だけずらす (境界は呼び出し側が先に割っている)。
+        for c in &mut self.chords {
+            r.shift(&mut c.start_beat);
+        }
         if shift_sections {
             for s in &mut self.sections {
                 r.shift(&mut s.start_beat);
@@ -180,6 +184,7 @@ impl Song {
         }
         self.ensure_scale_changes_sorted();
         self.normalize_sections();
+        self.normalize_chords();
         r
     }
 
@@ -236,6 +241,8 @@ impl Song {
         // 0. 境界をまたぐ clip を a / b で分割し、 以降の membership 抽出を正確にする。
         self.split_clips_at(a);
         self.split_clips_at(b);
+        self.split_chords_at(a);
+        self.split_chords_at(b);
 
         // 1. 範囲内の content を取り出し、 帯先頭 (a) 基準のローカル位置に正規化。
         let mut taken_clips: Vec<(u32, Clip)> = Vec::new();
@@ -293,6 +300,16 @@ impl Song {
                 true
             }
         });
+        // コードトラックの箱 (id は保ったまま帯と一緒に動く)。
+        let mut taken_chords: Vec<ChordEvent> = Vec::new();
+        self.chords.retain(|c| {
+            if in_range(c.start_beat) {
+                taken_chords.push(ChordEvent { start_beat: c.start_beat - a, ..c.clone() });
+                false
+            } else {
+                true
+            }
+        });
         // 帯自身も取り出す (ripple では動かさず、 後で dest に置き直す)。
         self.sections.retain(|s| s.id != section_id);
 
@@ -340,6 +357,10 @@ impl Song {
             s.beat += dest2;
             self.scale_changes.push(s);
         }
+        for mut c in taken_chords {
+            c.start_beat += dest2;
+            self.chords.push(c);
+        }
         // 6. 帯を dest2 に置き直す。
         self.sections.push(Section {
             id: sec.id,
@@ -352,6 +373,7 @@ impl Song {
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
         self.normalize_sections();
+        self.normalize_chords();
         vec![close, open]
     }
 

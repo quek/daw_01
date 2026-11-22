@@ -35,6 +35,10 @@ pub mod ring_axis;
 pub mod virtual_keyboard;
 /// r.md #156: オーディオデバイスの設定 / 一覧 / 開いているデバイス。
 pub mod audio_device;
+/// r.md #157: コードトラックの帯の表示状態とポップアップ。
+pub mod chord_band;
+/// r.md #157: コードの試聴 / voicing / 検出 / 録音の、タブごとの状態。
+pub mod chord_tools;
 
 pub use loudness::{LoudnessPhase, LoudnessState};
 pub use project::{ProjectEphemeral, ProjectIpc, ProjectState, ProjectView, ProjectVoicevox};
@@ -258,6 +262,15 @@ impl AppData {
         let r = self.cur.song_doc.normalize(f);
         self.reconcile_song_refs_after(structure);
         r
+    }
+
+    /// 音源から決まる派生データ (r.md #157 のオーディオのコード検出) の書き込みの標準口
+    /// ([`SongDoc::write_derived`])。`edit_song` / `normalize_song` と同じく **書く直前に export_lock を
+    /// transport から同期する** (直呼びすると、走査の開始直後の書き込みが素通りして render 中に LoadSong を送る)。
+    /// 戻り値 = `Some(changed)` (書き出し / 解析中の拒否は `None`)。
+    pub fn write_derived_song(&mut self, f: impl FnMut(&mut common::model::Song) -> bool) -> Option<bool> {
+        self.sync_export_lock();
+        self.cur.song_doc.write_derived(f)
     }
 
     /// no-op 検出付き [`AppData::normalize_song`] ([`SongDoc::normalize_checked`]

@@ -939,6 +939,9 @@ pub enum EditSurface {
     /// `edit_surface` の非空優先順 fallback には入れない (タグ経由の
     /// last-wins だけで足りる)。
     Devices,
+    /// r.md #157: コードトラックの帯の箱 (`SelectionState::selected_chord_ids`)。帯で明示的に
+    /// 選んだときだけ立つ (fallback には入れない)。
+    Chords,
 }
 
 /// gui_01 #028: `MoveAutomationPoints` 用の 1 point delta。`value_norm`
@@ -1456,6 +1459,10 @@ pub enum FileDialogKind {
         clip: ClipKey,
         position_in_clip_beats: f64,
     },
+    /// r.md #157: コード進行プリセット (`.chords`) の保存先。保存する箱の id。
+    SaveChordPreset { ids: Vec<u32> },
+    /// r.md #157: 挿入するコード進行プリセット。置く位置 (拍)。
+    InsertChordPreset { at: f64 },
 }
 
 /// `spawn_file_dialog` が走らせる rfd dialog の呼び出し種別。

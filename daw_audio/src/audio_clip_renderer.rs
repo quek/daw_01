@@ -29,6 +29,7 @@ use common::model::{
     clamp_semitones, FORMANT_SEMITONES_LIMIT, PITCH_SEMITONES_LIMIT,
 };
 
+use crate::pitch_map::PitchMap;
 use crate::stretch_engine::StretchEngine;
 
 /// Decoded sample buffer for a single `AudioSource`. Planar storage
@@ -135,10 +136,14 @@ pub struct RenderedEvent {
     /// `0.0` かつ tape / slice mode なら DSP は完全バイパスされる。
     pub formant_semitones: f32,
     /// r.md #130: この event がグローバルトランスポーズで **0 以外に移調されうる**か (compile 時に確定:
-    /// トラックが追従し、かつ曲の移調が 0 以外になりうる `Song::transpose_can_be_nonzero`)。
+    /// トラックが追従し、かつ曲の移調が 0 以外になりうる `Song::transpose_can_be_nonzero`)。r.md #157: コードトラックに
+    /// 追従するトラックの event も立つ (`Song::chord_follow_can_apply` && トラックのモードが Off 以外)。
     /// tape / slice の event でもスペクトルエンジンを用意しておく条件で、実際に移調するかは render 時の
-    /// 移調量で決まる (0 の間は従来どおり完全バイパス)。
+    /// 移動量で決まる (移調だけの event は 0 の間は従来どおり完全バイパス。追従する event は [`Self::follows_chords`])。
     pub transposable: bool,
+    /// r.md #157: トラックがコードトラックに追従する (立っていれば `transposable` も立つ)。移動量がコードの箱ごとに
+    /// 0 と 0 以外を行き来するので、tape / slice でも移動量 0 の間も**エンジンを通し続ける** ([`render_uses_engine`])。
+    pub follows_chords: bool,
     /// 発音の安定キー (= `AudioEvent.source_id`)。 stretch engine が「同じ発音の続きか」 を
     /// 判定するのに使う (= positional index を使わない、アーキ不変条件 #1)。 編集で schedule を
     /// 組み直しても値が変わらないので、無関係な編集で発音中の clip が re-prime されない。
@@ -392,8 +397,11 @@ pub fn compile_audio_schedule(
     // r.md #130: 移調が 0 のままの曲はエンジンを 1 基も増やさない。
     let may_transpose = song.transpose_can_be_nonzero();
     let follows = song.follows_transpose_mask();
+    // r.md #157: コードトラックに追従するトラックも移動されうる (箱もスイッチも無い曲は 1 基も増やさない)。
+    let chords_apply = song.chord_follow_can_apply();
     for (track_idx, track) in song.tracks.iter().enumerate().filter(|&(i, _)| enabled[i]) {
-        let transposable = may_transpose && follows[track_idx];
+        let follows_chords = chords_apply && !song.track_chord_follow(track.id).is_off();
+        let transposable = (may_transpose && follows[track_idx]) || follows_chords;
         // 隣接の突き合わせ表は張り出しを要求するクリップがあるトラックだけ作る (要求ゼロが普通)。
         let neighbors = track
             .clips
@@ -418,7 +426,7 @@ pub fn compile_audio_schedule(
                 track_idx,
                 clip,
                 engine_sample_rate,
-                ClipPlacement { cell_clip_id: 0, xfade: (lead, tail), transposable },
+                ClipPlacement { cell_clip_id: 0, xfade: (lead, tail), transposable, follows_chords },
             );
         }
         // r.md #87: ランチャーのセルも同じ schedule に載せる。`clip.start_beat` は
@@ -434,7 +442,7 @@ pub fn compile_audio_schedule(
                 track_idx,
                 &cell.clip,
                 engine_sample_rate,
-                ClipPlacement { cell_clip_id: id, xfade: (0.0, 0.0), transposable },
+                ClipPlacement { cell_clip_id: id, xfade: (0.0, 0.0), transposable, follows_chords },
             );
         }
     }
@@ -467,12 +475,14 @@ pub fn compile_audio_schedule(
 /// `cell_clip_id` は 0 = アレンジのクリップ、それ以外 = そのランチャーセルの `clip.id`。
 /// `xfade` は隣接クリップとのクロスフェードで窓の外へ鳴らし進める量 `(先頭側, 末尾側)` (拍)
 /// で、**隣が実在するときだけ**非ゼロで渡ってくる。
-/// `transposable` はトラックの event が移調されうるか ([`RenderedEvent::transposable`])。
+/// `transposable` / `follows_chords` はトラックの event が移動されうるか / コードに追従するか
+/// ([`RenderedEvent::transposable`] / [`RenderedEvent::follows_chords`])。
 #[derive(Clone, Copy)]
 struct ClipPlacement {
     cell_clip_id: u32,
     xfade: (f64, f64),
     transposable: bool,
+    follows_chords: bool,
 }
 
 /// トラック 1 本のアレンジのクリップの境界 `(拍, clip id)` を拍の昇順に (NaN は載せない)。隣接の突き合わせを
@@ -509,7 +519,7 @@ fn push_clip_events(
     engine_sample_rate: u32,
     placement: ClipPlacement,
 ) {
-    let ClipPlacement { cell_clip_id, xfade, transposable } = placement;
+    let ClipPlacement { cell_clip_id, xfade, transposable, follows_chords } = placement;
     let Some(content) = song.clip_contents.get(&clip.content_id) else {
         return;
     };
@@ -614,6 +624,7 @@ fn push_clip_events(
             pitch_semitones,
             formant_semitones,
             transposable,
+            follows_chords,
             // 素材の安定 id で発音を識別する (`RenderedEvent::stream_key` の doc)。
             stream_key: u64::from(event.source_id),
             // 判定は schedule 完成後 (`count_engines_per_track`)。
@@ -636,29 +647,39 @@ fn push_clip_events(
 
 /// 1 track が同時に持てる stretch engine の数。1 個あたり ~1 MB (STFT 120 ms /
 /// 2ch) 使うので、`MAX_GRANULAR_EVENTS_PER_TRACK` (256) 相当を確保すると破綻する。
-/// 「1 track で **同時に鳴っている** Stretch / formant≠0 の event 数」が上限なので、
+/// 「1 track で **同時に鳴っている** エンジンを要る event (Stretch / formant≠0 / 移動されうる) の数」が上限なので、
 /// クロスフェード込みでも実用上 2〜4。32 は十分な余裕。溢れた event はエンジン
 /// 無しに degrade する (`render_audio_events` の fallback を参照)。
 pub const MAX_STRETCH_ENGINES_PER_TRACK: usize = 32;
 
 /// この event はスペクトルエンジンを要るか。
 /// - `Stretch`: 常に要る (時間伸縮 + 移調 + フォルマントを一括で担う)
-/// - tape / slice: `formant_semitones != 0` か、グローバルトランスポーズで移調されうる (r.md #130、
-///   長さと位置を変えずに音程だけ動かす) ときだけ。フォルマント 0 / 移調 0 の間は完全バイパスで、
-///   出力が 1 サンプルも変わらないことを保証する ([`render_uses_engine`])
+/// - tape / slice: `formant_semitones != 0` か、移動されうる (r.md #130 の移調 / r.md #157 のコードへの追従、
+///   長さと位置を変えずに音程だけ動かす) ときだけ。フォルマント 0 / 移動量 0 の間は (追従する event を除き)
+///   完全バイパスで、出力が 1 サンプルも変わらないことを保証する ([`render_uses_engine`])
 fn needs_stretch_engine(ev: &RenderedEvent) -> bool {
     ev.stretch_mode == StretchMode::Stretch || ev.formant_semitones != 0.0 || ev.transposable
 }
 
 /// この buffer で `ev` を実際にエンジンで描くか (`needs_engine` は容量計画、こちらは描画時の判定)。
-/// tape / slice はフォルマントも移調も 0 ならエンジンを通さない (= 完全バイパス)。
-fn render_uses_engine(ev: &RenderedEvent, transpose: i32) -> bool {
-    ev.needs_engine && (ev.stretch_mode == StretchMode::Stretch || ev.formant_semitones != 0.0 || transpose != 0)
+/// tape / slice はフォルマントも移動量も 0 ならエンジンを通さない (= 完全バイパス)。ただしコードに追従する event は
+/// **いつも**通す — 移動量が箱ごとに 0 と 0 以外を行き来し、素通し ↔ エンジンの切り替えのたびに波形が途切れていた
+/// (エンジンの出力は素の波形と位相が揃わない。0 → 0 以外は prime し直しにもなる)。エンジンの中で移動量を変えるのは
+/// 連続 (`StretchEngine::render` の移調はストリームの途中で変えられる)。
+fn render_uses_engine(ev: &RenderedEvent, shift: i32) -> bool {
+    ev.needs_engine
+        && (ev.stretch_mode == StretchMode::Stretch || ev.formant_semitones != 0.0 || ev.follows_chords || shift != 0)
 }
 
+/// 接する 2 つの発音を同時発音として数える隙間 (拍)。前の event の終わりと後ろの event の頭が同じ buffer に落ちると、
+/// その buffer では両方がエンジンを要る (前は終わりまで、後ろは頭から)。1 基を共有させると後ろはその buffer だけ
+/// エンジン無しで鳴り (移動量のある tape / slice は移調されない音、Stretch は伸縮だけの degrade)、次の buffer で
+/// prime し直して途切れていた。1 buffer (最大 `MAX_FRAMES` = 1024 frame) は 44.1 kHz なら 2,500 BPM 未満で 1 拍より短い。
+const ENGINE_HANDOFF_GUARD_BEATS: f64 = 1.0;
+
 /// 各 event の `needs_engine` を確定し、track index → **必要エンジン数**
-/// (= 同時に鳴りうる Stretch / formant≠0 event の最大数) を返す。
-/// off-RT (compile 時) 専用。
+/// (= 同時に鳴りうる、エンジンを要る event の最大数。接する別の発音も同時に数える: [`ENGINE_HANDOFF_GUARD_BEATS`])
+/// を返す。off-RT (compile 時) 専用。
 ///
 /// 数だけを出し、**どの event がどのエンジンを使うかは決めない**。 区間グラフの
 /// 貪欲彩色は「使う色数 = 最大同時発音数」で最適だが、**event 集合が変わると
@@ -668,8 +689,8 @@ fn render_uses_engine(ev: &RenderedEvent, transpose: i32) -> bool {
 /// 「full reset はクリックが出る」 と TODO に明記) になる。 引き当ては RT 側で
 /// `stream_key` で行い、ここは容量計画だけを担う。
 fn count_engines_per_track(schedule: &mut [RenderedEvent]) -> Vec<u16> {
-    // track index → 「現在鳴っている event の end_beat」 の集合 (同時発音数の計測)。
-    let mut per_track: HashMap<usize, Vec<f64>> = HashMap::new();
+    // track index → 「現在鳴っている event の (end_beat, 発音キー, take の頭)」 の集合 (同時発音数の計測)。
+    let mut per_track: HashMap<usize, Vec<(f64, u64, f64)>> = HashMap::new();
     let mut max_track = 0usize;
     for ev in schedule.iter_mut() {
         max_track = max_track.max(ev.track_idx);
@@ -682,10 +703,17 @@ fn count_engines_per_track(schedule: &mut [RenderedEvent]) -> Vec<u16> {
         // 窓で切られて短くなった event に素の span を使うと過大に数えてしまう。
         let audible_start = ev.start_beat.max(ev.gate_start_beat);
         let audible_end = ev.end_beat.min(ev.gate_end_beat);
-        // 既に終わっている枠を再利用 (= 同時発音数を数える貪欲彩色と同型)。
-        match live.iter().position(|&end| end <= audible_start) {
-            Some(i) => live[i] = audible_end,
-            None if live.len() < MAX_STRETCH_ENGINES_PER_TRACK => live.push(audible_end),
+        // 既に終わっている枠を再利用 (= 同時発音数を数える貪欲彩色と同型)。接する別の発音は再利用しない
+        // (`ENGINE_HANDOFF_GUARD_BEATS`)。同じ take の続き (分割の片) は RT でストリームごと引き継ぐ
+        // (`StretchEngine::continues`) ので 1 基でよい。
+        let reusable = |&(end, key, origin): &(f64, u64, f64)| {
+            end + ENGINE_HANDOFF_GUARD_BEATS <= audible_start
+                || (end <= audible_start && key == ev.stream_key && origin == ev.origin_beat)
+        };
+        let slot = (audible_end, ev.stream_key, ev.origin_beat);
+        match live.iter().position(reusable) {
+            Some(i) => live[i] = slot,
+            None if live.len() < MAX_STRETCH_ENGINES_PER_TRACK => live.push(slot),
             // 上限超過: RT で引き当てに失敗し、エンジン無しで degrade する。
             None => {}
         }
@@ -879,7 +907,7 @@ pub struct ClipRenderState<'a> {
 /// audio clip output bypasses the instrument and joins the FX chain
 /// input alongside it, see §13 Q6).
 #[allow(clippy::too_many_arguments)]
-pub fn render_audio_events(
+pub fn render_audio_events<'p>(
     renderer: &AudioClipRenderer,
     track_idx: usize,
     // r.md #87: この行が今どこから鳴っているか。`0` = アレンジのクリップ列、
@@ -894,9 +922,11 @@ pub fn render_audio_events(
     // r.md #130: この行の移調量 (半音、追従しないトラックは 0)。**長さと位置を変えずに**音程だけを動かす —
     // Stretch はスペクトルエンジンの移調に足し、tape / slice は素の出力をエンジンで移調する (テープ式に
     // 読む速度を変えると鳴る長さが変わるため)。波形の描画 (`event_wave_spans`) は長さが変わらないので影響しない。
-    track_transpose: i32,
+    // r.md #157: コードトラックへの追従の移動量も同じ経路に足す (`PitchMap::audio_semitones`、buffer ごとの今の位置)。
+    pitch: impl Into<PitchMap<'p>>,
     state: &mut ClipRenderState<'_>,
 ) {
+    let pitch: PitchMap<'p> = pitch.into();
     if frames == 0 || current_bpm <= 0.0 || sample_rate == 0 {
         return;
     }
@@ -1046,12 +1076,10 @@ pub fn render_audio_events(
         // - `Stretch`: 時間伸縮 + 移調 + フォルマントを 1 段で担う (granular を置換)
         // - tape / slice + formant≠0: 素の DSP 出力に **フォルマントだけ**掛ける後段
         //
-        // `None` = formant 0 の tape / slice (= 完全バイパスで出力が 1 サンプルも
-        // 変わらない) か、pool 上限超過 / 配送待ちの degrade。 degrade した Stretch は
+        // `None` = formant 0 / 移動量 0 の tape / slice (= 完全バイパスで出力が 1 サンプルも
+        // 変わらない。コードに追従する event は除く) か、pool 上限超過 / 配送待ちの degrade。 degrade した Stretch は
         // 下の tape 経路を **ピッチ比なし**の伸縮率で通るので、長さと拍同期は保たれ、
         // 伸縮率 1.0 近傍 (= 大多数) では正しい出力と一致する。
-        // compile 時に移調されうると決まった event だけが移調を受ける (容量計画と食い違う値は捨てる)。
-        let transpose = if event.transposable { track_transpose } else { 0 };
         // この buffer の先頭出力サンプルに対応する take-local beat。 playhead_beats は engine が
         // 積分した真の拍位置なので、buffer を跨いでも tempo が変わっても連続。
         let first_beat = playhead_beats + first_i as f64 / samples_per_beat - event.origin_beat;
@@ -1061,6 +1089,14 @@ pub fn render_audio_events(
             StreamAt { key: event.stream_key, el_start, du: time_stride, u: stretch_map(el_start) }
         } else {
             StreamAt { key: event.stream_key, el_start, du: 1.0, u: el_start as f64 }
+        };
+        // compile 時に移調されうると決まった event だけが移調 / 追従を受ける (容量計画と食い違う値は捨てる)。
+        let transpose = if event.transposable {
+            let pos = if event.stretch_mode == StretchMode::Stretch { at.u } else { el_start as f64 * effective_pitch_ratio };
+            let source_frame = crate::pitch_map::event_source_frame(event, pos);
+            pitch.audio_semitones(event.source_id, source_frame, first_beat + event.origin_beat)
+        } else {
+            0
         };
         let engine = if render_uses_engine(event, transpose) {
             acquire_engine(state.engines, at, render_seq)
@@ -1103,9 +1139,11 @@ pub fn render_audio_events(
                 }
                 mode => {
                     // テープ / slice の素の出力を 1:1 (`du = 1`) で食わせ、スペクトル包絡と
-                    // グローバルトランスポーズ (r.md #130) だけを動かす。1:1 なので長さは変わらない。
+                    // 移動量 (r.md #130 の移調 + r.md #157 の追従) だけを動かす。1:1 なので長さは変わらない。
                     // 移調 0 ならエンジンは `formantMultiplier != 1` で包絡処理だけを走らせ、移調中は
-                    // Stretch と同じく包絡を据え置く (チップマンク化させない)。
+                    // Stretch と同じく包絡を据え置く (チップマンク化させない)。コードに追従する event は
+                    // 移動量 0 の間もエンジンを通るので、包絡の据え置きを 0 を跨ぐたびに切り替えず、いつも据え置く
+                    // (移動量 0 では据え置きは素通しと同じ包絡になる)。
                     // 積分器はエンジンが次に食わせる位置 (先読みの続き) から引き当て、borrow 衝突を
                     // 避けるためコピーして使い、後で書き戻す。
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1116,7 +1154,7 @@ pub fn render_audio_events(
                         event.stream_key,
                         transpose as f32,
                         event.formant_semitones,
-                        transpose != 0,
+                        transpose != 0 || event.follows_chords,
                         el_start,
                         1.0,
                         |el| el as f64,
@@ -1709,6 +1747,7 @@ mod render_tests {
             pitch_semitones: semitones,
             formant_semitones: formant,
             transposable: transpose.is_some(),
+            follows_chords: false,
             stream_key: 1,
             needs_engine: false,
             stretch_ratio: stretch_ratio_for(source_frames, source_sr, LEN_BEATS, BPM),
@@ -1802,6 +1841,7 @@ mod render_tests {
                 pitch_semitones: 0.0,
                 formant_semitones: 0.0,
                 transposable: false,
+                follows_chords: false,
                 stream_key: 1,
                 needs_engine: false,
                 stretch_ratio: 1.0,
@@ -1910,6 +1950,7 @@ mod render_tests {
                 pitch_semitones: 0.0,
                 formant_semitones: 0.0,
                 transposable: false,
+                follows_chords: false,
                 stream_key: 1,
                 needs_engine: false,
                 stretch_ratio: 1.0,
@@ -2175,6 +2216,112 @@ mod render_tests {
         }
     }
 
+    /// 2 秒の 440 Hz × 0.5 のサイン (`ids` の素材ごとに同じもの)。440 Hz は 1 秒で整数周期なので、拍 2 (= 1 秒) から
+    /// 頭出しした別の素材も位相が揃う (つなぎ目で波形が途切れるなら経路のせい)。
+    fn sine_sources(ids: &[u32]) -> HashMap<AudioSourceId, Arc<AudioSourceBuffer>> {
+        let sine: Vec<f32> = (0..96_000).map(|i| (std::f64::consts::TAU * 440.0 * f64::from(i) / 48_000.0).sin() as f32 * 0.5).collect();
+        ids.iter()
+            .map(|&id| {
+                let buf = AudioSourceBuffer {
+                    origin: std::path::PathBuf::from(format!("test://sine-{id}")),
+                    sample_rate: 48_000,
+                    channels: 1,
+                    frames: 96_000,
+                    samples: vec![sine.clone()],
+                };
+                (id, Arc::new(buf))
+            })
+            .collect()
+    }
+
+    /// トラック 0 の `events` を 512 frame ずつ `buffers` 回描く (buffer `n` の移動量 = `shift_at(n)`)。エンジンは
+    /// compile が出した必要数を用意する (live の配送と同じ)。
+    fn render_track(
+        events: Vec<RenderedEvent>,
+        sources: HashMap<AudioSourceId, Arc<AudioSourceBuffer>>,
+        shift_at: impl Fn(u64) -> i32,
+        buffers: u64,
+    ) -> Vec<f32> {
+        let renderer = AudioClipRenderer::new(events, sources);
+        let mut engines: Vec<StretchEngine> = (0..renderer.engines_per_track.first().copied().unwrap_or(0))
+            .map(|_| StretchEngine::new(ENGINE_SR).expect("engine"))
+            .collect();
+        let spb = f64::from(ENGINE_SR) * 60.0 / f64::from(BPM);
+        let (mut accum, mut seq) = (vec![TapeCursor::IDLE; 4], 0u64);
+        let mut event_l = vec![0.0f32; common::process_data::MAX_FRAMES];
+        let mut event_r = vec![0.0f32; common::process_data::MAX_FRAMES];
+        let mut out: Vec<f32> = Vec::new();
+        for buf in 0..buffers {
+            let (mut l, mut r) = (vec![0.0f32; 512], vec![0.0f32; 512]);
+            let state = &mut ClipRenderState {
+                repitch_accum: &mut accum,
+                engines: &mut engines,
+                event_l: &mut event_l,
+                event_r: &mut event_r,
+                render_seq: &mut seq,
+            };
+            render_audio_events(&renderer, 0, 0, &mut l, &mut r, out.len() as f64 / spb, BPM, ENGINE_SR, 512, shift_at(buf), state);
+            out.extend_from_slice(&l);
+        }
+        out
+    }
+
+    /// `out[lo..hi]` の隣り合うサンプルの差の最大 (440 Hz × 0.5 の定常は 2π·440/48k·0.5 ≈ 0.029)。
+    fn max_step(out: &[f32], lo: usize, hi: usize) -> f32 {
+        (lo..hi).map(|i| (out[i] - out[i - 1]).abs()).fold(0.0f32, f32::max)
+    }
+
+    fn following(mode: StretchMode, source_id: u32, start: f64, end: f64) -> RenderedEvent {
+        RenderedEvent {
+            source_id,
+            stream_key: u64::from(source_id),
+            source_end_frames: 96_000,
+            transposable: true,
+            follows_chords: true,
+            fade_in_start_beats: start,
+            fade_out_end_beats: end,
+            ..test_event(mode, 0.0, start, end)
+        }
+    }
+
+    /// r.md #157: コードに追従する tape / slice は移動量 0 の間もエンジンを通る — 移動量がコードの箱ごとに 0 ↔ +2 と
+    /// 替わっても経路が替わらず、境界で波形が途切れない。0 の間だけ素通しにしていたときは、エンジンから素通しへ戻る
+    /// 境界で隣のサンプルとの差が定常の約 18 倍 (0.52) 跳んでいた。
+    #[test]
+    fn chord_following_shifts_through_zero_keep_the_waveform_continuous() {
+        for mode in [StretchMode::Raw, StretchMode::Repitch, StretchMode::Slice] {
+            let out = render_track(vec![following(mode, 1, 0.0, LEN_BEATS)], sine_sources(&[1]), |buf| if (buf / 40) % 2 == 1 { 2 } else { 0 }, 170);
+            let steady = max_step(&out, 5_000, 15_000);
+            assert!(steady > 0.02, "{mode:?}: 鳴っている前提: {steady}");
+            for boundary in [20_480usize, 40_960, 61_440, 81_920] {
+                let at = max_step(&out, boundary - 4, boundary + 4);
+                assert!(at < steady * 1.5, "{mode:?}: 境界 {boundary} で波形が途切れる: 段差 {at} (定常 {steady})");
+            }
+        }
+    }
+
+    /// 隣り合う別素材の 2 つの event (拍 0..2 / 2..4、つなぎ目 48,000 は buffer 93 の途中) は、後ろも頭から
+    /// エンジンを通る。つなぎ目の buffer では両方がエンジンを要るので、容量計画は接する発音を同時に数える
+    /// ([`ENGINE_HANDOFF_GUARD_BEATS`])。1 基を共有していたときは、後ろの頭の 128 sample が移調されない素の音で鳴り、
+    /// 次の buffer で prime し直していた。移動量 0 ならつなぎ目で波形も途切れない (素材の位相が揃っている)。
+    #[test]
+    fn adjacent_chord_following_events_each_get_an_engine_from_their_head() {
+        let raw = |i: usize| (std::f64::consts::TAU * 440.0 * i as f64 / 48_000.0).sin() as f32 * 0.5;
+        for mode in [StretchMode::Raw, StretchMode::Slice] {
+            let mut schedule = vec![following(mode, 1, 0.0, 2.0), following(mode, 2, 2.0, 4.0)];
+            assert_eq!(count_engines_per_track(&mut schedule), vec![2], "接する 2 つの発音は 2 基");
+            let shifted = render_track(schedule, sine_sources(&[1, 2]), |_| 2, 170);
+            assert!((48_000..48_128).any(|i| (shifted[i] - raw(i)).abs() > 1e-3), "{mode:?}: 後ろの頭が移調されずに鳴る");
+            let flat = render_track(vec![following(mode, 1, 0.0, 2.0), following(mode, 2, 2.0, 4.0)], sine_sources(&[1, 2]), |_| 0, 170);
+            let (steady, at) = (max_step(&flat, 30_000, 40_000), max_step(&flat, 47_000, 50_000));
+            assert!(at < steady * 1.5, "{mode:?}: つなぎ目で波形が途切れる: 段差 {at} (定常 {steady})");
+        }
+        // 同じ take の続き (分割の片) は RT でストリームごと引き継ぐので 1 基のまま。
+        let mut pieces = vec![following(StretchMode::Raw, 1, 0.0, 2.0), following(StretchMode::Raw, 1, 2.0, 4.0)];
+        pieces[1].origin_beat = 0.0;
+        assert_eq!(count_engines_per_track(&mut pieces), vec![1]);
+    }
+
     /// Slice は「slice の trigger 位置だけが伸縮し、 slice 本体は native rate」。
     /// trigger の写像にも SR 比が要る (落とすと slice 境界が出力上でずれる)。
     #[test]
@@ -2223,6 +2370,7 @@ mod render_tests {
             pitch_semitones: 0.0,
             formant_semitones: formant,
             transposable: false,
+            follows_chords: false,
             stream_key: 1,
             needs_engine: false,
             stretch_ratio: 1.0,
@@ -2521,29 +2669,33 @@ mod render_tests {
     #[cfg(feature = "rt-assert")]
     #[test]
     fn spectral_render_does_not_allocate_on_the_audio_thread() {
-        assert_render_does_not_allocate(StretchMode::Stretch, 5.0, -3.0, false, |_| 0, 4);
+        assert_render_does_not_allocate(StretchMode::Stretch, 5.0, -3.0, (false, false), |_| 0, 4);
     }
 
     /// r.md #130: グローバルトランスポーズで **tape / slice の event もスペクトルエンジンを通る** 経路と、
     /// 再生中の移調の変化 (0 → +3 = 発音の途中で prime / +3 → -2 = ストリームの途中で音程を変える / -2 → 0 =
-    /// バイパスへ戻る / 0 → +5 = もう一度 prime) が、どの mode でも audio thread で確保しない。
+    /// バイパスへ戻る / 0 → +5 = もう一度 prime) が、どの mode でも audio thread で確保しない。r.md #157 のコードに
+    /// 追従する event (移動量 0 の間もエンジンを通り続ける) も同じ移動量の列で確かめる。
     #[cfg(feature = "rt-assert")]
     #[test]
     fn transposed_render_does_not_allocate_on_the_audio_thread() {
         const STEPS: [i32; 8] = [0, 3, 3, -2, 0, 0, 5, 5];
         for mode in [StretchMode::Raw, StretchMode::Repitch, StretchMode::Slice, StretchMode::Stretch] {
-            assert_render_does_not_allocate(mode, 0.0, 0.0, true, |buf| STEPS[buf as usize % STEPS.len()], 16);
+            for follows_chords in [false, true] {
+                assert_render_does_not_allocate(mode, 0.0, 0.0, (true, follows_chords), |buf| STEPS[buf as usize % STEPS.len()], 16);
+            }
         }
     }
 
     /// 1 本の event を `buffers` 回 (512 frame ずつ) `assert_no_alloc` の中で描き、Rust / C++ の確保が 0 回か検査する
-    /// (上の 2 本の本体)。`transposable` / `transpose_at(buf)` は r.md #130 の移調 (buffer ごとの値)。
+    /// (上の 2 本の本体)。`(transposable, follows_chords)` / `transpose_at(buf)` は r.md #130 の移調と r.md #157 の追従
+    /// (buffer ごとの移動量)。
     #[cfg(feature = "rt-assert")]
     fn assert_render_does_not_allocate(
         mode: StretchMode,
         pitch: f32,
         formant: f32,
-        transposable: bool,
+        (transposable, follows_chords): (bool, bool),
         transpose_at: impl Fn(u64) -> i32,
         buffers: u64,
     ) {
@@ -2567,6 +2719,7 @@ mod render_tests {
             pitch_semitones: pitch,
             formant_semitones: formant,
             transposable,
+            follows_chords,
             stream_key: 1,
             needs_engine: false,
             stretch_ratio: stretch_ratio_for(source_frames, 48_000, LEN_BEATS, BPM),
@@ -2823,6 +2976,7 @@ mod wave_span_binding_tests {
             pitch_semitones: event.pitch_semitones,
             formant_semitones: event.formant_semitones,
             transposable: false,
+            follows_chords: false,
             stream_key: 1,
             needs_engine: false,
             stretch_ratio: stretch_ratio_for(

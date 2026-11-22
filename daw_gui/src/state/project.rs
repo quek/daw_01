@@ -385,6 +385,10 @@ pub struct ProjectView {
     /// piano_roll snap toolbar の「Fold」 toggle で切替、 dirty は立てないが `ViewState` で保存する。
     /// `Song.scale_changes` が空のときは `view.scale = None` で機能 OFF。
     pub piano_roll_fold: bool,
+    /// r.md #157: piano_roll にコード適合 (ノートの色分け + 背景の構成音のガイド) を出すか。
+    /// snap toolbar の「Chord」 で切替、 dirty は立てないが `ViewState` で保存する。
+    /// 曲にコードが無ければ何も出ない (トグルの値に関係なく)。
+    pub piano_roll_chord_guide: bool,
     /// ランチャー帯とアレンジのレーンをどう見せるか (`Tab` で巡回)。
     pub launcher_layout: common::model::LauncherLayout,
     /// アレンジと下部パネルの境界比率 (上の取り分)。`ViewState` に保存され、
@@ -397,6 +401,8 @@ pub struct ProjectView {
     pub launcher_scene_col_w: f32,
     /// ランチャー帯の横スクロール位置 (列数、小数可)。
     pub launcher_scroll_scene: f32,
+    /// r.md #157: コードトラックの帯の表示 / 表記 (`ViewState` に保存、dirty は立てない)。
+    pub chord_band: crate::state::chord_band::ChordBandView,
 }
 
 /// 旧 `UiEphemeral` の per-project 部分 (hover / rename / スクラブ / テクスチャキャッシュ等、
@@ -768,6 +774,8 @@ pub struct ProjectEphemeral {
     /// modal が開いており、 宛先選択 or 閉じる操作で `None` に戻る。
     /// plugin picker の `is_plugin_picker_open` と同 idiom。
     pub send_picker: Option<SendPickerState>,
+    /// r.md #157: コードトラックの帯のポップアップ / 右クリックメニュー / 帯の位置の mirror。
+    pub chord_band: crate::state::chord_band::ChordBandEphemeral,
 }
 
 impl ProjectEphemeral {
@@ -806,6 +814,8 @@ pub struct ProjectState {
     pub launcher: LauncherUiState,
     /// r.md #54: 範囲ラウドネス解析の進行とレポート (session-only)。
     pub loudness: LoudnessState,
+    /// r.md #157: コードの試聴 / voicing / 検出 / 録音 (`handler::chord_audition` ほか)。
+    pub chord_tools: super::chord_tools::ChordToolsState,
     /// 子プロセスとの帳簿 (device_id keyed)。
     pub pipc: ProjectIpc,
     /// VOICEVOX / 口パクの per-project 状態。
@@ -844,6 +854,7 @@ impl ProjectState {
             key,
             // r.md #54: 解析はセッション限りなので既定 (Idle / レポート無し)。
             loudness: LoudnessState::default(),
+            chord_tools: super::chord_tools::ChordToolsState::default(),
             song_doc: SongDoc::new(song),
             transport: TransportState::new(initial_peak_display),
             selection: SelectionState {
@@ -864,6 +875,8 @@ impl ProjectState {
                 automation_clip_anchor: None,
                 device_anchor: None,
                 scene_anchor: None,
+                selected_chord_ids: Vec::new(),
+                chord_anchor: None,
             },
             media: MediaState {
                 audio_source_cache: AudioSourceCache::new(),
@@ -968,6 +981,7 @@ impl ProjectState {
                 snap_on_draw: false,
                 plugin_editor_windows: std::collections::HashMap::new(),
                 piano_roll_fold: false,
+                piano_roll_chord_guide: true,
                 // r.md #87: 0 = 未設定 → widget が既定幅を使う。
                 launcher_layout: common::model::LauncherLayout::default(),
                 // 0.0 = 未設定 (view が既定比率へ倒す)。
@@ -975,6 +989,7 @@ impl ProjectState {
                 launcher_width: 0.0,
                 launcher_scene_col_w: 0.0,
                 launcher_scroll_scene: 0.0,
+                chord_band: crate::state::chord_band::ChordBandView::default(),
             },
             peph: ProjectEphemeral {
                 arr_label_cache: std::cell::RefCell::default(),
@@ -1053,6 +1068,7 @@ impl ProjectState {
                 clip_text_content_edit_text: String::new(),
                 clip_text_font_family_edit_text: String::new(),
                 send_picker: None,
+                chord_band: crate::state::chord_band::ChordBandEphemeral::default(),
             },
         }
     }

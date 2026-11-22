@@ -547,6 +547,26 @@ impl SongDoc {
         }
     }
 
+    /// 音源から決まる **派生データ** (r.md #157 のオーディオのコード検出 `Song.audio_chords`) の書き込み専用。
+    /// live と undo / redo に積んである全 Song へ同じ `f` を掛け、undo step も `*` も作らず、子プロセス sync
+    /// (`sync_epoch`) だけ進める。履歴に積むと、undo で消える → 未検出なので自動検出し直す → redo が消える、を
+    /// 繰り返して手前の編集へ戻れなくなる。`f` は「変わったか」を返す (live の結果だけを見る)。
+    /// ユーザーの編集には決して使わないこと — 曲の中身は必ず [`SongDoc::edit`]。
+    pub fn write_derived(&mut self, mut f: impl FnMut(&mut Song) -> bool) -> Option<bool> {
+        if self.export_lock {
+            self.rejection = Some("書き出し中は編集できません");
+            return None;
+        }
+        let changed = f(&mut self.song);
+        for e in self.undo_stack.iter_mut().chain(self.redo_stack.iter_mut()) {
+            f(&mut e.song);
+        }
+        if changed {
+            self.sync_epoch += 1;
+        }
+        Some(changed)
+    }
+
     pub fn edit_epoch(&self) -> u64 {
         self.edit_epoch
     }

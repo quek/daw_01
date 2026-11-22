@@ -40,6 +40,11 @@ pub(super) struct ArrangementFrame<'a> {
     pub ruler: Rect,
     pub arranger_rect: Rect,
     pub arranger_header_rect: Rect,
+    /// r.md #157: コードトラックの帯 (Arranger 帯の直下、lanes 幅) と見出し側。隠していれば高さ 0。
+    pub chord_rect: Rect,
+    pub chord_header_rect: Rect,
+    /// r.md #157: 帯の 1 フレーム分のビュー。
+    pub chord: &'a run::chord_lane::ChordLaneView,
     pub lanes: Rect,
     pub header_w: f32,
     pub arranger_lane_h: f32,
@@ -121,7 +126,9 @@ pub(super) fn build<'a>(
     // y 原点を arranger 分だけ下げることで track row (header / lanes 双方) が自動的に下にずれる
     // (`header_pane.y == lanes.y` の不変条件は維持 = tops を header / lanes で共有する前提)。
     let arranger_lane_h = view.arranger_lane_h.max(0.0);
-    let head_h = ruler_h + arranger_lane_h;
+    // r.md #157: コードトラックの帯も同じ head に積む (縦スクロールしても上に残る)。
+    let chord_lane_h = built.chord_lane_h.max(0.0);
+    let head_h = ruler_h + arranger_lane_h + chord_lane_h;
     let lanes_h = (rect.h - head_h).max(1.0);
     // r.md #87: ヘッダとアレンジのレーンの **間**にランチャー帯を 1 本挟む
     // (Bitwig のハイブリッドレイアウト)。 帯幅は `ui_prefs` + `LauncherLayout` から
@@ -145,7 +152,10 @@ pub(super) fn build<'a>(
     let arranger_rect = Rect { x: lanes_x, y: rect.y + ruler_h, w: lanes_w, h: arranger_lane_h };
     let arranger_header_rect =
         Rect { x: rect.x, y: rect.y + ruler_h, w: header_w, h: arranger_lane_h };
-    let lanes = Rect { x: lanes_x, y: rect.y + head_h, w: lanes_w, h: lanes_h };
+    let chord_y = rect.y + ruler_h + arranger_lane_h;
+    let chord_rect = Rect { x: lanes_x, y: chord_y, w: lanes_w, h: chord_lane_h };
+    let chord_header_rect = Rect { x: rect.x, y: chord_y, w: header_w, h: chord_lane_h };
+    let lanes =Rect { x: lanes_x, y: rect.y + head_h, w: lanes_w, h: lanes_h };
     let content_below_ruler = Rect {
         x: rect.x,
         y: header_pane.y,
@@ -208,6 +218,9 @@ pub(super) fn build<'a>(
         ruler,
         arranger_rect,
         arranger_header_rect,
+        chord_rect,
+        chord_header_rect,
+        chord: &built.chord,
         lanes,
         header_w,
         arranger_lane_h,

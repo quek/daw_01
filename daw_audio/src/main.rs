@@ -30,6 +30,8 @@ mod audio_clip_renderer;
 mod audio_rec;
 mod audio_worker;
 mod automation;
+/// r.md #157: 再生中のコードの試聴 (コードトラックを試聴トラックのノート源にする)。
+mod chord_audition;
 mod device;
 #[cfg(test)]
 // r.md #129: 内蔵 device DSP の golden (`native_dsp/golden_v38.txt`) の刺激・統計・形式。
@@ -48,6 +50,7 @@ mod native_dsp;
 mod note_ledger;
 mod offline_jobs;
 mod output_render;
+mod pitch_map;
 mod project_ctl;
 mod sampler;
 mod sequencer;

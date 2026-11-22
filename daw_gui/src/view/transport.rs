@@ -298,9 +298,11 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // 左詰め列はまとまりごとに分けて、running `x` をバケツリレーする。
     // 分けてあるのは実コード 300 行 budget (不変条件 9) のため — r.md #87 の
     // ランチャー用コントロールを足す前に、既存の `draw` を責務ごとに割った。
-    // **並び順はこの 5 行が SSoT** (r.md #130: 移調は Key の右隣)。
+    // **並び順はこの 6 行が SSoT** (r.md #130: 移調は Key の右隣。r.md #157: 今 / 次のコードは
+    // Key と移調の間 — 曲にコードがあるときだけ幅を取る)。
     let mut x = area.x + pad;
     x = draw_tempo_and_key(app, ui, area, x, cy, bh);
+    x = crate::view::transport_chord::draw(app, ui, area, x, cy, bh);
     x = draw_transpose(app, ui, area, x, cy, bh);
     x = draw_playback_buttons(app, ui, area, x, cy, bh);
     x = draw_recording_controls(app, ui, x, cy, bh);

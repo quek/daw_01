@@ -1492,7 +1492,9 @@ fn current_version_is_pinned() {
     // v45 (r.md #151 / #152): device の Mix と `DeviceMix` の target、映像 / 画像 event の `speed`
     // (serde default の 1.0 で読める)。
     // v46 (r.md #156): `Track.input` / `Track.monitor` (serde default の MIDI / 自動で読める)。
-    assert_eq!(CURRENT_VERSION, 46);
+    // v47 (r.md #157): コードトラック (`Song.chords` / `chord_follow_enabled` / `audio_chords`、`Track.follow_chords`。
+    // serde default の空 / ON / Off で読める)。
+    assert_eq!(CURRENT_VERSION, 47);
 }
 
 #[test]

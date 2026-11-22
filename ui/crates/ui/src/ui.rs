@@ -38,6 +38,7 @@ use crate::widgets::WidgetState;
 use crate::widgets::drag_in_rect::{DragInRectState, DragInfo, DragKind};
 
 mod debug_overlay;
+mod focused_keys;
 mod typography;
 pub use typography::DEFAULT_CONTROL_FONT_SIZE;
 use crate::widgets::drag_rect::{DragRect, DragRectState};
@@ -897,6 +898,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             open_popups: &mut self.open_popups,
             context_menus_seen: Vec::new(),
             popup_primitives: Vec::new(),
+            nested_popup_primitives: Vec::new(),
             drawing_in_popup: false,
             current_popup: None,
             floating: crate::floating::FloatingFrame::default(),
@@ -1112,6 +1114,9 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// drawing_in_popup 中の primitive 列 (`Primitive::Rect/Glyph/Line` の混在)。
     /// frame 末で `scene.popup_primitives` に move する。
     popup_primitives: Vec<Primitive>,
+    /// popup の中で開いた popup の primitive 列。最も外側の `popup_layer` の出口で `popup_primitives` の
+    /// 末尾へ足す (親の body 全体より手前)。その外では常に空。
+    nested_popup_primitives: Vec<Primitive>,
     /// `popup_layer` 内で描画中フラグ。push_* が popup_buffer に積むかを切替える。
     pub(crate) drawing_in_popup: bool,
     /// いま `popup_layer` の body を描いている popup の id。`Ui::popup_scroll` が
@@ -1552,7 +1557,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.drawing_in_popup = true;
         self.current_clip = None;
         self.current_popup = Some(wid);
-        f(self);
+        if prev_in_popup {
+            // popup の中で開いた popup (modal の中の dropdown の一覧、cascade の子メニュー) は、親の body が
+            // **この後に** 描く widget より手前に出す。親の buffer にそのまま積むと、一覧の上に下の行の
+            // widget が重なって描かれる。子の中身は別に取り、親 (最も外側) の body が終わってから足す。
+            // 孫は子の後ろ (`mark` の位置に子を差し込む — 孫は先に `nested_popup_primitives` へ入っている)。
+            let mark = self.nested_popup_primitives.len();
+            let parent = std::mem::take(&mut self.popup_primitives);
+            f(self);
+            let child = std::mem::replace(&mut self.popup_primitives, parent);
+            self.nested_popup_primitives.splice(mark..mark, child);
+        } else {
+            f(self);
+            self.popup_primitives.append(&mut self.nested_popup_primitives);
+        }
         self.drawing_in_popup = prev_in_popup;
         self.current_clip = prev_clip;
         self.current_popup = prev_popup;
@@ -2460,40 +2478,8 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         Some(result)
     }
 
-    /// `wid` がフォーカスを持っているならフレームに溜まったキー入力を取り出す。
-    ///
-    /// チェック対象は **フレーム開始時の focus** (`self.focused`)。これによって、
-    /// 「同フレームに click でフォーカスを取った直後に、その widget が直前まで
-    /// 流れていたキー入力を遡って消費してしまう」事故を防ぐ
-    /// (= 例: 何かを打鍵中に間違えて click した場合、打鍵は古い focus に流すのが正解)。
-    /// 取り出すと内部 buffer は空になるので、フレーム内で 1 回だけ呼ぶこと。
-    pub fn take_keyboard_events_if_focused(&mut self, wid: WidgetId) -> Vec<KeyEvent> {
-        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background の focused widget を遮断。
-        // **drain しない** ので、modal body の text_input (drawing_in_popup) が同じ
-        // keyboard_events を取得できる。
-        if self.keyboard_blocked_by_modal() {
-            return Vec::new();
-        }
-        if self.focused == Some(wid) {
-            std::mem::take(self.keyboard_events)
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// `wid` がフォーカスを持っているならフレームに溜まった IME イベントを取り出す。
-    /// `take_keyboard_events_if_focused` と同じく、フレーム開始時 focus でチェックする。
-    pub fn take_ime_events_if_focused(&mut self, wid: WidgetId) -> Vec<ImeEvent> {
-        // M14 Phase 94 (daw_01 #065): 真のモーダル中は background の focused widget を遮断。
-        if self.keyboard_blocked_by_modal() {
-            return Vec::new();
-        }
-        if self.focused == Some(wid) {
-            std::mem::take(self.ime_events)
-        } else {
-            Vec::new()
-        }
-    }
+    // focus を持つ widget 宛てのキー / IME 入力の取り出し (`take_keyboard_events_if_focused` /
+    // `take_focused_key_presses` / `take_ime_events_if_focused`) は `ui/focused_keys.rs`。
 
     /// IME 候補ウィンドウを表示するべき領域 (cursor 直下) を要求する。
     /// 通常は focused text_input が自分の cursor 位置周辺の rect を渡す。

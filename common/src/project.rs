@@ -1008,6 +1008,7 @@ mod tests {
             pianoroll_snap_choice: 2,
             piano_roll_fold: true,
             snap_on_draw: true,
+            piano_roll_chord_guide: false,
             snap_live_input: false,
             bottom_panel: Some(1),
             piano_roll_views: vec![
@@ -1041,6 +1042,13 @@ mod tests {
                 crate::model::RackPanelKey::Device(7),
                 crate::model::RackPanelKey::MasterLimiter,
             ],
+            chord_lane_hidden: true,
+            chord_notation: crate::chord_name::ChordNotation::Roman,
+            chord_tools: crate::model::ChordToolsView {
+                audition_track: Some(3),
+                audition_while_playing: true,
+                ..crate::model::ChordToolsView::default()
+            },
         }
     }
 

@@ -187,6 +187,8 @@ pub struct NativeIo<'a> {
     /// r.md #156: この buffer のデバイス入力 (モニター / 入力メーター用に project の受け皿へ写したもの)。
     /// live 描画だけ `Some` — 書き出しに入力音は入らない。
     pub input: Option<&'a crate::graph::input_stage::InputStage>,
+    /// r.md #157: 再生中のコードの試聴の計画。live 描画だけ `Some` — 書き出しに試聴音は入らない。
+    pub chord_audition: Option<&'a crate::chord_audition::ChordAuditionPlan>,
 }
 
 impl NativeIo<'_> {

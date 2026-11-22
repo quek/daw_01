@@ -439,6 +439,8 @@ pub struct ProjectCtl {
     /// r.md #156: 進行中のオーディオ入力の録音 (`StartAudioTakes`)。便で RT へ届ける。次の録音が来るまで
     /// 持ち続ける (終わった録音は RT 側で閉じていて、何もしない)。
     pub audio_take: Option<Arc<crate::audio_rec::TakeCtl>>,
+    /// r.md #157: 再生中のコードの試聴 (`SetChordAudition`) の設定と計画。「聴き方」なので Song の外。
+    pub chord_audition: crate::chord_audition::ChordAuditionCtl,
 }
 
 /// `SetDeviceScopes` の device id 列を slot 表にする: 0 と重複を除き、先頭 [`MAX_DEVICE_SCOPES`] 個に切り詰める。
@@ -470,6 +472,8 @@ impl ProjectCtl {
             self.publisher.song_derived(song.as_ref(), sample_rate).clone();
         let audio_clip_renderer = self.shared.audio_clip_renderer.load_full(); // arch-lint: allow-arcswap-load (off-RT: RT へ送る便を組む)
         self.publisher.published_renderer = Arc::downgrade(&audio_clip_renderer);
+        // r.md #157: 試聴の計画も song と同じ便 (track index は同じ snapshot の位置)。
+        let chord_audition = self.chord_audition.plan_for(song.as_ref());
         RtBundle {
             song,
             song_index,
@@ -486,6 +490,7 @@ impl ProjectCtl {
             preview_sequence: self.shared.preview_sequence.load_full(), // arch-lint: allow-arcswap-load (off-RT: RT へ送る便を組む)
             loop_region: self.loop_region,
             recording_lanes: Arc::clone(&self.recording_lanes),
+            chord_audition,
             audio_clip_renderer,
             device_scope_watch: self.device_scope_watch,
             mod_plan: None,
@@ -755,6 +760,7 @@ pub fn open_project(
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             atomic: BatchGate::default(),
             audio_take: None,
+            chord_audition: crate::chord_audition::ChordAuditionCtl::default(),
         },
     );
     tracing::info!(project = key.0, slot, "project slot opened");
@@ -1021,6 +1027,11 @@ pub fn handle_project_command(
         AudioCommand::SetScListen { device_id, .. } => {
             shared.sc_listen_device.store(device_id.unwrap_or(0), Ordering::Release);
         }
+        // r.md #157: 再生中のコードの試聴も「聴き方」。計画は次の便で Song から組む。
+        AudioCommand::SetChordAudition { track_id, voicing, .. } => {
+            ctl.chord_audition.set(track_id, voicing);
+            ctl.republish(engine_shared, session_sample_rate, phase_tables);
+        }
         // r.md #151: Δ (差分試聴) も「聴き方」。上限を超えたぶんは捨て、余りの slot は空き (0) に戻す。
         AudioCommand::SetDeltaDevices { device_ids, .. } => {
             let mut ids = device_ids.iter().copied().filter(|&id| id != 0);
@@ -1271,6 +1282,7 @@ mod tests {
             preview_sequence: None,
             loop_region: common::model::LoopRegion::default(),
             recording_lanes: Arc::new(RecordingLanes::new()),
+            chord_audition: Arc::default(),
             audio_clip_renderer: Arc::new(audio_clip_renderer::AudioClipRenderer::empty()),
             device_scope_watch: [0; MAX_DEVICE_SCOPES],
             mod_plan: None,

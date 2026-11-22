@@ -13,8 +13,11 @@
 //!
 //! wire に載らないロジックだけを持つ (`common/build.rs` の `WIRE_SOURCES` 対象外)。
 
+use std::collections::HashMap;
+
 use crate::automation::{apply_modulation_over, lane_value_in_clip};
-use crate::model::{AutomationClip, AutomationLane, AutomationTarget, ModRouting, Song};
+use crate::chord_follow::TrackChordFollow;
+use crate::model::{AutomationClip, AutomationLane, AutomationTarget, ContentId, ModRouting, Note, Song, SourceChord};
 use crate::song_index::CoverIndex;
 
 /// 移調の幅 (半音、`-24..=24`)。値域の SSoT — 正規化 (`automation::target_range`)、読み込みの丸め
@@ -122,35 +125,60 @@ impl<'a> TransposeCurve<'a> {
     }
 }
 
-/// トラック 1 本のノートが **オフラインで** 鳴らす鍵盤の読み口 ([`TransposeCurve`] + 追従するか)。
+/// トラック 1 本のノートが **オフラインで** 鳴らす鍵盤の読み口 (VOICEVOX 歌唱 / 口パク / SMF 書き出し)。
+///
+/// r.md #157: コードトラックへの追従 ([`crate::chord_follow::TrackChordFollow`]) もここに相乗りする
+/// (順序は 追従 → 移調。engine の `daw_audio::pitch_map` と同じ)。平行移動 / ベースの素材のコードは、作るときに
+/// トラックの content ごとに 1 回だけ検出しておく ([`crate::chord_follow::collect_source_chords`])。
 #[derive(Debug, Clone)]
 pub struct TrackTranspose<'a> {
     curve: TransposeCurve<'a>,
     follows: bool,
+    chords: TrackChordFollow<'a>,
+    /// content id → 素材のコード (content-local 拍)。平行移動 / ベースで追従するときだけ埋まる。
+    sources: HashMap<ContentId, Vec<SourceChord>>,
 }
 
 impl<'a> TrackTranspose<'a> {
     /// `track_id` のトラックの読み口 (追従しないトラックは書いた音のまま)。
     #[must_use]
     pub fn of(song: &'a Song, track_id: u32) -> Self {
-        Self { curve: TransposeCurve::of(song), follows: song.track_follows_transpose(track_id) }
+        let chords = TrackChordFollow::of(song, track_id);
+        let mut sources = HashMap::new();
+        if chords.is_active()
+            && chords.needs_source()
+            && let Some(track) = song.track_by_id(track_id)
+        {
+            crate::chord_follow::collect_source_chords(song, track, &mut sources);
+        }
+        Self { curve: TransposeCurve::of(song), follows: song.track_follows_transpose(track_id), chords, sources }
     }
 
-    /// 移調しない読み口 (焼き込み = プロジェクトの中に作るものは書いた音、確定仕様 Q8)。
+    /// 移調も追従もしない読み口 (焼き込み = プロジェクトの中に作るものは書いた音、確定仕様 Q8)。
     #[must_use]
     pub fn written(song: &'a Song) -> Self {
-        Self { curve: TransposeCurve::of(song), follows: false }
+        Self { curve: TransposeCurve::of(song), follows: false, chords: TrackChordFollow::written(song), sources: HashMap::new() }
     }
 
-    /// 音程 `pitch` のノートが鳴らす鍵盤。`song_beat` はノートの開始の曲の拍 (`None` = 曲の位置を持たない
-    /// ランチャーのセル → [`TransposeCurve::base`])。範囲外は `None`。
+    /// content `content_id` のノート `note` が鳴らす鍵盤。`song_beat` はノートの開始の曲の拍 (`None` = 曲の位置を
+    /// 持たないランチャーのセル → 移調は [`TransposeCurve::base`]、コードは引けないので追従しない)。範囲外は `None`。
     #[must_use]
-    pub fn key(&self, pitch: u8, song_beat: Option<f64>) -> Option<u8> {
+    pub fn key(&self, content_id: ContentId, note: &Note, song_beat: Option<f64>) -> Option<u8> {
+        let followed = match song_beat {
+            Some(beat) if self.chords.is_active() => {
+                let source = self
+                    .sources
+                    .get(&content_id)
+                    .and_then(|spans| crate::chord_detect::source_chord_at(spans, note.start_beat));
+                self.chords.key(note.pitch, beat, source)?
+            }
+            _ => note.pitch,
+        };
         if !self.follows {
-            return Some(pitch);
+            return Some(followed);
         }
         let semitones = song_beat.map_or_else(|| self.curve.base(), |b| self.curve.at(b));
-        sounding_key(pitch, semitones)
+        sounding_key(followed, semitones)
     }
 }
 
@@ -241,5 +269,25 @@ mod tests {
         assert_eq!(transpose_at(&song, 2.0, |_| None, |r| r.depth), 4, "値面に無いソースの変調は効かない");
 
         assert_eq!([sounding_key(60, 2), sounding_key(126, 2), sounding_key(1, -2)], [Some(62), None, None]);
+    }
+
+    /// r.md #157: オフラインの読み口はコードへの追従 → 移調の順。平行移動の基準はクリップのノートから検出した
+    /// 素材のコード (ここでは Am)。曲の位置を持たないセルは追従せず移調だけ。焼き込みの読み口はどちらもしない。
+    #[test]
+    fn offline_keys_follow_the_chord_then_transpose() {
+        use crate::model::{Chord, ChordEvent, ChordFollow, ChordKind, Clip, MidiContent, Note};
+        let mut song = Song { transpose: 2, ..Song::default() };
+        let content_id = song.alloc_content_id();
+        let note = |id, pitch| Note { id, start_beat: 0.0, duration_beats: 4.0, pitch, velocity: 100, lyric: None, muted: false };
+        let notes = vec![note(1, 57), note(2, 60), note(3, 64)];
+        song.clip_contents.insert(content_id, ClipContent::Midi(MidiContent { notes: notes.clone(), next_note_id: 4 }));
+        let clip = Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id, ..Clip::default() };
+        song.tracks = vec![Track { id: 1, follow_chords: ChordFollow::Parallel, clips: vec![clip], ..Track::default() }];
+        song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: Chord::new(2, ChordKind::Minor), color: None });
+        // Am → Dm は +5 (最短の向き)、それから移調 +2。
+        let of = TrackTranspose::of(&song, 1);
+        assert_eq!(notes.iter().map(|n| of.key(content_id, n, Some(0.0))).collect::<Vec<_>>(), [Some(64), Some(67), Some(71)]);
+        assert_eq!(of.key(content_id, &notes[0], None), Some(59), "セルは移調だけ");
+        assert_eq!(TrackTranspose::written(&song).key(content_id, &notes[0], Some(0.0)), Some(57));
     }
 }

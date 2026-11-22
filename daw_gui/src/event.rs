@@ -1462,6 +1462,10 @@ pub enum AppEvent {
     Range(crate::event_range::RangeEvent),
     /// Arranger セクション帯の作成 / 移動 / 伸縮 / 複製 / 削除。
     Section(crate::event_section::SectionEvent),
+    /// r.md #157: コードトラックの箱の編集 / 追従の設定 / 検出・変換 (`event_chord.rs`)。
+    Chord(crate::event_chord::ChordTrackEvent),
+    ChordFollow(crate::event_chord::ChordFollowEvent),
+    ChordTool(crate::event_chord::ChordToolEvent),
 
     // -------- Audio event field edits (Phase 2 PR1) ------------------------
     /// Toggle `AudioEvent.reversed` for every event in the selected
@@ -1826,6 +1830,9 @@ impl AppEvent {
             E::Clipboard(ev) => ev.undo_label(),
             E::Range(ev) => ev.undo_label(),
             E::Section(ev) => ev.undo_label(),
+            E::Chord(ev) => ev.undo_label(),
+            E::ChordFollow(ev) => ev.undo_label(),
+            E::ChordTool(ev) => ev.undo_label(),
             E::SetClipColor { .. } => "クリップ色変更",
             E::SetAutomationClipColor { .. } => "オートメーションクリップ色変更",
             E::SetAutomationLaneColor { .. } => "レーン色変更",

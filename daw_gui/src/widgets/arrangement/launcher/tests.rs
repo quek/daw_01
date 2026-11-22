@@ -205,7 +205,7 @@ fn 帯の行とアレンジの行は同じ縦位置に並ぶ() {
         row_h: None,
         kind: TrackKind::Audio,
         color: None,
-        no_transpose_mark: false,
+        marks: Default::default(),
     };
     let tracks = vec![
         // 行高 override 付き
@@ -300,7 +300,7 @@ fn グループ行のまとめセルは子行へ展開される() {
         row_h: None,
         kind: TrackKind::Audio,
         color: None,
-        no_transpose_mark: false,
+        marks: Default::default(),
     };
     let tracks = vec![
         ArrangementTrack { id: 10, ..base.clone() },              // グループ

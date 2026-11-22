@@ -42,6 +42,8 @@ pub(crate) fn copy_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface:
             .map(|(j, c)| (j, c, "オートメーションポイント")),
         // 範囲: 形のまま (前後の空白込みで) コピーする。
         EditSurface::TimeRange => app.copy_time_selection_clip().map(|(j, c)| (j, c, "範囲")),
+        // r.md #157: コードトラックの箱。
+        EditSurface::Chords => app.copy_chords_clip().map(|(j, c)| (j, c, "コード")),
         // セル面はこの関数の頭で捌き済 (`copy_launcher_cells_clip`)。ここへ来るのは
         // 「面はセルだが実在するセルが 1 つも無い」ときだけなので何もしない —
         // アレンジのクリップの copy へ落とすと、帯を触っていたつもりの `Ctrl+C` が
@@ -112,6 +114,8 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
             .map(|(j, c)| (j, c, "オートメーションポイント")),
         // 範囲: 形のまま (前後の空白込みで) コピーする。
         EditSurface::TimeRange => app.copy_time_selection_clip().map(|(j, c)| (j, c, "範囲")),
+        // r.md #157: コードトラックの箱。
+        EditSurface::Chords => app.copy_chords_clip().map(|(j, c)| (j, c, "コード")),
         // セル面はこの関数の頭で捌き済 (`copy_launcher_cells_clip`)。ここへ来るのは
         // 「面はセルだが実在するセルが 1 つも無い」ときだけなので何もしない —
         // アレンジのクリップの copy へ落とすと、帯を触っていたつもりの `Ctrl+C` が
@@ -139,6 +143,7 @@ pub(crate) fn cut_for_surface(app: &AppData, ui: &mut Ui<'_, AppData>, surface: 
                 points: app.cur.selection.selected_automation_points.clone(),
             },
             EditSurface::TimeRange => AppEvent::DeleteTimeSelection,
+            EditSurface::Chords => AppEvent::Chord(crate::event_chord::ChordTrackEvent::Delete { ids: app.live_chord_ids() }),
             EditSurface::AutomationClips => AppEvent::DeleteAutomationClips {
                 keys: app.cur.selection.selected_automation_clips.clone(),
             },
@@ -249,6 +254,19 @@ pub(crate) fn paste_from_clipboard(
             devices: crate::clipboard::sanitize_devices(devices),
             dest_track,
         }),
+        // r.md #157: コードの箱は **ポインタがコードの帯の上にあるとき** だけ、その拍 (snap 済み) に貼る。
+        P::Chords(chords) => {
+            let lane = peph.chord_band.lane;
+            let at = ui.pointer().pos.filter(|&(x, y)| lane.rect.h > 0.0 && lane.rect.contains(x, y)).map(|(x, _)| {
+                let snap = crate::view::snap::arrange_snap_config(app);
+                snap.snap_beat(lane.beat_of(x).max(0.0), false, app.cur.view.arrange_zoom_x).max(0.0)
+            });
+            match at {
+                Some(at) => ui.push_edit(Edit::mutate(move |app: &mut AppData| app.place_chords_at(at, chords))),
+                None => paste_noop(ui),
+            }
+            return;
+        }
         // Cut Time で載せた時間ごとの写しは、 素の Ctrl+V でも Paste Time として貼る
         // (貼り先は範囲選択の先頭 = ポインタ位置ではない。 `paste_time` と同じ経路)。
         P::Time(copy) => {
@@ -405,6 +423,11 @@ if (dup_shared || dup_unique)
             crate::event_launcher::LauncherEvent::DuplicateScenes { scene_ids, unique },
         ));
     }));
+    return;
+}
+// r.md #157: コードの箱を選んでいるなら D / Alt+D は箱の複製 (箱に共有 / 独立の区別は無い)。
+if (dup_shared || dup_unique) && matches!(app.edit_surface(is_pianoroll_active), Some(EditSurface::Chords)) {
+    ui.push_edit(Edit::mutate(|app: &mut AppData| app.duplicate_selected_chords()));
     return;
 }
 if dup_shared && !dup_devices {

@@ -2189,6 +2189,47 @@ fn popup_primitives_not_clipped_by_outer_with_clip_rect() {
     );
 }
 
+/// popup の中で開いた popup (modal の中の dropdown の一覧) は、親の body が **その後に** 描く widget より
+/// 手前に出る。親の buffer に呼ばれた順で積むと、一覧の上に下の行の widget が重なって描かれる。孫は子の手前。
+#[test]
+fn nested_popup_draws_above_what_its_parent_draws_afterwards() {
+    use daw_ui_renderer::{Color, RectCommand};
+
+    let mut host: UiHost<()> = UiHost::no_redraw();
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: 800, height: 600 };
+    let anchor = Rect { x: 100.0, y: 100.0, w: 400.0, h: 300.0 };
+    host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        ui.open_popup("parent", anchor, true);
+        ui.open_popup("child", anchor, false);
+        ui.open_popup("grandchild", anchor, false);
+    });
+    // 幅で区別する: 親の前半 1 / 子 2 / 孫 3 / 子の後半 4 / 親の後半 5。
+    let mark = |ui: &mut Ui<'_, ()>, w: f32| {
+        ui.push_rect(RectCommand {
+            rect: Rect { x: 100.0, y: 100.0, w, h: 10.0 },
+            fill: Color::rgb(0.1, 0.1, 0.1),
+            border: Color::rgb(0.3, 0.3, 0.3),
+            border_width: 0.0,
+            radius: [0.0; 4],
+            clip_rect: None,
+        });
+    };
+    host.frame_to_edits(&(), &mut scene, screen, FrameInput::default(), |(), ui| {
+        ui.popup_layer("parent", |ui| {
+            mark(ui, 1.0);
+            ui.popup_layer("child", |ui| {
+                mark(ui, 2.0);
+                ui.popup_layer("grandchild", |ui| mark(ui, 3.0));
+                mark(ui, 4.0);
+            });
+            mark(ui, 5.0);
+        });
+    });
+    let order: Vec<f32> = scene.popup_rects_vec().iter().map(|r| r.rect.w).collect();
+    assert_eq!(order, vec![1.0, 5.0, 2.0, 4.0, 3.0], "親 → 子 → 孫 の順に手前");
+}
+
 // -------- M14 Phase 63l (daw_01 #026): take_primary_press_in_rect / take_drag_in_rect --------
 
 /// press frame で `pos` の primary just_pressed を返すヘルパ。

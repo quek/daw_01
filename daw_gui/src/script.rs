@@ -16,6 +16,8 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 mod audio_device;
 mod audio_rec;
+mod chords;
+mod chord_tools;
 mod editing;
 mod host;
 mod native_device;
@@ -59,6 +61,14 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     // ----- headless export-range test harness ----------------
     ("loadSongFile", daw_load_song_file, 1),
     ("log", daw_log, 1),
+    // ----- r.md #157 コードトラック (`docs/plan_chord_track.md`) -----
+    ("chordEvent", chords::daw_chord_event, 1),
+    ("chordsJson", chords::daw_chords_json, 0),
+    ("parseChord", chords::daw_parse_chord, 1),
+    ("followedKey", chords::daw_followed_key, 3),
+    ("auditionChord", chord_tools::daw_audition_chord, 1),
+    ("chordToolsJson", chord_tools::daw_chord_tools_json, 0),
+    ("pumpAssetDecode", chord_tools::daw_pump_asset_decode, 0),
     ("perfJson", tabs::daw_perf_json, 0),
     // ----- GUI と同じ経路 (人の操作と区別が付かない口。`--gui` での再現・計測に使う) -----
     ("appOpenProject", daw_app_open_project, 1),

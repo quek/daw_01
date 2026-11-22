@@ -10,6 +10,7 @@
 //! daw-ui-core の `pub` API を呼ぶ。
 
 pub mod arrangement;
+pub(crate) mod chord_colors;
 pub mod piano_roll;
 pub mod ruler_ops;
 pub mod select_modifier;

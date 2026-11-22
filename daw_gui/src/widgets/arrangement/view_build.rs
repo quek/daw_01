@@ -47,6 +47,15 @@ pub(super) struct BuiltArrangement {
     pub master_row: ArrangementMasterRow,
     /// r.md #87: クリップランチャー帯の 1 フレーム分のビュー。
     pub launcher: super::launcher::LauncherView,
+    /// r.md #157: コードトラックの帯の高さ (隠していれば 0) とビュー。
+    pub chord_lane_h: f32,
+    pub chord: super::run::chord_lane::ChordLaneView,
+}
+
+/// ruler より下・lanes より上に積む帯 (Arranger 帯 + コードトラックの帯) の高さ。
+/// lanes の高さを式で出す所 (`tracks_visible` / `lane_h_bounds`) はこれを引く。
+fn head_bands_h(app: &AppData) -> f32 {
+    SECTION_LANE_H + super::run::chord_lane::lane_h(app)
 }
 
 /// `AppData` から widget 入力を組み立てる (旧 `arrangement_view::draw` L106-568)。
@@ -108,7 +117,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         hidden_lanes: &app.cur.view.hidden_automation_lanes,
         content_names: &labels.content_names,
         active_groups: &active_groups,
-        lane_h_bounds: lane_h_bounds(area),
+        lane_h_bounds: lane_h_bounds(area, head_bands_h(app)),
     };
     // r.md #131: 実効的に無効なトラック (行を沈め、clip を灰色にする)。
     let enabled = app.cur.song_doc.song().effectively_enabled_mask();
@@ -224,7 +233,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
             ),
             row_h: app.cur.view.track_row_overrides.get(&t.id).copied(),
             color: Some(track_color::to_renderer(track_color::effective_track_color(t))),
-            no_transpose_mark: app.track_shows_no_transpose_mark(t, follows[track_idx]),
+            marks: super::header::TrackMarks::of(app, t, follows[track_idx]),
         })
         .collect();
 
@@ -267,7 +276,7 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         // r.md #63: 分母は「行が実際に描かれる高さ」 = ruler と Arranger 帯を除いた lanes 高さ。
         // ここは heavy cache キーにしか使わないが、 `area.h - RULER_H` のままだと同じ誤式の
         // 3 つ目のコピーとして残り、 次に誰かが「lanes の高さ」 としてコピーする種になる。
-        tracks_visible: ((area.h - RULER_H - SECTION_LANE_H) / row_h).max(1.0),
+        tracks_visible: ((area.h - RULER_H - head_bands_h(app)) / row_h).max(1.0),
         track_row_h: row_h,
         header_w: app.cur.view.arrange_header_w,
         ruler_h: RULER_H,
@@ -369,6 +378,8 @@ pub(super) fn build(app: &AppData, area: Rect) -> BuiltArrangement {
         selected_automation_points,
         master_row,
         launcher,
+        chord_lane_h: super::run::chord_lane::lane_h(app),
+        chord: super::run::chord_lane::build_view(app),
     }
 }
 
@@ -636,8 +647,8 @@ pub(crate) fn clip_display_label(clip: &common::model::Clip, song: &common::mode
 /// lane 行が他より高くなる。 max は **レーンが描かれるペインの高さ**
 /// (`geometry::lane_pane_cap_px`) と絶対上限の小さい方。min を下回らせないのは、ペインが
 /// 極端に小さいフレーム (起動直後 / 帯を畳んだ瞬間) で全レーンが 0 px に潰れないようにするため。
-fn lane_h_bounds(area: Rect) -> (u16, u16) {
-    let lanes_h = (area.h - RULER_H - SECTION_LANE_H).max(0.0);
+fn lane_h_bounds(area: Rect, head_bands_h: f32) -> (u16, u16) {
+    let lanes_h = (area.h - RULER_H - head_bands_h).max(0.0);
     let min = MIN_ARRANGE_LANE_H_PX;
     let max = MAX_ARRANGE_LANE_H_PX.min(super::geometry::lane_pane_cap_px(lanes_h)).max(min);
     (min, max)

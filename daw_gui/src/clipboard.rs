@@ -74,6 +74,8 @@ pub enum ClipboardPayload {
     /// `Clips` (選んだ行だけ、貼り先はポインタ下) と違い、貼り先は範囲選択の先頭で、
     /// 貼るときに `span_beats` の時間を差し込んでから元のトラック / レーンへ戻す。
     Time(common::model::TimeRangeCopy),
+    /// r.md #157: コードトラックの箱。位置は最も早い箱を 0 とした相対、id は 0 (貼るときに振る)。
+    Chords(Vec<common::model::ChordEvent>),
 }
 
 impl ClipboardPayload {
@@ -98,6 +100,7 @@ impl ClipboardPayload {
             | ClipboardPayload::AudioEvents(_)
             | ClipboardPayload::AutomationClips(_)
             | ClipboardPayload::Devices(_)
+            | ClipboardPayload::Chords(_)
             | ClipboardPayload::Time(_) => Vec::new(),
         }
     }

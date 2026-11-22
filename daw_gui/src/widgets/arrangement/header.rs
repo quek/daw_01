@@ -31,26 +31,50 @@ fn draw_header_meter(ui: &mut Ui<'_, AppData>, t: &ArrangementTrack, meter: Rect
     ui.level_meter_stereo(("arr_thmeter", t.id), meter, t.peak.0, t.peak.1, MeterBallistic::Peak, style);
 }
 
-/// r.md #130: 移調に追従しないトラックの印 (`♮` = 書いた音のまま鳴る) を名前帯 `name` の右端に描き、
-/// 名前ボタンに残す領域を返す。印の上の click は名前ボタンではなく行の click (トラック選択) に落ちる。
-/// 色は disclosure と同じ二次テキスト (ヘッダの地の上なのでテーマのクローム色で読める)。
-fn draw_no_transpose_mark(ui: &mut Ui<'_, AppData>, t: &ArrangementTrack, name: Rect, style: &ArrangementStyle) -> Rect {
-    let w = style.track_text_size * 1.2;
-    if !t.no_transpose_mark || name.w <= w {
-        return name;
+/// トラックヘッダの名前の横の印 (caller が Song から解いて渡す)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackMarks {
+    /// r.md #130: 「移調に追従しない」(`AppData::track_shows_no_transpose_mark`、祖先グループまで辿った実効値 / ARA)。
+    pub no_transpose: bool,
+    /// r.md #157 Q6: コードトラックへの追従モードの印 (`ChordFollow::mark`、曲全体のスイッチ込みの実効値)。
+    pub chord_follow: Option<&'static str>,
+}
+
+impl TrackMarks {
+    /// `t` の印。`follows_transpose` は `Song::follows_transpose_mask` の値 (全トラックを 1 回で引く caller から)。
+    pub fn of(app: &AppData, t: &common::model::Track, follows_transpose: bool) -> Self {
+        // 実効モード (`Song::track_chord_follow` と同じ: 曲全体のスイッチが切れていれば Off)。`t` は手元にあるので
+        // id で引き直さない (全トラックの行を組むたびに線形探索すると O(トラック数²))。
+        let chord_follow =
+            if app.cur.song_doc.song().chord_follow_enabled { t.follow_chords } else { common::model::ChordFollow::Off };
+        Self { no_transpose: app.track_shows_no_transpose_mark(t, follows_transpose), chord_follow: chord_follow.mark() }
     }
-    let mark = Rect { x: name.x + name.w - w, w, ..name };
-    ui.push_text(GlyphArea {
-        text: Arc::from("\u{266E}"),
-        left: mark.x,
-        top: mark.y + (mark.h - style.track_text_size * 1.2) * 0.5,
-        font_size: style.track_text_size,
-        line_height: style.track_text_size * 1.2,
-        color: style.disclosure_color,
-        clip_rect: Some(mark),
-        ..GlyphArea::default()
-    });
-    Rect { w: name.w - w, ..name }
+}
+
+/// 名前帯 `name` の右端に印を右から並べて描き、名前ボタンに残す領域を返す: `♮` (r.md #130 移調に追従しない =
+/// 書いた音のまま鳴る) と、その左にコードへの追従モード (r.md #157、`P` / `N` / `B` / `S`)。印の上の click は名前
+/// ボタンではなく行の click (トラック選択) に落ちる。色は disclosure と同じ二次テキスト (ヘッダの地の上なので
+/// テーマのクローム色で読める)。
+fn draw_track_marks(ui: &mut Ui<'_, AppData>, t: &ArrangementTrack, name: Rect, style: &ArrangementStyle) -> Rect {
+    let no_transpose = t.marks.no_transpose.then_some("\u{266E}");
+    [no_transpose, t.marks.chord_follow].into_iter().flatten().fold(name, |name, glyph| {
+        let w = style.track_text_size * 1.2;
+        if name.w <= w {
+            return name;
+        }
+        let mark = Rect { x: name.x + name.w - w, w, ..name };
+        ui.push_text(GlyphArea {
+            text: Arc::from(glyph),
+            left: mark.x,
+            top: mark.y + (mark.h - style.track_text_size * 1.2) * 0.5,
+            font_size: style.track_text_size,
+            line_height: style.track_text_size * 1.2,
+            color: style.disclosure_color,
+            clip_rect: Some(mark),
+            ..GlyphArea::default()
+        });
+        Rect { w: name.w - w, ..name }
+    })
 }
 
 /// volume band の 0dB 目印。 band を縦に横切る 1px 線を、 band より上下 1px ずつ長く引く
@@ -401,7 +425,7 @@ fn draw_rows_inner(
         } else {
             name_rect
         };
-        let name_rect_visible = draw_no_transpose_mark(ui, t, name_rect_visible, style);
+        let name_rect_visible = draw_track_marks(ui, t, name_rect_visible, style);
         let button_zones: [Rect; 4] = [name_rect_visible, m_rect, s_rect, r_rect];
 
         let id_name = ("arr_tname", t.id);

@@ -17,15 +17,15 @@ mod mouth_rebuild;
 
 use mouth_rebuild::{rebuild_mouth_clip, rebuild_mouth_containers, split_spans_by_container};
 
-/// `clip` のノート `note` を **歌う音程** (r.md #130: 移調込み、範囲外で歌わないなら `None`)。
+/// `clip` のノート `note` を **歌う音程** (r.md #157 のコード追従 → r.md #130 の移調、範囲外で歌わないなら `None`)。
 ///
 /// 歌唱のメタデータ ([`collect_sing_metadata`])・口パクの問い合わせ ([`collect_lipsync_snaps`])・その入力
 /// fingerprint ([`hash_lipsync_clip`]) が **この 1 本** を通す (合成と口の形で別の音程を使わない / 開いただけで
-/// fingerprint がずれない)。`in_song` = アレンジのクリップ (ノート開始の曲の拍で移調量を解く)。ランチャーの
-/// セルは曲の位置を持たないので曲の基準値 (`TrackTranspose::key`)。
+/// fingerprint がずれない)。`in_song` = アレンジのクリップ (ノート開始の曲の拍で移調量とコードを解く)。ランチャーの
+/// セルは曲の位置を持たないので曲の基準値の移調だけ (`TrackTranspose::key`)。
 /// 範囲外を 0 に丸めない — 0 は VOICEVOX で休符と衝突する。
 fn sung_pitch(transpose: &TrackTranspose<'_>, clip: &Clip, in_song: bool, note: &common::model::Note) -> Option<u8> {
-    transpose.key(note.pitch, in_song.then(|| clip.content_to_song_beat(note.start_beat)))
+    transpose.key(clip.content_id, note, in_song.then(|| clip.content_to_song_beat(note.start_beat)))
 }
 
 /// 口パクの入力 clip / セル 1 つを fingerprint へ混ぜる
@@ -539,9 +539,9 @@ impl AppData {
             // 曲頭で歌い出す** ので、走査と原点は必ず `synth_clips_with_base` 1 本で
             // 揃える (r.md #87)。
             let clips = synth_clips_with_base(song, track, bpm);
-            // r.md #130: 歌うのは移調込みの音程。ただし **このトラックを焼いている間は書いた音** (Q8: 焼いた音は
-            // もう一度移調に追従するので、移調を焼き込むと二重になる)。焼き終えたら差分キャッシュの比較で
-            // 移調込みのメタデータが自動で送り直される。
+            // r.md #130 / #157: 歌うのは追従・移調込みの音程。ただし **このトラックを焼いている間は書いた音** (Q8:
+            // 焼いた音はもう一度移調 / コードに追従するので、焼き込むと二重になる)。焼き終えたら差分キャッシュの比較で
+            // 追従・移調込みのメタデータが自動で送り直される。
             let transpose = if self.baking_vocal_track() == Some(track.id) {
                 TrackTranspose::written(song)
             } else {

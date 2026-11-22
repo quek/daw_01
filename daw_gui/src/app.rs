@@ -1931,6 +1931,9 @@ impl AppData {
             AppEvent::Clipboard(ev) => self.handle_clipboard_event(ev),
             AppEvent::Range(ev) => self.handle_range_event(ev),
             AppEvent::Section(ev) => self.handle_section_event(ev),
+            AppEvent::Chord(ev) => self.handle_chord_event(ev),
+            AppEvent::ChordFollow(ev) => self.handle_chord_follow_event(ev),
+            AppEvent::ChordTool(ev) => self.handle_chord_tool_event(ev),
             // PR-V4: SynthesizeVocal / VocalSynthCompleted は削除済。
             // vocal track は builtin VOICEVOX plugin が自動 synth する
             // (= sync_vocal_metadata 経由で歌詞 / note を flush →
