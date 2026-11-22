@@ -72,26 +72,30 @@ fn diatonic_triads(root: u8, mask: u16) -> Vec<Chord> {
         .collect()
 }
 
+/// `from` から `to` へ上向きに何半音か (`0..12`)。
+fn interval(from: u8, to: u8) -> u8 {
+    (to % 12 + 12 - from % 12) % 12
+}
+
 fn score(prev: Option<&Chord>, c: &Chord, key_root: u8, diatonic: bool) -> f32 {
     let mut s = if diatonic { 2.0 } else { 0.0 };
     let Some(p) = prev else {
         // 直前が無い: 主和音 → 下属 → 属の順 (曲の頭の定番)。
-        return s + match (c.root + 12 - key_root) % 12 {
+        return s + match interval(key_root, c.root) {
             0 => 3.0,
             5 => 2.0,
             7 => 1.5,
             _ => 0.0,
         };
     };
-    let motion = (c.root + 12 - p.root % 12) % 12;
-    s += match motion {
-        5 => 3.0,     // 5 度下 (終止形 / 強進行)
-        7 => 1.5,     // 5 度上 (五度圏の反対隣)
+    s += match interval(p.root, c.root) {
+        5 => 3.0,      // 5 度下 (終止形 / 強進行)
+        7 => 1.5,      // 5 度上 (五度圏の反対隣)
         2 | 10 => 1.0, // 2 度 (IV → V 等)
         _ => 0.0,
     };
     // 属和音 → 主和音。
-    if (p.root + 12 - key_root) % 12 == 7 && (c.root + 12 - key_root) % 12 == 0 {
+    if interval(key_root, p.root) == 7 && interval(key_root, c.root) == 0 {
         s += 1.5;
     }
     let common = (p.pitch_class_mask() & c.pitch_class_mask()).count_ones();
