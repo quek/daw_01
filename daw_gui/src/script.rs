@@ -68,6 +68,7 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("followedKey", chords::daw_followed_key, 3),
     ("auditionChord", chord_tools::daw_audition_chord, 1),
     ("chordToolsJson", chord_tools::daw_chord_tools_json, 0),
+    ("pumpAssetDecode", chord_tools::daw_pump_asset_decode, 0),
     ("perfJson", tabs::daw_perf_json, 0),
     // ----- GUI と同じ経路 (人の操作と区別が付かない口。`--gui` での再現・計測に使う) -----
     ("appOpenProject", daw_app_open_project, 1),

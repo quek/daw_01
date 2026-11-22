@@ -7,7 +7,7 @@
 //! chroma の作り方:
 //! - 窓 (Hann) → 実数 FFT (`realfft`、`master_meter/spectrum.rs` と同じ) → 振幅スペクトルの **山だけ** を拾い
 //!   (山の間の漏れを数えない)、放物線補間した周波数を MIDI の音高に直して pitch class へ足す。
-//!   音高の中心から 0.3 半音より外れた山は捨てる (打楽器・雑音)。
+//!   音高の中心から 0.25 半音より外れた山は捨てる (打楽器・雑音、平均律から 31 cent 低い第 7 倍音)。
 //! - **倍音の差し引き**: 低い方の山から順に、その山の整数倍 (2〜6 倍) に当たる山の強さを減らす。
 //!   C の第 3 倍音は G、E の第 3 倍音は B — 差し引かないと C が Cmaj7 に、Am が Am9 に化ける。
 //! - ベース: 40〜260 Hz で最も強い山の pitch class を、窓の中で強さを足し合わせて最低音とする
@@ -37,6 +37,8 @@ const F_HI: f32 = 2_100.0;
 const BASS_HI: f32 = 260.0;
 /// これより小さい窓はコードを作らない (RMS、−50 dBFS)。
 const SILENCE_RMS: f32 = 0.003_16;
+/// 山を音として数える、平均律の音高からのずれの上限 (半音)。第 7 倍音 (−0.31) を外す。
+const MAX_DEVIATION: f32 = 0.25;
 /// 窓の chroma で、最も強い pitch class に対してこれ未満の pitch class は落とす。
 const RELATIVE_FLOOR: f64 = 0.2;
 
@@ -202,15 +204,23 @@ fn fill_chroma(mags: &[f32], bin_hz: f32, frame: &mut Frame) {
     // 倍音の差し引き: 低い山から、その 2〜8 倍に当たる山を「基音の強さ / 倍数」(弦・管・鋸歯波の
     // おおよその倍音の減り方) だけ減らす。差し引いた後の山が次の山の基音として働く (低い順なので、
     // 和音の上の音の基音が下の音の倍音と重なっても、残りが上の音として残る)。
+    // 許容幅 (±3%) の中で **最寄り** の山 (最初の山を取ると、近くの別の音の倍音を削って本命が残る —
+    // A2 の第 7 倍音 770 Hz と C4 の第 3 倍音 785 Hz)。
+    let nearest = |peaks: &[(f32, f32)], target: f32| {
+        peaks
+            .iter()
+            .enumerate()
+            .filter(|(_, (f, _))| (f - target).abs() <= target * 0.03)
+            .min_by(|(_, (x, _)), (_, (y, _))| (x - target).abs().total_cmp(&(y - target).abs()))
+            .map(|(j, _)| j)
+    };
     for i in 0..peaks.len() {
         let (f0, a0) = peaks[i];
         if a0 <= 0.0 {
             continue;
         }
         for h in 2..=8u8 {
-            let target = f0 * f32::from(h);
-            let tol = target * 0.03;
-            if let Some(j) = peaks.iter().position(|(f, _)| (f - target).abs() <= tol) {
+            if let Some(j) = nearest(&peaks, f0 * f32::from(h)) {
                 peaks[j].1 = (peaks[j].1 - a0 / f32::from(h)).max(0.0);
             }
         }
@@ -223,7 +233,7 @@ fn fill_chroma(mags: &[f32], bin_hz: f32, frame: &mut Frame) {
         }
         let pitch = 69.0 + 12.0 * (f / 440.0).log2();
         let nearest = pitch.round();
-        if (pitch - nearest).abs() > 0.3 {
+        if (pitch - nearest).abs() > MAX_DEVIATION {
             continue;
         }
         #[allow(clippy::cast_possible_truncation)]
