@@ -23,6 +23,8 @@ pub mod export_overlay;
 /// r.md #61: 終了処理中オーバーレイ。
 pub mod shutdown_overlay;
 pub mod export_range_modal;
+/// r.md #157: 「コードを抽出…」の設定ダイアログ。
+pub mod chord_extract_modal;
 pub mod font_picker;
 /// r.md #87: クリップランチャーのキーボード操作と widget イベントの流し込み。
 pub mod launcher_keys;

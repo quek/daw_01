@@ -7,7 +7,7 @@
 //                out=<書き出す WAV>
 //     既知の進行 (PROGRESSION) を帯に置き、`ChordsToClip` で音源トラックのノートにして書き出す。
 //   mode=detect  wav=<WAV> sr=<Hz> frames=<N> [window=<拍>]
-//     その WAV をオーディオクリップにして `DetectAudioClips { place: true }` を撃ち、帯に置かれた
+//     その WAV をオーディオクリップにして `ExtractChords` (→ `DetectAudioClips { place: true }`) を撃ち、帯に置かれた
 //     コードを元の進行と突き合わせて、合った数を `RESULT <一致>/<全体>` で出す (全部合えば exit 0)。
 
 const BPM = 120.0;
@@ -138,8 +138,23 @@ if (mode === "render") {
     if (++tries > 300) fail("音源の decode が終わらない");
     daw.sleepMs(100);
   }
+  if (args.auto === "1") {
+    // 追従を ON にしたオーディオトラックの未検出の音源は、頼まなくても検出して保存する (帯には置かない)。
+    chordEvent({ ChordFollow: { SetEnabled: true } });
+    chordEvent({ ChordFollow: { SetTracks: { track_ids: [1], mode: "Parallel" } } });
+    for (tries = 0; !JSON.parse(daw.chordToolsJson()).audio_chords["1"]; tries++) {
+      if (tries > 600) fail("自動検出が保存されない");
+      daw.sleepMs(50);
+      daw.appTick();
+    }
+    const spans = JSON.parse(daw.chordToolsJson()).audio_chords["1"];
+    daw.log("auto-detected spans: " + spans.map((s) => s[2]).join(", "));
+    if (JSON.parse(daw.chordsJson()).length !== 0) fail("自動検出が帯に置いた");
+    daw.log("RESULT auto OK");
+  } else {
   const t0 = Date.now();
-  chordEvent({ ChordTool: { DetectAudioClips: { clips: [[1, 1]], place: true } } });
+  // クリップの右クリック「コードを抽出…」の「抽出」と同じ口 (MIDI / オーディオを振り分ける)。
+  chordEvent({ ChordTool: { ExtractChords: { clips: [[1, 1]] } } });
   if (JSON.parse(daw.chordToolsJson()).detecting === 0) fail("検出が始まらない");
   // 回収は on_tick (script では appTick が回す)。
   for (tries = 0; JSON.parse(daw.chordToolsJson()).detecting > 0; tries++) {
@@ -165,6 +180,7 @@ if (mode === "render") {
   daw.log("placed: " + placed.map((c) => c.start_beat + "+" + c.len_beats + " " + c.name).join(", "));
   daw.log("RESULT " + ok + "/" + PROGRESSION.length);
   if (ok !== PROGRESSION.length) fail("一致 " + ok + "/" + PROGRESSION.length);
+  }
 } else {
   fail("--arg mode=render|detect");
 }

@@ -256,6 +256,9 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // とき開く。 export 実行前なので export_overlay より前に描いてよい。
     export_range_modal::draw(app, ui, screen);
 
+    // Modal: r.md #157「コードを抽出…」。app.cur.chord_tools.extract_dialog == Some のとき開く。
+    crate::view::chord_extract_modal::draw(app, ui, screen);
+
     // Overlay: WAV / Video export 中の進捗 + Cancel。app.cur.transport.export_stage を監視。
     export_overlay::draw(app, ui, screen);
 

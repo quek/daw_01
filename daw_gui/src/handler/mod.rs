@@ -30,6 +30,8 @@ pub mod chord_audition;
 pub mod chord_audio;
 /// r.md #157: MIDI 鍵盤で弾いた和音をコードに (帯の録音 / Instrument Input)。
 pub mod chord_capture;
+/// r.md #157: MIDI ファイル → コードトラック (帯へのドロップ)。
+pub mod chord_midi_import;
 pub mod clip_events;
 /// r.md #132 残件: クリップへの編集が効く範囲 = 窓に見えている片 (ひと続きは 1 つとして)。
 pub mod clip_window;
