@@ -82,7 +82,8 @@ impl AppData {
         if self.cur.chord_tools.detect_jobs.is_empty() {
             return;
         }
-        let mut done: Vec<(AudioSourceId, Vec<AudioChordSpan>, Vec<(u32, u32)>)> = Vec::new();
+        // (音源, 区間, 帯にも置くクリップ)。
+        let mut done = Vec::new();
         self.cur.chord_tools.detect_jobs.retain(|job| match job.rx.try_recv() {
             Ok(spans) => {
                 done.push((job.source_id, spans, job.place_on.clone()));
@@ -195,40 +196,6 @@ impl AppData {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use common::model::{AudioChordSpan, AudioSource, AudioSourcePath, Chord, ChordKind};
-
-    /// 検出結果は undo に積まず `*` も立てない。後の編集を undo しても消えない (消えると自動検出し直して
-    /// redo が消え、手前へ戻れなくなる)。
-    #[test]
-    fn detected_chords_stay_out_of_the_undo_history() {
-        let mut app = crate::test_support::headless_app();
-        let source_id = 7;
-        app.edit_song(|song| {
-            song.media.audio_sources.insert(source_id, AudioSource {
-                path: AudioSourcePath::Absolute("x.wav".into()),
-                sample_rate: 48_000,
-                channels: 1,
-                frames: 96_000,
-                original_bpm: None,
-                root_key: None,
-            });
-        });
-        app.cur.song_doc.mark_saved();
-        let depth = app.cur.song_doc.undo_depth();
-        let spans = vec![AudioChordSpan { start_frame: 0, end_frame: 48_000, chord: Chord::new(9, ChordKind::Minor) }];
-        app.set_audio_chords(source_id, spans.clone(), &[]);
-        assert_eq!(app.cur.song_doc.undo_depth(), depth, "undo step を作らない");
-        assert!(!app.cur.song_doc.is_dirty(), "`*` を立てない");
-        // 検出より後の編集を undo すると、検出より前に積んだ snapshot に戻る — そこにも検出結果が入っている。
-        app.edit_song(|song| song.bpm = 90.0);
-        app.handle_event(crate::event::AppEvent::Undo);
-        assert_eq!(app.cur.song_doc.song().bpm, 120.0);
-        assert_eq!(app.cur.song_doc.song().audio_chords.get(&source_id), Some(&spans), "undo しても残る");
-    }
-}
-
 /// `wanted` のクリップのどれかが音源 `source_id` を使っているか (同じ音源を 2 回発注しない)。
 fn wanted_has_source(song: &Song, wanted: &[(u32, u32)], source_id: AudioSourceId) -> bool {
     wanted.iter().any(|&(t, c)| {
@@ -291,4 +258,38 @@ fn chords_on_clip(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use common::model::{AudioChordSpan, AudioSource, AudioSourcePath, Chord, ChordKind};
+
+    /// 検出結果は undo に積まず `*` も立てない。後の編集を undo しても消えない (消えると自動検出し直して
+    /// redo が消え、手前へ戻れなくなる)。
+    #[test]
+    fn detected_chords_stay_out_of_the_undo_history() {
+        let mut app = crate::test_support::headless_app();
+        let source_id = 7;
+        app.edit_song(|song| {
+            song.media.audio_sources.insert(source_id, AudioSource {
+                path: AudioSourcePath::Absolute("x.wav".into()),
+                sample_rate: 48_000,
+                channels: 1,
+                frames: 96_000,
+                original_bpm: None,
+                root_key: None,
+            });
+        });
+        app.cur.song_doc.mark_saved();
+        let depth = app.cur.song_doc.undo_depth();
+        let spans = vec![AudioChordSpan { start_frame: 0, end_frame: 48_000, chord: Chord::new(9, ChordKind::Minor) }];
+        app.set_audio_chords(source_id, spans.clone(), &[]);
+        assert_eq!(app.cur.song_doc.undo_depth(), depth, "undo step を作らない");
+        assert!(!app.cur.song_doc.is_dirty(), "`*` を立てない");
+        // 検出より後の編集を undo すると、検出より前に積んだ snapshot に戻る — そこにも検出結果が入っている。
+        app.edit_song(|song| song.bpm = 90.0);
+        app.handle_event(crate::event::AppEvent::Undo);
+        assert_eq!(app.cur.song_doc.song().bpm, 120.0);
+        assert_eq!(app.cur.song_doc.song().audio_chords.get(&source_id), Some(&spans), "undo しても残る");
+    }
 }
