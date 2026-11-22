@@ -20,7 +20,6 @@ pub(crate) const CHORD_AUDITION_LEN: std::time::Duration = std::time::Duration::
 impl AppData {
     /// コード `chord` を試聴トラックで短く鳴らす (帯のクリック / ポップアップの編集 / 候補の選択 / 鍵盤で
     /// 弾いたコード)。前の試聴音は止める。試聴トラックが無ければ何もしない。
-    #[allow(dead_code)] // 帯 / ポップアップ (c157-band) が載るまで script からしか呼ばれない。載ったら外す。
     pub(crate) fn audition_chord(&mut self, chord: &Chord) {
         self.release_chord_audition();
         let Some(track_id) = self.chord_audition_track() else {

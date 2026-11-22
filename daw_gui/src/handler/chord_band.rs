@@ -130,10 +130,10 @@ impl AppData {
         self.cur.peph.chord_band.menu_open = true;
     }
 
-    /// 箱 1 つを試聴する (クリック / ポップアップでの変更)。試聴の本体は c157-tools の
-    /// `AppData::audition_chord` (`handler/chord_audition.rs`、計画書 §4) で、統合時にこの関数の中身を
-    /// `self.audition_chord(&chord)` の 1 行でつなぐ。帯の呼び出し側はすべてここを通す。
+    /// 箱 1 つを試聴する (クリック / ポップアップでの変更 / 候補の選択)。本体は
+    /// `AppData::audition_chord` (`handler/chord_audition.rs`、試聴トラックが無ければ無音)。
     pub(crate) fn audition_chord_box(&mut self, id: u32) {
-        let Some(_chord) = self.cur.song_doc.song().chord_by_id(id).map(|c| c.chord) else { return };
+        let Some(chord) = self.cur.song_doc.song().chord_by_id(id).map(|c| c.chord) else { return };
+        self.audition_chord(&chord);
     }
 }

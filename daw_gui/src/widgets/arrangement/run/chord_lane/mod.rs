@@ -16,6 +16,7 @@ use crate::app::AppData;
 use crate::state::chord_band::ChordLaneGeom;
 use crate::widgets::chord_colors::{chord_box_fill, chord_box_ink};
 
+pub(in crate::widgets::arrangement) mod controls;
 mod draw;
 mod gesture;
 mod input;
@@ -46,8 +47,6 @@ pub(in crate::widgets::arrangement) struct ChordBox {
 pub(in crate::widgets::arrangement) struct ChordLaneView {
     /// 位置順 (`Song.chords` の不変条件のまま)。
     pub boxes: Vec<ChordBox>,
-    /// 曲全体の追従スイッチ (見出しの On/Off)。
-    pub follow_enabled: bool,
 }
 
 #[must_use]
@@ -71,7 +70,7 @@ pub(in crate::widgets::arrangement) fn build_view(app: &AppData) -> ChordLaneVie
             }
         })
         .collect();
-    ChordLaneView { boxes, follow_enabled: song.chord_follow_enabled }
+    ChordLaneView { boxes }
 }
 
 /// 帯の drag session (arrangement の widget state とは別の id に持つ)。

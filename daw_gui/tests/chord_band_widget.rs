@@ -165,6 +165,29 @@ fn range_drag_selects_and_delete_removes_only_the_selection() {
     assert_eq!(layout(&app), vec![(0.0, 1.0, 0)]);
 }
 
+/// 見出し (ヘッダ幅 160): `追従` で曲全体の追従スイッチ (Song) が切り替わり、Arranger 帯の見出しの
+/// `コード` で帯が隠れる (lanes が Arranger 帯の直下へ詰まる)。
+#[test]
+fn header_buttons_toggle_follow_and_visibility() {
+    let (mut app, _a, _p) = build_app();
+    app.cur.view.arrange_header_w = 160.0;
+    let mut host = UiHost::no_redraw();
+    let click = |host: &mut UiHost<AppData>, app: &mut AppData, x: f32, y: f32| {
+        drive(host, app, press(x, y, none()));
+        drive(host, app, release(x, y, none()));
+    };
+    drive(&mut host, &mut app, hold(700.0, 500.0, none()));
+    // 見出しの右端 (x = -12 + 160 - 2 = 146) から `▾` 18 / `追従` 30 / `●` 18 の順に並ぶ。
+    let before = app.cur.song_doc.song().chord_follow_enabled;
+    click(&mut host, &mut app, 109.0, 48.0);
+    assert_eq!(app.cur.song_doc.song().chord_follow_enabled, !before, "`追従` で Song のスイッチが切り替わる");
+    // Arranger 帯の見出しの右端の `コード` (幅 38)。
+    click(&mut host, &mut app, 125.0, 29.0);
+    assert!(!app.cur.view.chord_band.visible, "帯が隠れる");
+    drive(&mut host, &mut app, hold(700.0, 500.0, none()));
+    assert_eq!(app.cur.peph.chord_band.lane.rect.h, 0.0, "隠した帯は高さ 0");
+}
+
 /// Alt+端のドラッグ (複数選択) は選択全体を比例伸縮する (右端を掴めば左端が軸)。
 #[test]
 fn alt_edge_drag_scales_the_selection() {

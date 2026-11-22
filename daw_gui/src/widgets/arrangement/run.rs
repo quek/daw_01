@@ -67,6 +67,9 @@ pub fn arrangement(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> Arran
     release::commit_releases(ui, &f, &mut response, released);
     let clicks = header::draw_rows(ui, &f, &live, &mut response);
     header::commit_clicks(ui, &f, clicks, &mut response);
+    // 6a. r.md #157: コードの帯の見出しのボタンと、Arranger 帯の見出しの表示トグル
+    //     (Arranger 帯の見出しは `render::dispatch` が塗るので、その後)。
+    chord_lane::controls::draw(ui, app, &f);
     // 6b. ランチャー帯 (r.md #87)。 帯はヘッダ / レーンと x が排他なので z の競合は無いが、
     //     ランチャー主導の行の減光だけはアレンジのクリップの上に乗るので **この位置**。
     launcher::draw::dispatch(
