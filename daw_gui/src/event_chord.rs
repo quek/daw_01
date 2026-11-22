@@ -79,7 +79,8 @@ impl ChordFollowEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChordToolEvent {
     /// オーディオ音源から検出したコードを保存する (空なら消す)。`place_on` のクリップ (`(track id, clip id)`)
-    /// があれば、そのクリップが鳴らす位置で帯にも置く (保存と帯への配置は 1 undo step)。
+    /// があれば、そのクリップが鳴らす位置で帯にも置く。検出結果は派生データなので undo にも `*` にも
+    /// 載らず (`SongDoc::write_derived`)、帯に置いた箱だけが 1 undo step になる。
     SetAudioChords {
         source_id: AudioSourceId,
         spans: Vec<AudioChordSpan>,
