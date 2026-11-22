@@ -22,7 +22,14 @@ impl AppData {
                         && song.chords_to_clip(&chord_ids, track_id, voicing, PREVIEW_VELOCITY).is_some()
                 });
             }
-            ChordToolEvent::ExtractFromClips { clips, window_beats } => self.extract_midi_chords(&clips, window_beats),
+            ChordToolEvent::ExtractFromClips { clips, window_beats } => {
+                // 窓を名指しした抽出 (script): 長さの自動は切る。
+                let detect = self.cur.chord_tools.view.detect;
+                self.extract_midi_chords(
+                    &clips,
+                    common::chord_detect::DetectOptions { auto_length: false, window_beats, ..detect },
+                );
+            }
             ChordToolEvent::DetectAudioClips { clips, place } => self.detect_audio_clips(&clips, place),
             ChordToolEvent::ImportMidiFile { path, at } => {
                 self.import_midi_chords(&path, at);
@@ -47,14 +54,19 @@ impl AppData {
         }
     }
 
-    /// MIDI クリップ `clips` のノートから (窓 `window_beats`、ほかは検出の設定で) コードを検出して帯に置く。
-    /// 窓は外 (script / ドラッグ) から来る値なので、検出の設定と同じ有効域に揃える。
-    fn extract_midi_chords(&mut self, clips: &[(u32, u32)], window_beats: f64) {
-        let opts = common::chord_detect::DetectOptions { window_beats, ..self.cur.chord_tools.view.detect }.sanitized();
-        self.edit_song_checked(|song| {
+    /// MIDI クリップ `clips` のノートから設定 `opts` でコードを検出して帯に置く。設定は外 (script / 保存値) から
+    /// 来うるので有効域に揃える。1 つも見つからなければ、何も起きなかったように見えないよう status に出す。
+    fn extract_midi_chords(&mut self, clips: &[(u32, u32)], opts: common::chord_detect::DetectOptions) {
+        let opts = opts.sanitized();
+        let placed = self.edit_song_checked(|song| {
             let found = song.chords_from_clips(clips, &opts);
             song.place_chords(found)
         });
+        self.ui_ephemeral.status_message = if placed {
+            "コードを抽出しました".to_string()
+        } else {
+            "コードが見つかりません (和音になっているノートがありません)".to_string()
+        };
     }
 
     /// `ChordToolEvent::ExtractChords`: MIDI クリップはノートから即座に、オーディオクリップは音源から
@@ -69,7 +81,7 @@ impl AppData {
         };
         let (audio, midi): (Vec<_>, Vec<_>) = clips.iter().copied().partition(is_audio);
         if !midi.is_empty() {
-            self.extract_midi_chords(&midi, self.cur.chord_tools.view.detect.window_beats);
+            self.extract_midi_chords(&midi, self.cur.chord_tools.view.detect);
         }
         if !audio.is_empty() {
             self.detect_audio_clips(&audio, true);

@@ -22,8 +22,10 @@ const LABEL_W: f32 = 150.0;
 const BTN_W: f32 = 110.0;
 const BTN_H: f32 = 28.0;
 
-/// 窓の長さの選択肢 (表示名, 拍。`None` = 1 小節 / 2 小節 = 拍子から)。
+/// 1 コードの長さの選択肢 (表示名, 長さ)。先頭の「自動」はノートの鳴り始めで区切る
+/// (`DetectOptions::auto_length`、既定)。ほかは固定の窓 (小節は拍子から)。
 const WINDOWS: &[(&str, WindowLen)] = &[
+    ("自動", WindowLen::Auto),
     ("1/2 拍", WindowLen::Beats(0.5)),
     ("1 拍", WindowLen::Beats(1.0)),
     ("2 拍", WindowLen::Beats(2.0)),
@@ -36,15 +38,34 @@ const IGNORE: &[(&str, f64)] = &[("無視しない", 0.0), ("1/32 未満", 0.125
 
 #[derive(Clone, Copy)]
 enum WindowLen {
+    Auto,
     Beats(f64),
     Bars(f64),
 }
 
 impl WindowLen {
-    fn beats(self, beats_per_bar: f64) -> f64 {
+    /// 固定の窓の長さ (拍)。`Auto` は `None`。
+    fn beats(self, beats_per_bar: f64) -> Option<f64> {
         match self {
-            WindowLen::Beats(b) => b,
-            WindowLen::Bars(n) => n * beats_per_bar,
+            WindowLen::Auto => None,
+            WindowLen::Beats(b) => Some(b),
+            WindowLen::Bars(n) => Some(n * beats_per_bar),
+        }
+    }
+
+    /// この選択肢を選んだ設定。
+    fn apply(self, opts: DetectOptions, beats_per_bar: f64) -> DetectOptions {
+        match self.beats(beats_per_bar) {
+            None => DetectOptions { auto_length: true, ..opts },
+            Some(window_beats) => DetectOptions { auto_length: false, window_beats, ..opts },
+        }
+    }
+
+    /// 設定 `opts` がこの選択肢か。
+    fn matches(self, opts: &DetectOptions, beats_per_bar: f64) -> bool {
+        match self.beats(beats_per_bar) {
+            None => opts.auto_length,
+            Some(b) => !opts.auto_length && (b - opts.window_beats).abs() < 1e-6,
         }
     }
 }
@@ -66,10 +87,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
     let opts = app.cur.chord_tools.view.detect;
     let bpb = common::timing::beats_per_bar(app.cur.song_doc.song().time_sig);
     let window_labels: Vec<&str> = WINDOWS.iter().map(|(l, _)| *l).collect();
-    let window_sel = WINDOWS
-        .iter()
-        .position(|(_, w)| (w.beats(bpb) - opts.window_beats).abs() < 1e-6)
-        .unwrap_or(2);
+    let window_sel = WINDOWS.iter().position(|(_, w)| w.matches(&opts, bpb)).unwrap_or(0);
     let ignore_labels: Vec<&str> = IGNORE.iter().map(|(l, _)| *l).collect();
     let ignore_sel = IGNORE.iter().position(|(_, b)| (b - opts.ignore_shorter_than_beats).abs() < 1e-6).unwrap_or(0);
     let style = ModalStyle { close_on_outside_click: false, close_on_escape: false, ..ModalStyle::from_palette(&app.theme.core) };
@@ -82,12 +100,12 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
         let x = panel.x + PAD;
         let full_w = panel.w - PAD * 2.0;
         let field = |y: f32| Rect { x: x + LABEL_W, y, w: full_w - LABEL_W, h: ROW_H };
-        // checkbox / button は開いた dropdown の一覧の下ではヒットしない (`pointer_blocked_by_modal_popup`)
-        // ので、一覧が下の行に重なっても入力は取り違えない。
+        // 開いた dropdown の一覧は下の行より手前に描かれ (daw-ui: popup の中の popup)、checkbox / button は
+        // 一覧の下ではヒットしない (`pointer_blocked_by_modal_popup`)。
         let mut y = panel.y + PAD + 30.0;
         ui.label_at("cex_win_l", "1 コードの長さ", x, y + 6.0, 13.0, p.text);
         if let Some(i) = ui.dropdown("cex_win", field(y), &window_labels, window_sel) {
-            ui.push_edit(set(DetectOptions { window_beats: WINDOWS[i].1.beats(bpb), ..opts }));
+            ui.push_edit(set(WINDOWS[i].1.apply(opts, bpb)));
         }
         y += ROW_H + 8.0;
         ui.label_at("cex_ign_l", "短いノートを無視", x, y + 6.0, 13.0, p.text);

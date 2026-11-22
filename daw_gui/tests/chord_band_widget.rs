@@ -283,6 +283,38 @@ fn dropping_a_midi_clip_on_the_band_extracts_chords() {
     assert!((song.chords[0].start_beat - 2.0).abs() < 1e-9);
 }
 
+/// 「コードを抽出…」のダイアログ: 「抽出」を押すとクリップのコードが帯に置かれ、ダイアログが閉じる。
+/// 画面 812×600 の中央に 380×236 のパネル (x∈[216,596) / y∈[182,418))。
+#[test]
+fn the_extract_dialog_places_chords_and_closes() {
+    use daw_gui::app::AppEvent;
+    use daw_gui::event_chord::ChordToolEvent;
+    let (mut app, _a, _p) = build_app();
+    add_triad_clip(&mut app, 1, 10, 2.0);
+    app.handle_event(AppEvent::ChordTool(ChordToolEvent::OpenExtractDialog { clips: vec![(1, 10)] }));
+    let mut host = UiHost::no_redraw();
+    let frame = |host: &mut UiHost<AppData>, app: &mut AppData, p: PointerFrame| {
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: WIDGET_RECT.w as u32, height: WIDGET_RECT.h as u32 };
+        let mut input = FrameInput::default();
+        input.pointer = p;
+        host.frame(app, &mut scene, screen, input, |app, ui| {
+            let _ = arrangement(app, ui, WIDGET_RECT);
+            daw_gui::view::chord_extract_modal::draw(app, ui, screen);
+        });
+    };
+    frame(&mut host, &mut app, hold(700.0, 500.0, none()));
+    frame(&mut host, &mut app, PointerFrame { pos: Some((523.0, 386.0)), ..PointerFrame::default() });
+    // 「抽出」: 右下 (x∈[468,578) / y∈[372,400))。
+    frame(&mut host, &mut app, press(523.0, 386.0, none()));
+    frame(&mut host, &mut app, release(523.0, 386.0, none()));
+    frame(&mut host, &mut app, PointerFrame { pos: Some((700.0, 500.0)), ..PointerFrame::default() });
+    let song = app.cur.song_doc.song();
+    let roots: Vec<(u8, ChordKind)> = song.chords.iter().map(|c| (c.chord.root, c.chord.kind)).collect();
+    assert_eq!(roots, vec![(0, ChordKind::Major)], "C が抽出される: {:?}", song.chords);
+    assert!(app.cur.chord_tools.extract_dialog.is_none(), "ダイアログが閉じる");
+}
+
 /// C メジャーの和音 (4 拍) を 1 つ持つ SMF (format 0、PPQ 480) を書く。
 fn write_triad_midi(dir: &std::path::Path) -> std::path::PathBuf {
     use midly::num::{u4, u7, u15, u28};

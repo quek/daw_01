@@ -2,12 +2,12 @@
 //!
 //! エクスプローラから `.mid` を帯へドロップすると、全トラックのノート (ドラムの ch 10 を除く) から
 //! コードを検出して置く。SMF の読みは `crate::midi_import` (トラックへの取り込みと同じ解析、
-//! `docs/plan_midi_import.md`)、検出は `common::chord_detect::detect_chords` (クリップからの抽出と同じ)。
+//! `docs/plan_midi_import.md`)、検出は `common::chord_detect::extract_chords` (クリップからの抽出と同じ)。
 //! SMF の tick 0 がドロップ位置に来る。テンポは採らない (帯はコードだけを受ける)。
 
 use std::path::Path;
 
-use common::chord_detect::{DetectNote, detect_chords};
+use common::chord_detect::{DetectNote, extract_chords};
 use common::model::ChordEvent;
 
 use crate::state::AppData;
@@ -33,7 +33,7 @@ impl AppData {
             .flat_map(|t| t.notes.iter().filter(|n| !n.muted))
             .map(|n| DetectNote { start_beat: n.start_beat, len_beats: n.duration_beats, pitch: n.pitch })
             .collect();
-        let found = detect_chords(&notes, &self.cur.chord_tools.view.detect);
+        let found = extract_chords(&notes, &self.cur.chord_tools.view.detect);
         if found.is_empty() {
             self.ui_ephemeral.status_message = format!("{}: コードが見つかりません", path.display());
             return 0;

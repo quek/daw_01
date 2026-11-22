@@ -73,6 +73,11 @@ chordEvent({ Chord: "Clear" });
 expectEq(names(), [], "全部削除");
 chordEvent({ ChordTool: { ExtractFromClips: { clips: [[1, clip.id]], window_beats: 2 } } });
 expectEq(names(), before, "ノートから抽出すると元の進行に戻る");
+// 「コードを抽出…」の「抽出」が撃つイベント (長さは自動 = 既定): 窓を指定しなくても、長さの違う箱 (4 / 2 / 4 / 6 拍) に戻る。
+chordEvent({ Chord: "Clear" });
+expectEq(JSON.parse(daw.chordToolsJson()).view.detect.auto_length, true, "1 コードの長さは既定で自動");
+chordEvent({ ChordTool: { ExtractChords: { clips: [[1, clip.id]] } } });
+expectEq(names(), before, "長さを指定せずに抽出しても元の進行に戻る");
 
 // ---- 移動 / 移調 ----------------------------------------------------------
 const ids = JSON.parse(daw.chordsJson()).map((c) => c.id);

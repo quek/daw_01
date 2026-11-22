@@ -6,7 +6,7 @@
 //!
 //! wire に載らないロジックだけを持つ (`common/build.rs` の `WIRE_SOURCES` 対象外)。
 
-use crate::chord_detect::{DetectNote, DetectOptions, detect_chords};
+use crate::chord_detect::{DetectNote, DetectOptions, extract_chords};
 use crate::model::{Chord, ChordEvent, Clip, ClipContent, MidiContent, Note, Song, Tensions};
 
 /// 型は「再生中も鳴らす」の設定として wire を渡るので `crate::model` (`chords.rs`、`WIRE_SOURCES`) に置く。
@@ -298,7 +298,7 @@ impl Song {
                 }
             }
         }
-        detect_chords(&notes, opts)
+        extract_chords(&notes, opts)
             .into_iter()
             .map(|s| ChordEvent { id: 0, start_beat: s.start_beat, len_beats: s.len_beats, chord: s.chord, color: None })
             .collect()

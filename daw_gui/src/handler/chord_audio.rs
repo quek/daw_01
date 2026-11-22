@@ -292,7 +292,7 @@ fn audio_detect_grid(song: &Song, clip: &Clip, ev: &AudioEvent, sample_rate: u32
     let source_start = ev.source_start_frames as f64;
     // 曲の拍 0 が音源のどこか: 拍 0 → content 拍 → take の頭からの拍 → フレーム。
     let origin_frame = source_start + (clip.song_to_content_beat(0.0) - ev.take_start_in_clip_beats()) * fpb;
-    DetectGrid { origin_frame, window_frames: opts.sanitized().window_beats * fpb }
+    DetectGrid { origin_frame, window_frames: opts.sanitized().audio_window_beats() * fpb }
 }
 
 /// 音源のコード `spans` を、クリップが鳴らしている位置 (曲の拍) の箱にする。クリップの窓と event の

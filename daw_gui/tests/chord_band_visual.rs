@@ -114,3 +114,52 @@ fn chord_band_and_popup_render_readably_in_both_themes() {
     let light = shoot(&mut renderer, "light");
     assert_ne!(dark, light, "テーマで描画が変わる");
 }
+
+/// 「コードを抽出…」のダイアログで「1 コードの長さ」の一覧を開くと、一覧が下の行 (もう 1 つの dropdown /
+/// checkbox / ボタン) より手前に描かれる。`target/chord_shots/extract_dialog.png` に撮る (目視用)。
+/// 画面 1100×700 の中央に 380×236 のパネル (左上 360,232)。1 行目の dropdown は x∈[528,722) / y∈[280,306)。
+#[test]
+fn the_extract_dialog_draws_its_open_list_above_the_rows_below() {
+    use daw_gui::event_chord::ChordToolEvent;
+    let (mut app, _rx) = build_app();
+    app.handle_event(AppEvent::ChordTool(ChordToolEvent::OpenExtractDialog { clips: vec![(1, 1)] }));
+    let mut host: UiHost<AppData> = UiHost::no_redraw();
+    if host.set_palette(app.theme.core.clone()) {
+        host.invalidate_scene_cache();
+    }
+    let screen = PhysicalSize { width: W, height: H };
+    let at = |x: f32, y: f32, down: bool, up: bool| FrameInput {
+        pointer: PointerFrame {
+            pos: Some((x, y)),
+            primary_just_pressed: down,
+            primary_pressed: down,
+            primary_just_released: up,
+            ..PointerFrame::default()
+        },
+        ..FrameInput::default()
+    };
+    let mut scene = Scene::new();
+    // 開く → dropdown の本体を click (press / release) → 一覧の上へ pointer を置いて描く。
+    for input in [
+        at(600.0, 293.0, false, false),
+        at(600.0, 293.0, true, false),
+        at(600.0, 293.0, false, true),
+        at(600.0, 340.0, false, false),
+    ] {
+        scene = Scene::new();
+        host.frame(&mut app, &mut scene, screen, input, |app, ui| daw_gui::view::root::build_root(app, ui, screen));
+    }
+    let rects = scene.popup_rects_vec();
+    // 一覧の背景 (6 項目 × 24px) と、2 行目の dropdown の本体 (y = 280 + 26 + 8)。
+    let list = rects.iter().position(|r| (r.rect.h - 144.0).abs() < 0.5 && (r.rect.y - 306.0).abs() < 2.0);
+    let second = rects.iter().position(|r| (r.rect.y - 314.0).abs() < 0.5 && (r.rect.h - 26.0).abs() < 0.5);
+    let (list, second) = (list.expect("一覧が開いている"), second.expect("2 行目の dropdown がある"));
+    assert!(list > second, "一覧 ({list}) は 2 行目の dropdown ({second}) より後 = 手前に描かれる");
+    if let Ok(mut renderer) = OffscreenRenderer::new(W, H) {
+        let rgba = renderer.render_to_rgba(&scene).expect("offscreen render");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/chord_shots");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = image::save_buffer(dir.join("extract_dialog.png"), &rgba, W, H, image::ColorType::Rgba8);
+        }
+    }
+}

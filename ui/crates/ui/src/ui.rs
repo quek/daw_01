@@ -898,6 +898,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             open_popups: &mut self.open_popups,
             context_menus_seen: Vec::new(),
             popup_primitives: Vec::new(),
+            nested_popup_primitives: Vec::new(),
             drawing_in_popup: false,
             current_popup: None,
             floating: crate::floating::FloatingFrame::default(),
@@ -1113,6 +1114,9 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// drawing_in_popup 中の primitive 列 (`Primitive::Rect/Glyph/Line` の混在)。
     /// frame 末で `scene.popup_primitives` に move する。
     popup_primitives: Vec<Primitive>,
+    /// popup の中で開いた popup の primitive 列。最も外側の `popup_layer` の出口で `popup_primitives` の
+    /// 末尾へ足す (親の body 全体より手前)。その外では常に空。
+    nested_popup_primitives: Vec<Primitive>,
     /// `popup_layer` 内で描画中フラグ。push_* が popup_buffer に積むかを切替える。
     pub(crate) drawing_in_popup: bool,
     /// いま `popup_layer` の body を描いている popup の id。`Ui::popup_scroll` が
@@ -1553,7 +1557,20 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         self.drawing_in_popup = true;
         self.current_clip = None;
         self.current_popup = Some(wid);
-        f(self);
+        if prev_in_popup {
+            // popup の中で開いた popup (modal の中の dropdown の一覧、cascade の子メニュー) は、親の body が
+            // **この後に** 描く widget より手前に出す。親の buffer にそのまま積むと、一覧の上に下の行の
+            // widget が重なって描かれる。子の中身は別に取り、親 (最も外側) の body が終わってから足す。
+            // 孫は子の後ろ (`mark` の位置に子を差し込む — 孫は先に `nested_popup_primitives` へ入っている)。
+            let mark = self.nested_popup_primitives.len();
+            let parent = std::mem::take(&mut self.popup_primitives);
+            f(self);
+            let child = std::mem::replace(&mut self.popup_primitives, parent);
+            self.nested_popup_primitives.splice(mark..mark, child);
+        } else {
+            f(self);
+            self.popup_primitives.append(&mut self.nested_popup_primitives);
+        }
         self.drawing_in_popup = prev_in_popup;
         self.current_clip = prev_clip;
         self.current_popup = prev_popup;
