@@ -281,6 +281,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                 "Bounce In Place",
                 "Bounce (with FX)",
                 "色...",
+                "コードを抽出…",
             ],
             move |idx, ui| {
                 ui.push_edit(Edit::mutate(move |app: &mut AppData| {
@@ -316,6 +317,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
                         // 「トラック色に戻す」 (継承へ) は Ableton と同様に track 側
                         // context menu (= 全 clip 一括) に置く。
                         7 => app.open_color_picker(ColorPickerTarget::Clip(target), menu_rect),
+                        // r.md #157: 選択に入っていれば選択のクリップ全部、でなければこのクリップ。
+                        8 => app.open_chord_extract_dialog(target),
                         _ => {}
                     }
                 }));

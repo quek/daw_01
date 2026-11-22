@@ -96,6 +96,15 @@ pub enum ChordToolEvent {
     /// 結果は `SetAudioChords` で保存し、`place` なら帯にも置く (クリップ → 帯のドロップ /
     /// 「コードを抽出…」)。MIDI クリップは無視する (MIDI は `ExtractFromClips`)。
     DetectAudioClips { clips: Vec<(u32, u32)>, place: bool },
+    /// MIDI ファイル `path` のノートからコードを検出し、拍 `at` を tick 0 として帯に置く
+    /// (エクスプローラから帯へのドロップ)。
+    ImportMidiFile { path: std::path::PathBuf, at: f64 },
+    /// クリップ `clips` からコードを抽出して帯に置く: MIDI はノートから (`ExtractFromClips`、窓は検出の設定)、
+    /// オーディオは音源から (`DetectAudioClips { place: true }`)。種類の混ざったドロップもこれ 1 つで撃てる。
+    ExtractChords { clips: Vec<(u32, u32)> },
+    /// 「コードを抽出…」のダイアログを開く (対象のクリップ)。設定を変えて「抽出」で `ExtractChords`。
+    OpenExtractDialog { clips: Vec<(u32, u32)> },
+    CloseExtractDialog,
     // ---- 以下は聴き方 / 道具の設定 (`ViewState.chord_tools`、Song を変えない = undo / `*` なし) ----
     /// 試聴を鳴らすトラック (`None` = 無音)。
     SetAuditionTrack(Option<u32>),
@@ -116,6 +125,8 @@ impl ChordToolEvent {
             Self::SetAudioChords { .. } | Self::DetectAudioClips { .. } => "オーディオのコード検出",
             Self::ChordsToClip { .. } => "コードをノートに変換",
             Self::ExtractFromClips { .. } => "コードを抽出",
+            Self::ImportMidiFile { .. } => "MIDI ファイルからコードを読み込む",
+            Self::ExtractChords { .. } | Self::OpenExtractDialog { .. } | Self::CloseExtractDialog => "コードを抽出",
             Self::SetAuditionTrack(_)
             | Self::SetAuditionWhilePlaying(_)
             | Self::SetVoicing(_)

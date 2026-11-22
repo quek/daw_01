@@ -47,6 +47,8 @@ pub struct ChordToolsState {
     /// 編集中の箱に設定する)。
     pub played: Option<(common::model::Chord, u64)>,
     pub played_seq: u64,
+    /// 「コードを抽出…」のダイアログの対象クリップ (`(track id, clip id)`)。`Some` の間開いている。
+    pub extract_dialog: Option<Vec<(u32, u32)>>,
 }
 
 /// MIDI 鍵盤で弾いた和音をコードにする途中の状態。

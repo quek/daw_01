@@ -95,6 +95,7 @@ impl AppData {
         tools.last_voiced.clear();
         tools.detect_jobs.clear();
         tools.auto_detect_epoch = None;
+        tools.extract_dialog = None;
     }
 
     /// 期限が来た試聴音を止める。`force` は停止 / 曲差し替えの即時消音。
