@@ -41,4 +41,23 @@ pub struct ChordToolsState {
     /// 直近 engine に送った「再生中も鳴らす」(`AudioCommand::SetChordAudition`) の値。差分送信用で、
     /// `None` = 未送信 (起動直後 / daw_audio の起こし直しの後は必ず送る)。
     pub sent_playback: Option<(Option<u32>, common::model::Voicing)>,
+    /// MIDI 鍵盤で弾いている和音 (`handler::chord_capture`)。
+    pub capture: ChordCapture,
+    /// 直近に鍵盤で弾き終えたコードと通し番号 (Instrument Input: 帯のポップアップは番号が変わったら
+    /// 編集中の箱に設定する)。
+    pub played: Option<(common::model::Chord, u64)>,
+    pub played_seq: u64,
+}
+
+/// MIDI 鍵盤で弾いた和音をコードにする途中の状態。
+#[derive(Debug, Clone, Default)]
+pub struct ChordCapture {
+    /// 押している鍵。
+    pub held: Vec<u8>,
+    /// いまの和音で押した鍵 (全部離したら 1 つのコードとして確定する)。
+    pub chord_notes: Vec<u8>,
+    /// 録音中: いまの和音の頭の拍。
+    pub start_beat: Option<f64>,
+    /// 録音中: 直前に置いた箱 (次の和音の頭まで伸ばす)。
+    pub last_recorded: Option<u32>,
 }

@@ -33,24 +33,13 @@ pub(super) fn daw_pump_asset_decode(_this: &JsValue, _args: &[JsValue], _ctx: &m
 pub(super) fn daw_chord_tools_json(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     let json = with_app(move |app, _side, _io| {
         let tools = &app.cur.chord_tools;
-        let song = app.cur.song_doc.song();
-        let audio: serde_json::Map<String, serde_json::Value> = song
+        let audio: serde_json::Map<String, serde_json::Value> = app
+            .cur
+            .song_doc
+            .song()
             .audio_chords
             .iter()
-            .map(|(id, spans)| {
-                let rows: Vec<serde_json::Value> = spans
-                    .iter()
-                    .map(|s| {
-                        let name = common::chord_name::format_chord(
-                            &s.chord,
-                            common::chord_name::ChordNotation::Regular,
-                            None,
-                        );
-                        serde_json::json!([s.start_frame, s.end_frame, name])
-                    })
-                    .collect();
-                (id.to_string(), serde_json::Value::Array(rows))
-            })
+            .map(|(id, spans)| (id.to_string(), serde_json::Value::Array(spans.iter().map(span_row).collect())))
             .collect();
         serde_json::to_string(&serde_json::json!({
             "view": tools.view,
@@ -62,4 +51,10 @@ pub(super) fn daw_chord_tools_json(_this: &JsValue, _args: &[JsValue], _ctx: &mu
     })
     .map_err(|e| js_native(format!("chordToolsJson: serialize: {e}")))?;
     Ok(JsString::from(json.as_str()).into())
+}
+
+/// 音源のコード 1 区間 → `[start_frame, end_frame, 表示名]`。
+fn span_row(s: &common::model::AudioChordSpan) -> serde_json::Value {
+    let name = common::chord_name::format_chord(&s.chord, common::chord_name::ChordNotation::Regular, None);
+    serde_json::json!([s.start_frame, s.end_frame, name])
 }

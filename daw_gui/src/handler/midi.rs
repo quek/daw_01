@@ -72,6 +72,8 @@ impl AppData {
         ) {
             return;
         }
+        // r.md #157: 弾いた和音をコードに (帯の録音 / ポップアップの Instrument Input)。
+        self.chord_capture_note_on(pitch);
         self.monitor_note_on(pitch, velocity);
         if self.cur.recording.live {
             self.record_midi_note_on(pitch, velocity);
@@ -93,6 +95,8 @@ impl AppData {
         // note-off だけが飲まれ、鳴らしっぱなしになる (押している最中に Learn を
         // 済ませると起こる)。飲むかどうかに関係なく先に消音する。
         let monitoring = self.cur.recording.monitor_notes.keys().any(|(_, p)| *p == pitch);
+        // r.md #157: 和音のまとめも、飲まれるかに関係なく先に離す (押したまま残すと和音が確定しない)。
+        self.chord_capture_note_off(pitch);
         if self.fire_launcher_bindings(
             channel,
             common::model::MidiBindInput::Note(pitch),
@@ -664,7 +668,8 @@ impl AppData {
         // 録音先が無いまま走り出すと、何も記録されないのに再生だけ始まって
         // 「録れているつもり」になる。トラックの arm 状態を勝手に変えるのではなく、
         // 理由を出して始めない。
-        if self.armed_track_ids().is_empty() {
+        // r.md #157: 帯の録音待機も録音先 (弾いた和音がコードの箱になる)。
+        if self.armed_track_ids().is_empty() && !self.cur.chord_tools.record_armed {
             self.ui_ephemeral.status_message =
                 "録音待機 (R) のトラックがありません".into();
             return;
@@ -765,6 +770,8 @@ impl AppData {
         for (track_id, start, note_id) in held {
             self.finalize_recorded_note(track_id, start, note_id, playhead);
         }
+        // r.md #157: 押したままの和音も、ここでコードの箱にする。
+        self.end_chord_recording(playhead);
         // count-in で強制 ON にしていたら元へ戻す (触っていなければ None)。
         if let Some(prev) = self.cur.recording.metronome_enabled_pre_recording.take()
             && prev != self.cur.transport.metronome_enabled
