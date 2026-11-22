@@ -567,11 +567,11 @@ fn glyph_and_backdrop(scene: &Scene, text: &str) -> (daw_ui_renderer::GlyphArea,
     let Primitive::Glyph(g) = &scene.primitives[at] else { unreachable!() };
     let fill = scene.primitives[..at]
         .iter()
-        .filter_map(|p| match p {
+        .rev()
+        .find_map(|p| match p {
             Primitive::Rect(r) if r.fill.a > 0.99 && r.rect.contains(g.left + 1.0, g.top + 4.0) => Some(r.fill),
             _ => None,
         })
-        .last()
         .expect("glyph の下に塗りがある");
     (g.clone(), fill)
 }
@@ -633,7 +633,7 @@ fn rects_at(scene: &Scene, x: f32, y: f32) -> Vec<daw_ui_renderer::RectCommand> 
         .iter()
         .filter_map(|p| match p {
             daw_ui_renderer::Primitive::Rect(r) if (r.rect.x - x).abs() < 0.5 && (r.rect.y - y).abs() < 0.5 => {
-                Some(r.clone())
+                Some(*r)
             }
             _ => None,
         })

@@ -7,7 +7,9 @@
 
 use common::model::{ChordFollow, Song};
 
-use crate::event_chord::ChordFollowEvent;
+use crate::app::ClipKey;
+use crate::event::AppEvent;
+use crate::event_chord::{ChordFollowEvent, FreezeTarget};
 use crate::handler::chord_follow_view::ClipSoundingKeys;
 use crate::state::AppData;
 
@@ -21,19 +23,67 @@ impl AppData {
                 changed
             }
             ChordFollowEvent::SetTracks { track_ids, mode } => set_modes(song, &track_ids, mode),
-            ChordFollowEvent::FreezePitch { clips, note_ids } => freeze_clips(song, &clips, &note_ids),
+            ChordFollowEvent::FreezePitch { targets } => freeze_clips(song, &targets),
             ChordFollowEvent::FreezeTracks { track_ids } => {
-                let clips: Vec<(u32, u32)> = song
+                let targets: Vec<FreezeTarget> = song
                     .tracks
                     .iter()
                     .filter(|t| track_ids.contains(&t.id))
-                    .flat_map(|t| t.clips.iter().map(move |c| (t.id, c.id)))
+                    .flat_map(|t| {
+                        t.clips.iter().map(move |c| FreezeTarget { track_id: t.id, clip_id: c.id, note_ids: Vec::new() })
+                    })
                     .collect();
                 // 確定してから追従を切る (切った後では鳴る音が書いた音になって確定するものが無い)。
-                let frozen = freeze_clips(song, &clips, &[]);
+                let frozen = freeze_clips(song, &targets);
                 set_modes(song, &track_ids, ChordFollow::Off) | frozen
             }
         });
+    }
+
+    /// クリップの右クリック「鳴る音で確定」: 対象は、右クリックしたクリップが選択に入っていれば選択の
+    /// クリップ全部、でなければそのクリップだけ (ノートは全部。「コードを抽出…」と同じ読み方)。
+    pub(crate) fn freeze_clip_pitch(&mut self, target: ClipKey) {
+        let selected = self.selected_clip_refs();
+        let keys = if selected.contains(&target) { selected } else { vec![target] };
+        let targets = keys
+            .into_iter()
+            .map(|k| FreezeTarget { track_id: k.track_id, clip_id: k.clip_id, note_ids: Vec::new() })
+            .collect();
+        self.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezePitch { targets }));
+    }
+
+    /// ピアノロールの「確定」: ノートを選んでいればそのノートだけ、選んでいなければ表示中のクリップのノート全部。
+    pub(crate) fn freeze_shown_pitch(&mut self) {
+        let shown = self.shown_pianoroll_clips();
+        let song = self.cur.song_doc.song();
+        let selected = self.selected_note_ids();
+        let targets: Vec<FreezeTarget> = shown
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, k)| {
+                let clip = song.track_by_id(k.track_id)?.clip_by_id(k.clip_id)?;
+                let notes = song.clip_notes(clip);
+                // packed id (表示 slot + content 内の index) → その content の `Note::id`。
+                let note_ids: Vec<u32> = selected
+                    .iter()
+                    .filter(|id| Self::note_id_clip_slot(**id) == slot)
+                    .filter_map(|id| notes.get(Self::note_id_local_index(*id)).map(|n| n.id))
+                    .collect();
+                (selected.is_empty() || !note_ids.is_empty())
+                    .then_some(FreezeTarget { track_id: k.track_id, clip_id: k.clip_id, note_ids })
+            })
+            .collect();
+        self.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezePitch { targets }));
+    }
+
+    /// ピアノロールに「確定」を出すか = 表示中のアレンジのクリップに、追従するトラックのものがあるか。
+    #[must_use]
+    pub(crate) fn can_freeze_shown_pitch(&self) -> bool {
+        let song = self.cur.song_doc.song();
+        self.shown_pianoroll_clips().iter().any(|k| {
+            song.track_by_id(k.track_id).is_some_and(|t| t.clip_by_id(k.clip_id).is_some())
+                && !song.track_chord_follow(k.track_id).is_off()
+        })
     }
 }
 
@@ -46,7 +96,7 @@ fn set_modes(song: &mut Song, track_ids: &[u32], mode: ChordFollow) -> bool {
     changed
 }
 
-/// クリップ `clips` のノート (`note_ids` が空なら全部) の書いた音を、今の追従結果で書き換える。変わったら `true`。
+/// `targets` のクリップのノート (`note_ids` が空なら全部) の書いた音を、今の追従結果で書き換える。変わったら `true`。
 ///
 /// - 鳴る音は **確定前の Song で全部解いてから** 書き換える (素材のコードの検出が書き換えの途中の値を見ない)。
 /// - 他のクリップ (別の位置の linked clip / セル) と content を共有していれば、先に複製してから書き換える
@@ -55,11 +105,12 @@ fn set_modes(song: &mut Song, track_ids: &[u32], mode: ChordFollow) -> bool {
 /// - トラックの追従モードは変えない。最寄りのコード音 / スケールは確定した音がそのまま鳴る。平行移動 / ベースは
 ///   確定した音から素材のコードを検出し直すので、検出できないクリップ (単音) はもう一度動く — トラック全体を
 ///   確定して追従を切るのは [`ChordFollowEvent::FreezeTracks`]。
-fn freeze_clips(song: &mut Song, clips: &[(u32, u32)], note_ids: &[u32]) -> bool {
+fn freeze_clips(song: &mut Song, targets: &[FreezeTarget]) -> bool {
     type Plan = ((u32, u32), Vec<(u32, Option<u8>)>);
-    let plans: Vec<Plan> = clips
+    let plans: Vec<Plan> = targets
         .iter()
-        .filter_map(|&(track_id, clip_id)| {
+        .filter_map(|FreezeTarget { track_id, clip_id, note_ids }| {
+            let (track_id, clip_id) = (*track_id, *clip_id);
             let clip = song.track_by_id(track_id)?.clip_by_id(clip_id)?;
             let keys = ClipSoundingKeys::of(song, track_id, clip);
             if !keys.is_active() {
@@ -120,7 +171,7 @@ mod tests {
     use common::model::{Chord, ChordEvent, ChordFollow, ChordKind, Clip, ClipContent, MidiContent, Note};
 
     use crate::event::AppEvent;
-    use crate::event_chord::ChordFollowEvent;
+    use crate::event_chord::{ChordFollowEvent, FreezeTarget};
     use crate::state::AppData;
 
     /// トラック 1 本目に、C の 3 和音の content を共有する linked clip 2 つ (拍 0 と 8) を置き、Am [0,4) / F [8,12)
@@ -193,8 +244,7 @@ mod tests {
         let (track_id, clips) = linked_triads(&mut app, ChordFollow::Narrow);
         // note id 3 = G。
         app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezePitch {
-            clips: vec![(track_id, clips[0])],
-            note_ids: vec![3],
+            targets: vec![FreezeTarget { track_id, clip_id: clips[0], note_ids: vec![3] }],
         }));
         assert_eq!(written_and_sounding(&app, track_id, clips[0]), (vec![60, 64, 69], vec![60, 64, 69]));
         assert_eq!(written_and_sounding(&app, track_id, clips[1]), (vec![60, 64, 67], vec![60, 65, 69]));

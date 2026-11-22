@@ -309,6 +309,14 @@ pub(super) fn draw_toggle(
     ui.toggle_button_at("pr_chord_guide", "Chord", rect, app.cur.view.piano_roll_chord_guide, style, |on| {
         daw_ui_core::edit::Edit::mutate(move |app: &mut AppData| app.cur.view.piano_roll_chord_guide = on)
     });
+    // 「鳴る音で確定」(Q5): 追従するトラックのクリップを開いているときだけ、トグルの右隣に出す。
+    // 選んだノートだけ (無ければ表示中のクリップのノート全部) の書いた音を、薄い枠の位置へ書き換える。
+    if app.can_freeze_shown_pitch() {
+        let freeze = Rect { x: rect.x + rect.w + 4.0, w: 84.0, ..rect };
+        ui.toggle_button_at("pr_freeze_pitch", "鳴る音で確定", freeze, false, style, |_| {
+            daw_ui_core::edit::Edit::mutate(|app: &mut AppData| app.freeze_shown_pitch())
+        });
+    }
 }
 
 fn clip_to(r: Rect, grid: Rect) -> Option<Rect> {

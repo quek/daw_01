@@ -58,6 +58,16 @@ impl ChordTrackEvent {
     }
 }
 
+/// 「鳴る音で確定」の対象 1 クリップ。`note_ids` (そのクリップの content の `Note::id`) が空ならノート全部、
+/// 空でなければそのノートだけ (ピアノロールの選択)。id は content ごとの採番なのでクリップごとに持つ。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FreezeTarget {
+    pub track_id: u32,
+    pub clip_id: u32,
+    #[serde(default)]
+    pub note_ids: Vec<u32>,
+}
+
 /// トラックの追従の設定。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ChordFollowEvent {
@@ -65,10 +75,9 @@ pub enum ChordFollowEvent {
     SetEnabled(bool),
     /// トラック `track_ids` の追従モード。
     SetTracks { track_ids: Vec<u32>, mode: ChordFollow },
-    /// 鳴る音で確定 (Q5、Studio One の Freeze Pitch): クリップ `clips` (`(track id, clip id)`) のノートの書いた音を、
-    /// 今の追従結果 (`handler::chord_follow_view`) で書き換える。`note_ids` が空ならクリップのノート全部、
-    /// 空でなければそのノートだけ (ピアノロールの選択)。
-    FreezePitch { clips: Vec<(u32, u32)>, note_ids: Vec<u32> },
+    /// 鳴る音で確定 (Q5、Studio One の Freeze Pitch): `targets` のクリップのノートの書いた音を、
+    /// 今の追従結果 (`handler::chord_follow_view`) で書き換える。
+    FreezePitch { targets: Vec<FreezeTarget> },
     /// トラック `track_ids` のアレンジのクリップを全部、鳴る音で確定し、追従モードを Off にする
     /// (ヘッダの右クリックメニュー。トラック全体を確定するので、確定後も同じ音で鳴る)。
     FreezeTracks { track_ids: Vec<u32> },
