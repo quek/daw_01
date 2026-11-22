@@ -104,7 +104,8 @@ pub(in crate::widgets::arrangement) fn run(
         return;
     }
     let clip_over = handoff::clip_over_band(ui, f);
-    handoff::take_clip_drop(ui, app, f, released);
+    handoff::take_clip_drop(ui, f, released);
+    handoff::take_file_drop(ui, app, f);
     input::escape(ui, f);
     input::press(ui, app, f);
     input::advance(ui, f);

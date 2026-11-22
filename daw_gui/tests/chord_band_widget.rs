@@ -238,6 +238,54 @@ fn dropping_a_midi_clip_on_the_band_extracts_chords() {
     assert!((song.chords[0].start_beat - 2.0).abs() < 1e-9);
 }
 
+/// C メジャーの和音 (4 拍) を 1 つ持つ SMF (format 0、PPQ 480) を書く。
+fn write_triad_midi(dir: &std::path::Path) -> std::path::PathBuf {
+    use midly::num::{u4, u7, u15, u28};
+    use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+    let ev = |delta: u32, key: u8, on: bool| TrackEvent {
+        delta: u28::from(delta),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(0),
+            message: if on {
+                MidiMessage::NoteOn { key: u7::from(key), vel: u7::from(100) }
+            } else {
+                MidiMessage::NoteOff { key: u7::from(key), vel: u7::from(0) }
+            },
+        },
+    };
+    let mut track = vec![ev(0, 60, true), ev(0, 64, true), ev(0, 67, true), ev(1920, 60, false), ev(0, 64, false), ev(0, 67, false)];
+    track.push(TrackEvent { delta: u28::from(0u32), kind: TrackEventKind::Meta(MetaMessage::EndOfTrack) });
+    let mut smf = Smf::new(Header::new(Format::SingleTrack, Timing::Metrical(u15::from(480))));
+    smf.tracks = vec![track];
+    let path = dir.join("triad.mid");
+    smf.save(&path).unwrap();
+    path
+}
+
+/// エクスプローラから MIDI ファイルを帯へ落とすと、落とした拍からコードが置かれる (トラックは増えない)。
+#[test]
+fn dropping_a_midi_file_on_the_band_places_its_chords() {
+    let (mut app, _a, _p) = build_app();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_triad_midi(dir.path());
+    let tracks_before = app.cur.song_doc.song().tracks.len();
+    let mut host = UiHost::no_redraw();
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: WIDGET_RECT.w as u32, height: WIDGET_RECT.h as u32 };
+    let input = FrameInput {
+        pointer: PointerFrame { pos: Some((4.0 * ZOOM, UPPER_Y)), ..PointerFrame::default() },
+        file_drop: Some(daw_ui_core::DroppedFiles { paths: vec![path], position: (4.0 * ZOOM, UPPER_Y) }),
+        ..FrameInput::default()
+    };
+    host.frame(&mut app, &mut scene, screen, input, |app, ui| {
+        let _ = arrangement(app, ui, WIDGET_RECT);
+    });
+    let song = app.cur.song_doc.song();
+    let got: Vec<(f64, u8, ChordKind)> = song.chords.iter().map(|c| (c.start_beat, c.chord.root, c.chord.kind)).collect();
+    assert_eq!(got.first().map(|c| (c.0, c.1, c.2)), Some((4.0, 0, ChordKind::Major)), "拍 4 から C: {got:?}");
+    assert_eq!(song.tracks.len(), tracks_before, "アレンジの取り込みへは流れない");
+}
+
 /// Alt+端のドラッグ (複数選択) は選択全体を比例伸縮する (右端を掴めば左端が軸)。
 #[test]
 fn alt_edge_drag_scales_the_selection() {

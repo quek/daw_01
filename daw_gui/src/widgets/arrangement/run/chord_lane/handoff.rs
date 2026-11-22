@@ -4,8 +4,9 @@
 //!   トラックの MIDI クリップにする (`ChordToolEvent::ChordsToClip`、voicing は c157-tools の設定)。
 //!   レーンの上にいる間は帯の箱を動かさず、落ちる行に箱の時間の幅のゴーストを出す。
 //! - クリップ → 帯: アレンジのクリップを掴んで帯の上で離すと、クリップは動かさずにコードを抽出して
-//!   帯に置く (MIDI は `ExtractFromClips`、オーディオは `DetectAudioClips { place: true }`。混ざって
-//!   いれば両方を撃つ — どちらも相手の種類のクリップは無視する)。帯の上にいる間は帯を縁取る。
+//!   帯に置く (`ChordToolEvent::ExtractChords` — MIDI はノートから、オーディオは音源から off-thread、
+//!   種類が混ざっていても 1 つ)。帯の上にいる間は帯を縁取る。
+//! - エクスプローラの MIDI ファイル → 帯: 落とした拍からコードを置く (`ChordToolEvent::ImportMidiFile`)。
 
 use daw_ui_core::{Edit, Ui};
 use daw_ui_renderer::{Color, Rect};
@@ -50,7 +51,6 @@ pub(super) fn clip_over_band(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>)
 /// `release::commit_releases` より前に呼ぶ (取り上げないとクリップが一番上のトラックへ動く)。
 pub(in crate::widgets::arrangement) fn take_clip_drop(
     ui: &mut Ui<'_, AppData>,
-    app: &AppData,
     f: &ArrangementFrame<'_>,
     released: &mut ReleasedSessions,
 ) {
@@ -75,10 +75,29 @@ pub(in crate::widgets::arrangement) fn take_clip_drop(
     if clips.is_empty() {
         return;
     }
-    let window_beats = app.cur.chord_tools.view.detect.window_beats;
     ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-        app.handle_event(AppEvent::ChordTool(ChordToolEvent::ExtractFromClips { clips: clips.clone(), window_beats }));
-        app.handle_event(AppEvent::ChordTool(ChordToolEvent::DetectAudioClips { clips, place: true }));
+        app.handle_event(AppEvent::ChordTool(ChordToolEvent::ExtractChords { clips }));
+    }));
+}
+
+/// エクスプローラから帯へ落としたファイル: MIDI ファイルならコードを検出して落とした拍から置く
+/// (`ChordToolEvent::ImportMidiFile`、tick 0 がその拍)。帯に落ちたものはアレンジの取り込みへ流さない。
+pub(super) fn take_file_drop(ui: &mut Ui<'_, AppData>, app: &AppData, f: &ArrangementFrame<'_>) {
+    if ui.is_file_hovering_in_rect(f.chord_rect) {
+        let style = f.style;
+        ui.panel_with_border("chord_band_file_drop_hint", f.chord_rect, Color::TRANSPARENT, style.clip_selected_border, 2.0, 0.0);
+    }
+    let Some(drop) = ui.take_file_drop_in_rect(f.chord_rect) else { return };
+    let raw = f.view.start_beat + f64::from(drop.position.0 - f.chord_rect.x) * f.beat_per_px;
+    let at = crate::view::snap::arrange_snap_config(app).snap_beat(raw.max(0.0), false, f.zoom_x_px_per_beat).max(0.0);
+    let midi: Vec<std::path::PathBuf> = drop.paths.into_iter().filter(|p| crate::midi_import::looks_like_midi(p)).collect();
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+        if midi.is_empty() {
+            app.ui_ephemeral.status_message = "コードの帯に置けるのは MIDI ファイルだけです".to_string();
+        }
+        for path in midi {
+            app.handle_event(AppEvent::ChordTool(ChordToolEvent::ImportMidiFile { path, at }));
+        }
     }));
 }
 
