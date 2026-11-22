@@ -133,6 +133,7 @@ impl AppData {
             pianoroll_snap_choice: self.cur.view.pianoroll_snap_choice,
             piano_roll_fold: self.cur.view.piano_roll_fold,
             snap_on_draw: self.cur.view.snap_on_draw,
+            piano_roll_chord_guide: self.cur.view.piano_roll_chord_guide,
             snap_live_input: self.cur.recording.snap_live_input,
             bottom_panel: self.cur.view.bottom_panel,
             piano_roll_views,
@@ -232,6 +233,7 @@ impl AppData {
         self.cur.view.pianoroll_snap_choice = v.pianoroll_snap_choice.min(max_choice);
         self.cur.view.piano_roll_fold = v.piano_roll_fold;
         self.cur.view.snap_on_draw = v.snap_on_draw;
+        self.cur.view.piano_roll_chord_guide = v.piano_roll_chord_guide;
         self.cur.recording.snap_live_input = v.snap_live_input;
         self.cur.view.bottom_panel = v.bottom_panel;
         // r.md #87: ランチャー帯。負の値 / NaN は「未設定」へ潰し、widget の既定幅に任せる

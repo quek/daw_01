@@ -47,6 +47,7 @@ pub(crate) mod view_build;
 mod cancel;
 mod chord_strip;
 mod draw;
+mod harmony;
 mod key_names;
 pub use key_names::KeyNames;
 mod press_ruler;

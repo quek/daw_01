@@ -76,6 +76,10 @@ pub struct ViewState {
     pub piano_roll_fold: bool,
     #[serde(default)]
     pub snap_on_draw: bool,
+    /// r.md #157: piano_roll のコード適合の表示 (ノートの色分け + 構成音のガイド)。
+    /// フィールドの無い旧ファイルは既定の ON。
+    #[serde(default = "default_true")]
+    pub piano_roll_chord_guide: bool,
     #[serde(default)]
     pub snap_live_input: bool,
     // ---- 下部パネル ----
@@ -148,4 +152,8 @@ pub enum RackPanelKey {
 /// `ViewState.bottom_panel` の serde 既定値 (フィールドが無い旧ファイル = Mixer を開く)。
 fn default_bottom_panel() -> Option<u8> {
     Some(0)
+}
+
+fn default_true() -> bool {
+    true
 }

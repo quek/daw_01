@@ -385,6 +385,10 @@ pub struct ProjectView {
     /// piano_roll snap toolbar の「Fold」 toggle で切替、 dirty は立てないが `ViewState` で保存する。
     /// `Song.scale_changes` が空のときは `view.scale = None` で機能 OFF。
     pub piano_roll_fold: bool,
+    /// r.md #157: piano_roll にコード適合 (ノートの色分け + 背景の構成音のガイド) を出すか。
+    /// snap toolbar の「Chord」 で切替、 dirty は立てないが `ViewState` で保存する。
+    /// 曲にコードが無ければ何も出ない (トグルの値に関係なく)。
+    pub piano_roll_chord_guide: bool,
     /// ランチャー帯とアレンジのレーンをどう見せるか (`Tab` で巡回)。
     pub launcher_layout: common::model::LauncherLayout,
     /// アレンジと下部パネルの境界比率 (上の取り分)。`ViewState` に保存され、
@@ -968,6 +972,7 @@ impl ProjectState {
                 snap_on_draw: false,
                 plugin_editor_windows: std::collections::HashMap::new(),
                 piano_roll_fold: false,
+                piano_roll_chord_guide: true,
                 // r.md #87: 0 = 未設定 → widget が既定幅を使う。
                 launcher_layout: common::model::LauncherLayout::default(),
                 // 0.0 = 未設定 (view が既定比率へ倒す)。

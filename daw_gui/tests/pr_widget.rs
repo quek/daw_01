@@ -620,3 +620,114 @@ fn chord_lane_shows_readable_chord_names_under_the_ruler() {
     drive_pointer(&mut host, &mut app, release(217.0, y, no_mods()));
     assert_eq!(app.selected_note_ids(), vec![AppData::pack_note_id(0, 0)]);
 }
+
+/// コードがあるときの、`pitch` の行の上端 y (grid は帯の分だけ下がる)。
+fn chord_row_top(pitch: u8) -> f32 {
+    GRID_Y + CHORD_LANE_H + (84.0 - f32::from(pitch)) * 14.0
+}
+
+/// 左上が `(x, y)` (±0.5px) の矩形を描いた順に返す。
+fn rects_at(scene: &Scene, x: f32, y: f32) -> Vec<daw_ui_renderer::RectCommand> {
+    scene
+        .primitives
+        .iter()
+        .filter_map(|p| match p {
+            daw_ui_renderer::Primitive::Rect(r) if (r.rect.x - x).abs() < 0.5 && (r.rect.y - y).abs() < 0.5 => {
+                Some(r.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// 色分け: Am の箱の上で、構成音 (A) は左端の帯、どちらでもない音 (C#) は輪郭、スケール内 (B) は
+/// 何も足さない。標識はノートの塗り (明るいトラック色 / 暗いトラック色) に対して 3:1 以上で読める。
+/// ガイドは箱の時間範囲の構成音の行を塗り、grid の地との差が見える。「Chord」を切ると両方消える。
+#[test]
+fn chord_fit_marks_and_guide_rows_contrast_on_light_and_dark_clips() {
+    use common::model::{Chord, ChordKind};
+    let (a, b, c_sharp) = (69_u8, 71_u8, 61_u8);
+    for theme in ["dark", "light"] {
+        for color in [[0.95, 0.90, 0.40], [0.05, 0.05, 0.12]] {
+            let (mut app, _a, _p) = build_app();
+            app.handle_event(daw_gui::app::AppEvent::SetTheme(theme.to_string()));
+            setup_clip(
+                &mut app,
+                1,
+                10,
+                vec![mk_note(a, 0.0, 1.0, 127), mk_note(b, 1.0, 1.0, 127), mk_note(c_sharp, 2.0, 1.0, 127)],
+            );
+            app.edit_song(|s| s.tracks[0].color = Some(color));
+            place_chord(&mut app, 0.0, 4.0, Chord::new(9, ChordKind::Minor), None);
+            let mut host = UiHost::<AppData>::no_redraw();
+            let scene = drive(&mut host, &mut app, FrameInput::default());
+            let tag = format!("{theme}/{color:?}");
+            let note_fill = |rs: &[daw_ui_renderer::RectCommand]| {
+                rs.iter().find(|r| (r.rect.w - 64.0).abs() < 0.5 && r.fill.a > 0.99).expect("ノートの塗り").fill
+            };
+
+            let at_a = rects_at(&scene, beat_x(0.0), chord_row_top(a));
+            let bar = at_a.iter().find(|r| r.rect.w <= 3.0 && r.fill.a > 0.99).expect("構成音の帯");
+            let ratio = daw_ui_core::theme::contrast_ratio(bar.fill, note_fill(&at_a));
+            assert!(ratio >= 3.0, "{tag}: 構成音の帯とノートのコントラスト {ratio:.2}");
+
+            let at_b = rects_at(&scene, beat_x(1.0), chord_row_top(b));
+            assert!(
+                !at_b.iter().any(|r| r.rect.w <= 3.0 || (r.border_width - 1.5).abs() < 0.01),
+                "{tag}: スケール内の音には標識を足さない"
+            );
+
+            let at_cs = rects_at(&scene, beat_x(2.0), chord_row_top(c_sharp));
+            let ring = at_cs.iter().find(|r| (r.border_width - 1.5).abs() < 0.01).expect("外れた音の輪郭");
+            let ratio = daw_ui_core::theme::contrast_ratio(ring.border, note_fill(&at_cs));
+            assert!(ratio >= 3.0, "{tag}: 外れた音の輪郭とノートのコントラスト {ratio:.2}");
+
+            // ガイド: 箱 (拍 0..4) の E の行 (ノートの無い構成音の行) が塗られ、地との差が見える。
+            let bg = daw_gui::widgets::piano_roll::PianoRollStyle::from_theme(&app.theme).bg;
+            let guide = rects_at(&scene, GRID_X, chord_row_top(64))
+                .into_iter()
+                .find(|r| r.fill.a > 0.0 && r.fill.a < 0.5 && (r.rect.w - 4.0 * 64.0).abs() < 0.5)
+                .expect("E の行のガイド");
+            let shown = daw_ui_core::color::composite_over(guide.fill, bg);
+            let ratio = daw_ui_core::theme::contrast_ratio(shown, bg);
+            assert!(ratio >= 1.15, "{tag}: ガイドの行と地の差 {ratio:.3}");
+
+            // 「Chord」を切ると標識もガイドも消える。
+            app.cur.view.piano_roll_chord_guide = false;
+            let scene = drive(&mut host, &mut app, FrameInput::default());
+            assert!(!rects_at(&scene, beat_x(0.0), chord_row_top(a)).iter().any(|r| r.rect.w <= 3.0));
+            assert!(!rects_at(&scene, GRID_X, chord_row_top(64)).iter().any(|r| (r.rect.w - 256.0).abs() < 0.5));
+        }
+    }
+}
+
+/// 鳴る音の薄い枠: 追従するトラック (最寄りのコード音) で G を Am の箱の上に書くと、鳴る A の行に枠が出る
+/// (書いた G はそのまま)。枠線は grid の地に対して 3:1 以上。追従しないトラックには出ない。
+#[test]
+fn following_track_overlays_the_sounding_note_frame() {
+    use common::model::{Chord, ChordFollow, ChordKind};
+    for theme in ["dark", "light"] {
+        for follow in [ChordFollow::Narrow, ChordFollow::Off] {
+            let (mut app, _a, _p) = build_app();
+            app.handle_event(daw_gui::app::AppEvent::SetTheme(theme.to_string()));
+            setup_clip(&mut app, 1, 10, vec![mk_note(67, 0.0, 1.0, 100)]);
+            app.edit_song(|s| s.tracks[0].follow_chords = follow);
+            place_chord(&mut app, 0.0, 4.0, Chord::new(9, ChordKind::Minor), None);
+            let mut host = UiHost::<AppData>::no_redraw();
+            let scene = drive(&mut host, &mut app, FrameInput::default());
+            let frame = rects_at(&scene, beat_x(0.0), chord_row_top(69))
+                .into_iter()
+                .find(|r| r.fill.a < 0.5 && r.border_width > 0.0);
+            if follow.is_off() {
+                assert!(frame.is_none(), "{theme}: 追従しないトラックには枠を出さない");
+                continue;
+            }
+            let frame = frame.expect("鳴る A の行に枠");
+            let bg = daw_gui::widgets::piano_roll::PianoRollStyle::from_theme(&app.theme).bg;
+            let ratio =
+                daw_ui_core::theme::contrast_ratio(daw_ui_core::color::composite_over(frame.border, bg), bg);
+            assert!(ratio >= 3.0, "{theme}: 枠線と地のコントラスト {ratio:.2}");
+            assert_eq!(clip_notes(&app, 1, 10)[0].pitch, 67, "書いた音は変わらない");
+        }
+    }
+}

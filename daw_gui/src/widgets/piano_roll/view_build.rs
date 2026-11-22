@@ -75,6 +75,8 @@ pub(super) struct PrContent {
     pub zoom_y: f32,
     /// r.md #138: 対象トラックの音源が申告する鍵盤ごとの名前 (`None` = 申告なし)。
     pub key_names: Option<Arc<KeyNames>>,
+    /// r.md #157: コード適合 (色分け / 構成音のガイド / 鳴る音の枠)。
+    pub harmony: super::harmony::Harmony,
 }
 
 /// `AppData` から widget 入力を組み立てる (旧 `piano_roll_view::draw` L42-286)。
@@ -235,6 +237,7 @@ pub(super) fn build(
         .collect();
 
     let selected: Vec<NoteId> = app.selected_note_ids();
+    let harmony = super::harmony::Harmony::build(app, &notes, &shown, view);
 
     BuiltPianoRoll {
         toolbar_rect,
@@ -258,6 +261,7 @@ pub(super) fn build(
             zoom_x,
             zoom_y,
             key_names,
+            harmony,
         }),
     }
 }

@@ -1008,6 +1008,7 @@ mod tests {
             pianoroll_snap_choice: 2,
             piano_roll_fold: true,
             snap_on_draw: true,
+            piano_roll_chord_guide: false,
             snap_live_input: false,
             bottom_panel: Some(1),
             piano_roll_views: vec![
