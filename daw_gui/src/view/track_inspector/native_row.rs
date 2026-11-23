@@ -1,10 +1,11 @@
 //! chain list の内蔵 device の行 (`名前 + 小表示 + [SC▾] [Par] [Mix] [x]`) とその直下の展開 (SC パネル /
-//! Par)、および master の末尾 (「Post-Fader」の区切り + 固定の Limiter 行)
+//! Par)、および master の末尾 (「フェーダー後」の区切り + 固定の Limiter 行)
 //! (Q3 / Q9 / Q10 / Q15、`docs/plan_rack_native_devices.md` §10.5)。
 //!
 //! 行のボタン列は右から plugin 行と同じ x に揃える。組み込みは × を出さず列だけ空ける (Q10: 組み込みと
 //! 足した分は × の有無で見分ける)。ON/OFF のボタンは置かない (Q15: `Q` / 右クリック / 小表示の
-//! ダブルクリック)。
+//! ダブルクリック)。OFF の行は小表示の位置に「オフ」の札を出す (r.md #158 仕様 10: 組み込みの Comp / EQ は
+//! 信号の流れを見せるためにいつも行があるので、灰色の小表示だと「使えない部品」に見える)。
 
 use common::model::{
     GR_METER_RANGE_DB, MASTER_TRACK_ID, NativeDevice, NativeKind, RackPanelKey,
@@ -20,10 +21,12 @@ use crate::view::native_device::{
     CurveLook, EqCurveSource, LIMITER_GR_SEGMENTS, draw_eq_curve, draw_gr_horizontal, draw_gr_segments, wid,
 };
 
-use super::chain_list::{ROW_GAP, ROW_H, RowCtx, draw_row_bg};
+use super::chain_list::{ROW_GAP, ROW_H, RowCtx, draw_off_tag, draw_row_bg, off_tag_w};
+use super::layout::{ROW_NAME_FONT as NAME_FONT, ROW_NAME_TOP, ROW_NAME_X, expansion_inset};
 use super::mix_knob::MIX_COL_W;
 use super::native_panel::{self, PanelCtx, layout};
-use super::plugin_row::draw_sidechain_panel;
+use super::plugin_row::{draw_sidechain_panel, expansion_cols};
+use super::vocab;
 
 /// ボタン列 (plugin 行と同じ寸法)。
 const BTN_X_W: f32 = 26.0;
@@ -36,9 +39,7 @@ const MINI_CURVE_H: f32 = 18.0;
 const MINI_GR_H: f32 = 8.0;
 /// 小表示とボタン列の間。
 const MINI_GAP: f32 = 4.0;
-/// 行の名前の文字サイズ (plugin 行と同じ)。
-const NAME_FONT: f32 = 11.0;
-/// master 末尾の「Post-Fader」の区切りの高さ。
+/// master 末尾の「フェーダー後」の区切りの高さ。
 const DIVIDER_H: f32 = 16.0;
 
 /// 内蔵 device の行 (26px) を描く。
@@ -84,33 +85,38 @@ pub(super) fn draw_native_row(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Row
             })
         });
     }
-    // 小表示 (EQ 系はミニカーブ、Comp 系は横 GR バー。OFF は共有部品が形を保って薄く描く)。
+    // 小表示 (EQ 系はミニカーブ、Comp 系は横 GR バー)。OFF はその位置に「オフ」の札。
     // ダブルクリックで ON/OFF (Q15)。単クリックは drag_list の click (選択) に流す。
     right -= MINI_W + MINI_GAP;
     let mini_hit = Rect { x: right, y: row.y + 2.0, w: MINI_W, h: ROW_H - 4.0 };
-    draw_mini(app, ui, ctx, entry, mini_hit);
+    if entry.bypassed {
+        let tag_x = mini_hit.x + (MINI_W - off_tag_w(ui)) * 0.5;
+        draw_off_tag(app, ui, wid(ParamSurface::Rack, key, "off", ()), tag_x, row.y, ROW_H);
+    } else {
+        draw_mini(app, ui, ctx, entry, mini_hit);
+    }
     if !popup_open && ui.take_double_click_in_rect(mini_hit).is_some() {
         let bypassed = !entry.bypassed;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::Device(DeviceEvent::SetDevicesBypassed { device_ids: vec![id], bypassed }));
         }));
     }
-    // 名前 (「Comp」 / 「Comp 2」、OFF は薄く)。
-    let name_x = row.x + 8.0;
+    // 名前 (「Comp」 / 「Comp 2」、OFF は text_dim — disabled の text_faint にはしない)。
+    let name_x = row.x + ROW_NAME_X;
     ui.label_at_clipped(
         wid(ParamSurface::Rack, key, "name", ()),
         &entry.name,
-        Rect { x: name_x, y: row.y + 8.0, w: (right - 6.0 - name_x).max(1.0), h: NAME_FONT * 1.2 },
+        Rect { x: name_x, y: row.y + ROW_NAME_TOP, w: (right - 6.0 - name_x).max(1.0), h: NAME_FONT * 1.2 },
         NAME_FONT,
-        if entry.bypassed { p.text_faint } else { p.text },
+        if entry.bypassed { p.text_dim } else { p.text },
     );
 }
 
-/// 行の小表示。値はレーンを重ねた live 値、ON/OFF の見せ方は Song の静的な状態 (§12.2)。
+/// 行の小表示 (ON の行だけ)。値はレーンを重ねた live 値 (§12.2)。
 fn draw_mini(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &RowCtx<'_>, entry: &NativeRowEntry, area: Rect) {
     let id = entry.device_id;
     let key = RackPanelKey::Device(id);
-    let active = !entry.bypassed;
+    let active = true;
     match entry.kind {
         NativeKind::Eq | NativeKind::ToneEq => {
             let Some(dev) = row_native(app, ctx, id) else { return };
@@ -152,7 +158,7 @@ pub(super) fn draw_native_expansions(app: &AppData, ui: &mut Ui<'_, AppData>, ct
     if ctx.sc_open == Some(id) && ctx.sc_panel_h > 0.0 {
         let rect = Rect { x: content.x, y: ey, w: content.w, h: ctx.sc_panel_h };
         claim_expansion_press(ui, rect, ("sc", id), ctx.popup_open);
-        draw_sidechain_panel(app, ui, id, ctx.sc_ports, rect);
+        draw_sidechain_panel(app, ui, id, ctx.sc_ports, &expansion_cols(ctx, rect), rect.y);
         ey += ctx.sc_panel_h;
     }
     let key = RackPanelKey::Device(id);
@@ -161,18 +167,20 @@ pub(super) fn draw_native_expansions(app: &AppData, ui: &mut Ui<'_, AppData>, ct
     }
     let Some(dev) = row_native(app, ctx, id) else { return };
     let Some(owner) = ctx.owner else { return };
-    let rect = Rect { x: content.x, y: ey, w: content.w, h: layout::panel_height(entry.kind) };
-    let bg = draw_panel_bg(app, ui, key, rect, ctx.popup_open);
+    let full = Rect { x: content.x, y: ey, w: content.w, h: layout::panel_height(entry.kind) };
+    let bg = draw_panel_bg(app, ui, key, full, ctx.popup_open);
+    let rect = expansion_inset(full);
     let panel = PanelCtx { dev, live: app.live_native_device(ctx.scope, owner, dev), owner, scope: ctx.scope, rect, bg };
     native_panel::draw_native_panel(app, ui, &panel);
 }
 
-/// Par / SC パネルの面 (行の hover 色に左右されない固定の面) を塗り、余白の press を名乗る。
-/// 戻り値 = 面の色 (つまみのリングのくり抜き色)。
-fn draw_panel_bg(app: &AppData, ui: &mut Ui<'_, AppData>, key: RackPanelKey, rect: Rect, popup_open: bool) -> daw_ui_renderer::Color {
+/// Par の面を塗り、余白の press を名乗る (`full` = 行幅いっぱいの展開。中身は `expansion_inset(full)`)。面は
+/// 帯の本文と同じ `panel` (行の背景を Par にかけないので、見た目は「背景なし」と揃う) — 塗るのは、つまみの
+/// リングのくり抜き色を行の hover に左右されない固定の面にするため。戻り値 = 面の色。
+fn draw_panel_bg(app: &AppData, ui: &mut Ui<'_, AppData>, key: RackPanelKey, full: Rect, popup_open: bool) -> daw_ui_renderer::Color {
     let bg = app.theme.core.panel;
-    ui.panel(wid(ParamSurface::Rack, key, "panel_bg", ()), Rect { x: rect.x + 1.0, y: rect.y, w: (rect.w - 2.0).max(0.0), h: (rect.h - 1.0).max(0.0) }, bg, 2.0);
-    claim_expansion_press(ui, rect, ("par", key), popup_open);
+    ui.panel(wid(ParamSurface::Rack, key, "panel_bg", ()), Rect { h: (full.h - 1.0).max(0.0), ..expansion_inset(full) }, bg, 2.0);
+    claim_expansion_press(ui, full, ("par", key), popup_open);
     bg
 }
 
@@ -186,7 +194,7 @@ pub(super) fn claim_expansion_press(ui: &mut Ui<'_, AppData>, rect: Rect, key: i
     }
 }
 
-/// master の末尾 (drag_list の外): 「Post-Fader」の区切り → 固定の Limiter 行 (+ 開いていれば Par)。
+/// master の末尾 (drag_list の外): 「フェーダー後」の区切り → 固定の Limiter 行 (+ 開いていれば Par)。
 /// 掴めず落とし先にもならないことが「drag_list の外に描く」で構造的に決まる (Q3)。
 /// 戻り値 = (消費後の y、Limiter 行 (Par 込み) の上にカーソルがあれば `Q` の宛先)。
 pub(super) fn draw_master_tail(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &RowCtx<'_>, x: f32, w: f32, mut y: f32) -> (f32, Option<BypassTarget>) {
@@ -194,7 +202,7 @@ pub(super) fn draw_master_tail(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Ro
     let p = &app.theme.core;
     // ---- 区切り (入力は取らない) ----
     y += ROW_GAP;
-    let label = "Post-Fader";
+    let label = vocab::POST_FADER;
     let font = 10.0;
     let tw = ui.measure_text(label, font);
     let mid = y + DIVIDER_H * 0.5;
@@ -210,8 +218,10 @@ pub(super) fn draw_master_tail(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Ro
     let open = app.rack_panel_open(key);
     let par_h = if open { layout::limiter_panel_height() } else { 0.0 };
     let row = Rect { x, y, w, h: ROW_H + par_h };
+    // Q の宛先は Par 込みの行全体、見た目の背景と hover は見出しだけ (chain list の行と同じ)。
     let hovered = ui.hovers(row);
-    draw_row_bg(ui, ("master_limiter", ()), row, false, hovered, false, p);
+    let head = Rect { h: ROW_H, ..row };
+    draw_row_bg(ui, ("master_limiter", ()), head, false, ui.hovers(head), false, p);
     let on = app.cur.song_doc.song().master_limiter.on;
     let popup_open = ctx.popup_open;
     let btn_h = ROW_H - 4.0;
@@ -228,29 +238,33 @@ pub(super) fn draw_master_tail(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Ro
     });
     right -= MINI_W + MINI_GAP;
     let mini_hit = Rect { x: right, y: y + 2.0, w: MINI_W, h: ROW_H - 4.0 };
-    let seg = Rect { y: y + (ROW_H - MINI_GR_H) * 0.5, h: MINI_GR_H, ..mini_hit };
-    draw_gr_segments(app, ui, wid(ParamSurface::Rack, key, "mini_gr", ()), seg, app.cur.transport.master_limiter_gr, on, LIMITER_GR_SEGMENTS);
+    if on {
+        let seg = Rect { y: y + (ROW_H - MINI_GR_H) * 0.5, h: MINI_GR_H, ..mini_hit };
+        draw_gr_segments(app, ui, wid(ParamSurface::Rack, key, "mini_gr", ()), seg, app.cur.transport.master_limiter_gr, on, LIMITER_GR_SEGMENTS);
+    } else {
+        let tag_x = mini_hit.x + (MINI_W - off_tag_w(ui)) * 0.5;
+        draw_off_tag(app, ui, wid(ParamSurface::Rack, key, "off", ()), tag_x, y, ROW_H);
+    }
     if !popup_open && ui.take_double_click_in_rect(mini_hit).is_some() {
         ui.push_edit(limiter_on_edit(!on));
     }
-    let name_x = x + 8.0;
+    let name_x = x + ROW_NAME_X;
     ui.label_at_clipped(
         wid(ParamSurface::Rack, key, "name", ()),
         "Limiter",
-        Rect { x: name_x, y: y + 8.0, w: (right - 6.0 - name_x).max(1.0), h: NAME_FONT * 1.2 },
+        Rect { x: name_x, y: y + ROW_NAME_TOP, w: (right - 6.0 - name_x).max(1.0), h: NAME_FONT * 1.2 },
         NAME_FONT,
-        if on { p.text } else { p.text_faint },
+        if on { p.text } else { p.text_dim },
     );
     // 右クリックは「有効化 / 無効化」だけ (動かせず消せない)。
-    let base = Rect { h: ROW_H, ..row };
     let labels = [if on { "無効化" } else { "有効化" }];
-    ui.context_menu_for(base, &labels, move |_, ui| {
+    ui.context_menu_for(head, &labels, move |_, ui| {
         ui.push_edit(limiter_on_edit(!on));
     });
     if open {
-        let rect = Rect { x, y: y + ROW_H, w, h: par_h };
-        let bg = draw_panel_bg(app, ui, key, rect, popup_open);
-        native_panel::draw_limiter_panel(app, ui, rect, bg, ctx.scope);
+        let full = Rect { x, y: y + ROW_H, w, h: par_h };
+        let bg = draw_panel_bg(app, ui, key, full, popup_open);
+        native_panel::draw_limiter_panel(app, ui, expansion_inset(full), bg, ctx.scope);
     }
     let hover = hovered.then_some(BypassTarget::MasterLimiter);
     (y + row.h, hover)

@@ -268,50 +268,30 @@ impl AppData {
             .collect()
     }
 
-    /// パラアウト (docs/plan_paraout.md): one entry per chain device on the
-    /// cursor track that declares `is_main=false` audio outputs
-    /// (`aux_output_count > 0`). Drives the inspector's "Parallel Out" section
-    /// (explode button + per-port destination dropdowns). Master fx are
-    /// skipped — the grouped explode model needs the source to be a real track
-    /// (master has no `parent_group_id` children). Mirrors `sidechain_entries`.
-    pub fn parallel_output_entries(&self) -> Vec<ParallelOutputEntry> {
-        // Only non-master tracks can be a grouped paraout source.
-        if self.cursor_track_id() == Some(common::model::MASTER_TRACK_ID) {
-            return Vec::new();
+    /// パラアウト (docs/plan_paraout.md): cursor track の chain (Parallel の中も) に居る `device_id` が
+    /// `is_main=false` の音声出力を持つ (`aux_output_count > 0`) なら、その配線。Rack の plugin 行の
+    /// `Out▾` で行の直下に開く出力のパネル (展開ボタン + port ごとの宛先) の中身 (r.md #158)。
+    /// マスターは対象外 — 子トラックへ展開する形は、出元が実トラック (`parent_group_id` の子を持てる) で
+    /// あることを要る (行の `Out▾` も同じ規則で出さない)。
+    pub fn aux_out_entry(&self, device_id: u64) -> Option<ParallelOutputEntry> {
+        let track = self.cursor_track_index().and_then(|i| self.cur.song_doc.song().tracks.get(i))?;
+        if track.id == common::model::MASTER_TRACK_ID {
+            return None;
         }
-        let Some(track) = self
-            .cursor_track_index()
-            .and_then(|i| self.cur.song_doc.song().tracks.get(i))
-        else {
-            return Vec::new();
-        };
-        let track_id = track.id;
-        track
-            .plugins()
-            .filter(|p| p.aux_output_count > 0)
-            .map(|p| {
-                let count = p.aux_output_count as usize;
-                // Normalize routes to length `count` (model Vec may be shorter
-                // when only some ports are wired).
-                let routes: Vec<Option<u32>> = (0..count)
-                    .map(|port| {
-                        p.aux_outputs
-                            .get(port)
-                            .and_then(|o| o.as_ref())
-                            .map(|r| r.dest_track)
-                    })
-                    .collect();
-                let exploded = routes.iter().any(Option::is_some);
-                ParallelOutputEntry {
-                    track_id,
-                    device_id: p.id,
-                    plugin_name: resolve_plugin_name(&self.ipc.plugin_db, &p.plugin_id),
-                    aux_output_count: p.aux_output_count,
-                    routes,
-                    exploded,
-                }
-            })
-            .collect()
+        let p = track.plugins().find(|p| p.id == device_id && p.aux_output_count > 0)?;
+        let count = p.aux_output_count as usize;
+        // Normalize routes to length `count` (model Vec may be shorter when only some ports are wired).
+        let routes: Vec<Option<u32>> = (0..count)
+            .map(|port| p.aux_outputs.get(port).and_then(|o| o.as_ref()).map(|r| r.dest_track))
+            .collect();
+        let exploded = routes.iter().any(Option::is_some);
+        Some(ParallelOutputEntry {
+            track_id: track.id,
+            device_id: p.id,
+            aux_output_count: p.aux_output_count,
+            routes,
+            exploded,
+        })
     }
 
     /// Sidechain source picker choices: "—" (None) followed by every
@@ -880,8 +860,8 @@ impl AppData {
     /// (master bus は `master_fx_chain`) を flat な行として返す。役割の判定は
     /// せず、plugin 名のみを並べる (挙動は engine の port 直結で決まる)。
     /// r.md #110: cursor track の **全 plugin** (Parallel の中も含む、信号順) の行情報。
-    /// 表示ツリーは [`Self::chain_rows`]。 こちらは「読み込み失敗」 section や
-    /// 選択の正規化のような「plugin の集合」 が欲しい呼び出し側用。
+    /// 表示ツリーは [`Self::chain_rows`]。 こちらは選択の正規化やテストのような
+    /// 「plugin の集合」 が欲しい呼び出し側用。
     pub fn inspector_chain(&self) -> Vec<ChainEntry> {
         let Some(track_id) = self.cursor_track_id() else {
             return Vec::new();

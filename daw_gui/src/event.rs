@@ -791,7 +791,7 @@ pub enum AppEvent {
     NudgeSelectedNotePitch { octave: bool, steps: i32 },
 
     // -------- Plugin picker / chain ---------------------------------------
-    /// r.md #110: `chain` = 挿入先 (`+ Plugin` の行が指す chain)。 `None` = cursor track
+    /// r.md #110: `chain` = 挿入先 (`+ プラグイン` の行が指す chain)。 `None` = cursor track
     /// の top-level 末尾。
     OpenPluginPicker { chain: Option<common::model::ChainRef> },
     ClosePluginPicker,

@@ -5,33 +5,15 @@ use super::super::*;
 use super::PanelCtx;
 
 pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
-    let p = &app.theme.core;
     let mut y = ctx.y;
     let device_id = ctx.device_id;
     // ---- Group Transform section (`docs/plan_tachie_group_transform.md` §5.5) --
     // cursor track が visual group のとき、立ち絵全体の 2D affine + opacity を
     // 数値編集 + per-param「A」automate トグルで expose。image inspector と同
-    // idiom。group は表示 clip を持たないので clip 選択ではなく track 選択が
-    // トリガ（§5.5）。純 audio バスには出ない（§5.6 group_has_visual_content）。
+    // idiom (ラベル左・値右の欄 + A 列)。group は表示 clip を持たないので clip 選択ではなく track 選択が
+    // トリガ（§5.5）。純 audio バスには出ない（§5.6 group_has_visual_content）。見出しは描かない (行の名前と同じ)。
     if let Some(summary) = app.inspector_group_transform_summary(device_id) {
-        ui.label_at(
-            ("inspector_group_transform_label", device_id),
-            "Group Transform",
-            ctx.x,
-            y,
-            12.0,
-            p.text,
-        );
-        y += 18.0;
-
-        let row_w = ctx.w;
-        let input_h = 22.0;
-        let label_w = 64.0;
-        let auto_btn_w = 22.0;
-        let auto_btn_gap = 4.0;
-        let input_x = ctx.x + label_w;
-        let input_w = row_w - label_w - auto_btn_w - auto_btn_gap;
-        let auto_btn_x = input_x + input_w + auto_btn_gap;
+        let c = ctx.cols();
         let track_id = summary.track_id;
         let gt = summary.transform;
         // 変調の持ち主 (このグループのトラック) はパネルにつき 1 回だけ解決する。
@@ -51,8 +33,8 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                 f32,
                 &str,
             ) = match param {
-                G::X => (gt.x.into(), 0.0, ScrubableNumberFormat::Decimal(3), None, 0.004, "X"),
-                G::Y => (gt.y.into(), 0.0, ScrubableNumberFormat::Decimal(3), None, 0.004, "Y"),
+                G::X => (gt.x.into(), 0.0, ScrubableNumberFormat::Decimal(3), None, 0.004, vocab::FIELD_X),
+                G::Y => (gt.y.into(), 0.0, ScrubableNumberFormat::Decimal(3), None, 0.004, vocab::FIELD_Y),
                 G::Rotation => (
                     gt.rotation_radians.to_degrees().into(),
                     0.0,
@@ -61,7 +43,7 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                     // は range なしだと枠強調のみ)。handler は従来どおり -π..π wrap。
                     Some((-180.0, 180.0)),
                     1.0,
-                    "Rot (°)",
+                    vocab::FIELD_ROTATION,
                 ),
                 G::ScaleX => (
                     gt.scale_x.into(),
@@ -69,7 +51,7 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                     ScrubableNumberFormat::Decimal(3),
                     Some((0.1, 10.0)),
                     0.01,
-                    "ScaleX",
+                    vocab::FIELD_SCALE_X,
                 ),
                 G::ScaleY => (
                     gt.scale_y.into(),
@@ -77,7 +59,7 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                     ScrubableNumberFormat::Decimal(3),
                     Some((0.1, 10.0)),
                     0.01,
-                    "ScaleY",
+                    vocab::FIELD_SCALE_Y,
                 ),
                 G::AnchorX => (
                     gt.anchor_x.into(),
@@ -85,7 +67,7 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                     ScrubableNumberFormat::Decimal(3),
                     Some((0.0, 1.0)),
                     0.004,
-                    "AnchorX",
+                    vocab::FIELD_ANCHOR_X,
                 ),
                 G::AnchorY => (
                     gt.anchor_y.into(),
@@ -93,7 +75,7 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                     ScrubableNumberFormat::Decimal(3),
                     Some((0.0, 1.0)),
                     0.004,
-                    "AnchorY",
+                    vocab::FIELD_ANCHOR_Y,
                 ),
                 G::Opacity => (
                     gt.opacity.into(),
@@ -101,10 +83,10 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                     ScrubableNumberFormat::Decimal(3),
                     Some((0.0, 1.0)),
                     0.004,
-                    "Opacity",
+                    vocab::FIELD_OPACITY,
                 ),
             };
-            ui.label_at((device_id, param, "group_label"), label, ctx.x, y + 5.0, 11.0, p.text);
+            form::label(ui, app, (device_id, param, "group_label"), label, &c, y);
             let style =
                 ScrubableNumberStyle { sensitivity: sens, range, ..scrub_style(&app.theme) };
             // per-control modulation (docs/plan_modulation_routing_redesign.md §6):
@@ -120,7 +102,7 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
             let g_modulation = g_mod_build.as_ref().map(|m| m.modulation());
             let resp = ui.scrubable_number_at(
                 (device_id, param, "group_scrub"),
-                Rect { x: input_x, y, w: input_w, h: input_h },
+                c.value(y),
                 value,
                 default,
                 fmt,
@@ -148,17 +130,11 @@ pub(super) fn draw_group_transform(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                 resp.dragging || resp.editing_text,
             );
             let auto_on = summary.automated[idx];
-            ui.toggle_button_at(
-                (device_id, param, "group_auto"),
-                "A",
-                Rect { x: auto_btn_x, y, w: auto_btn_w, h: input_h },
-                auto_on,
-                &toggle_automate_style(&app.theme),
-                move |_| toggle_group_automation_edit(param, auto_on),
-            );
-            y += input_h + 4.0;
+            form::auto_toggle(ui, app, (device_id, param, "group_auto"), &c, y, auto_on, move |_| {
+                toggle_group_automation_edit(param, auto_on)
+            });
+            y += layout::FORM_ROW_PITCH;
         }
-        y += 8.0;
     }
     y
 }

@@ -133,6 +133,11 @@ pub(super) fn fade_row(ui, app, c, y, FadeRowSpec) -> f32;  // 長さ (scrubable
 ```
 
 - 値の部品は既存の `scrub_field` / `ui.dropdown` / `ui.toggle_button_at` / `ui.text_input_at` をそのまま使う (bespoke な widget は作らない。daw_gui/CLAUDE.md:23-24)。
+- **段 3 で決めたこと: 入れ子の欄は `cols_nested(left, width, origin_left)`**。Rack の行の直下 (Par / SC / 出力) の欄は、
+  ラベルを行の名前の左端 (`left`、深さとともに右へずれる) から始め、値の欄の左端は帯の欄と同じ x
+  (`origin_left + FORM_LABEL_W + FORM_GAP`) に揃える — ラベル列はそのぶん狭くなる (深さ 0 で 88px)。§5 段 3 の完了条件
+  「字幕・画像・音声・Par の欄の値の左端の x が全部同じ」をそのまま満たす形。ラベル列が 48px を割る深い入れ子だけ
+  値の欄を右へ逃がす。`FormCols` に `label_w` を持たせ、`label` はそれで切る。
 - `sub_heading` は `native_panel/cell.rs:85-113` の `section_label` を一般化したもの。`section_label` はこれを呼ぶだけにする (同じ描き方を 2 本持たない)。
 - フェードの行は今、音声 (`audio_event_section.rs:292-383`)、画像 (`image_event_section.rs` の `draw_fade_rows`)、字幕 (`text_event.rs:206-266`) が別々に書いていて、形も違う。`fade_row` 1 本にまとめ、カーブの表記も `mod.rs:191` の定数 1 本 (表記は「S-Curve」) にする。今は `text_event.rs:211` に別表記の「S-Curve」がある。
 
@@ -262,6 +267,11 @@ pub fn resize_handle(&mut self, id: impl Hash, rect: Rect, axis: Orientation) ->
 | `chain_sections::draw_failed_load_section` (`chain_sections.rs:35-105`、`mod.rs:309`) | plugin 行の中。失敗した行は Par/GUI の位置に `[再読込]` を置き、行の直下に理由 1 行 (11px text_dim、幅で切る) をいつも出す | 同じ失敗が行の「[未ロード] 名前」と別セクションの 2 か所に出る重複 (map §4-7) が消える。`chain_sections.rs` はファイルごと消える |
 
 - マスターでは今どおり Parallel Out を出さない (`view_model.rs:293-295`)。
+- **段 3 の実装**: 出力のパネルは `aux_out_panel.rs` (`chain_sections.rs` を `git mv` して書き直した)。中身は欄の形で、
+  1 行目「子トラック [展開]」、展開済みなら port ごとに「出力 N [宛先 ▾]」。`Out▾` は配線済み (`ChainEntry::aux_out_wired`)
+  で ON 色、幅は SC▾ + 6px (「Out▴」が切れない幅)。`[再読込]` の幅は文言に合わせて広げる (Par / GUI の 44px では
+  全角 3 文字が「…」で切れた)。読み込みに失敗した行では ⌨ も出さない (host に instance が無い)。SC パネルも同じ欄の形
+  (「入力 N [source ▾] [tap ▾]」)。
 
 ### 仕様 3 クリップの設定をクリップの帯へ集める (段 2)
 
@@ -394,6 +404,12 @@ pub struct InspectorTitle {
   - `group_transform.rs:17-24` (「Group Transform」)
   - `lipsync.rs:41-48` の見出しは欄のラベルに変える。
 - 内蔵 device の Par の背景 (`native_row.rs:172-177` の `p.panel`) は残す。帯の本文の面と同じ色なので、見た目は「背景なし」と揃う。つまみのリングのくり抜き色に使っているので消さない。
+- **段 3 の実装**: 展開 (Par / SC / 出力) は、余白の press を行幅いっぱい (`full`) で名乗り (行の左 8px の隙間を
+  掴んでも行が動かない)、中身は `layout::expansion_inset(full)` に描く (`par_rect` は Par が最初の展開のときの形)。
+  Par の欄の値の列は帯と同じ x (§2.3 `cols_nested`)。Par の上下の余白 (`PAR_PAD`) は `device_panel::draw_device_panel`
+  が持ち、各セクションは欄を積むだけ (見出しを描かない)。Group Transform の欄名も日本語 (X / Y / 回転 ° / 拡大 X・Y /
+  基準点 X・Y / 不透明度)。Parallel の Selector の欄は「アクティブ」「フェード」(帯域名 Low / Mid / High は chain 名と
+  同じ語のまま)。口パクの帯 (形状 → 画像) も欄の形にした。
 
 ### 仕様 10 組み込みの Comp / EQ のオフの見た目 (段 3)
 
@@ -410,8 +426,12 @@ pub struct InspectorTitle {
 | `native_row.rs:229-243` (master Limiter) | text_dim + 札 |
 | `plugin_row.rs:159-165` (plugin のバイパス) | text_dim + 名前の右に札 |
 | Parallel のヘッダ (`parallel_header.rs` のバイパス表示) | text_dim + 札 |
+| モジュレーションの変調器の見出し (`modulation_rack/mod.rs` の `src.enabled`、段 3 の同件チェックで追加) | text_dim + メーターの位置に札 |
+| モジュレーションの変調先の行 (`row.effective` / `row.enabled`、同上) | 効いていない行は text_dim、その 1 本がバイパスなら depth 欄の左に札 |
 
 - トラック自体が無効 (r.md #131、`plugin_row.rs:161` の `disabled`) は本当に使えない状態なので、`text_faint` のまま区別する。
+  Selector の非アクティブ chain (`chain_row.rs` の `inactive`) は「今鳴っていない」の表示でバイパスではないので変えない。
+  内蔵 Par の中の GR の値 (`native_panel/limiter.rs`) は音のパラメータの格子の中なので変えない。
 - ミキサーの帯とマスターパネルの共有部品 (`view/native_device`) は変えない。Rack の行の小表示だけを変える。
 
 ### 仕様 11 言葉 (段 1 で見出し、段 3 で欄名)
@@ -512,6 +532,9 @@ pub struct InspectorTitle {
 | 「+ チェーン」(`chain_row.rs:261-275`) | chain 行の色見本の左端 (chain 行と同じ階層) | 「+ チェーン」の小さいボタン、11px |
 
 - これで「chain の中に足す」は device と同じ段、「Parallel に chain を足す」は chain と同じ段に並ぶ。
+- **段 3 の実装**: 「+ チェーン」の左端は色見本の左端ではなく色見本の右 (`content.x + BAR_W`) にした。色見本の左端から
+  置くと Parallel の括弧の帯 (色見本と同じ x) をボタンが切り、括弧が途中で途切れて見えたため (撮影で確認)。chain 行の
+  見える面も色見本の右から始まるので、段は chain 行と揃う。
 
 ---
 

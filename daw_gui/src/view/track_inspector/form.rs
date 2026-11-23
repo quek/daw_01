@@ -13,10 +13,13 @@ use common::model::FadeCurve;
 use super::layout::{FORM_AUTO_W, FORM_GAP, FORM_LABEL_W, FORM_ROW_H, FORM_ROW_PITCH, LABEL_FONT};
 use crate::app::{AppData, AppEvent, ClipKey, DiscreteClipEdit, InspectorScrubField};
 
-/// 欄の列の x。帯の中なら `cols(area.x + PAD, area.w - 2 * PAD)`。
+/// 欄の列の x。帯の中なら `cols(area.x + PAD, area.w - 2 * PAD)`、Rack の行の直下 (Par / SC / 出力) なら
+/// [`cols_nested`]。
 #[derive(Debug, Clone, Copy)]
 pub(super) struct FormCols {
     pub label_x: f32,
+    /// ラベルを切る幅 (ラベル列の左端から値の手前の隙間まで)。
+    pub label_w: f32,
     pub value_x: f32,
     pub value_w: f32,
     pub auto_x: f32,
@@ -43,15 +46,32 @@ impl FormCols {
 
 /// 左端 `left`・幅 `width` の欄の列。
 pub(super) fn cols(left: f32, width: f32) -> FormCols {
-    let value_x = left + FORM_LABEL_W + FORM_GAP;
+    cols_nested(left, width, left)
+}
+
+/// 入れ子の欄 (Rack の行の直下に開く Par / SC / 出力) の値の欄がこれより狭くならない、ラベル列の下限。
+const NESTED_LABEL_MIN_W: f32 = 48.0;
+
+/// 帯の中に入れ子で置く欄の列 (Rack の行の直下。左端 `left` は行の名前の左端で、深さとともに右へずれる)。
+/// 値の欄の左端は帯の欄と同じ x (`origin_left` = 帯の欄の左端から [`FORM_LABEL_W`]) に揃え、ラベルは
+/// 入れ子の左端から始めて、そのぶん狭いラベル列で切る — インスペクタのどこでも値の列が 1 本に並ぶ。
+/// 深い入れ子でラベル列が [`NESTED_LABEL_MIN_W`] を割るときだけ値の欄を右へ逃がす。右端 (A 列) は `left + width`。
+pub(super) fn cols_nested(left: f32, width: f32, origin_left: f32) -> FormCols {
+    let value_x = (origin_left + FORM_LABEL_W + FORM_GAP).max(left + NESTED_LABEL_MIN_W + FORM_GAP);
     let auto_x = left + width - FORM_AUTO_W;
-    FormCols { label_x: left, value_x, value_w: (auto_x - FORM_GAP - value_x).max(1.0), auto_x }
+    FormCols {
+        label_x: left,
+        label_w: value_x - FORM_GAP - left,
+        value_x,
+        value_w: (auto_x - FORM_GAP - value_x).max(1.0),
+        auto_x,
+    }
 }
 
 /// 欄のラベル (11px text_dim、ラベル列の幅で切る)。
 pub(super) fn label(ui: &mut Ui<'_, AppData>, app: &AppData, id: impl std::hash::Hash, text: &str, c: &FormCols, y: f32) {
     let h = LABEL_FONT * 1.2;
-    let rect = Rect { x: c.label_x, y: y + (FORM_ROW_H - h) * 0.5, w: FORM_LABEL_W - FORM_GAP, h };
+    let rect = Rect { x: c.label_x, y: y + (FORM_ROW_H - h) * 0.5, w: c.label_w, h };
     ui.label_at_clipped(id, text, rect, LABEL_FONT, app.theme.core.text_dim);
 }
 

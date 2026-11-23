@@ -16,6 +16,8 @@
 //! - 名前の欄で改名しても、アレンジのクリップの上の改名欄は出ない。
 //! - 欄名は全部ラベル列に収まる。
 //!
+//! 段 3 (仕様 2・9): 欄の値の列は帯でも Par / SC でも同じ x。読み込み失敗と aux 出力は行の中。
+//!
 //! daw_gui 本体は起動しない (AppData を直に組む)。
 
 use std::cell::Cell;
@@ -23,7 +25,8 @@ use std::sync::Arc;
 
 use common::app_dirs::AppDirs;
 use common::model::{
-    AudioContent, Clip, ClipContent, ClipKey, ImageContent, MidiContent, NativeKind, RackPanelKey, TextContent, TextEvent,
+    AudioContent, AudioEvent, Clip, ClipContent, ClipKey, ImageContent, MidiContent, NativeKind, RackPanelKey, TextContent,
+    TextEvent,
 };
 use common::plugin_db::{BUILTIN_ID_VOICEVOX, PluginDatabase, SUBTITLE_ID, builtin_descriptors};
 use common::protocol::{AudioCommand, PluginCommand};
@@ -35,7 +38,7 @@ use daw_gui::event_device::DeviceEvent;
 use daw_gui::event_inspector::InspectorEvent;
 use daw_gui::handler::inspector_view::{INSPECTOR_MAX_W, INSPECTOR_MIN_W};
 use daw_gui::state::inspector_view::{ClipBandKind, InspectorBand, InspectorDetail, InspectorFolds};
-use daw_gui::view::track_inspector::layout::{FORM_GAP, FORM_LABEL_W, LABEL_FONT};
+use daw_gui::view::track_inspector::layout::{FORM_GAP, FORM_LABEL_W, FORM_ROW_H, LABEL_FONT};
 use daw_gui::view::track_inspector::{panel_width, vocab};
 use daw_gui::voicevox_client::{VoiceVoxSinger, VoiceVoxStyle};
 use daw_gui::widgets::select_modifier::SelectModifier;
@@ -335,7 +338,7 @@ fn band_folds_are_shared_per_kind() {
     h.select(t1);
     let scene = h.settle();
     assert!(!h.app.inspector_band_open(InspectorBand::Rack));
-    assert!(find(&scene, 360.0, "+ Plugin").is_none(), "別のトラックでも Rack は畳まれたまま");
+    assert!(find(&scene, 360.0, vocab::ADD_PLUGIN).is_none(), "別のトラックでも Rack は畳まれたまま");
 }
 
 /// 畳んだ帯 / 隠したインスペクタは Q の宛先を残さず、見えない EQ にスペクトラムを要求しない。
@@ -598,4 +601,85 @@ fn subtitle_field_drag_is_one_undo_step() {
     assert!(x > 0.15, "右へ引いたので X が増える: {x}");
     assert!((y - 0.4).abs() < 1e-6, "Y は動かない: {y}");
     assert_eq!(h.app.cur.song_doc.undo_depth(), undo + 1, "1 ドラッグ = 1 undo step");
+}
+
+/// `label` の欄の値の部品 (数値欄 / dropdown) の左端 x: ラベルと同じ行にある、欄の高さの矩形のうち一番左のもの。
+fn value_left(h: &Harness, scene: &Scene, label: &str) -> f32 {
+    let label = one(h, scene, label);
+    let row_y = label.top - (FORM_ROW_H - LABEL_FONT * 1.2) * 0.5;
+    scene
+        .primitives
+        .iter()
+        .filter_map(|p| match p {
+            Primitive::Rect(r)
+                if (r.rect.h - FORM_ROW_H).abs() < 0.5 && (r.rect.y - row_y).abs() < 1.0 && r.rect.x > label.left + 8.0 =>
+            {
+                Some(r.rect.x)
+            }
+            _ => None,
+        })
+        .fold(None, |m: Option<f32>, x| Some(m.map_or(x, |m| m.min(x))))
+        .unwrap_or_else(|| panic!("`{}` の欄の値の部品", label.text))
+}
+
+/// r.md #158 仕様 9: 欄の値の列は、帯 (クリップ / 入力) の欄でも Rack の行の直下 (Par / SC) の欄でも同じ x に
+/// 1 本で並ぶ (Par の中身は行の名前の左端から始まり、ラベル列だけが狭くなる)。
+#[test]
+fn field_values_line_up_in_one_column_across_bands_and_par() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    let vv = h.add_builtin(t0, BUILTIN_ID_VOICEVOX);
+    h.app.handle_event(AppEvent::Device(DeviceEvent::ToggleRackPanel(RackPanelKey::Device(vv))));
+    let comp = h.app.cur.song_doc.song().builtin_native(t0, NativeKind::Comp).expect("組み込み Comp").id;
+    h.app.cur.peph.open_sidechain_panel = Some(comp);
+    let event = AudioEvent { id: 1, source_id: 1, event_length_beats: 4.0, ..AudioEvent::default() };
+    let clip = place(&mut h.app, t0, 0.0, ClipContent::Audio(AudioContent { events: vec![event], next_event_id: 2 }), "A");
+    h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
+    let scene = h.settle();
+    let expected = daw_gui::view::track_inspector::layout::PAD + FORM_LABEL_W + FORM_GAP;
+    for label in [vocab::FIELD_GAIN, vocab::FIELD_INPUT_SOURCE, vocab::FIELD_LIPSYNC_TARGET, &vocab::sc_port(1)] {
+        let x = value_left(&h, &scene, label);
+        assert!((x - expected).abs() < 0.5, "`{label}` の値の左端 {x} が帯の欄の列 {expected} に揃う");
+    }
+    let lipsync = one(&h, &scene, vocab::FIELD_LIPSYNC_TARGET);
+    let rack_row_name = daw_gui::view::track_inspector::layout::PAD + daw_gui::view::track_inspector::layout::ROW_NAME_X;
+    assert!((lipsync.left - rack_row_name).abs() < 0.5, "Par の欄は行の名前の左端から: {}", lipsync.left);
+}
+
+/// r.md #158 仕様 2: 読み込みに失敗した plugin は行の中 ([再読込] と直下の理由 1 行)、aux 出力は行の `Out▾` で
+/// 直下に開く (チェーンの下の別セクションに出さない)。展開すると port ごとの宛先の行が同じパネルに足される。
+#[test]
+fn failed_load_and_aux_outputs_live_in_their_own_row() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    let vv = h.add_builtin(t0, BUILTIN_ID_VOICEVOX);
+    let sub = h.add_builtin(t0, SUBTITLE_ID);
+    h.app.edit_song(|song| {
+        song.plugin_by_id_mut(vv).expect("VOICEVOX").aux_output_count = 2;
+    });
+    h.app.cur.pipc.failed_plugin_loads.insert(sub, "shmem create failed".to_string());
+    let scene = h.settle();
+    let failed = glyphs_left_of(&scene, panel_width(&h.app))
+        .into_iter()
+        .find(|g| g.text.starts_with(vocab::NOT_LOADED))
+        .expect("失敗した行の名前に [未ロード]");
+    let reload = one(&h, &scene, vocab::RELOAD);
+    assert!((reload.top - failed.top).abs() < 8.0, "[再読込] は失敗した行の中");
+    let reason = one(&h, &scene, "shmem create failed");
+    let row_h = daw_gui::view::track_inspector::layout::RACK_ROW_H;
+    assert!(reason.top > failed.top && reason.top < failed.top + row_h + 4.0, "理由は失敗した行の直下");
+    assert!(find(&scene, 360.0, "読み込み失敗").is_none() && find(&scene, 360.0, "Parallel Out").is_none());
+
+    // Out▾ を押すと VOICEVOX の行の直下に出力のパネル。展開すると子トラックと port ごとの宛先の行。
+    let out = one(&h, &scene, "Out\u{25BE}");
+    h.click(center(&out));
+    let scene = h.settle();
+    let child = one(&h, &scene, vocab::FIELD_CHILD_TRACKS);
+    assert!(child.top > out.top && child.top < out.top + row_h + 8.0, "出力のパネルは Out の行の直下");
+    assert!(child.top < failed.top, "パネルは次の行 (字幕) より上");
+    h.click(center(&field_value(&h, &scene, vocab::FIELD_CHILD_TRACKS, vocab::EXPLODE_OUTPUTS)));
+    let scene = h.settle();
+    assert!(h.app.aux_out_entry(vv).is_some_and(|e| e.exploded), "展開で配線された");
+    let port2 = one(&h, &scene, &vocab::aux_out_port(2));
+    assert!(port2.top > one(&h, &scene, vocab::FIELD_CHILD_TRACKS).top, "port の行は展開の行の下");
 }

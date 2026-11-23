@@ -38,7 +38,7 @@ pub(super) fn draw_lipsync_target(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: 
             labels.push(t.display_name(i).into_owned());
         }
         // 「口パク先 [トラック ▾]」の 1 行 (r.md #158 仕様 9: Par の中も ラベル左・値右)。
-        let c = super::super::form::cols(ctx.x, ctx.w);
+        let c = ctx.cols();
         super::super::form::label(ui, app, ("inspector_lipsync_target_label", device_id), vocab::FIELD_LIPSYNC_TARGET, &c, y);
         let dropdown_rect = c.value(y);
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();

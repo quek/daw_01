@@ -31,16 +31,21 @@ pub struct ChainEntry {
     pub send_all_keys: bool,
     /// plugin_host での load が失敗した device の理由 (`SlotPluginLoadFailed`)。
     /// `Some` = song には居るが host には instance が無い = **無音**。
-    /// チェーン行に警告色 + ⚠ を出し、 「読み込み失敗」 セクションで理由と
-    /// 「再読込」 ボタンを出す (自動リトライはしない)。
+    /// 行の名前を警告色 (「[未ロード]」付き) にし、 行の `[再読込]` と直下の理由 1 行を出す
+    /// (自動リトライはしない、 r.md #158 で別セクションから行の中へ移した)。
     pub load_error: Option<String>,
-    /// r.md #105: 信号経路から外れている (`PluginInstance::bypassed`)。 行の名前を
-    /// dim 色で描く。 切替は `Q` / 右クリックメニュー (行にトグルは置かない)。
+    /// r.md #105: 信号経路から外れている (`PluginInstance::bypassed`)。 行の名前の横に「オフ」の札を出す。
+    /// 切替は `Q` / 右クリックメニュー (行にトグルは置かない)。
     pub bypassed: bool,
     /// r.md #110: host が報告した aux 入力 port 数。 1 以上の device にだけ `SC` を出す。
     pub aux_input_count: u8,
     /// r.md #110: sidechain が 1 port でも配線済み (`SC` ボタンの強調)。
     pub sc_wired: bool,
+    /// パラアウト (`docs/plan_paraout.md`): host が報告した aux 出力 port 数。 1 以上の device にだけ
+    /// `Out▾` を出す (行の直下に出力のパネル、 r.md #158)。
+    pub aux_output_count: u8,
+    /// aux 出力が 1 port でも配線済み (= 展開済み、 `Out▾` の強調)。
+    pub aux_out_wired: bool,
 }
 
 /// r.md #129 (`docs/plan_rack_native_devices.md` §10.5): 内蔵 device (`Device::Native`) の行の表示情報。
@@ -114,9 +119,9 @@ pub enum ChainRowKind {
         /// `false`)。 表示だけで、 切替はヘッダ直下の `Active` 欄 (編集面は 1 つ)。
         inactive: bool,
     },
-    /// `+ chain`。
+    /// `+ チェーン`。
     AddChain { parallel_id: u64 },
-    /// `+ Plugin` (その chain の末尾へ)。
+    /// `+ プラグイン` (その chain の末尾へ。マスターは `+ エフェクト`)。
     AddPlugin { chain: common::model::ChainRef },
     /// `╰` (終了行)。
     ParallelEnd { parallel_id: u64, color: Option<[f32; 3]> },
@@ -135,7 +140,7 @@ pub struct ChainRow {
     pub depth: u32,
     /// 左端の色帯 (外側の Parallel から順に、 展開中 chain の色)。 深さぶんの本数。
     pub bars: Vec<Option<[f32; 3]>>,
-    /// この行が Parallel の直接の行 (開始 / Split / chain / `+ chain` / 終了) なら、 その Parallel の
+    /// この行が Parallel の直接の行 (開始 / Split / chain / `+ チェーン` / 終了) なら、 その Parallel の
     /// 色。 描画は `bars` の次の位置 (= 行内容の左端、 chain 行の色見本と同じ x / 幅) に Parallel 色の
     /// 帯を通し、 開始行の `「` から終了行の `L` まで 1 本に繋げる (chain の帯はその上に乗る)。
     /// chain の中身の行は chain の帯が同じ x を占めるので `None`。

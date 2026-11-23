@@ -5,7 +5,9 @@
 //! `target/inspector_shots/<名前>.png` に保存する。今の見た目は、スクロールしない 2 行のタイトル
 //! (選んでいるもの + 色見本) の下に、見出しの帯 (選択 → 列 → 入力 → Rack → 口パク → モジュレーション) を
 //! 積んだ 1 本の縦スクロール。クリップの設定 (音声 / 画像 / 歌声 / 読み上げ / 字幕 / ローンチ) は全部一番上の
-//! 選択の帯に「ラベル左・値右」の欄で並び、Par にはデバイスそのものの設定だけが残る。
+//! 選択の帯に「ラベル左・値右」の欄で並び、Par にはデバイスそのものの設定だけが残る。Rack の行の直下に開く
+//! Par / SC / 出力は行の名前の左端から始まり (行の背景と hover は見出しだけ)、欄の値は帯の欄と同じ列。OFF の
+//! 行は「オフ」の札、読み込み失敗と出力 (パラアウト) は行の中。
 //! 見た目の良し悪しは人が判断するので、ここで確かめるのは
 //! 「PNG が書けた」ことだけ (インスペクタの文言に依存する assert を置くと、作り直すたびにこのカメラが壊れる)。
 //! 各状態で期待した見出しが描かれたかは `--nocapture` の出力に出す (文言は `track_inspector::vocab`)。
@@ -57,8 +59,11 @@ struct Project {
     audio_clip: ClipKey,
     image_clip: ClipKey,
     color_grade: u64,
+    vignette: u64,
     image: u32,
     group: u32,
+    /// グループの Parallel の High の chain の Reverb。
+    group_reverb: u64,
     talk_clip: ClipKey,
     talk_voicevox: u64,
     video_clip: ClipKey,
@@ -333,7 +338,7 @@ fn populate(app: &mut AppData) -> Project {
         ImageEvent { source_id: 1, event_length_beats: 8.0, x: 0.6, y: 0.05, w: 0.35, h: 0.35, ..ImageEvent::default() };
     let image_clip = place(app, image, 0.0, 8.0, ClipContent::Image(ImageContent { events: vec![image_event] }), "Logo");
     let color_grade = add_plugin(app, image, COLOR_GRADE_ID);
-    add_plugin(app, image, VIGNETTE_ID);
+    let vignette = add_plugin(app, image, VIGNETTE_ID);
 
     // 5. グループ (バス): 2 本を束ね、グループに 3 帯域分割の Parallel (Low: Comp / Mid: EQ / High: Reverb)。
     let gtr_l = add_track(app, "Gtr L");
@@ -349,8 +354,9 @@ fn populate(app: &mut AppData) -> Project {
     }
     app.handle_event(AppEvent::Device(DeviceEvent::SetParallelSplit { parallel_id, split: Split::DEFAULT_FREQUENCY3 }));
     let chains: Vec<u64> = parallel_of(app, group).chains.iter().map(|c| c.id).collect();
+    let mut group_reverb = 0;
     for (chain, kind) in chains.into_iter().zip([NativeKind::Comp, NativeKind::Eq, NativeKind::Reverb]) {
-        add_native(app, ChainRef::Chain(chain), kind);
+        group_reverb = add_native(app, ChainRef::Chain(chain), kind);
     }
 
     // 6. 読み上げ + 字幕トラック: 内蔵 VOICEVOX + 字幕デバイス + Text クリップ (セリフ = 字幕の文字)。
@@ -387,8 +393,10 @@ fn populate(app: &mut AppData) -> Project {
         audio_clip,
         image_clip,
         color_grade,
+        vignette,
         image,
         group,
+        group_reverb,
         talk_clip,
         talk_voicevox,
         video_clip,
@@ -495,20 +503,6 @@ fn capture_track_inspector_states() {
         h.set_theme("light");
         h.select_clip(h.project.audio_clip);
     });
-    // 9. 同じ MIDI トラックで、組み込み EQ と Reverb の Par を開いた状態。
-    shot(r, "s1_9_midi_track_par_open", &["HP", "LMF"], |h| {
-        h.select_track(h.project.synth);
-        h.open_panel(h.project.synth_eq);
-        h.open_panel(h.project.synth_reverb);
-    });
-    // 13. グループ (バス) トラック: 3 帯域分割の Parallel。入力の帯は出ない (段 2、録れる入力が無い)。
-    shot(r, "s1_13_group_parallel", &["Bus", "Parallel", "Low", "Mid", "High"], |h| {
-        h.select_track(h.project.group);
-    });
-    // 14. マスター (入力の帯は出ない)。
-    shot(r, "s1_14_master", &["Bus Comp", "Tone EQ", "Post-Fader", "Limiter"], |h| {
-        h.select_track(MASTER_TRACK_ID);
-    });
     // 16. ランチャーのセルで MIDI 割り当ての詳細を開いた。
     shot(r, "s1_16_launcher_cell_midi_open", &["セル", "割り当てを消す"], |h| {
         let row = LauncherRow::Track(h.project.synth);
@@ -580,6 +574,69 @@ fn capture_track_inspector_states() {
         let scene_id = h.app.cur.song_doc.song().scenes.first().expect("足した列").id;
         h.app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene { scene_id, modifier: SelectModifier::Single }));
     });
-    // 11. 画像トラック (映像 FX): 入力の帯は出ない (録れる入力が無い。グループのバスは s1_13)。
+    // 11. 画像トラック (映像 FX): 入力の帯は出ない (録れる入力が無い。グループのバスは s3_2)。
     shot(r, "s2_11_image_track", &[rack, "Color Grade"], |h| h.select_track(h.project.image));
+
+    // 段 3 (r.md #158 中身の揃え): Par は行の名前の左端から (背景・hover は見出しだけ)、欄の値は帯と同じ列、
+    // OFF は「オフ」の札、+ チェーン / + プラグイン の主従、読み込み失敗と出力は行の中。
+    // 1. MIDI トラック: EQ と Reverb の Par、組み込み Comp の SC パネル (OFF の札)。
+    shot(r, "s3_1_rack_par_open", &["HP", "ROOM", &vocab::sc_port(1), vocab::OFF_TAG, vocab::ADD_PLUGIN], |h| {
+        h.select_track(h.project.synth);
+        h.open_panel(h.project.synth_eq);
+        h.open_panel(h.project.synth_reverb);
+        let comp = h.app.cur.song_doc.song().builtin_native(h.project.synth, NativeKind::Comp).expect("組み込み Comp").id;
+        h.app.cur.peph.open_sidechain_panel = Some(comp);
+    });
+    // 2. グループ (バス) トラック: 3 帯域分割の Parallel。chain の中の「+ プラグイン」(小さく device の段) と
+    //    「+ チェーン」(chain の段)。High の Reverb はバイパス (chain の中の札)。入力の帯は出ない。
+    shot(r, "s3_2_group_parallel", &["Bus", "Parallel", "Low", "Mid", "High", vocab::ADD_CHAIN, vocab::OFF_TAG], |h| {
+        h.select_track(h.project.group);
+        let reverb = h.project.group_reverb;
+        h.app.handle_event(AppEvent::Device(DeviceEvent::SetDevicesBypassed { device_ids: vec![reverb], bypassed: true }));
+    });
+    // 3. マスター: 「+ エフェクト」「フェーダー後」、OFF の Limiter は札。
+    shot(r, "s3_3_master", &["Bus Comp", "Tone EQ", vocab::ADD_EFFECT, vocab::POST_FADER, "Limiter", vocab::OFF_TAG], |h| {
+        h.select_track(MASTER_TRACK_ID);
+    });
+    // 4. 画像トラック: Color Grade の Par (効果の名前の見出しを繰り返さない)、Vignette はバイパス (plugin 行の札)。
+    shot(r, "s3_4_image_fx_par", &["Color Grade", "Exposure", vocab::OFF_TAG], |h| {
+        h.select_track(h.project.image);
+        h.open_panel(h.project.color_grade);
+        let vignette = h.project.vignette;
+        h.app.handle_event(AppEvent::Device(DeviceEvent::SetDevicesBypassed { device_ids: vec![vignette], bypassed: true }));
+    });
+    // 5. 出力 (パラアウト): aux 出力 2 本の VOICEVOX を展開し、行の Out▴ で直下に開いたパネル + Par の口パク先。
+    shot(r, "s3_5_aux_out_open", &[vocab::FIELD_CHILD_TRACKS, &vocab::aux_out_port(2), vocab::FIELD_LIPSYNC_TARGET], |h| {
+        let vv = h.project.voicevox;
+        h.app.edit_song(|song| {
+            song.plugin_by_id_mut(vv).expect("VOICEVOX").aux_output_count = 2;
+        });
+        h.select_track(h.project.vocal);
+        h.app.handle_event(AppEvent::Device(DeviceEvent::ExplodeParallelOut { device_id: vv }));
+        h.select_track(h.project.vocal);
+        h.app.cur.peph.open_aux_out_panel = Some(vv);
+        h.open_panel(vv);
+    });
+    // 6. 読み込みに失敗した plugin: 行の [再読込] と直下の理由 1 行 (別セクションに出さない)。
+    shot(r, "s3_6_failed_load", &[vocab::RELOAD, "shmem create failed"], |h| {
+        h.select_track(h.project.image);
+        h.app.cur.pipc.failed_plugin_loads.insert(h.project.vignette, "shmem create failed".to_string());
+    });
+    // 8. モジュレーション: LFO 2 つのうち 1 つをバイパス (メーターの位置に札、名前は text_dim)。Rack は畳む。
+    shot(r, "s3_8_modulation_off", &[modulation, "LFO", vocab::OFF_TAG], |h| {
+        h.select_track(h.project.synth);
+        for _ in 0..2 {
+            h.app.handle_event(AppEvent::AddModSource { kind: daw_gui::app::ModSourceKindTag::Lfo });
+        }
+        let ids: Vec<u32> = h.app.mod_source_display().iter().map(|s| s.id).collect();
+        h.app.handle_event(AppEvent::SetModSourceEnabled { id: ids[1], enabled: false });
+        h.app.cur.peph.expanded_mod_sources.insert(ids[0]);
+        h.inspector(InspectorEvent::ToggleBand(InspectorBand::Rack));
+    });
+    // 7. ライトテーマ: Par の面 / 行の見出し / 札のコントラスト。
+    shot(r, "s3_7_light_theme_rack", &["HP", vocab::OFF_TAG], |h| {
+        h.set_theme("light");
+        h.select_track(h.project.synth);
+        h.open_panel(h.project.synth_eq);
+    });
 }

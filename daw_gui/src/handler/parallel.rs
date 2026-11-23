@@ -378,7 +378,7 @@ impl AppData {
 
     /// インスペクタの chain list (縦回転 Live 型、`docs/plan_parallel.md` §6.1)。 cursor track の
     /// device ツリーを行に flatten する: Parallel は 開始行 / chain 行 × N (展開中の chain はその直下に
-    /// device (再帰) + `+ Plugin`) / `+ chain` / 終了行。 折り畳んだ chain / Parallel は 1 行だけ。
+    /// device (再帰) + `+ プラグイン`) / `+ チェーン` / 終了行。 折り畳んだ chain / Parallel は 1 行だけ。
     pub fn chain_rows(&self) -> Vec<ChainRow> {
         let Some(track_id) = self.cursor_track_id() else {
             return Vec::new();
@@ -433,7 +433,7 @@ impl AppData {
     }
 
     /// Parallel 1 つぶんの行: 開始行 / chain 行 × N (展開中の chain はその行の直下に中身 (再帰) +
-    /// `+ Plugin`) / `+ chain` / 終了行。 折り畳んだ Parallel は開始行だけ。
+    /// `+ プラグイン`) / `+ チェーン` / 終了行。 折り畳んだ Parallel は開始行だけ。
     fn push_parallel_rows(
         &self,
         r: &Parallel,
@@ -564,6 +564,8 @@ impl AppData {
             bypassed: p.bypassed,
             aux_input_count: p.aux_input_count,
             sc_wired: p.aux_inputs.iter().any(Option::is_some),
+            aux_output_count: p.aux_output_count,
+            aux_out_wired: p.aux_outputs.iter().any(Option::is_some),
         }
     }
 

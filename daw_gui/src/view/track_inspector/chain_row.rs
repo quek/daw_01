@@ -1,5 +1,5 @@
 //! chain list の Parallel 内 chain の行 (`[色] ▶ 名前 / preview / gain / pan / M / S / x`) と
-//! 操作行 (`+ chain` / `+ Plugin`)、 Parallel ヘッダ行 (`parallel_header.rs`) と共有する開閉
+//! 操作行 (`+ チェーン` / `+ プラグイン`)、 Parallel ヘッダ行 (`parallel_header.rs`) と共有する開閉
 //! disclosure / 改名欄。 chain list 本体 (`chain_list.rs`) から切り出したもの (サイズ budget、
 //! 不変条件 9)。
 
@@ -14,7 +14,8 @@ use crate::view::param_gesture::push_param_gesture;
 use common::model::{AutomationTarget, ChainRef, TrackBuiltinParam};
 
 use super::chain_list::{BAR_W, ROW_GAP, ROW_H};
-use super::toggle_audio_style;
+use super::layout::ROW_NAME_X;
+use super::{toggle_audio_style, vocab};
 
 /// chain 行の mixer: ミニ knob と M / S。
 pub(super) const CHAIN_KNOB: f32 = 18.0;
@@ -257,42 +258,53 @@ pub(super) fn draw_rename_input(
     }
 }
 
-/// `+ chain` 行 (Parallel の chain 列の末尾)。
-pub(super) fn draw_add_chain_row(ui: &mut Ui<'_, AppData>, i: usize, parallel_id: u64, content: Rect, popup_open: bool) {
-    ui.button_at_sized(
-        ("inspector_add_chain", i),
-        "+ chain",
-        Rect { x: content.x + 8.0, y: content.y + 1.0, w: 80.0, h: content.h - 2.0 },
-        11.0,
-        move || {
-            Edit::mutate(move |app: &mut AppData| {
-                if !popup_open {
-                    app.handle_event(AppEvent::Device(DeviceEvent::AddParallelChain { parallel_id }));
-                }
-            })
-        },
-    );
+/// 小さい操作ボタン (`+ チェーン` / chain の中の `+ プラグイン`) の文字。
+const SMALL_OP_FONT: f32 = 11.0;
+
+/// 文字幅 + 16px の小さい操作ボタンの矩形 (左端 `x`、操作行の高さ)。
+fn small_op_rect(ui: &mut Ui<'_, AppData>, text: &str, x: f32, content: Rect) -> Rect {
+    let w = ui.measure_text(text, SMALL_OP_FONT) + 16.0;
+    Rect { x, y: content.y + 1.0, w, h: content.h - 2.0 }
 }
 
-/// `+ Plugin` (master では `+ FX`) 行 — その chain の末尾に picker を開く。
+/// `+ チェーン` 行 (Parallel の chain 列の末尾)。r.md #158 仕様 15: chain 行と同じ段 (chain 行の色見本の右、
+/// Parallel の括弧の帯は切らない) に置く — chain の中の `+ プラグイン` (device の名前の左端、chain の色帯の内側) と
+/// 段で見分ける。
+pub(super) fn draw_add_chain_row(ui: &mut Ui<'_, AppData>, i: usize, parallel_id: u64, content: Rect, popup_open: bool) {
+    let rect = small_op_rect(ui, vocab::ADD_CHAIN, content.x + BAR_W, content);
+    ui.button_at_sized(("inspector_add_chain", i), vocab::ADD_CHAIN, rect, SMALL_OP_FONT, move || {
+        Edit::mutate(move |app: &mut AppData| {
+            if !popup_open {
+                app.handle_event(AppEvent::Device(DeviceEvent::AddParallelChain { parallel_id }));
+            }
+        })
+    });
+}
+
+/// `+ プラグイン` (master では `+ エフェクト`) 行 — その chain の末尾に picker を開く。トラックの chain の末尾
+/// (`nested == false`) は全幅 (主)、Parallel の chain の中は device の名前の左端から小さく (従、仕様 15)。
 pub(super) fn draw_add_plugin_row(
     ui: &mut Ui<'_, AppData>,
     i: usize,
     chain: ChainRef,
     is_master: bool,
+    nested: bool,
     content: Rect,
     popup_open: bool,
 ) {
-    ui.button_at(
-        ("inspector_add_plugin", i),
-        if is_master { "+ FX" } else { "+ Plugin" },
-        Rect { x: content.x, y: content.y + 1.0, w: content.w, h: content.h - 2.0 },
-        move || {
-            Edit::mutate(move |app: &mut AppData| {
-                if !popup_open {
-                    app.handle_event(AppEvent::OpenPluginPicker { chain: Some(chain) });
-                }
-            })
-        },
-    );
+    let text = if is_master { vocab::ADD_EFFECT } else { vocab::ADD_PLUGIN };
+    let on_click = move || {
+        Edit::mutate(move |app: &mut AppData| {
+            if !popup_open {
+                app.handle_event(AppEvent::OpenPluginPicker { chain: Some(chain) });
+            }
+        })
+    };
+    if nested {
+        let rect = small_op_rect(ui, text, content.x + ROW_NAME_X, content);
+        ui.button_at_sized(("inspector_add_plugin", i), text, rect, SMALL_OP_FONT, on_click);
+    } else {
+        let rect = Rect { x: content.x, y: content.y + 1.0, w: content.w, h: content.h - 2.0 };
+        ui.button_at(("inspector_add_plugin", i), text, rect, on_click);
+    }
 }

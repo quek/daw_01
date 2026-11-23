@@ -3,13 +3,16 @@
 //! - その下は 1 本の縦スクロールに **帯** を積む (`band.rs`)。上から 選択 (クリップ / セル) → 列 →
 //!   入力 → Rack → 口パク → モジュレーション。見出しのクリックで開閉 (種類ごとに共通、ViewState に保存)
 //! - 右端の 5px で幅を変える (360〜640)。`I` / View メニューで丸ごと隠す (app_config に保存)
+//! - 帯の中の欄は「ラベル左・値右」(`form.rs`、寸法は `layout.rs`)。Rack の行の直下に開く Par / SC / 出力の
+//!   欄も、値の列は帯の欄と同じ x (`form::cols_nested`)。見出し・欄名の文言は `vocab.rs`
 
+/// r.md #158: plugin 行の `Out▾` で直下に開く出力 (パラアウト) のパネル。
+mod aux_out_panel;
 /// r.md #158: 帯 (見出し / 詳細 / 小見出し)。
 mod band;
 mod chain_list;
 /// chain list の chain 行 / 操作行と、 Parallel ヘッダ行と共有する disclosure / 改名欄。
 mod chain_row;
-mod chain_sections;
 /// r.md #158: 選択の帯 (クリップ / セル) と列の帯の中身 (音声 / 画像 / 歌声 / 読み上げ / 字幕 / ローンチ)。
 mod clip_band;
 mod device_panel;
@@ -25,7 +28,7 @@ mod mix_knob;
 mod mouth_map_section;
 /// r.md #129: 内蔵 device の Par パネル (格子の寸法 `layout` はテストが座標を求めるのに使う)。
 pub mod native_panel;
-/// r.md #129: chain list の内蔵 device の行と展開、 master の末尾 (Post-Fader / Limiter)。
+/// r.md #129: chain list の内蔵 device の行と展開、 master の末尾 (フェーダー後 / Limiter)。
 mod native_row;
 mod parallel_header;
 /// chain list の plugin 行と、 その直下の展開 (SC パネル / param パネル)。
@@ -322,12 +325,11 @@ fn draw_bands(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, mut y: f32, h
         target = format!("{target} {}", vocab::TARGET_DISABLED);
     }
     let head = BandHead { key: InspectorBand::Rack, title: vocab::BAND_RACK, target: &target, actions_w: 0.0 };
+    // 読み込み失敗と出力 (パラアウト) は各 plugin 行の中 (`plugin_row`、仕様 2: トリガの近く)。
     y = band::band(app, ui, area, y, &head, |ui, y| {
         let (y, row) = chain_list::draw_chain_list(app, ui, area, PAD, y);
         hover.row = row;
-        // ロード失敗 / Parallel Out はチェーンの直下 (段 3 で各行の中へ移す)。
-        let y = chain_sections::draw_failed_load_section(app, ui, area, PAD, y);
-        chain_sections::draw_parallel_out_section(app, ui, area, PAD, y)
+        y
     }) + BAND_GAP;
     // ---- 口パク (このトラックを口パク出力先にしている歌声トラックがあるとき) ----
     let cursor_only = app.inspector_track_band_target(false);

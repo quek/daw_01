@@ -1,6 +1,6 @@
 //! r.md #158: トラックインスペクタの寸法 (SSoT、`docs/plan_rmd_158_inspector.md` §2.1)。
 //!
-//! 帯 / タイトル / 余白の寸法はここだけに置く。テストも同じ定数を読む (手で写さない)。
+//! 帯 / タイトル / 余白 / 欄 / Rack の行の寸法はここだけに置く。テストも同じ定数を読む (手で写さない)。
 
 /// 左右の余白。
 pub const PAD: f32 = 12.0;
@@ -56,3 +56,48 @@ pub const LABEL_FONT: f32 = 11.0;
 /// 値の下に添える補足 (text_dim) の文字と行の送り。
 pub const HINT_FONT: f32 = 10.0;
 pub const HINT_PITCH: f32 = 16.0;
+
+// ---- Rack (chain list) の行と、行の直下に開く Par (r.md #158 仕様 9) ----
+
+/// Rack の行 (plugin / 内蔵 / Parallel 開始 / chain) の見出しの高さ。行の背景と hover はこの高さだけ
+/// (展開した Par / SC にはかけない)。
+pub const RACK_ROW_H: f32 = 26.0;
+/// 行の名前の左端 (行の中身の左端から)。行の直下に開く Par / SC / 出力の中身もここから始める。
+pub const ROW_NAME_X: f32 = 8.0;
+/// 行の名前の上端 (行の上端から)。
+pub const ROW_NAME_TOP: f32 = 8.0;
+/// 行の名前の文字。
+pub const ROW_NAME_FONT: f32 = 11.0;
+/// 行の直下に開く Par (plugin / 映像 FX / VOICEVOX / Transform) の中身の上下の余白。
+pub const PAR_PAD: f32 = 6.0;
+/// 読み込みに失敗した plugin の行の直下に出す理由の 1 行の高さ。
+pub const FAIL_REASON_H: f32 = 18.0;
+/// バイパス中の行の「オフ」の札 (`inset_bg` の窪み + 10px `text_dim`)。
+pub const OFF_TAG_FONT: f32 = 10.0;
+pub const OFF_TAG_H: f32 = 16.0;
+pub const OFF_TAG_PAD_X: f32 = 8.0;
+
+/// 行の直下に開く展開 (Par / SC / 出力) の行幅いっぱいの矩形 `full` から、中身を描く矩形を返す。左端は
+/// 行の名前と同じ ([`ROW_NAME_X`])、右端は行の右端。余白の press は `full` で名乗る (行が動かない)。
+#[must_use]
+pub fn expansion_inset(full: daw_ui_renderer::Rect) -> daw_ui_renderer::Rect {
+    daw_ui_renderer::Rect { x: full.x + ROW_NAME_X, w: (full.w - ROW_NAME_X).max(1.0), ..full }
+}
+
+/// 行の中身 `row_content` (行の上端 = 見出しの上端) の直下に開く Par の矩形 (他の展開が開いていないとき)。
+/// 描画とテスト (座標を求める側) が同じ関数を通す。
+#[must_use]
+pub fn par_rect(row_content: daw_ui_renderer::Rect, panel_h: f32) -> daw_ui_renderer::Rect {
+    expansion_inset(daw_ui_renderer::Rect { y: row_content.y + RACK_ROW_H, h: panel_h, ..row_content })
+}
+
+/// 欄 (ラベル左・値右) を `rows` 行積んだ展開 (SC / 出力のパネル) の高さ (上下の [`PAR_PAD`] 込み)。
+#[must_use]
+pub fn form_block_h(rows: usize) -> f32 {
+    if rows == 0 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let n = rows as f32;
+    PAR_PAD * 2.0 + n * FORM_ROW_PITCH - (FORM_ROW_PITCH - FORM_ROW_H)
+}

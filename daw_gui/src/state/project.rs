@@ -672,6 +672,8 @@ pub struct ProjectEphemeral {
     pub last_arrange_rows: Vec<crate::widgets::arrangement::ArrangementRow>,
     /// r.md #110: `SC` パネルを展開中の device (plugin 行の直下に port ごとの配線を出す)。
     pub open_sidechain_panel: Option<u64>,
+    /// r.md #158: `Out▾` で出力 (パラアウト) のパネルを展開中の device (plugin 行の直下に展開と port ごとの宛先)。
+    pub open_aux_out_panel: Option<u64>,
     /// r.md #110: 名前を編集中の chain / Parallel (id) とその編集バッファ。
     pub renaming_chain: Option<(u64, String)>,
     /// rename 中の track の **安定 ID** (positional index ではない)。 index で持つと
@@ -1054,6 +1056,7 @@ impl ProjectState {
                 last_arrange_lanes_size: (0.0, 0.0),
                 last_arrange_rows: Vec::new(),
                 open_sidechain_panel: None,
+                open_aux_out_panel: None,
                 renaming_chain: None,
                 track_rename_id: None,
                 track_rename_text: String::new(),

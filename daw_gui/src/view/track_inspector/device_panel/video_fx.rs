@@ -6,25 +6,19 @@ use super::PanelCtx;
 use crate::event_device::DeviceEvent;
 
 pub(super) fn draw_video_fx_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
-    let p = &app.theme.core;
     let mut y = ctx.y;
     // 内蔵映像 FX のパラメータ調整パネル（チェーン行の "Par" ボタンで開閉）。
     // 各 param を scrubable_number で実レンジ表示 + per-control 変調（Ranged domain で kick→効果）。
     // 値の SSoT は PluginParam lane の default_value（`SetVideoFxParam` が格納）。
+    // 効果の名前の見出しは描かない (行の名前と同じ、r.md #158 仕様 9)。
     if let Some(view) = app.inspector_video_fx_params(ctx.device_id) {
         let device_id = view.device_id;
-        ui.label_at(("inspector_vfx_label", device_id), view.def.name, ctx.x, y, 12.0, p.text);
-        y += 18.0;
-        let row_w = ctx.w;
-        let input_h = 22.0;
-        let label_w = 88.0;
-        let input_x = ctx.x + label_w;
-        let input_w = (row_w - label_w).max(40.0);
+        let c = ctx.cols();
         let track_id = view.track_id;
         // 変調の持ち主 (device を持つトラック) はパネルにつき 1 回だけ解決し、全行で使い回す。
         let owner = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), track_id);
         // 見えている行だけ描き、高さは全行ぶん消費する (plugin の Par と同じ、`Ui::visible_rows`)。
-        let pitch = input_h + 4.0;
+        let pitch = layout::FORM_ROW_PITCH;
         let rows_top = y;
         let visible = ui.visible_rows(rows_top, pitch, view.def.params.len());
         #[allow(clippy::cast_precision_loss)]
@@ -38,18 +32,7 @@ pub(super) fn draw_video_fx_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
             let default_real = f64::from(param.kind.norm_to_real(param.kind.default_norm()));
             #[allow(clippy::cast_possible_truncation)]
             let sens = (((max - min) / 220.0).max(0.0001)) as f32;
-            ui.label_at_clipped(
-                (device_id, i, "vfx_label"),
-                param.name,
-                Rect {
-                    x: ctx.x,
-                    y: y + 5.0,
-                    w: (label_w - 4.0).max(1.0),
-                    h: 11.0 * 1.2,
-                },
-                11.0,
-                p.text,
-            );
+            form::label(ui, app, (device_id, i, "vfx_label"), param.name, &c, y);
             let style = ScrubableNumberStyle {
                 sensitivity: sens,
                 range: Some((min, max)),
@@ -66,7 +49,7 @@ pub(super) fn draw_video_fx_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
             let param_id = param.id;
             let resp = ui.scrubable_number_at(
                 (device_id, i, "vfx_scrub"),
-                Rect { x: input_x, y, w: input_w, h: input_h },
+                c.value(y),
                 value,
                 default_real,
                 ScrubableNumberFormat::Decimal(3),
@@ -94,7 +77,7 @@ pub(super) fn draw_video_fx_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx:
                 resp.mod_dragging,
             );
         }
-        y = rows_end + 8.0;
+        y = rows_end;
     }
     y
 }

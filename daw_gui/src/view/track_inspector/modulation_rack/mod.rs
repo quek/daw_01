@@ -190,8 +190,9 @@ pub(super) fn draw_modulation_rack(
         let sid = src.id;
         let expanded = app.cur.peph.expanded_mod_sources.contains(&sid);
         let block_top = y;
-        // バイパス中は名前 / メーターを減光 (プラグイン行の bypass と同じ見せ方)。
-        let ink = if src.enabled { p.text } else { p.text_faint };
+        // バイパス中は名前を text_dim にしてメーターの位置に「オフ」の札 (Rack の行の bypass と同じ見せ方、
+        // r.md #158 仕様 10: disabled の text_faint で薄くすると「使えない部品」に見える)。
+        let ink = if src.enabled { p.text } else { p.text_dim };
 
         // --- header row: [▶/▼][name/track] [meter] [arm] [×] ---
         //
@@ -201,9 +202,14 @@ pub(super) fn draw_modulation_rack(
         let rm_rect = Rect { x: area.x + area.w - pad - 20.0, y, w: 20.0, h: 20.0 };
         let meter_w = 50.0;
         let meter_x = rm_rect.x - 4.0 - meter_w;
-        let filled = ((src.scalar.clamp(0.0, 1.0) * 6.0).round() as usize).min(6);
-        let meter: String = "\u{25ae}".repeat(filled) + &"\u{25af}".repeat(6 - filled);
-        ui.label_at(("inspector_mod_src_meter", sid), &meter, meter_x, y + 4.0, 11.0, ink);
+        if src.enabled {
+            let filled = ((src.scalar.clamp(0.0, 1.0) * 6.0).round() as usize).min(6);
+            let meter: String = "\u{25ae}".repeat(filled) + &"\u{25af}".repeat(6 - filled);
+            ui.label_at(("inspector_mod_src_meter", sid), &meter, meter_x, y + 4.0, 11.0, ink);
+        } else {
+            let tag_x = meter_x + (meter_w - super::chain_list::off_tag_w(ui)) * 0.5;
+            super::chain_list::draw_off_tag(app, ui, ("mod_src", sid), tag_x, y, ROW_H);
+        }
         let arm_w = 24.0;
         let arm_x = meter_x - 4.0 - arm_w;
         let node = plan.nodes.iter().find(|n| n.source_id == sid);
@@ -307,7 +313,7 @@ pub(super) fn draw_modulation_rack(
             if hit(Rect { x: lx, y, w: row_w, h: ROW_PITCH }) {
                 hover = Some(ModRackHover::Routing(row.id));
             }
-            let g = RoutingRowGeom { area, pad, lx, row_w, y };
+            let g = RoutingRowGeom { area, pad, lx, y };
             any_mod_drag |= draw_routing_row(ui, app, g, &row, sid);
             y += ROW_PITCH;
         }
@@ -408,12 +414,11 @@ fn draw_mod_badges(
     used
 }
 
-/// routing 1 行の配置 (呼び側の y カーソルと幅をそのまま渡す)。
+/// routing 1 行の配置 (呼び側の y カーソルをそのまま渡す。右端は `area` と `pad` から)。
 struct RoutingRowGeom {
     area: Rect,
     pad: f32,
     lx: f32,
-    row_w: f32,
     y: f32,
 }
 
@@ -429,29 +434,31 @@ fn draw_routing_row(
     row: &crate::app::ModRoutingRow,
     sid: u32,
 ) -> bool {
-    let RoutingRowGeom { area, pad, lx, row_w, y: row_y } = g;
+    let RoutingRowGeom { area, pad, lx, y: row_y } = g;
     let p = &app.theme.core;
     // widget id は **1 本の変調の安定 id** (`ModRouting::id`)。 旧実装は全ソースを
     // 通したグローバル連番 `route_i` で、 routing を 1 本消すとそれ以降の行の depth
     // ドラッグ / テキストバッファが 1 つ隣へずれた (不変条件 1)。
     let rid = row.id;
-    ui.label_at_clipped(
-        ("inspector_mod_rt_lbl", rid),
-        &format!("\u{2192} {}", row.label),
-        Rect {
-            x: lx + MOD_NAME_INSET,
-            y: row_y + 4.0,
-            // 右側の depth / 極性 / × と重ねない (幅は下の x 計算と対)。
-            w: (row_w - MOD_NAME_INSET - 4.0 - 46.0 - 4.0 - 22.0 - 4.0 - 20.0).max(1.0),
-            h: 11.0 * 1.2,
-        },
-        11.0,
-        // r.md #115: 効いていない (自分かソースがバイパス中) 行は減光。
-        if row.effective { p.text } else { p.text_faint },
-    );
     let rm_x = area.x + area.w - pad - 20.0;
     let pol_x = rm_x - 4.0 - 22.0;
     let depth_x = pol_x - 4.0 - 46.0;
+    // この 1 本がバイパス中なら depth 欄の左に「オフ」の札 (Rack の行と同じ見せ方、r.md #158 仕様 10)。
+    let mut label_right = depth_x - 4.0;
+    if !row.enabled {
+        label_right -= super::chain_list::off_tag_w(ui) + 4.0;
+        super::chain_list::draw_off_tag(app, ui, ("mod_rt", rid), label_right + 4.0, row_y, ROW_H);
+    }
+    let label_x = lx + MOD_NAME_INSET;
+    ui.label_at_clipped(
+        ("inspector_mod_rt_lbl", rid),
+        &format!("\u{2192} {}", row.label),
+        // 右側の札 / depth / 極性 / × と重ねない。
+        Rect { x: label_x, y: row_y + 4.0, w: (label_right - label_x).max(1.0), h: 11.0 * 1.2 },
+        11.0,
+        // r.md #115: 効いていない (自分かソースがバイパス中) 行は text_dim (disabled の text_faint にはしない)。
+        if row.effective { p.text } else { p.text_dim },
+    );
     let (t, s) = (row.track_id, sid);
     let tgt = row.target.clone();
     // r.md #89 Q9: **深さ欄も普通のツマミ**として扱う (◉ 待受中にドラッグすれば

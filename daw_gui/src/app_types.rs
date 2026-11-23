@@ -726,17 +726,14 @@ pub struct SidechainSourceChoice {
     pub source: Option<common::model::TapSource>,
 }
 
-/// パラアウト (docs/plan_paraout.md): one inspector row group per chain device
-/// that declares `is_main=false` audio outputs (`aux_output_count > 0`). The
-/// inspector shows an "explode" button (auto-create child tracks) plus a
-/// per-port destination dropdown. `routes[port]` = the current
-/// `PluginInstance::aux_outputs[port]` destination track id (`None` = unrouted
-/// = silent, the industry-standard default).
+/// パラアウト (docs/plan_paraout.md): `is_main=false` の音声出力を持つ (`aux_output_count > 0`) chain の
+/// device 1 つの配線。Rack の plugin 行の `Out▾` で開く出力のパネル (r.md #158) が「展開」ボタン
+/// (子トラックを自動で作る) と port ごとの宛先 dropdown を出す。`routes[port]` = 今の
+/// `PluginInstance::aux_outputs[port]` の宛先トラック id (`None` = 未配線 = 無音、業界標準の既定)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParallelOutputEntry {
     pub track_id: u32,
     pub device_id: u64,
-    pub plugin_name: String,
     pub aux_output_count: u8,
     pub routes: Vec<Option<u32>>,
     /// True once at least one aux output is routed (so the inspector shows the

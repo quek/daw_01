@@ -82,6 +82,46 @@ pub const FIELD_MONITOR: &str = "モニター";
 
 /// VOICEVOX の Par の欄「口パク先」(口形状の画像を焼き込むトラック)。
 pub const FIELD_LIPSYNC_TARGET: &str = "口パク先";
+/// Transform (立ち絵グループ) の Par の欄 (X / Y はそのまま、回転 / 不透明度は画像クリップと同じ語)。
+pub const FIELD_X: &str = "X";
+pub const FIELD_Y: &str = "Y";
+pub const FIELD_SCALE_X: &str = "拡大 X";
+pub const FIELD_SCALE_Y: &str = "拡大 Y";
+pub const FIELD_ANCHOR_X: &str = "基準点 X";
+pub const FIELD_ANCHOR_Y: &str = "基準点 Y";
+
+// ---- Rack の行 (r.md #158 仕様 10 / 11 / 15) ----
+
+/// chain の末尾に足す (トラック / chain)。マスターは「エフェクト」(楽器を挿せない)。
+pub const ADD_PLUGIN: &str = "+ プラグイン";
+pub const ADD_EFFECT: &str = "+ エフェクト";
+/// Parallel に chain を足す。
+pub const ADD_CHAIN: &str = "+ チェーン";
+/// マスターの Rack の末尾の区切り (この下の Limiter はフェーダーの後ろ)。
+pub const POST_FADER: &str = "フェーダー後";
+/// バイパス中の行の札。
+pub const OFF_TAG: &str = "オフ";
+/// 読み込みに失敗した plugin の行: 名前の頭と、再読込のボタン。
+pub const NOT_LOADED: &str = "[未ロード]";
+pub const RELOAD: &str = "再読込";
+/// 出力 (パラアウト) のパネル: 子トラックを作って出力を割り当てるボタンと、その欄名。
+pub const EXPLODE_OUTPUTS: &str = "展開";
+pub const FIELD_CHILD_TRACKS: &str = "子トラック";
+/// Parallel の Selector の欄 (アクティブな chain / 切り替えのクロスフェード)。
+pub const SPLIT_ACTIVE: &str = "アクティブ";
+pub const SPLIT_FADE: &str = "フェード";
+
+/// SC パネルの 1 行の欄名 (plugin の aux 入力 port、1 始まり)。
+#[must_use]
+pub fn sc_port(n: u8) -> String {
+    format!("入力 {n}")
+}
+
+/// 出力 (パラアウト) のパネルの 1 行の欄名 (plugin の aux 出力 port、1 始まり)。
+#[must_use]
+pub fn aux_out_port(n: usize) -> String {
+    format!("出力 {n}")
+}
 
 /// ラベル列 (`layout::FORM_LABEL_W`) に入る欄名の全部。テストが全部を測り、ラベル列に収まることを確かめる。
 pub const FORM_LABELS: &[&str] = &[
@@ -121,6 +161,11 @@ pub const FORM_LABELS: &[&str] = &[
     FIELD_TALK_PITCH,
     FIELD_TALK_INTONATION,
     FIELD_TALK_VOLUME,
+    FIELD_SCALE_X,
+    FIELD_SCALE_Y,
+    FIELD_ANCHOR_X,
+    FIELD_ANCHOR_Y,
+    FIELD_CHILD_TRACKS,
 ];
 
 // ---- ローンチ / 読み上げのスケール ----

@@ -33,23 +33,41 @@ use super::*;
 pub(super) struct PanelCtx {
     /// Par を開いた device。
     pub device_id: u64,
-    /// 行の中身の左端と幅。
+    /// Par の中身の左端 (行の名前と同じ) と幅。
     pub x: f32,
     pub w: f32,
     /// このセクションを描き始める y。
     pub y: f32,
+    /// 帯の欄の左端 (値の欄の x を帯の欄と揃える、`form::cols_nested`)。
+    pub form_left: f32,
+}
+
+impl PanelCtx {
+    /// この Par の欄の列 (ラベルは Par の左端から、値の欄は帯の欄と同じ x)。
+    pub fn cols(&self) -> form::FormCols {
+        form::cols_nested(self.x, self.w, self.form_left)
+    }
 }
 
 /// Par を開いた device の param パネルを描き、消費後の `y` を返す。
 ///
 /// **この順序が画面の上下順**。 セクションはそれぞれ自分の gate で「出す / 出さない」を
-/// 決めるので、 出ないセクションは `y` を素通しする。
+/// 決めるので、 出ないセクションは `y` を素通しする。各セクションは欄 (ラベル左・値右、`form`) を
+/// [`layout::FORM_ROW_PITCH`] で積むだけで、見出しは描かない (行の名前と同じ見出しを繰り返さない、
+/// r.md #158 仕様 9)。上下の余白 ([`layout::PAR_PAD`]) はここが持つ。中身が無ければ高さ 0。
 pub(super) fn draw_device_panel(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
-    let mut ctx = ctx;
+    let top = ctx.y;
+    let mut ctx = PanelCtx { y: top + layout::PAR_PAD, ..ctx };
+    let start = ctx.y;
     ctx.y = group_transform::draw_group_transform(app, ui, ctx);
     ctx.y = video_fx::draw_video_fx_params(app, ui, ctx);
     ctx.y = plugin_params::draw_plugin_params(app, ui, ctx);
-    lipsync::draw_lipsync_target(app, ui, ctx)
+    let end = lipsync::draw_lipsync_target(app, ui, ctx);
+    if end <= start {
+        return top;
+    }
+    // 最後の行の送りの余り (行と行の間) を下の余白に含める。
+    end - (layout::FORM_ROW_PITCH - layout::FORM_ROW_H) + layout::PAR_PAD
 }
 
 /// Par を開いた device が `plugin_id` の plugin か (VOICEVOX の専用欄の gate)。

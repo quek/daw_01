@@ -2,7 +2,7 @@
 //!
 //! Live の Device View は「Chain List (縦) | 選択 chain の device (横)」 で、 Parallel の中の
 //! Parallel は括弧の中の括弧。 幅の限られたインスペクタ (360〜640px) では「隣」を「下」にする: Parallel は
-//! 開始行 `「` / chain 行 × N / `+ chain` / 選択 chain の device (再帰) / `+ Plugin` /
+//! 開始行 `「` / chain 行 × N (展開中の chain はその直下に device (再帰) / `+ プラグイン`) / `+ チェーン` /
 //! 終了行 `L`。 括弧は chain の色帯と同じ x / 幅の Parallel 色の帯で、 開始行から終了行まで 1 本に
 //! 繋がる (chain の帯はその上に乗る)。 非選択 chain は 1 行だけなので縦にも横にも爆発しない。 展開中 chain の
 //! device 区間は左端の細い色帯 (chain 色) で示し、 インデントは帯の幅 (4px / 深さ) だけ。
@@ -11,7 +11,10 @@
 //! drag&drop は daw-ui の [`Ui::drag_list`] (行の種類を知らない generic widget) に、
 //! 「掴める行 / 運ぶブロック長 / 落とせるスロット」 を渡して結果を `RelocateDevices` へ
 //! 写像する。 Sidechain は旧 独立セクションを撤去し、 aux 入力 port を持つ plugin 行の
-//! `SC` で行直下に展開する (source は他 track + 同 track の Parallel 内 chain)。
+//! `SC` で行直下に展開する (source は他 track + 同 track の Parallel 内 chain)。 r.md #158: aux 出力
+//! (パラアウト) は `Out▾`、 読み込み失敗は行の `[再読込]` と直下の理由 — どれも行の中。 行の背景と hover は
+//! 見出し (26px) だけで、 直下に開く Par / SC / 出力は行の名前の左端から (`layout::expansion_inset`)。
+//! バイパス中は名前を text_dim + 「オフ」の札 ([`draw_off_tag`])。
 //!
 //! 行の種類ごとの中身は別ファイル (サイズ budget、 不変条件 9): plugin 行と展開は
 //! `plugin_row.rs`、 内蔵 device の行と展開と master の末尾 (Limiter) は `native_row.rs`、
@@ -40,15 +43,16 @@ use crate::widgets::select_modifier::SelectModifier;
 use common::model::{ChainRef, MASTER_TRACK_ID, RackPanelKey};
 
 use super::chain_row::{draw_add_chain_row, draw_add_plugin_row, draw_chain_row};
+use super::layout::{FAIL_REASON_H, OFF_TAG_FONT, OFF_TAG_H, OFF_TAG_PAD_X, ROW_NAME_FONT, ROW_NAME_TOP};
 use super::native_panel::layout;
 use super::native_row::{draw_master_tail, draw_native_expansions, draw_native_row};
-use super::plugin_row::{SC_PAD, SC_PORT_H, draw_plugin_expansions, draw_plugin_row};
+use super::plugin_row::{draw_plugin_expansions, draw_plugin_row, sc_panel_height};
 use super::row_menu::{carried_device_ids, draw_context_menus};
-use super::toggle_audio_style;
+use super::{aux_out_panel, toggle_audio_style, vocab};
 
-/// 行高 (plugin / Parallel 開始 / chain 行)。
-pub(super) const ROW_H: f32 = 26.0;
-/// 操作行 (`+ chain` / `+ Plugin`) と終了行の高さ。
+/// 行高 (plugin / Parallel 開始 / chain 行)。寸法の SSoT は `layout` (テストも読む)。
+pub(super) use super::layout::RACK_ROW_H as ROW_H;
+/// 操作行 (`+ チェーン` / `+ プラグイン`) と終了行の高さ。
 const OP_ROW_H: f32 = 22.0;
 const END_ROW_H: f32 = 10.0;
 pub(super) const ROW_GAP: f32 = 3.0;
@@ -99,17 +103,38 @@ pub(super) fn draw_chain_list(
         })
     });
     let sc_ports = sc_open.map(|id| app.sidechain_ports(id)).unwrap_or_default();
-    let sc_panel_h = if sc_ports.is_empty() {
-        0.0
-    } else {
-        sc_ports.len() as f32 * SC_PORT_H + SC_PAD
-    };
-
-    let (list_rows, slots, slot_targets) = build_list_rows(app, &rows, sc_open, sc_panel_h);
-    let content_h: f32 = list_rows.iter().map(|r| r.height + ROW_GAP).sum::<f32>() + 4.0;
+    let sc_panel_h = sc_panel_height(sc_ports.len());
+    // 展開中の出力 (パラアウト) パネル (表示中の chain に居る plugin だけ。行の `Out▾` で開く)。
+    let aux_entry = app.cur.peph.open_aux_out_panel.and_then(|id| {
+        rows.iter()
+            .any(|r| matches!(&r.kind, ChainRowKind::Plugin(e) if e.device_id == id))
+            .then(|| app.aux_out_entry(id))
+            .flatten()
+    });
+    let aux_panel_h = aux_entry.as_ref().map_or(0.0, aux_out_panel::panel_height);
 
     // r.md #131: 無効なトラックのチェーンは host に居ない (窓を開けない)。見出しの「(無効中)」は Rack の帯の対象。
     let disabled = cursor_tid.is_some_and(|tid| !app.cur.song_doc.song().track_effectively_enabled(tid));
+    let scope = app.live_param_scope();
+    let song = app.cur.song_doc.song();
+    let ctx = RowCtx {
+        rows: &rows,
+        popup_open,
+        cursor_tid,
+        sc_open,
+        sc_ports: &sc_ports,
+        sc_panel_h,
+        aux_entry: aux_entry.as_ref(),
+        aux_panel_h,
+        form_left: area.x + pad,
+        keys_style: toggle_audio_style(&app.theme),
+        scope: &scope,
+        owner: cursor_tid.and_then(|tid| ParamOwner::resolve(song, tid)),
+        disabled,
+    };
+
+    let (list_rows, slots, slot_targets) = build_list_rows(app, &ctx);
+    let content_h: f32 = list_rows.iter().map(|r| r.height + ROW_GAP).sum::<f32>() + 4.0;
     let list_rect = Rect { x: area.x + pad, y, w: area.w - pad * 2.0, h: content_h };
     let style = DragListStyle {
         row_gap: ROW_GAP,
@@ -120,7 +145,6 @@ pub(super) fn draw_chain_list(
     // 落とせるか: handler と同じ規則 (`device_guard` → `Song::can_relocate`)。 運ぶ id 列は drag の
     // 間ずっと同じなので 1 度だけ作る (`valid_drop` は slot ごとに毎フレーム呼ばれる)。 外部 drag
     // (別トラックから) は札の id 列と、 押していた最後のフレームの Ctrl。
-    let song = app.cur.song_doc.song();
     let internal_ctrl = ui.pointer().modifiers.ctrl;
     let external = ui
         .drag_payload::<DeviceDragPayload>(crate::app_types::DEVICE_DRAG_KIND)
@@ -145,19 +169,6 @@ pub(super) fn draw_chain_list(
         })
     };
 
-    let scope = app.live_param_scope();
-    let ctx = RowCtx {
-        rows: &rows,
-        popup_open,
-        cursor_tid,
-        sc_open,
-        sc_ports: &sc_ports,
-        sc_panel_h,
-        keys_style: toggle_audio_style(&app.theme),
-        scope: &scope,
-        owner: cursor_tid.and_then(|tid| ParamOwner::resolve(song, tid)),
-        disabled,
-    };
     let resp = ui.drag_list(
         "inspector_chain",
         list_rect,
@@ -171,7 +182,7 @@ pub(super) fn draw_chain_list(
         },
     );
 
-    // master の末尾 (drag_list の外): 「Post-Fader」の区切り + 固定の Limiter 行。
+    // master の末尾 (drag_list の外): 「フェーダー後」の区切り + 固定の Limiter 行。
     let (end_y, tail_hover) = if cursor_tid == Some(MASTER_TRACK_ID) {
         draw_master_tail(app, ui, &ctx, list_rect.x, list_rect.w, list_rect.y + list_rect.h)
     } else {
@@ -258,12 +269,8 @@ pub(super) fn panel_height(app: &AppData, device_id: u64) -> f32 {
 
 /// drag_list の入力: 行ごとの高さ (展開込み) / 掴めるか / ブロック長と、落とせるスロット
 /// (`slots[i]` の落とし先が `slot_targets[i] = (chain, index)`)。
-fn build_list_rows(
-    app: &AppData,
-    rows: &[ChainRow],
-    sc_open: Option<u64>,
-    sc_panel_h: f32,
-) -> (Vec<DragListRow>, Vec<DragListSlot>, Vec<(ChainRef, u32)>) {
+fn build_list_rows(app: &AppData, ctx: &RowCtx<'_>) -> (Vec<DragListRow>, Vec<DragListSlot>, Vec<(ChainRef, u32)>) {
+    let rows = ctx.rows;
     let mut list_rows: Vec<DragListRow> = Vec::with_capacity(rows.len());
     let mut slots: Vec<DragListSlot> = Vec::new();
     let mut slot_targets: Vec<(ChainRef, u32)> = Vec::new();
@@ -273,13 +280,20 @@ fn build_list_rows(
         let mut block_len = 1;
         let mut slot: Option<(ChainRef, u32)> = None;
         match &r.kind {
+            // 展開は上から 読み込み失敗の理由 → SC → 出力 → Par (`plugin_row::draw_plugin_expansions` と同じ順)。
             ChainRowKind::Plugin(e) => {
                 draggable = true;
+                if e.load_error.is_some() {
+                    h += FAIL_REASON_H;
+                }
+                if ctx.sc_open == Some(e.device_id) {
+                    h += ctx.sc_panel_h;
+                }
+                if ctx.aux_entry.is_some_and(|a| a.device_id == e.device_id) {
+                    h += ctx.aux_panel_h;
+                }
                 if app.rack_panel_open(RackPanelKey::Device(e.device_id)) {
                     h += panel_height(app, e.device_id);
-                }
-                if sc_open == Some(e.device_id) {
-                    h += sc_panel_h;
                 }
                 slot = Some((r.chain, r.index));
             }
@@ -289,8 +303,8 @@ fn build_list_rows(
                 if app.rack_panel_open(RackPanelKey::Device(n.device_id)) {
                     h += layout::panel_height(n.kind);
                 }
-                if sc_open == Some(n.device_id) {
-                    h += sc_panel_h;
+                if ctx.sc_open == Some(n.device_id) {
+                    h += ctx.sc_panel_h;
                 }
                 slot = Some((r.chain, r.index));
             }
@@ -387,7 +401,8 @@ fn draw_parallel_band(
     ui.panel(("inspector_parallel_band", i), Rect { x: content.x, y: top, w, h: bottom - top }, col, 0.0);
 }
 
-/// 行の背景 (`key` は widget id の鍵: list の行は行 index、 master の Limiter 行は固定の鍵)。
+/// 行の背景 (`key` は widget id の鍵: list の行は行 index、 master の Limiter 行は固定の鍵)。`rect` は
+/// 見出しの高さだけ (r.md #158 仕様 9: 行の背景と hover を、展開した Par / SC にかけない)。
 pub(super) fn draw_row_bg(
     ui: &mut Ui<'_, AppData>,
     key: impl std::hash::Hash,
@@ -413,6 +428,60 @@ pub(super) fn rgb_or(color: Option<[f32; 3]>, fallback: Color) -> Color {
     color.map_or(fallback, |rgb| Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 })
 }
 
+/// バイパス中の行の「オフ」の札の幅。
+pub(super) fn off_tag_w(ui: &mut Ui<'_, AppData>) -> f32 {
+    ui.measure_text(vocab::OFF_TAG, OFF_TAG_FONT) + OFF_TAG_PAD_X * 2.0
+}
+
+/// バイパス中の行の「オフ」の札 (r.md #158 仕様 10)。`inset_bg` の窪みに 10px `text_dim` を中央寄せ —
+/// 名前や小表示を disabled の色 (`text_faint`) で薄く描くと「使えない部品」に見えるので、状態は札で言う。
+/// `x` は札の左端、`row_y` / `row_h` は行の上端と高さ (札は行の高さの中央)。Rack の行と、モジュレーションの
+/// 変調器 / 変調先の行が使う。
+pub(super) fn draw_off_tag(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    key: impl std::hash::Hash + Copy,
+    x: f32,
+    row_y: f32,
+    row_h: f32,
+) {
+    let p = &app.theme.core;
+    let w = off_tag_w(ui);
+    let rect = Rect { x, y: row_y + (row_h - OFF_TAG_H) * 0.5, w, h: OFF_TAG_H };
+    ui.panel(("inspector_off_tag", key), rect, p.inset_bg, 3.0);
+    let line_h = OFF_TAG_FONT * 1.2;
+    ui.label_at(("inspector_off_tag_text", key), vocab::OFF_TAG, x + OFF_TAG_PAD_X, rect.y + (OFF_TAG_H - line_h) * 0.5, OFF_TAG_FONT, p.text_dim);
+}
+
+/// 行の名前 (行の左端から `ROW_NAME_X`、幅 `w` で切る)。`off` なら名前を `text_dim` にして直後に「オフ」の札
+/// (plugin / Parallel の行。内蔵 device の行は札を小表示の位置に出す)。`color` はオフでないときの色。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_row_name(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    key: impl std::hash::Hash + Copy,
+    name: &str,
+    x: f32,
+    row_y: f32,
+    w: f32,
+    color: Color,
+    off: bool,
+) {
+    let tag_w = if off { off_tag_w(ui) + 6.0 } else { 0.0 };
+    let name_w = ui.measure_text(name, ROW_NAME_FONT).min((w - tag_w).max(1.0));
+    let color = if off { app.theme.core.text_dim } else { color };
+    ui.label_at_clipped(
+        ("inspector_row_name", key),
+        name,
+        Rect { x, y: row_y + ROW_NAME_TOP, w: name_w + 1.0, h: ROW_NAME_FONT * 1.2 },
+        ROW_NAME_FONT,
+        color,
+    );
+    if off {
+        draw_off_tag(app, ui, key, x + name_w + 6.0, row_y, ROW_H);
+    }
+}
+
 /// 1 行ぶんの描画に要る、buffer 全体で共通の文脈 (drag_list の row closure から呼ぶ)。
 pub(super) struct RowCtx<'a> {
     pub(super) rows: &'a [ChainRow],
@@ -421,6 +490,11 @@ pub(super) struct RowCtx<'a> {
     pub(super) sc_open: Option<u64>,
     pub(super) sc_ports: &'a [crate::app_types::SidechainPort],
     pub(super) sc_panel_h: f32,
+    /// 出力 (パラアウト) のパネルを開いている plugin の配線 (表示中の chain の行に居るときだけ)。
+    pub(super) aux_entry: Option<&'a crate::app_types::ParallelOutputEntry>,
+    pub(super) aux_panel_h: f32,
+    /// 帯の欄の左端 (行の直下に開く欄の値の x を帯の欄と揃える、`form::cols_nested`)。
+    pub(super) form_left: f32,
     pub(super) keys_style: ToggleButtonStyle,
     /// フレームで 1 回だけ組む live 値の文脈 (内蔵の小表示 / Par のつまみ)。
     pub(super) scope: &'a LiveParamScope,
@@ -441,7 +515,7 @@ fn draw_row(
     dragging: bool,
 ) {
     let p = &app.theme.core;
-    let RowCtx { rows, popup_open, cursor_tid, keys_style, .. } = ctx;
+    let RowCtx { rows, popup_open, cursor_tid, .. } = ctx;
     let (popup_open, cursor_tid) = (*popup_open, *cursor_tid);
     let r = &rows[i];
     draw_bars(ui, r, row_rect, p);
@@ -451,13 +525,16 @@ fn draw_row(
         w: (row_rect.w - indent_of(r)).max(1.0),
         h: row_rect.h,
     };
-    // 背景 → Parallel の帯 → 中身、 の順 (chain 行の色見本は中身側で帯の上に描く)。
+    // 背景 → Parallel の帯 → 中身、 の順 (chain 行の色見本は中身側で帯の上に描く)。背景と hover の見た目は
+    // 見出しの高さだけ (展開した Par / SC / 出力にはかけない)。Q の宛先 (`hovered`) は Par 込みの行全体のまま。
     let selected = r.select_id().is_some_and(|id| app.cur.selection.selected_device_ids.contains(&id));
+    let head = Rect { h: base_row_h(&r.kind), ..content };
+    let head_hovered = hovered && ui.hovers(head);
     match &r.kind {
         ChainRowKind::Plugin(_) | ChainRowKind::Native(_) | ChainRowKind::ParallelBegin { .. } => {
-            draw_row_bg(ui, i, content, selected, hovered, dragging, p);
+            draw_row_bg(ui, i, head, selected, head_hovered, dragging, p);
         }
-        ChainRowKind::Chain { .. } => draw_row_bg(ui, i, content, selected, hovered, false, p),
+        ChainRowKind::Chain { .. } => draw_row_bg(ui, i, head, selected, head_hovered, false, p),
         _ => {}
     }
     draw_parallel_band(ui, i, r, content, popup_open, p);
@@ -467,8 +544,8 @@ fn draw_row(
     }
     match &r.kind {
         ChainRowKind::Plugin(e) => {
-            draw_plugin_row(app, ui, i, e, content, popup_open, keys_style, ctx.disabled);
-            draw_plugin_expansions(app, ui, ctx, e.device_id, content);
+            draw_plugin_row(app, ui, ctx, i, e, content);
+            draw_plugin_expansions(app, ui, ctx, e, content);
         }
         ChainRowKind::Native(n) => {
             draw_native_row(app, ui, ctx, n, content);
@@ -498,7 +575,7 @@ fn draw_row(
         ChainRowKind::AddChain { parallel_id } => draw_add_chain_row(ui, i, *parallel_id, content, popup_open),
         ChainRowKind::AddPlugin { chain } => {
             let is_master = cursor_tid == Some(common::model::MASTER_TRACK_ID);
-            draw_add_plugin_row(ui, i, *chain, is_master, content, popup_open);
+            draw_add_plugin_row(ui, i, *chain, is_master, r.depth > 0, content, popup_open);
         }
         // 終了行は `draw_parallel_band` の `L` だけ。
         ChainRowKind::ParallelEnd { .. } => {}

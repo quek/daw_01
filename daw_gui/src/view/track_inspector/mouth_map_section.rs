@@ -1,6 +1,6 @@
 //! インスペクタの「口パク」の帯の中身 (口形状 → 画像)。
 //!
-//! contract は `chain_sections.rs` / `clip_band` と同じ
+//! contract は `clip_band` / `input_section` と同じ
 //! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。 `track_inspector/mod.rs::draw` から
 //! 切り出したもの (サイズ budget、 不変条件 9)。
 
@@ -45,7 +45,6 @@ pub(super) fn draw_mouth_map_section(
     pad: f32,
     mut y: f32,
 ) -> f32 {
-    let p = &app.theme.core;
     let cursor_idx = app.cursor_track_index();
     let Some(track) = cursor_idx.and_then(|i| app.cur.song_doc.song().tracks.get(i)) else {
         return y;
@@ -80,21 +79,11 @@ pub(super) fn draw_mouth_map_section(
         labels.push(name);
     }
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    // 形状ごとに「あ [画像 ▾]」の欄 (ラベル左・値右、r.md #158 仕様 9)。
+    let c = super::form::cols(area.x + pad, area.w - pad * 2.0);
     for (slot_i, (shape, shape_label)) in SHAPES.iter().enumerate() {
-        ui.label_at(
-            format!("inspector_mouthmap_slot_label_{slot_i}"),
-            shape_label,
-            area.x + pad,
-            y + 5.0,
-            11.0,
-            p.text,
-        );
-        let dropdown_rect = Rect {
-            x: area.x + pad + 40.0,
-            y,
-            w: area.w - pad * 2.0 - 40.0,
-            h: 22.0,
-        };
+        super::form::label(ui, app, ("inspector_mouthmap_slot_label", slot_i), shape_label, &c, y);
+        let dropdown_rect = c.value(y);
         let cur = map.map_or(0, |m| m.get(*shape));
         let selected_idx = if cur == 0 {
             0
@@ -106,7 +95,7 @@ pub(super) fn draw_mouth_map_section(
                 .unwrap_or(0)
         };
         if let Some(picked) = ui.dropdown(
-            format!("inspector_mouthmap_dropdown_{slot_i}"),
+            ("inspector_mouthmap_dropdown", slot_i),
             dropdown_rect,
             &label_refs,
             selected_idx,
@@ -125,7 +114,7 @@ pub(super) fn draw_mouth_map_section(
                 });
             }));
         }
-        y += 26.0;
+        y += super::layout::FORM_ROW_PITCH;
     }
     y
 }

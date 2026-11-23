@@ -6,36 +6,22 @@ use super::PanelCtx;
 use crate::event_device::DeviceEvent;
 
 pub(super) fn draw_plugin_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
-    let p = &app.theme.core;
     let mut y = ctx.y;
     // ---- Plugin param panel -----------------------------------
     // 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し CLAP・VST3) の
-    // チェーン行「Par」ボタンで開閉。 VOICEVOX は device 既定の声 (キャラ→スタイル)
-    // を、 汎用 plugin は param を scrubable_number で実レンジ編集する。 値の SSoT は
-    // PluginParam lane の default_value (= `set_plugin_param`、 映像 FX と同 idiom)。
+    // チェーン行「Par」ボタンで開閉。 汎用 plugin は param を scrubable_number で実レンジ編集する。
+    // 値の SSoT は PluginParam lane の default_value (= `set_plugin_param`、 映像 FX と同 idiom)。
+    // plugin 名の見出しは描かない (行の名前と同じ)。
     if let Some(view) = app.inspector_plugin_params(ctx.device_id) {
         let device_id = view.device_id;
         let track_id = view.track_id;
         // 変調の持ち主 (device を持つトラック) はパネルにつき 1 回だけ解決し、全行で使い回す。
         let owner = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), track_id);
-        ui.label_at_clipped(
-            ("inspector_pp_label", device_id),
-            &view.plugin_name,
-            Rect { x: ctx.x, y, w: ctx.w.max(1.0), h: 12.0 * 1.2 },
-            12.0,
-            p.text,
-        );
-        y += 18.0;
-
-        // 汎用 param 行 (scrubable_number で実レンジ + per-control 変調)。
-        let row_w = ctx.w;
-        let input_h = 22.0;
-        let label_w = 96.0;
-        let input_x = ctx.x + label_w;
-        let input_w = (row_w - label_w).max(40.0);
+        // 汎用 param 行 (ラベル左・値右の欄、scrubable_number で実レンジ + per-control 変調)。
+        let c = ctx.cols();
         // 行は param 表の全 param ぶんある (数万の実例)。**見えている行だけ** 描き、高さは全行ぶん消費する
         // (Rack の行高 / インスペクタの content 高は変わらない、`Ui::visible_rows`)。
-        let pitch = input_h + 4.0;
+        let pitch = layout::FORM_ROW_PITCH;
         let rows_top = y;
         let visible = ui.visible_rows(rows_top, pitch, view.params.len());
         #[allow(clippy::cast_precision_loss)]
@@ -43,30 +29,12 @@ pub(super) fn draw_plugin_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: P
         for (i, row) in view.params.iter().enumerate().take(visible.end).skip(visible.start) {
             #[allow(clippy::cast_precision_loss)]
             let y = rows_top + i as f32 * pitch;
-            // param 名はプラグイン由来で長さ上限が無い。 label_w(96) を超えると
-            // 後続の値ボックス (不透明 bg) に覆われて途中で消えるので rect で切る。
-            ui.label_at_clipped(
-                (device_id, i, "pp_name"),
-                &row.name,
-                Rect {
-                    x: ctx.x,
-                    y: y + 5.0,
-                    w: (label_w - 4.0).max(1.0),
-                    h: 11.0 * 1.2,
-                },
-                11.0,
-                p.text,
-            );
+            // param 名はプラグイン由来で長さ上限が無い。ラベル列の幅で切る (値の欄に覆われて途中で消えない)。
+            form::label(ui, app, (device_id, i, "pp_name"), &row.name, &c, y);
             if row.readonly {
                 // 編集不可 param は現値をラベル表示するだけ。
                 let txt = format!("{:.3}", row.value_real);
-                ui.label_at_clipped(
-                    (device_id, i, "pp_ro"),
-                    &txt,
-                    Rect { x: input_x, y: y + 5.0, w: input_w, h: 11.0 * 1.2 },
-                    11.0,
-                    p.text,
-                );
+                form::value_text(ui, app, (device_id, i, "pp_ro"), &txt, &c, y);
                 continue;
             }
             let (min, max) = (row.min, row.max);
@@ -93,7 +61,7 @@ pub(super) fn draw_plugin_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: P
             };
             let resp = ui.scrubable_number_at(
                 (device_id, i, "pp_scrub"),
-                Rect { x: input_x, y, w: input_w, h: input_h },
+                c.value(y),
                 row.value_real,
                 row.default_real,
                 fmt,
@@ -123,7 +91,7 @@ pub(super) fn draw_plugin_params(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: P
                 resp.mod_dragging,
             );
         }
-        y = rows_end + 8.0;
+        y = rows_end;
     }
     y
 }

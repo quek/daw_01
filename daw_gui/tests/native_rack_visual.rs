@@ -1,12 +1,13 @@
 //! r.md #129 (`docs/plan_rack_native_devices.md` §15.7 R-10 / R-11): Rack の内蔵 device の **見た目と入力** を
 //! `build_root` + 合成ポインタで確かめる。GPU 不要 (Scene の描画コマンドの座標と色を読む)。
 //!
-//! - 行の並び / × の有無 / Par の格子 / Par 同士が重ならない / master の末尾 (Post-Fader / Limiter)
+//! - 行の並び / × の有無 / Par の格子 / Par 同士が重ならない / master の末尾 (フェーダー後 / Limiter)
+//! - OFF の行は灰色の小表示ではなく「オフ」の札 (r.md #158 仕様 10)
 //! - EQ カーブの点のドラッグ (Freq + Gain、数値欄が追従、undo 1 回) とホイール (Q、scroll_area が奪わない)
 //! - Par の余白を掴んでも行が動かない
 //! - `Q` の宛先 (Rack の Limiter 行 / Mixer の hover が先)
 //! - ダーク / ライトで、スペクトラムの上の EQ 点と OFF 行の名前が背景に沈まない
-//! - ダーク / ライトで、OFF 行の GR の小表示が形を保ったまま薄くなる (Q9)
+//! - 最小幅 (360) で、Parallel の深さ 2 にある内蔵 Par の数値欄が隣と重ならない (r.md #158 §6-10)
 
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ use daw_gui::view::native_device::{CurveAxes, CurveBand, EqCurveSource, curve_ha
 use daw_gui::view::root::INSPECTOR_DEFAULT_W;
 use daw_gui::view::track_inspector::layout as inspector_layout;
 use daw_gui::view::track_inspector::native_panel::layout;
+use daw_gui::view::track_inspector::vocab;
 use daw_gui::widgets::select_modifier::SelectModifier;
 use daw_ui_core::{FrameInput, PointerFrame, UiHost, contrast_ratio};
 use daw_ui_platform::PhysicalSize;
@@ -32,10 +34,10 @@ const W: u32 = 1400;
 const H: u32 = 900;
 /// インスペクタの左右の余白。
 const PAD: f32 = inspector_layout::PAD;
-/// chain list の行高 (`chain_list::ROW_H`)。
-const ROW_H: f32 = 26.0;
-/// 行の名前のラベルは行の上端から 8px 下に描かれる (`native_row` / `plugin_row`)。
-const NAME_TOP: f32 = 8.0;
+/// chain list の行高。
+const ROW_H: f32 = inspector_layout::RACK_ROW_H;
+/// 行の名前のラベルの行の上端からの位置 (`native_row` / `plugin_row`)。
+const NAME_TOP: f32 = inspector_layout::ROW_NAME_TOP;
 
 struct Harness {
     app: AppData,
@@ -182,11 +184,12 @@ fn par_of(scene: &Scene, row_name: &str) -> (f32, f32) {
         .center()
 }
 
-/// 行の名前の glyph から、その行の Par の矩形 (行の中身の幅、行の直下)。インスペクタの右端の
-/// 幅のドラッグ帯 (`RESIZE_HANDLE_W`) は本文の外 (r.md #158)。
+/// 行の名前の glyph から、その行 (深さ 0) の Par の矩形 (描画と同じ `layout::par_rect` を通す)。インスペクタの
+/// 右端の幅のドラッグ帯 (`RESIZE_HANDLE_W`) は本文の外 (r.md #158)。
 fn panel_rect(name: &Glyph, kind: NativeKind) -> Rect {
     let w = INSPECTOR_DEFAULT_W - inspector_layout::RESIZE_HANDLE_W - PAD * 2.0;
-    Rect { x: PAD, y: name.top - NAME_TOP + ROW_H, w, h: layout::panel_height(kind) }
+    let row = Rect { x: PAD, y: name.top - NAME_TOP, w, h: ROW_H };
+    inspector_layout::par_rect(row, layout::panel_height(kind))
 }
 
 /// EQ の Par のカーブ上の点の座標 (描画と同じ写像を通す)。
@@ -231,7 +234,7 @@ fn native_rows_and_panels_are_laid_out_in_the_rack() {
         assert!(g.left >= PAD && g.left < INSPECTOR_DEFAULT_W - PAD, "{g:?}");
     }
     let eq_name = one(&scene, "EQ");
-    let next = one(&scene, "+ Plugin");
+    let next = one(&scene, vocab::ADD_PLUGIN);
     assert!(
         next.top >= eq_name.top - NAME_TOP + ROW_H + layout::panel_height(NativeKind::Eq),
         "次の行は EQ の Par の下: next={} eq={}",
@@ -247,13 +250,14 @@ fn native_rows_and_panels_are_laid_out_in_the_rack() {
     assert!(h.app.rack_panel_open(RackPanelKey::Device(h.builtin(t0, NativeKind::Comp))));
 }
 
-/// R-11: master は「Bus Comp」「Tone EQ」「+ FX」「Post-Fader」「Limiter」の順。Limiter 行に × は無く、掴んでも動かない。
+/// R-11: master は「Bus Comp」「Tone EQ」「+ エフェクト」「フェーダー後」「Limiter」の順。Limiter 行に × は無く、掴んでも動かない。
 #[test]
 fn master_rack_ends_with_a_fixed_limiter_after_the_post_fader_divider() {
     let mut h = Harness::new("dark");
     h.select(MASTER_TRACK_ID);
     let scene = h.settle();
-    let order: Vec<f32> = ["Bus Comp", "Tone EQ", "+ FX", "Post-Fader", "Limiter"].iter().map(|t| one(&scene, t).top).collect();
+    let labels = ["Bus Comp", "Tone EQ", vocab::ADD_EFFECT, vocab::POST_FADER, "Limiter"];
+    let order: Vec<f32> = labels.iter().map(|t| one(&scene, t).top).collect();
     assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
     let limiter = one(&scene, "Limiter");
     assert!(!find(&scene, "x").iter().any(|g| (g.top - limiter.top).abs() < 10.0), "Limiter 行に × は無い");
@@ -262,7 +266,7 @@ fn master_rack_ends_with_a_fixed_limiter_after_the_post_fader_divider() {
     let scene = h.drag((x, y), (x, y - 20.0), 4);
     let after = h.app.cur.song_doc.song().master_fx_chain.iter().map(|d| d.id()).collect::<Vec<_>>();
     assert_eq!(after, before);
-    let order2: Vec<f32> = ["Bus Comp", "Tone EQ", "+ FX", "Post-Fader", "Limiter"].iter().map(|t| one(&scene, t).top).collect();
+    let order2: Vec<f32> = labels.iter().map(|t| one(&scene, t).top).collect();
     assert_eq!(order2, order, "並びも位置も変わらない");
 }
 
@@ -482,71 +486,144 @@ fn eq_points_over_the_spectrum_and_off_row_names_keep_contrast_in_both_themes() 
 }
 
 /// 行の小表示 (幅 `MINI_W` × 高さ `MINI_GR_H` の GR の溝) の、行の背景に対するコントラスト。
-/// `row_name` の行の中にある溝を探し、溝の塗りを行の背景に重ねた色と背景を比べる。
-fn gr_mini_slot_contrast(scene: &Scene, row_name: &str) -> f32 {
+/// `row_name` の行の中にある溝を探し、溝の塗りを行の背景に重ねた色と背景を比べる。溝が無ければ `None`。
+fn gr_mini_slot_contrast(scene: &Scene, row_name: &str) -> Option<f32> {
     const MINI_W: f32 = 80.0;
     const MINI_GR_H: f32 = 8.0;
     let row_y = one(scene, row_name).top - NAME_TOP;
-    let (idx, slot) = scene
-        .primitives
-        .iter()
-        .enumerate()
-        .find_map(|(i, p)| match p {
-            Primitive::Rect(r)
-                if (r.rect.w - MINI_W).abs() < 0.01
-                    && (r.rect.h - MINI_GR_H).abs() < 0.01
-                    && r.rect.x < INSPECTOR_DEFAULT_W
-                    && r.rect.y >= row_y
-                    && r.rect.y + r.rect.h <= row_y + ROW_H =>
-            {
-                Some((i, *r))
-            }
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("`{row_name}` の行に GR の溝が描かれる"));
+    let (idx, slot) = scene.primitives.iter().enumerate().find_map(|(i, p)| match p {
+        Primitive::Rect(r)
+            if (r.rect.w - MINI_W).abs() < 0.01
+                && (r.rect.h - MINI_GR_H).abs() < 0.01
+                && r.rect.x < INSPECTOR_DEFAULT_W
+                && r.rect.y >= row_y
+                && r.rect.y + r.rect.h <= row_y + ROW_H =>
+        {
+            Some((i, *r))
+        }
+        _ => None,
+    })?;
     let center = (slot.rect.x + slot.rect.w * 0.5, slot.rect.y + slot.rect.h * 0.5);
     let bg = backdrop(scene, center, idx);
-    contrast_ratio(composite(bg, slot.fill), bg)
+    Some(contrast_ratio(composite(bg, slot.fill), bg))
 }
 
-/// Q9: OFF の Comp / Limiter 行の小表示 (GR の溝) は、形を保ったまま薄くなる — ダーク / ライトの両方で、
-/// 行の背景が静止 / hover (溝が沈む側) のどちらでも、溝のコントラストが ON の行より下がり、しかも消えない
-/// (EQ 系の小表示のカーブと同じ見せ方)。停止中 (GR 0 = 塗りが出ない) で比べる。
+/// `row_name` の行 (同じ高さ) に描かれた「オフ」の札の文字。
+fn off_tag_in_row(scene: &Scene, row_name: &str) -> Option<Glyph> {
+    let row_y = one(scene, row_name).top - NAME_TOP;
+    find(scene, vocab::OFF_TAG).into_iter().find(|g| g.top >= row_y && g.top < row_y + ROW_H)
+}
+
+/// r.md #158 仕様 10: OFF の Comp / Limiter 行は、灰色の小表示 (disabled の部品に見える) の代わりに「オフ」の札を
+/// 出す — ダーク / ライトの両方で、行が静止 / hover のどちらでも、札の文字が札の面から読める。ON の行は
+/// 小表示 (GR の溝) のままで、札は出ない。停止中 (GR 0 = 塗りが出ない) で比べる。
 #[test]
-fn off_rows_dim_their_gr_mini_displays_but_keep_the_shape_in_both_themes() {
-    /// ON と OFF の見分けに要るコントラストの差。
-    const MIN_DIFF: f32 = 0.05;
-    /// 溝の輪郭が残る下限 (80×8 の無彩色の面なら数 % の輝度差で見える)。
+fn off_rows_show_an_off_tag_instead_of_a_greyed_mini_display_in_both_themes() {
+    /// 札の文字 (10px) と札の面のコントラスト (非テキストの UI 部品として 3:1 以上)。
+    const MIN_CONTRAST: f32 = 3.0;
+    /// ON の行の溝の輪郭が見える下限 (80×8 の無彩色の面なら数 % の輝度差で見える)。
     const MIN_VISIBLE: f32 = 1.04;
-    // `row` の行の溝のコントラスト。`hovered` なら行の名前の上にポインタを置いたフレームで測る。
-    let measure = |h: &mut Harness, row: &str, hovered: bool| {
+    // `hovered` なら行の名前の上にポインタを置いたフレームで撮る。
+    let shoot = |h: &mut Harness, row: &str, hovered: bool| {
         let scene = h.settle();
         if !hovered {
-            return gr_mini_slot_contrast(&scene, row);
+            return scene;
         }
         let (x, y) = one(&scene, row).center();
         let _ = h.frame(hover(x, y));
-        gr_mini_slot_contrast(&h.frame(hover(x, y)), row)
+        h.frame(hover(x, y))
     };
-    let check = |what: String, on: f32, off: f32| {
-        assert!(off <= on - MIN_DIFF, "{what}: OFF の溝 {off:.3} が ON {on:.3} より薄くない");
-        assert!(off >= MIN_VISIBLE, "{what}: OFF の溝 {off:.3} が消えている (ON {on:.3})");
+    let check_off = |what: String, scene: &Scene, row: &str| {
+        let tag = off_tag_in_row(scene, row).unwrap_or_else(|| panic!("{what}: OFF の `{row}` 行に札が出る"));
+        assert!(gr_mini_slot_contrast(scene, row).is_none(), "{what}: OFF の `{row}` 行に灰色の小表示を描かない");
+        let ratio = contrast_ratio(tag.color, backdrop(scene, tag.center(), tag.order));
+        assert!(ratio >= MIN_CONTRAST, "{what}: 札の文字 {:?} のコントラスト {ratio:.2}", tag.color);
+    };
+    let check_on = |what: String, scene: &Scene, row: &str| {
+        assert!(off_tag_in_row(scene, row).is_none(), "{what}: ON の `{row}` 行に札は出ない");
+        let slot = gr_mini_slot_contrast(scene, row).unwrap_or_else(|| panic!("{what}: ON の `{row}` 行に GR の溝"));
+        assert!(slot >= MIN_VISIBLE, "{what}: ON の溝 {slot:.3} が見える");
     };
     for theme in ["dark", "light"] {
         for hovered in [false, true] {
+            let what = format!("{theme} hovered={hovered}");
             let mut h = Harness::new(theme);
             let t0 = h.track(0);
             assert!(h.native(h.builtin(t0, NativeKind::Comp)).bypassed, "前提: 組み込み Comp は既定で OFF");
             h.dev(DeviceEvent::AddNative { chain: common::model::ChainRef::Track(t0), kind: NativeKind::Comp, open_panel: false });
-            let (on, off) = (measure(&mut h, "Comp 2", hovered), measure(&mut h, "Comp", hovered));
-            check(format!("{theme} hovered={hovered} Comp"), on, off);
+            check_off(what.clone(), &shoot(&mut h, "Comp", hovered), "Comp");
+            check_on(what.clone(), &shoot(&mut h, "Comp 2", hovered), "Comp 2");
 
             h.select(MASTER_TRACK_ID);
             assert!(!h.app.cur.song_doc.song().master_limiter.on, "前提: Limiter は既定で OFF");
-            let off = measure(&mut h, "Limiter", hovered);
+            check_off(what.clone(), &shoot(&mut h, "Limiter", hovered), "Limiter");
             h.dev(DeviceEvent::MasterLimiterEdit(daw_gui::event_native::MasterLimiterEdit::On(true)));
-            let on = measure(&mut h, "Limiter", hovered);
-            check(format!("{theme} hovered={hovered} Limiter"), on, off);
+            check_on(what, &shoot(&mut h, "Limiter", hovered), "Limiter");
+        }
+    }
+}
+
+/// `devices` の最初の Parallel の最初の chain の id。
+fn first_parallel_chain(devices: &[common::model::Device]) -> u64 {
+    devices
+        .iter()
+        .find_map(|d| match d {
+            common::model::Device::Parallel(p) => p.chains.first().map(|c| c.id),
+            _ => None,
+        })
+        .expect("Parallel の chain")
+}
+
+/// r.md #158 §6-10: インスペクタの最小幅 (既定 360) で、Parallel の深さ 2 (Parallel の chain の中の Parallel の
+/// chain) にある EQ の Par を開いても、数値欄 (つまみの下の常時表示) が同じ段の隣と重ならず、Par は行の名前の
+/// 左端から始まってインスペクタの本文の右端に収まる (Par の格子は幅の 6 等分で、数値欄は固定幅)。
+#[test]
+fn nested_par_number_fields_do_not_overlap_at_the_minimum_width() {
+    let mut h = Harness::new("dark");
+    let t0 = h.track(0);
+    h.dev(DeviceEvent::AddParallel { chain: common::model::ChainRef::Track(t0), at: daw_gui::device_addr::InsertAt::Default });
+    let song = h.app.cur.song_doc.song();
+    let c1 = first_parallel_chain(&song.track_by_id(t0).expect("track").devices);
+    h.dev(DeviceEvent::AddParallel { chain: common::model::ChainRef::Chain(c1), at: daw_gui::device_addr::InsertAt::Default });
+    let song = h.app.cur.song_doc.song();
+    let (_, inner) = song.chain_by_id(c1).expect("chain");
+    let c2 = first_parallel_chain(&inner.devices);
+    h.dev(DeviceEvent::AddNative { chain: common::model::ChainRef::Chain(c2), kind: NativeKind::Eq, open_panel: true });
+    let scene = h.settle();
+    // 組み込み EQ (深さ 0) の Par は閉じている = 数値欄はすべて深さ 2 の EQ のもの。
+    // 足した EQ は組み込みの「EQ」と見分ける名前 (`NativeDevice::display_name`)。
+    let eq_name = one(&scene, "EQ 2");
+    let mut fields: Vec<Rect> = scene
+        .primitives
+        .iter()
+        .filter_map(|p| match p {
+            Primitive::Rect(r)
+                if (r.rect.w - layout::NUM_W).abs() < 0.01
+                    && (r.rect.h - layout::NUM_H).abs() < 0.01
+                    && r.rect.x < INSPECTOR_DEFAULT_W
+                    && r.rect.y > eq_name.top =>
+            {
+                Some(r.rect)
+            }
+            _ => None,
+        })
+        .collect();
+    // 数値欄は面と枠を同じ矩形に重ねて描くことがある (同じ欄の 2 枚は 1 つに数える)。
+    fields.dedup_by(|a, b| a == b);
+    assert!(fields.len() >= 12, "EQ の Par の数値欄 (Freq / Gain / Q の段): {}", fields.len());
+    let right = INSPECTOR_DEFAULT_W - inspector_layout::RESIZE_HANDLE_W - PAD;
+    let par_left = eq_name.left;
+    assert!(par_left > PAD + inspector_layout::ROW_NAME_X + 2.0 * 4.0 - 0.5, "深さ 2 の行は帯 2 本ぶん右: {par_left}");
+    let mut rows: std::collections::BTreeMap<i32, Vec<Rect>> = std::collections::BTreeMap::new();
+    for f in &fields {
+        assert!(f.x >= par_left - 0.5 && f.x + f.w <= right + 0.5, "数値欄 {f:?} は Par の中 ({par_left}..{right})");
+        rows.entry(f.y.round() as i32).or_default().push(*f);
+    }
+    for row in rows.values_mut() {
+        row.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
+        row.dedup_by(|a, b| a == b);
+        for w in row.windows(2) {
+            assert!(w[0].x + w[0].w <= w[1].x + 0.01, "隣の数値欄と重ならない: {:?} / {:?}", w[0], w[1]);
         }
     }
 }

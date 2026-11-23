@@ -40,10 +40,10 @@ const H: u32 = 1000;
 const STRIP_WIDTH: f32 = 80.0;
 /// 1 フレームあたりのドラッグ量 (px)。
 const STEP: f32 = 10.0;
-/// インスペクタの左右の余白 / chain list の行高 / 行の名前の上端からの距離 (`native_rack_visual.rs` と同じ)。
+/// インスペクタの左右の余白 / chain list の行高 / 行の名前の上端からの距離 (寸法の SSoT は `track_inspector::layout`)。
 const RACK_PAD: f32 = daw_gui::view::track_inspector::layout::PAD;
-const RACK_ROW_H: f32 = 26.0;
-const NAME_TOP: f32 = 8.0;
+const RACK_ROW_H: f32 = daw_gui::view::track_inspector::layout::RACK_ROW_H;
+const NAME_TOP: f32 = daw_gui::view::track_inspector::layout::ROW_NAME_TOP;
 
 /// 1 トラック目を選んだ app (インスペクタの Rack はこのトラックを出す)。
 fn build_app() -> AppData {
@@ -157,15 +157,16 @@ fn inspector_glyph(scene: &Scene, text: &str) -> (f32, f32) {
     v[0]
 }
 
-/// Rack の行の名前の glyph から、その行の Par の矩形 (行の直下、行の中身の幅)。
+/// Rack の行 (深さ 0) の名前の glyph から、その行の Par の矩形 (描画と同じ `layout::par_rect` を通す)。
 fn rack_panel_rect(name: (f32, f32), kind: NativeKind) -> Rect {
-    Rect {
+    let row = Rect {
         x: RACK_PAD,
-        y: name.1 - NAME_TOP + RACK_ROW_H,
+        y: name.1 - NAME_TOP,
         // インスペクタの右端の幅のドラッグ帯は本文の外 (r.md #158)。
         w: INSPECTOR_DEFAULT_W - daw_gui::view::track_inspector::layout::RESIZE_HANDLE_W - RACK_PAD * 2.0,
-        h: layout::panel_height(kind),
-    }
+        h: RACK_ROW_H,
+    };
+    daw_gui::view::track_inspector::layout::par_rect(row, layout::panel_height(kind))
 }
 
 fn native_param(app: &AppData, id: u64, param: NativeParamId) -> f32 {
