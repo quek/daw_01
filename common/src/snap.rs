@@ -144,7 +144,7 @@ impl SnapConfig {
             return raw;
         }
         match self.beat_unit(zoom_x_px_per_beat) {
-            Some(unit) => (raw / unit).round() * unit,
+            Some(unit) => round_to_grid(raw, unit),
             None => raw,
         }
     }
@@ -161,6 +161,45 @@ impl Default for SnapConfig {
     fn default() -> Self {
         Self::DEFAULT
     }
+}
+
+/// `raw` (拍) を、曲の拍 0 を原点にした `unit` 拍の格子の最寄りの線へ丸める。スナップ
+/// ([`SnapConfig::snap_beat`]) とクオンタイズ ([`quantize_content_beat`]) が共有する唯一の丸め。
+#[must_use]
+pub fn round_to_grid(raw: f64, unit: f64) -> f64 {
+    (raw / unit).round() * unit
+}
+
+/// クオンタイズ: content-local 拍 `content_beat` (content の原点 = song 拍 `origin`、
+/// `Clip::content_origin_beat`) を、**曲の拍 0 を原点にした** `unit` 拍の格子へ寄せて content-local 拍で返す。
+/// clip が格子の上から始まらなくても、曲の上で格子に載る (ドラッグのスナップと同じ絶対位置)。
+/// 最寄りの線が content の先頭 (local 0 — model が持てる最小位置) より前なら、先頭以降で最初の線。
+#[must_use]
+pub fn quantize_content_beat(content_beat: f64, origin: f64, unit: f64) -> f64 {
+    let snapped = round_to_grid(origin + content_beat, unit);
+    let first_line = (origin / unit).ceil() * unit;
+    (snapped.max(first_line) - origin).max(0.0)
+}
+
+/// 窓の端で格子の線を引くときの許容 (格子の数で数える。浮動小数の誤差で端ちょうどの線を飛ばさない)。
+const GRID_LINE_EPS: f64 = 1e-9;
+
+/// [`quantize_content_beat`] の、clip の窓 `[w0, w1)` (content-local 拍、`Clip::content_window`) の中に
+/// 留める版 (ノートの始まり用)。寄せた先が窓の前なら窓の中で最初の線、窓の終わり以降なら窓の中で最後の線へ
+/// (窓の外へ出たノートは描かれも鳴りもしない)。窓の中に線が 1 本も無ければ `content_beat` のまま。
+/// 窓の外から始まっていた値は窓に縛らない ([`quantize_content_beat`] と同じ)。
+#[must_use]
+pub fn quantize_content_beat_in_window(content_beat: f64, origin: f64, unit: f64, (w0, w1): (f64, f64)) -> f64 {
+    let snapped = quantize_content_beat(content_beat, origin, unit);
+    if !(content_beat >= w0 - GRID_LINE_EPS * unit && content_beat < w1) {
+        return snapped;
+    }
+    let lo = ((origin + w0.max(0.0)) / unit - GRID_LINE_EPS).ceil() * unit - origin;
+    let hi = (((origin + w1) / unit - GRID_LINE_EPS).ceil() - 1.0) * unit - origin;
+    if lo > hi {
+        return content_beat;
+    }
+    snapped.clamp(lo, hi)
 }
 
 /// グリッド線 `phase + k * unit` (k は整数) のうち、開区間 `(start, end)` に入るものを昇順で返す。

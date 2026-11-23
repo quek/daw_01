@@ -104,7 +104,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.cur.song_doc.song().project_id,
+            self.clipboard_source(),
             crate::clipboard::ClipboardPayload::Notes(copied),
         )
         .to_json()?;
@@ -154,27 +154,6 @@ impl AppData {
         count
     }
 
-    pub(crate) fn set_note_velocity(&mut self, note_idx: u32, velocity: u8) {
-        let Some(r) = self.selected_clip_ref() else {
-            return;
-        };
-        // r.md #64: ロック中トラックの note は編集不可 (batch 版 `set_note_velocities` は
-        // `for_each_note_clip_group` が除外するので、単発版もそこへ揃える)。
-        if self.reject_write_if_pianoroll_locked(r) {
-            return;
-        }
-        let _ = self.edit_song(|song| {
-            let Some(notes) = song.notes_in_clip_mut(r) else {
-                return false;
-            };
-            let Some(note) = notes.get_mut(note_idx as usize) else {
-                return false;
-            };
-            note.velocity = velocity;
-            true
-        });
-    }
-
     /// gui_01 #018 (M14 Phase 64): velocity lane drag の release frame で
     /// 1 batch 発行される `(note_id, new_velocity)` 列を一括適用。 widget
     /// から渡される id は piano_roll widget 上の `NoteId` (= clip 内 note
@@ -198,32 +177,6 @@ impl AppData {
                             }
                         }
                     }
-                });
-            },
-        );
-    }
-
-    pub(crate) fn quantize_selected_notes(&mut self, div: u8) {
-        // 選択 (packed) を所属クリップごとに分配し、各クリップ内 clip-local start を
-        // 量子化。重なりは edit_clip_notes が解消し選択 (packed) を remap で追従。
-        if self.selected_note_ids().is_empty() {
-            return;
-        }
-        let div = div.max(1) as f64;
-        let selected = self.selected_note_ids();
-        self.for_each_note_clip_group(
-            selected.into_iter().map(|id| (id, ())),
-            |app, slot, r, items| {
-                let locals: Vec<usize> = items.iter().map(|&(local, ())| local).collect();
-                app.edit_clip_notes(slot, r, move |notes| {
-                    let mut winners = Vec::with_capacity(locals.len());
-                    for local in locals {
-                        if let Some(n) = notes.get_mut(local) {
-                            n.start_beat = ((n.start_beat * div).round() / div).max(0.0);
-                            winners.push(local as u32);
-                        }
-                    }
-                    winners
                 });
             },
         );
@@ -268,12 +221,7 @@ impl AppData {
         // `scale_at` の semantics に合わせて「playhead 以下の最新 event」
         // を update。 playhead 未満の event が無ければ最初の event を update
         // (Cubase Transport の Chord Track edit と同じ idiom)。
-        let target_idx = self
-            .cur.song_doc.song()
-            .scale_changes
-            .iter()
-            .rposition(|c| c.beat <= playhead)
-            .unwrap_or(0);
+        let target_idx = self.cur.song_doc.song().scale_index_at(playhead).unwrap_or(0);
         self.edit_song(|song| {
             if let Some(ev) = song.scale_changes.get_mut(target_idx) {
                 ev.root = root;
@@ -630,28 +578,6 @@ impl AppData {
         if !new_selection.is_empty() {
             self.set_note_selection(&(new_selection));
         }
-    }
-
-    pub(crate) fn resize_note(&mut self, key: ClipKey, note_idx: u32, new_duration: f64) {
-        // r.md #64: ロック中トラックの note は編集不可 (batch 版 `resize_notes` と同じ扱い)。
-        if self.reject_write_if_pianoroll_locked(key) {
-            return;
-        }
-        let new_duration = new_duration.max(common::model::MIN_NOTE_LEN_BEATS);
-        let remap = self
-            .edit_song(|song| {
-                let notes = song.notes_in_clip_mut(key)?;
-                let note = notes.get_mut(note_idx as usize)?;
-                note.duration_beats = new_duration;
-                // リサイズした note を勝者として重なり解消。既存選択は remap で追従。
-                Some(resolve_note_overlaps(notes, &[note_idx]))
-            })
-            .flatten();
-        let Some(remap) = remap else {
-            return;
-        };
-        let sel = self.selected_note_ids();
-        self.set_note_selection(&(remap_indices(&remap, &sel)));
     }
 
     pub(crate) fn delete_selected_notes(&mut self) {

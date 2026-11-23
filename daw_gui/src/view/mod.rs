@@ -38,6 +38,8 @@ pub mod master_panel;
 pub mod master_strip_ui;
 /// 上部 menu bar (File / Edit / View / Help)。root.rs から分離。
 pub mod menu_bar;
+/// トランスポートの「Learn」を右クリックで開く MIDI 割り当ての一覧。
+pub mod midi_bindings_list;
 pub mod mixer_strips;
 pub mod modulation;
 /// r.md #129: 内蔵 device の共有描画部品 (Rack / Mixer 帯 / マスターパネル)。

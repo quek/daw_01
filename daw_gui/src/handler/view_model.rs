@@ -9,6 +9,22 @@ pub struct LiveParamScope {
     running: Vec<crate::launcher_time::RunningRow>,
 }
 
+/// パラアウトの出力を子トラックへ展開できるトラックか (Rack の plugin 行の `Out▾` と、開いた出力のパネル)。
+/// マスターは対象外 — 子トラックへ展開する形は、出元が実トラック (`parent_group_id` の子を持てる) であることを
+/// 要る。行ごとに model を引かずに済むよう、トラックだけで決まる規則をここ 1 か所に置く。
+#[must_use]
+pub fn aux_out_allowed_on(track_id: u32) -> bool {
+    track_id != common::model::MASTER_TRACK_ID
+}
+
+/// plugin の出力を配線済み (展開済み) と見せるか: いま申告している出力の数 (`aux_output_count`) の中に配線がある。
+/// 行の `Out▾` の点灯と、開いた出力のパネル (配線済みなら port ごとの宛先、無ければ [展開]) が同じこの 1 本を
+/// 読む — plugin の更新で出力の数が減り、数を超えた位置にだけ配線が残っても、点灯とパネルが食い違わない。
+#[must_use]
+pub fn wired_aux_outputs(p: &common::model::PluginInstance) -> bool {
+    p.aux_outputs.iter().take(usize::from(p.aux_output_count)).any(Option::is_some)
+}
+
 impl AppData {
     // -------- Derived snapshots (毎フレーム計算; cache が必要なら view 側で持つ) -----
 
@@ -271,26 +287,22 @@ impl AppData {
     /// パラアウト (docs/plan_paraout.md): cursor track の chain (Parallel の中も) に居る `device_id` が
     /// `is_main=false` の音声出力を持つ (`aux_output_count > 0`) なら、その配線。Rack の plugin 行の
     /// `Out▾` で行の直下に開く出力のパネル (展開ボタン + port ごとの宛先) の中身 (r.md #158)。
-    /// マスターは対象外 — 子トラックへ展開する形は、出元が実トラック (`parent_group_id` の子を持てる) で
-    /// あることを要る。行の `Out▾` を出すかどうかもこの関数で決める (規則は 1 か所)。
+    /// 出せるトラックかは [`aux_out_allowed_on`]、配線済みかは [`wired_aux_outputs`] の 1 本
+    /// (行の `Out▾` の有無と点灯も同じ規則を読む)。
     pub fn aux_out_entry(&self, device_id: u64) -> Option<ParallelOutputEntry> {
-        let track = self.cursor_track_index().and_then(|i| self.cur.song_doc.song().tracks.get(i))?;
-        if track.id == common::model::MASTER_TRACK_ID {
-            return None;
-        }
+        let tid = self.cursor_track_id().filter(|tid| aux_out_allowed_on(*tid))?;
+        let track = self.cur.song_doc.song().track_by_id(tid)?;
         let p = track.plugins().find(|p| p.id == device_id && p.aux_output_count > 0)?;
         let count = p.aux_output_count as usize;
         // Normalize routes to length `count` (model Vec may be shorter when only some ports are wired).
         let routes: Vec<Option<u32>> = (0..count)
             .map(|port| p.aux_outputs.get(port).and_then(|o| o.as_ref()).map(|r| r.dest_track))
             .collect();
-        let exploded = routes.iter().any(Option::is_some);
         Some(ParallelOutputEntry {
-            track_id: track.id,
             device_id: p.id,
             aux_output_count: p.aux_output_count,
             routes,
-            exploded,
+            exploded: wired_aux_outputs(p),
         })
     }
 
@@ -658,36 +670,6 @@ impl AppData {
     // プラグイン自身の窓の中のツマミは `plugin_window_gesture_begin` が拾う
     // (`handler/param_gesture.rs`)。 どちらも `connect_armed_mod_source_to` に集まる。
 
-    /// Audio event field の inspector 表示用ライト read snapshot。
-    /// 選択 clip (`selected_clip`) が `ClipContent::Audio` で、 窓に見えている event がある場合に
-    /// `Some` を返す。 それ以外 (no selection / MIDI clip / Vocal clip / 見えている event 無し) は `None`。
-    ///
-    /// 値は **編集が効く片** (`handler::clip_window`) から読む: Audio Editor がこの clip を開いて
-    /// event を選んでいればその event、そうでなければ窓に見えている最初のひと続き。 fade はひと続きの
-    /// 外側の端 (窓の中に見えているランプの長さ)、上限はひと続きの長さ — 編集が効くのと同じ単位。
-    pub fn inspector_audio_event_summary(&self) -> Option<InspectorAudioEventSummary> {
-        let cref = self.selected_clip_ref()?;
-        let clip = self.cur.song_doc.song().clip_by_key(cref)?;
-        let anchor = (self.cur.peph.audio_editor_clip == Some(cref)).then(|| self.audio_editor_anchor_event()).flatten();
-        let (event, fade) =
-            self.clip_edit_anchor(self.audio_edit_targets(cref)?, common::model::ClipContent::audio_events, anchor)?;
-        Some(InspectorAudioEventSummary {
-            target: cref,
-            reversed: event.reversed,
-            // "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
-            muted: clip.muted,
-            stretch_mode: event.stretch_mode,
-            fade_in_curve: fade.fade_in_curve,
-            fade_out_curve: fade.fade_out_curve,
-            gain_db: event.gain_db,
-            pan: event.pan,
-            pitch_semitones: event.pitch_semitones,
-            fade_in_beats: fade.visible_fade_in_beats(),
-            fade_out_beats: fade.visible_fade_out_beats(),
-            fade_max_beats: fade.len_beats,
-        })
-    }
-
     /// PR-D 段階 2: Audio Editor の event 選択を `delta` (= +1 / -1) 分
     /// 進める / 戻す helper。 wrap-around (= 末尾 +1 で 0 に戻る、 0
     /// -1 で末尾)。 events が空 / audio_editor_clip が None のときは
@@ -719,49 +701,30 @@ impl AppData {
         self.selected_audio_event_indices().last().copied()
     }
 
-    /// `selected_clip` が `ClipContent::Image` の clip を指していて、
-    /// 中に少なくとも 1 event があれば first event を代表値として
-    /// `InspectorImageEventSummary` を返す。
-    /// 編集 AppEvent (`SetClipImageX` 等) は全 event に同じ値を broadcast
-    /// するので、 multi-event clip でも view は first event を「代表値」
-    /// として見せれば編集後に整合が取れる。 数値値 (x/y/w/h/opacity/
-    /// fade_in_beats/fade_out_beats) は inspector の edit buffer (text
-    /// 文字列) 側に持つので summary には含めない (= dropdown / toggle
-    /// のみ snapshot に乗せる)。
-    pub fn inspector_image_event_summary(&self) -> Option<InspectorImageEventSummary> {
-        let cref = self.selected_clip_ref()?;
-        let track = self.cur.song_doc.song().track_by_id(cref.track_id)?;
-        let clip = track.clip_by_id(cref.clip_id)?;
+    /// 代表クリップ `rep` が `ClipContent::Image` で、窓に見えている片があれば、画像クリップの帯の欄のうち
+    /// **代表から読むもの** (「A」のレーンの有無・dblclick で戻す大きさ・フェードの上限) を返す。値の欄は
+    /// 選んでいる全部を畳む (`InspectorSelection::fold_*`)。
+    pub fn inspector_image_event_summary(
+        &self,
+        rep: crate::handler::selection_view::LiveClip<'_>,
+    ) -> Option<InspectorImageEventSummary> {
         // 値は窓に見えている最初のひと続きから読む (`handler::clip_window`)。
         let events_of = common::model::ClipContent::image_events;
-        let (event, fade) = self.clip_edit_anchor(self.clip_shown_targets(cref, events_of)?, events_of, None)?;
+        let (event, fade) = self.clip_edit_anchor(self.clip_shown_targets_of(rep.clip, events_of)?, events_of, None)?;
         let has_lane = |field: common::model::ImageBuiltinParam| {
-            track.automation_lanes.iter().any(|l| {
+            rep.track.automation_lanes.iter().any(|l| {
                 matches!(l.target, common::model::AutomationTarget::ImageBuiltin(p) if p == field)
             })
         };
         Some(InspectorImageEventSummary {
-            target: cref,
-            // "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
-            muted: clip.muted,
-            fade_in_curve: fade.fade_in_curve,
-            fade_out_curve: fade.fade_out_curve,
             x_automated: has_lane(common::model::ImageBuiltinParam::X),
             y_automated: has_lane(common::model::ImageBuiltinParam::Y),
             w_automated: has_lane(common::model::ImageBuiltinParam::W),
             h_automated: has_lane(common::model::ImageBuiltinParam::H),
             opacity_automated: has_lane(common::model::ImageBuiltinParam::Opacity),
             rotation_automated: has_lane(common::model::ImageBuiltinParam::Rotation),
-            x: event.x,
-            y: event.y,
             w: event.w,
             h: event.h,
-            opacity: event.opacity,
-            rotation_radians: event.rotation_radians,
-            fade_in_beats: fade.visible_fade_in_beats(),
-            fade_out_beats: fade.visible_fade_out_beats(),
-            flip_h: event.flip_h,
-            flip_v: event.flip_v,
             fade_max_beats: fade.len_beats,
         })
     }
@@ -968,7 +931,9 @@ impl AppData {
                 let song = self.cur.song_doc.song();
                 for (i, t) in song.tracks.iter().enumerate() {
                     cache.track_names.insert(t.id, std::sync::Arc::from(t.display_name(i).as_ref()));
-                    cache.clip_labels.extend(t.clips.iter().map(|c| {
+                    // ランチャーのセルも入れる (アレンジのクリップと同じ id 空間。インスペクタのタイトルと帯の対象が
+                    // セルの名前もここから引く、`AppData::clip_name`)。
+                    cache.clip_labels.extend(t.all_clips().map(|c| {
                         let label = crate::widgets::arrangement::view_build::clip_display_label(c, song);
                         (ClipKey { track_id: t.id, clip_id: c.id }, label)
                     }));

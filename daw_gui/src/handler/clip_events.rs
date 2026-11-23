@@ -593,22 +593,6 @@ impl AppData {
         self.resync_clip_text_event_edit_buffers(target);
     }
 
-    pub(crate) fn commit_clip_text_content_edit(&mut self) {
-        let Some(target) = self.selected_clip_ref() else {
-            return;
-        };
-        let value = self.cur.peph.clip_text_content_edit_text.clone();
-        self.set_clip_text_event_content(target, value);
-    }
-
-    pub(crate) fn commit_clip_text_font_family_edit(&mut self) {
-        let Some(target) = self.selected_clip_ref() else {
-            return;
-        };
-        let value = self.cur.peph.clip_text_font_family_edit_text.clone();
-        self.set_clip_text_event_font_family(target, value);
-    }
-
     // -------- Font picker -------------------------------------
 
     /// 編集対象 text クリップの現在のフォント名 (窓に見えている最初の片)。text クリップで
@@ -766,39 +750,22 @@ impl AppData {
         self.cur.peph.clip_edit_buffer_target = is_text.then_some(target);
     }
 
-    /// docs/plan_text_overlay.md §4 P5: text inspector が表示する
-    /// snapshot (= image idiom)。 selected_clip が Text variant の clip
-    /// を指していて、 first event があれば `Some` を返す。 各 numeric
-    /// field の `*_automated` は対応する TextBuiltin lane が track に
-    /// 存在するか。
-    pub fn inspector_text_event_summary(&self) -> Option<InspectorTextEventSummary> {
-        let cref = self.selected_clip_ref()?;
-        let track = self.cur.song_doc.song().track_by_id(cref.track_id)?;
-        let clip = track.clip_by_id(cref.clip_id)?;
+    /// docs/plan_text_overlay.md §4 P5: 代表クリップ `rep` が Text variant で、窓に見えている片があれば、字幕の欄の
+    /// うち代表から読むもの (「A」のレーンの有無とフェードの上限) を返す (= image idiom)。 各 numeric
+    /// field の `*_automated` は対応する TextBuiltin lane が track に存在するか。
+    pub fn inspector_text_event_summary(
+        &self,
+        rep: crate::handler::selection_view::LiveClip<'_>,
+    ) -> Option<InspectorTextEventSummary> {
         // 値は窓に見えている最初のひと続きから読む (`handler::clip_window`)。
-        let events_of = common::model::ClipContent::text_events;
-        let (event, fade) = self.clip_edit_anchor(self.clip_shown_targets(cref, events_of)?, events_of, None)?;
+        let (_, fade) = self.text_first_run_of(rep.clip)?;
         let mut automated = std::collections::HashSet::new();
-        for lane in &track.automation_lanes {
+        for lane in &rep.track.automation_lanes {
             if let common::model::AutomationTarget::TextBuiltin(p) = lane.target {
                 automated.insert(p);
             }
         }
-        Some(InspectorTextEventSummary {
-            target: cref,
-            // "Mute" トグル状態は clip-level `Clip.muted` を表示する (SSoT)。
-            muted: clip.muted,
-            align: event.align,
-            fade_in_curve: fade.fade_in_curve,
-            fade_out_curve: fade.fade_out_curve,
-            automated,
-            fade_max_beats: fade.len_beats,
-            event: common::model::TextEvent {
-                fade_in_beats: fade.visible_fade_in_beats(),
-                fade_out_beats: fade.visible_fade_out_beats(),
-                ..event.clone()
-            },
-        })
+        Some(InspectorTextEventSummary { automated, fade_max_beats: fade.len_beats })
     }
 
     pub(crate) fn set_clip_image_event_fade_in_beats(&mut self, target: ClipKey, beats: f64) {

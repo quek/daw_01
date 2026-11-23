@@ -24,7 +24,7 @@ pub const MIN_CLIP_LEN_BEATS: f64 = 1.0 / 32.0;
 ///
 /// r.md #68 同件: [`MIN_CLIP_LEN_BEATS`] と同じ理由で **preview と commit の共通下限**。
 /// widget 側 (`piano_roll` の resize preview) が `0.05`、handler 側
-/// (`AppData::resize_notes` / `resize_note`) が `0.0625` と割れていたため、
+/// (`AppData::resize_notes`) が `0.0625` と割れていたため、
 /// snap off (Alt) で 1/16 未満まで縮めるとゴーストより長く確定していた。
 /// `ResizeLeft` ではさらに悪く、start は見えたとおりに確定するのに長さだけ伸ばされる
 /// ので、**固定していたはずの右端が動く**。
@@ -171,6 +171,11 @@ pub struct Clip {
     /// `Clip::speaker_id` を流用する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub talk: Option<TalkParams>,
+    /// v48 (r.md #159): この clip の素材が **置かれた時点のコード** の記録 (コードトラックへの追従の基準、箱の系統と組)。
+    /// コードの箱を書き換えたときだけ書く ([`ClipChordBasis`] の doc)。content ではなく clip に持つ — linked clip
+    /// は同じノートを別の位置 (別の箱の下) で鳴らすので、記録はクリップごとに違う。
+    #[serde(default, skip_serializing_if = "ClipChordBasis::is_empty")]
+    pub chord_basis: ClipChordBasis,
 }
 
 impl Clip {

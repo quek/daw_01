@@ -56,6 +56,8 @@ pub mod history;
 pub mod inspector_view;
 /// r.md #158: トラックインスペクタのタイトル (選んでいるもの) と帯の対象の表示。
 pub mod inspector_title;
+/// r.md #158: インスペクタが 1 フレームに 1 回だけ作る選択のスナップショットと、欄の値の取り出し。
+pub mod inspector_selection;
 pub mod ipc;
 /// r.md #87: クリップランチャーの発火 / 行の主導権 / 列 (シーン) の CRUD。
 pub mod launcher;
@@ -69,6 +71,8 @@ pub mod loudness;
 pub mod master_panel;
 pub mod media;
 pub mod midi;
+/// MIDI Learn の割り当て一覧の言葉と削除。
+pub mod midi_bindings;
 pub mod sampler;
 /// r.md #156: オーディオ入力の録音 (トラックの入力 / モニター、開始・終了とクリップ生成)。
 pub mod audio_rec;
@@ -84,6 +88,8 @@ pub mod parallel;
 pub mod param_gesture;
 /// パラメーターの現在値と、 それを初期値にする `A` キーのレーン追加 (`automation_lanes.rs` から分離)。
 pub mod param_value;
+/// 選択ノートの始まり / オートメーションの点を曲の格子へ寄せる (`Ctrl+U`)。
+pub mod quantize;
 pub mod range_ops;
 /// autosave / クラッシュ復旧 modal / recovery file の掃除 (`project.rs` から分離)。
 pub mod recovery;

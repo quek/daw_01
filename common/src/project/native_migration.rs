@@ -381,7 +381,7 @@ mod tests {
 
         // 正規化の 2 回目で不変 / 保存 → 開き直しで等値。
         let mut again = song.clone();
-        again.normalize_after_load();
+        again.normalize_after_load().unwrap();
         assert_eq!(again, song);
         assert!(!again.enforce_edit_invariants());
         let dir = tempfile::tempdir().unwrap();

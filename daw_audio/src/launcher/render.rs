@@ -80,7 +80,7 @@ pub fn collect_row_midi<'p>(
             id => match index.track_cell(song, track_idx as usize, id) {
                 // r.md #157: セルのノートのコードは曲の playhead の位置で引く (区間の中では実効拍と曲の拍が同じ速さで
                 // 進むので、区間の差を足せばノートの開始の曲の拍になる。差は発火拍からの閉じた式 — buffer ごとに揺れない)。
-                Some(cell) => (std::slice::from_ref(&cell.clip), None, pitch.with_song_beat_offset(segment_offset(src, seg, playhead_beats, bpf))),
+                Some(cell) => (std::slice::from_ref(&cell.clip), None, pitch.for_cell(segment_offset(src, seg, playhead_beats, bpf))),
                 None => return,
             },
         };
@@ -141,7 +141,7 @@ pub fn render_row_audio<'p>(
         // r.md #157: セルのコードは曲の playhead の位置で引く (`collect_row_midi` と同じ)。
         let seg_pitch = match seg.cell_clip_id {
             0 => pitch,
-            _ => pitch.with_song_beat_offset(segment_offset(src, seg, playhead_beats, bpf)),
+            _ => pitch.for_cell(segment_offset(src, seg, playhead_beats, bpf)),
         };
         render_audio_events(
             renderer,
@@ -574,19 +574,31 @@ mod tests {
         assert!(active.is_empty(), "鳴っている note が残った: {active:?}");
     }
 
+    /// セルの拍 `starts` に C の 3 和音 (60 64 67、0.5 拍) を並べた content。
+    fn triads_at(starts: &[f64]) -> MidiContent {
+        let notes: Vec<Note> = starts
+            .iter()
+            .flat_map(|&s| [60u8, 64, 67].map(|pitch| (s, pitch)))
+            .zip(1u32..)
+            .map(|((s, pitch), id)| Note { id, start_beat: s, duration_beats: 0.5, pitch, ..Note::default() })
+            .collect();
+        let next_note_id = u32::try_from(notes.len()).unwrap_or(0) + 1;
+        MidiContent { notes, next_note_id }
+    }
+
     /// r.md #157: セルのノートは、撃ったときの **曲の playhead の位置** のコードに追従する (セルの拍ではない)。
-    /// 拍 8 で撃ったセルの頭の G は曲の拍 8 の Am で A に、セルの拍 2 の E は曲の拍 10 の F で F に寄る。
+    /// 拍 8 で撃ったセルの頭の C の和音は曲の拍 8 の Am で G → A に、セルの拍 2 の和音は曲の拍 10 の F で E → F /
+    /// G → A に寄る (r.md #159: 和音のパートは自分の和音から帯のコードへ。セルの拍 0 には箱が無いので、セルの拍で
+    /// 引けば書いた音のまま)。
     #[test]
     fn セルのノートは曲の_playhead_の位置のコードに追従する() {
         use common::model::{Chord, ChordEvent, ChordFollow, ChordKind};
         let mut song = song_with_cell();
         let cid = song.tracks[0].session_clips[0].clip.content_id;
-        if let Some(ClipContent::Midi(m)) = song.clip_contents.get_mut(&cid) {
-            m.notes[0].pitch = 67;
-        }
+        song.clip_contents.insert(cid, ClipContent::Midi(triads_at(&[0.0, 2.0])));
         song.tracks[0].follow_chords = ChordFollow::Narrow;
         for (start, root, kind) in [(8.0, 9, ChordKind::Minor), (10.0, 5, ChordKind::Major)] {
-            song.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: 2.0, chord: Chord::new(root, kind), color: None });
+            song.place_chord(ChordEvent::new(start, 2.0, Chord::new(root, kind)));
         }
         let index = SongIndex::build(&song);
         let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(8.0));
@@ -604,7 +616,46 @@ mod tests {
             }));
             beat += bpf;
         }
-        assert_eq!(ons, vec![69, 65]);
+        // 同じ拍の On の並びは決まっていないので、和音ごとに並べ替えて比べる。
+        let chords: Vec<Vec<u8>> = ons
+            .chunks(3)
+            .map(|c| {
+                let mut c = c.to_vec();
+                c.sort_unstable();
+                c
+            })
+            .collect();
+        assert_eq!(chords, vec![vec![60, 64, 69], vec![60, 65, 69]]);
+    }
+
+    /// r.md #159: セルはクリップの記録 (置いた時点のコード) を読まない — 曲の位置を持たないので「どの箱の下で置いたか」が
+    /// 無い。アレンジで書き換えを経験したクリップをセルへ運んで、記録と同じ系統の箱の下で撃っても、旋律は書いた音のまま。
+    #[test]
+    fn セルはクリップの記録を読まない() {
+        use common::model::{Chord, ChordEvent, ChordFollow, ChordKind, NoteChordBasis};
+        let mut song = song_with_cell();
+        let cid = song.tracks[0].session_clips[0].clip.content_id;
+        let melody = Note { id: 1, start_beat: 0.0, duration_beats: 1.0, pitch: 64, ..Note::default() };
+        song.clip_contents.insert(cid, ClipContent::Midi(MidiContent { notes: vec![melody], next_note_id: 2 }));
+        song.tracks[0].follow_chords = ChordFollow::Parallel;
+        let id = song.place_chord(ChordEvent::new(8.0, 4.0, Chord::new(2, ChordKind::Major))).expect("box");
+        let lineage = song.chord_by_id(id).expect("box").lineage;
+        song.tracks[0].session_clips[0].clip.chord_basis.notes =
+            vec![NoteChordBasis { note_id: 1, lineage, chord: Chord::new(0, ChordKind::Major) }];
+        let index = SongIndex::build(&song);
+        let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(8.0));
+        let mut active = NoteLedger::default();
+        let mut out = Vec::with_capacity(256);
+        let pitch = crate::pitch_map::PitchMap::for_track(&song, &index, 0, 0);
+        collect_row_midi(Some(&song), &index, 0, src, 48_000, 8.0, 120.0, 512, pitch, &mut out, &mut active);
+        let ons: Vec<u8> = out
+            .iter()
+            .filter_map(|e| match e.event {
+                crate::sequencer::NoteTransition::On { key, .. } => Some(key),
+                crate::sequencer::NoteTransition::Off { .. } => None,
+            })
+            .collect();
+        assert_eq!(ons, vec![64], "記録 (C → D なら 66) を読まない");
     }
 
     /// r.md #157: 3 連符の量子化で撃ったセル (発火拍が 2/3 拍の端数を持つ) でも、コードの箱の境界ちょうどに始まる
@@ -616,14 +667,13 @@ mod tests {
         use common::model::{Chord, ChordEvent, ChordFollow, ChordKind};
         let mut song = song_with_cell();
         let cid = song.tracks[0].session_clips[0].clip.content_id;
-        let notes: Vec<Note> = (0..4)
-            .map(|j| Note { id: j + 1, start_beat: f64::from(j) + 1.0 / 3.0, duration_beats: 0.5, pitch: 60, ..Note::default() })
-            .collect();
-        song.clip_contents.insert(cid, ClipContent::Midi(MidiContent { notes, next_note_id: 5 }));
+        // r.md #159: 追従するのは和音のパート (自分の和音から帯のコードへ) なので、C の 3 和音を並べる。
+        let starts: Vec<f64> = (0..4).map(|j| f64::from(j) + 1.0 / 3.0).collect();
+        song.clip_contents.insert(cid, ClipContent::Midi(triads_at(&starts)));
         song.tracks[0].follow_chords = ChordFollow::Parallel;
         for b in 0..160u32 {
             let root = if b % 2 == 0 { 0 } else { 2 };
-            song.place_chord(ChordEvent { id: 0, start_beat: f64::from(b), len_beats: 1.0, chord: Chord::new(root, ChordKind::Major), color: None });
+            song.place_chord(ChordEvent::new(f64::from(b), 1.0, Chord::new(root, ChordKind::Major)));
         }
         let index = SongIndex::build(&song);
         let bpf = 512.0 * 120.0 / (60.0 * 48_000.0);
@@ -643,12 +693,21 @@ mod tests {
                 }));
                 beat += bpf;
             }
-            // 20 個のノートが 1 回ずつ。ノート i は拍 `launch + 1/3 + i` (整数) の箱ちょうどに始まり、その箱のコード
-            // (偶数拍 = C で 60 / 奇数拍 = D で 62) で鳴る。
+            // 20 個の和音が 1 回ずつ。和音 i は拍 `launch + 1/3 + i` (整数) の箱ちょうどに始まり、その箱のコード
+            // (偶数拍 = C でそのまま / 奇数拍 = D で +2) で鳴る。同じ拍の On の並びは決まっていないので和音ごとに並べ替える。
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let first_box = (launch + 1.0 / 3.0).round() as u32;
-            let want: Vec<u8> = (0..20).map(|i| if (first_box + i).is_multiple_of(2) { 60 } else { 62 }).collect();
-            report.push((launch, ons == want, ons));
+            let want: Vec<Vec<u8>> =
+                (0..20).map(|i| if (first_box + i).is_multiple_of(2) { vec![60, 64, 67] } else { vec![62, 66, 69] }).collect();
+            let got: Vec<Vec<u8>> = ons
+                .chunks(3)
+                .map(|c| {
+                    let mut c = c.to_vec();
+                    c.sort_unstable();
+                    c
+                })
+                .collect();
+            report.push((launch, got == want, ons));
         }
         assert!(report.iter().all(|r| r.1), "撃った拍ごとの鍵盤 (各ノート 1 回): {report:?}");
     }
@@ -679,7 +738,7 @@ mod tests {
             let split_now = !split_done && beat >= 2.0;
             if split_now {
                 let Some(ClipContent::Midi(m)) = song.clip_contents.get_mut(&cid) else { panic!("Midi") };
-                assert_eq!(m.split_notes(|_| vec![1.0], 0.0), 1);
+                assert_eq!(m.split_notes(|_| vec![1.0], 0.0).len(), 1);
                 split_done = true;
             }
             let mut out = Vec::with_capacity(256);

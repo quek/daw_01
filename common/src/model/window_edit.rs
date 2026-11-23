@@ -277,10 +277,8 @@ impl Song {
         if !Self::content_crosses(content, edge) {
             return false;
         }
-        let cut = self.split_content_at_points(content_id, &[edge]);
-        if let Some(clip) = self.clip_by_key_mut(key) {
-            clip.content_id = cut;
-        }
+        // クリップの上の content を切る口は 1 本 (audio は take が片に継がれるので、記録の写しは何もしない)。
+        self.split_clip_content_at(key, &[edge]);
         true
     }
 

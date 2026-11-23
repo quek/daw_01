@@ -44,7 +44,7 @@ use common::model::{ChainRef, MASTER_TRACK_ID, RackPanelKey};
 
 use super::chain_row::{draw_add_chain_row, draw_add_plugin_row, draw_chain_row};
 use super::layout::{FAIL_REASON_H, OFF_TAG_FONT, OFF_TAG_GAP, OFF_TAG_H, OFF_TAG_PAD_X, ROW_NAME_FONT, ROW_NAME_TOP};
-use super::native_panel::layout;
+use super::native_panel::{EqScopes, layout};
 use super::native_row::{draw_master_tail, draw_native_expansions, draw_native_row};
 use super::plugin_row::{draw_plugin_expansions, draw_plugin_row, sc_panel_height};
 use super::row_menu::{carried_device_ids, draw_context_menus};
@@ -76,16 +76,20 @@ pub(super) fn base_row_h(kind: &ChainRowKind) -> f32 {
     }
 }
 
-/// chain list を `y` から描き、 `(消費後の y, Q の宛先 = hover 中の行)` を返す。 見出しは Rack の帯
-/// (`band.rs`、 r.md #158) が持つ。 hover の宛先は `track_inspector::draw` が末尾で 1 回だけ公開する
-/// (帯を畳んだ / インスペクタを隠したフレームに古い宛先を残さない)。
-pub(super) fn draw_chain_list(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    y: f32,
-) -> (f32, Option<BypassTarget>) {
+/// chain list を描いた結果。
+pub(super) struct ChainListOut {
+    /// 消費後の y。
+    pub y: f32,
+    /// Q の宛先 = hover 中の行。
+    pub row: Option<BypassTarget>,
+    /// スクロールの viewport の中にカーブを描いた EQ / Tone EQ の Par (上から、[`EqScopes`] の上限まで)。
+    pub eq_scopes: Vec<u64>,
+}
+
+/// chain list を `y` から描く。 見出しは Rack の帯 (`band.rs`、 r.md #158) が持つ。 hover の宛先と、スペクトラムを
+/// 要求する EQ (実際に見える所に描いたものだけ) は `track_inspector::draw` が末尾で 1 回だけ公開する
+/// (帯を畳んだ / インスペクタを隠した / スクロールで外れたフレームに古い宛先を残さない)。
+pub(super) fn draw_chain_list(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, pad: f32, y: f32) -> ChainListOut {
     let p = &app.theme.core;
     let rows = app.chain_rows();
     let cursor_tid = app.cursor_track_id();
@@ -117,6 +121,7 @@ pub(super) fn draw_chain_list(
     let disabled = cursor_tid.is_some_and(|tid| !app.cur.song_doc.song().track_effectively_enabled(tid));
     let scope = app.live_param_scope();
     let song = app.cur.song_doc.song();
+    let eq_scopes = EqScopes::default();
     let ctx = RowCtx {
         rows: &rows,
         popup_open,
@@ -126,6 +131,8 @@ pub(super) fn draw_chain_list(
         sc_panel_h,
         aux_entry: aux_entry.as_ref(),
         aux_panel_h,
+        aux_out_allowed: cursor_tid.is_some_and(crate::handler::view_model::aux_out_allowed_on),
+        eq_scopes: &eq_scopes,
         form_left: area.x + pad,
         keys_style: toggle_audio_style(&app.theme),
         scope: &scope,
@@ -252,7 +259,7 @@ pub(super) fn draw_chain_list(
     }
     draw_context_menus(app, ui, &rows, &resp.row_rects);
 
-    (end_y, hovered_row)
+    ChainListOut { y: end_y, row: hovered_row, eq_scopes: ctx.eq_scopes.take() }
 }
 
 /// plugin / 映像 FX / VOICEVOX の Par パネルの高さ。前フレームの実測 (lag-by-one、 実測 0 もそのまま
@@ -517,6 +524,11 @@ pub(super) struct RowCtx<'a> {
     /// 出力 (パラアウト) のパネルを開いている plugin の配線 (表示中の chain の行に居るときだけ)。
     pub(super) aux_entry: Option<&'a crate::app_types::ParallelOutputEntry>,
     pub(super) aux_panel_h: f32,
+    /// 表示中のトラックが出力を子トラックへ展開できるか (`handler::view_model::aux_out_allowed_on`、フレームに
+    /// 1 回だけ求める。行ごとに model を引かない)。
+    pub(super) aux_out_allowed: bool,
+    /// 見える所にカーブを描いた EQ (Par が描くたびに積む)。
+    pub(super) eq_scopes: &'a EqScopes,
     /// 帯の欄の左端 (行の直下に開く欄の値の x を帯の欄と揃える、`form::cols_nested`)。
     pub(super) form_left: f32,
     pub(super) keys_style: ToggleButtonStyle,

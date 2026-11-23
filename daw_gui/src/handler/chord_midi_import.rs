@@ -41,13 +41,7 @@ impl AppData {
         let at = if at.is_finite() { at.max(0.0) } else { 0.0 };
         let n = found.len();
         self.edit_song(|song| {
-            song.place_chords(found.into_iter().map(|s| ChordEvent {
-                id: 0,
-                start_beat: at + s.start_beat,
-                len_beats: s.len_beats,
-                chord: s.chord,
-                color: None,
-            }));
+            song.place_chords(found.into_iter().map(|s| ChordEvent::new(at + s.start_beat, s.len_beats, s.chord)));
         });
         self.ui_ephemeral.status_message = format!("MIDI からコードを {n} 個置きました");
         n
@@ -67,7 +61,7 @@ mod tests {
         let prog = [(0, ChordKind::Major), (9, ChordKind::Minor7), (5, ChordKind::Major), (7, ChordKind::Dominant7)];
         app.edit_song(|song| {
             for (i, (root, kind)) in prog.iter().enumerate() {
-                song.place_chord(ChordEvent { id: 0, start_beat: i as f64 * 4.0, len_beats: 4.0, chord: Chord::new(*root, *kind), color: None });
+                song.place_chord(ChordEvent::new(i as f64 * 4.0, 4.0, Chord::new(*root, *kind)));
             }
             song.chords_to_clip(&[], track, Voicing::Piano, 100);
             song.chords.clear();

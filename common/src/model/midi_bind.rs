@@ -156,7 +156,14 @@ impl BindingTarget {
             Self::StopAllLauncherRows => "全行を止める",
             Self::SwitchRowToArranger { .. } => "行をアレンジへ戻す",
             Self::SwitchAllToArranger => "全行をアレンジへ戻す",
-            _ => return None,
+            // 宛先を列挙する (ランチャー操作を足したら、ここで言葉を決めるまでコンパイルが通らない)。
+            Self::TrackVolume(_)
+            | Self::TrackPan(_)
+            | Self::SongTempo
+            | Self::SongTranspose
+            | Self::PluginParam { .. }
+            | Self::NativeParam { .. }
+            | Self::MasterLimiter(_) => return None,
         })
     }
 }

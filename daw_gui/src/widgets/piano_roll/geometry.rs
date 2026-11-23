@@ -72,7 +72,7 @@ pub(crate) fn clamp_shared_pitch_delta(
 /// (別々に書くと overlay と確定値がずれる)。
 /// r.md #68 同件: 下限そのものも **model と共有** する (`MIN_NOTE_LEN` =
 /// `common::model::MIN_NOTE_LEN_BEATS`)。 ここが `0.05` だった頃は、 handler 側
-/// (`AppData::resize_notes` / `resize_note` / `add_note`) が別の下限に clamp するため、
+/// (`AppData::resize_notes` / `add_note`) が別の下限に clamp するため、
 /// snap off (Alt) でその下限未満まで縮めるとゴーストより長く確定していた。
 /// `ResizeLeft` では start だけ見えたとおりに確定して長さが伸ばされるので、
 /// **固定していたはずの右端が動く**。 ドラッグ作成 ([`note_create_geometry`]) も同じ値を使う。

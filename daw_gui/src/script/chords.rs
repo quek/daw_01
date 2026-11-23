@@ -6,7 +6,6 @@
 
 use boa_engine::value::TryFromJs;
 use boa_engine::{Context, JsArgs, JsResult, JsString, JsValue};
-use common::chord_follow::TrackChordFollow;
 use common::chord_name::parse_chord;
 use serde::Deserialize;
 use serde_json::Value;
@@ -77,15 +76,19 @@ pub(super) fn daw_parse_chord(_this: &JsValue, args: &[JsValue], ctx: &mut Conte
     Ok(JsString::from(json.as_str()).into())
 }
 
-/// `daw.followedKey(trackId, pitch, songBeat)` → その拍で始まるノートが鳴らす鍵盤 (書いた音の空間、
-/// 移調は含まない)。素材のコードは渡さない (平行移動 / ベースはキーのトニック基準)。鳴らさなければ `null`。
-/// engine を通さずに `common::chord_follow` の評価だけを確かめる口。
-pub(super) fn daw_followed_key(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+/// `daw.soundingKey(trackId, clipId, noteId)` → クリップのノートが追従で鳴らす鍵盤 (書いた音の空間、移調は
+/// 含まない)。ピアノロールの薄い枠と「鳴る音で確定」と同じ読み口 (`ClipSoundingKeys`、自分の和音とクリップの記録
+/// 込み)。鳴らさなければ / クリップかノートが無ければ `null`。engine を通さずに追従の評価だけを確かめる口。
+pub(super) fn daw_sounding_key(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let track_id = u32::try_from_js(args.get_or_undefined(0), ctx)?;
-    let pitch = u8::try_from_js(args.get_or_undefined(1), ctx)?;
-    let beat = args.get_or_undefined(2).to_number(ctx)?;
+    let clip_id = u32::try_from_js(args.get_or_undefined(1), ctx)?;
+    let note_id = u32::try_from_js(args.get_or_undefined(2), ctx)?;
     let key = with_app(move |app, _side, _io| {
-        TrackChordFollow::of(app.cur.song_doc.song(), track_id).key(pitch, beat, None)
+        let keys = app.clip_sounding_keys(track_id, clip_id)?;
+        let song = app.cur.song_doc.song();
+        let clip = song.track_by_id(track_id)?.clip_by_id(clip_id)?;
+        let note = song.clip_notes(clip).iter().find(|n| n.id == note_id)?;
+        keys.key(note)
     });
     Ok(key.map_or(JsValue::null(), |k| JsValue::from(i32::from(k))))
 }

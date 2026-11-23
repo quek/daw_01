@@ -328,7 +328,7 @@ fn chords_on_clip(
         for s in spans {
             let (a, b) = (to_beat(s.start_frame).max(vis_start), to_beat(s.end_frame).min(vis_end));
             if b - a > 1e-6 {
-                out.push(ChordEvent { id: 0, start_beat: a, len_beats: b - a, chord: s.chord, color: None });
+                out.push(ChordEvent::new(a, b - a, s.chord));
             }
         }
     }
@@ -357,7 +357,7 @@ mod tests {
         });
         app.cur.song_doc.mark_saved();
         let depth = app.cur.song_doc.undo_depth();
-        let spans = vec![AudioChordSpan { start_frame: 0, end_frame: 48_000, chord: Chord::new(9, ChordKind::Minor) }];
+        let spans = vec![AudioChordSpan { start_frame: 0, end_frame: 48_000, chord: Chord::new(9, ChordKind::Minor), chordal: true }];
         app.set_audio_chords(source_id, spans.clone(), &[]);
         assert_eq!(app.cur.song_doc.undo_depth(), depth, "undo step を作らない");
         assert!(!app.cur.song_doc.is_dirty(), "`*` を立てない");

@@ -238,6 +238,9 @@ impl Song {
             remap.insert(cid, new);
             Some(new)
         };
+        // r.md #159: 貼った箱は写しの系統ごとに新しい系統になる。貼ったクリップの記録も同じ表で付け替える
+        // (表に無い系統 = 範囲の外の箱の下で書いた記録は捨てる)。貼った区間は元と同じ音で鳴り、以後は独立する。
+        let lineages = self.push_chords_at(at, &copy.chords);
         for (tid, c) in &copy.clips {
             let Some(content_id) = resolve(self, c.content_id) else { continue };
             let Some(t) = self.tracks.iter_mut().find(|t| t.id == *tid) else { continue };
@@ -245,6 +248,7 @@ impl Song {
                 id: 0,
                 start_beat: at + c.start_beat,
                 content_id,
+                chord_basis: c.chord_basis.relineaged(&lineages),
                 ..c.clone()
             });
         }
@@ -268,7 +272,6 @@ impl Song {
             section_ids.push(id);
             self.sections.push(Section { id, start_beat: s.start_beat + at, ..s.clone() });
         }
-        self.push_chords_at(at, &copy.chords);
         self.ensure_scale_changes_sorted();
         self.ensure_automation_points_sorted();
         self.normalize_sections();

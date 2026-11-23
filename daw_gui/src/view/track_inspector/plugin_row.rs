@@ -178,9 +178,9 @@ pub(super) fn draw_plugin_row(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Row
         });
     }
     // [Out] (aux 出力 port を持つ plugin だけ。マスターは子トラックへ展開できないので出さない)。出すかどうかは
-    // 開いたパネルの中身と同じ `AppData::aux_out_entry` の 1 本で決める (規則を 2 か所に書かない)。
-    // 配線済み (展開済み) は ON 色。
-    if entry.aux_output_count > 0 && app.aux_out_entry(device_id).is_some() {
+    // 開いたパネル (`AppData::aux_out_entry`) と同じ `aux_out_allowed_on` の 1 本、配線済み (展開済み、ON 色) も
+    // パネルと同じ `wired_aux_outputs` の 1 本 (規則を 2 か所に書かない)。行は model を引き直さない。
+    if entry.aux_output_count > 0 && ctx.aux_out_allowed {
         let open = app.cur.peph.open_aux_out_panel == Some(device_id);
         let label = if open { "Out\u{25B4}" } else { "Out\u{25BE}" };
         ui.toggle_button_at(("inspector_row_aux_out", i), label, col.take(BTN_SC_W + 6.0), entry.aux_out_wired || open, &ctx.keys_style, move |_| {

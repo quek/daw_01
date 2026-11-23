@@ -293,7 +293,7 @@ impl AppData {
         }
         let count = out.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            song.project_id,
+            self.clipboard_source(),
             crate::clipboard::ClipboardPayload::Devices(out),
         )
         .to_json()?;

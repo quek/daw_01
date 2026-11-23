@@ -300,7 +300,7 @@ impl Song {
         }
         extract_chords(&notes, opts)
             .into_iter()
-            .map(|s| ChordEvent { id: 0, start_beat: s.start_beat, len_beats: s.len_beats, chord: s.chord, color: None })
+            .map(|s| ChordEvent::new(s.start_beat, s.len_beats, s.chord))
             .collect()
     }
 }
@@ -393,7 +393,7 @@ mod tests {
         let mut song = Song { tracks: vec![Track { id: 1, ..Track::default() }], ..Song::default() };
         let progression = [(0.0, 4.0, 0, ChordKind::Major), (4.0, 4.0, 9, ChordKind::Minor7), (8.0, 8.0, 7, ChordKind::Dominant7)];
         for (s, l, root, kind) in progression {
-            song.place_chord(ChordEvent { id: 0, start_beat: s, len_beats: l, chord: Chord::new(root, kind), color: None });
+            song.place_chord(ChordEvent::new(s, l, Chord::new(root, kind)));
         }
         let clip_id = song.chords_to_clip(&[], 1, Voicing::Basic, 100).expect("クリップができる");
         let clip = song.tracks[0].clips.iter().find(|c| c.id == clip_id).unwrap();

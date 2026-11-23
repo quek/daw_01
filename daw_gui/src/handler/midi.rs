@@ -119,7 +119,7 @@ impl AppData {
     /// engine の `pending_preview`) をそのまま使う。 engine は次の dispatch の
     /// frame 0 に注入するので、再生中でも停止中でも鳴る。
     fn monitor_note_on(&mut self, pitch: u8, velocity: u8) {
-        for track_id in self.armed_track_ids() {
+        for track_id in self.midi_armed_track_ids() {
             self.monitor_note_on_track(track_id, pitch, velocity);
         }
     }
@@ -160,13 +160,26 @@ impl AppData {
         }
     }
 
-    /// 録音待機 (`Track::armed`) のトラック id。 録音・モニターの宛先。
+    /// 録音待機 (`Track::armed`) で、入力がそのトラックで効く (`common::model::InputRules::effective_input`) トラック
+    /// id。録音を始めてよいか (録音先があるか) の判定。音声の書き先は `request_audio_takes` が同じ規則で決める。
     /// r.md #131: 実効的に無効なトラックは宛先にしない (待機のまま無効な group へ移した場合も)。
     pub(crate) fn armed_track_ids(&self) -> Vec<u32> {
+        self.armed_tracks_where(|_| true)
+    }
+
+    /// MIDI 入力の録音・モニターの宛先: 録音待機で、効く入力が MIDI のトラック。入力の帯が「未選択」と出す
+    /// トラック (MIDI を録れない) や、音声入力を選んだトラックには MIDI を録らない / 鳴らさない。
+    pub(crate) fn midi_armed_track_ids(&self) -> Vec<u32> {
+        self.armed_tracks_where(common::model::TrackInput::is_midi)
+    }
+
+    fn armed_tracks_where(&self, input: impl Fn(&common::model::TrackInput) -> bool) -> Vec<u32> {
         let song = self.cur.song_doc.song();
+        let rules = common::model::InputRules::new(song);
         song.tracks
             .iter()
             .filter(|t| t.armed && song.track_effectively_enabled(t.id))
+            .filter(|t| rules.effective_input(t).is_some_and(|i| input(&i)))
             .map(|t| t.id)
             .collect()
     }
@@ -374,6 +387,18 @@ impl AppData {
         }
     }
 
+    /// ステップ入力の書き先: 選んでいるクリップと、その窓の中へ戻したステップカーソル (content-local 拍)。
+    /// r.md #44: step カーソルは content-local。 clip が見せている窓 `[offset, offset + length)` の中を進み、
+    /// 外れたら窓の先頭へ戻す (`selected_clip` 切替時の 0 初期化も窓外なのでここで吸収される)。ステップ入力の書く位置と
+    /// モニターの寄せる位置 (`AppData::live_input_landing`) が同じこれを通す (戻し方をずらさない)。
+    pub(crate) fn step_input_cursor(&self) -> Option<(crate::app::ClipKey, f64)> {
+        let target = self.selected_clip_ref()?;
+        let clip = self.cur.song_doc.song().clip_by_key(target)?;
+        let cursor = self.cur.recording.step_cursor_beat;
+        let (win_start, win_end) = clip.content_window();
+        Some((target, if cursor < win_start || cursor >= win_end { win_start } else { cursor }))
+    }
+
     /// 既存 step-input mode (= selected_clip + step_cursor_beat に固定 length
     /// で 1 note ずつ手動入力)。 録音を要求していないときだけ走る。
     pub(crate) fn step_input_note_on(&mut self, pitch: u8, velocity: u8) {
@@ -385,20 +410,14 @@ impl AppData {
         if self.reject_write_if_pianoroll_locked(target) {
             return;
         }
-        let cursor = self.cur.recording.step_cursor_beat;
         let step = self.cur.recording.step_size_beats;
-        let Some(clip) = self.cur.song_doc.song().clip_by_key(target) else {
+        let Some((_, cursor)) = self.step_input_cursor() else {
             return;
         };
-        // r.md #44: step カーソルは content-local。 clip が見せている窓
-        // `[offset, offset + length)` の中を進み、外れたら窓の先頭へ戻す
-        // (`selected_clip` 切替時の 0 初期化も窓外なのでここで吸収される)。
-        let (win_start, win_end) = clip.content_window();
-        let cursor = if cursor < win_start || cursor >= win_end {
-            win_start
-        } else {
-            cursor
-        };
+        // r.md #159 Q2: 書く音はモニターと同じ口 (`live_input_key` — 最寄りのコード音 / スケールで追従するトラックの
+        // アレンジは書く位置 (カーソル) のコードへ寄せる、セルは弾いた音のまま)。書いたノートに記録は無いので、再生は
+        // 書いた音のまま = 聴いた音 = 書いた音 = 再生の音。
+        let pitch = self.live_input_key(target.track_id, pitch);
         let Some(Some(selected)) = self.edit_song(|song| {
             let content =
                 midi_content_in_clip_mut(song, target)?;
@@ -435,7 +454,7 @@ impl AppData {
     /// 録音書き込みでも同じ動作、 不都合なら別 phase で「録音前に
     /// make_unique」 を検討)。
     pub(crate) fn record_midi_note_on(&mut self, pitch: u8, velocity: u8) {
-        let tracks = self.armed_track_ids();
+        let tracks = self.midi_armed_track_ids();
         self.record_midi_note_on_tracks(&tracks, pitch, velocity);
     }
 
@@ -447,19 +466,21 @@ impl AppData {
         if playhead < 0.0 {
             return;
         }
-        // Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input。
-        // note_off も同じ snap を適用するので、 deterministic snap で
-        // (track_id, pitch) lookup が整合する。 step input は別 path
-        // (`step_input_note_on`) を経由するのでここの snap は録音時のみ。
-        let pitch = if self.cur.recording.snap_live_input {
-            self.cur.song_doc.song()
-                .scale_at(playhead)
-                .map(|sc| sc.snap(pitch))
-                .unwrap_or(pitch)
-        } else {
-            pitch
-        };
+        // 押している台帳は **弾いた鍵盤** で引く (下)。 寄せた音程は書いたノートの側にある — 寄せた音程で引くと、
+        // 押している間に転調 / コードの箱の境界を越えたときに note_off が別の鍵で引いて見つからず、2 つの鍵が
+        // 同じ音へ寄ると台帳が上書きされた。
+        let played = pitch;
         for &track_id in tracks {
+            // Phase 7 B5 (`docs/plan_scale.html` §5.2) の Snap Live Input と r.md #159 Q2 (最寄りのコード音 / スケールで
+            // 追従するトラックはコードへ寄せる) を、モニターと同じ口で通す (聴いた音 = 録れた音 = 再生の音)。
+            // step input は別 path (`step_input_note_on`) なので Snap Live Input は録音時のみ。
+            let pitch = self.live_input_key(track_id, played);
+            // 別の鍵が同じ音へ寄って押されたまま (Snap Live Input / コードへ寄せた 2 つの鍵) なら、新しいノートを書かずに
+            // そのノートを一緒に押さえる (同じ音程の重なったノートを作らない)。長さは最後に離した鍵で決まる。
+            if let Some(held) = self.held_recorded_note(track_id, pitch) {
+                self.cur.recording.midi_recording_active_notes.insert((track_id, played), held);
+                continue;
+            }
             self.ensure_midi_clip_at_playhead(track_id, playhead);
             let Some(key) = self.find_midi_clip_at_playhead(track_id, playhead) else {
                 continue;
@@ -494,27 +515,30 @@ impl AppData {
             if let Some(Some(note_id)) = note_id {
                 self.cur.recording
                     .midi_recording_active_notes
-                    .insert((track_id, pitch), (playhead, note_id));
+                    .insert((track_id, played), (playhead, note_id));
             }
         }
     }
 
+    /// トラック `track_id` で押されたまま録っているノートのうち、書いた音程が `pitch` のもの (台帳の値)。音程は書いた
+    /// ノートの側を読む (台帳に写さない — 押している間に消された / 音程を変えられたノートに相乗りしない)。
+    fn held_recorded_note(&self, track_id: u32, pitch: u8) -> Option<(f64, u32)> {
+        let song = self.cur.song_doc.song();
+        self.cur.recording.midi_recording_active_notes.iter().filter(|((t, _), _)| *t == track_id).find_map(|(_, &(start, id))| {
+            let clip = song.clip_by_key(self.find_midi_clip_containing_beat(track_id, start)?)?;
+            // id は content の中で一意 (`alloc_note_id`) なので、id で引いた時点で止める。録ったノートは末尾へ足すので、
+            // 押しているノートは後ろにある (長いテイクでも打鍵ごとに全ノートを読まない)。
+            let held = song.clip_notes(clip).iter().rev().find(|n| n.id == id);
+            held.is_some_and(|n| n.pitch == pitch).then_some((start, id))
+        })
+    }
+
     /// Phase 7 B4 Step D: 録音中の note_off 処理。 `active_notes` から
     /// `(start_beat, note_id)` を取り出し、 `length = playhead - start` で確定する。
+    /// 台帳は弾いた鍵盤 `pitch` で引く (note_on が Snap Live Input / コードへ寄せた音程はノートの側にある)。
     pub(crate) fn record_midi_note_off(&mut self, pitch: u8) {
         let playhead =
             self.cur.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
-        // Phase 7 B5: note_on 側で snap した pitch で active_notes に登録して
-        // いるので、 note_off の lookup key も同じ snap を適用。 snap は
-        // deterministic なので転調を跨がない note なら lookup は必ず hit する。
-        let pitch = if self.cur.recording.snap_live_input {
-            self.cur.song_doc.song()
-                .scale_at(playhead)
-                .map(|sc| sc.snap(pitch))
-                .unwrap_or(pitch)
-        } else {
-            pitch
-        };
         // 押している台帳を引く (arm を外した / カーソルを移した後の note_off でも、
         // 書き込んだトラックのノートを確定できる)。
         let held: Vec<(u32, u8)> = self
@@ -545,8 +569,9 @@ impl AppData {
         };
         let length = (end - start).max(0.05);
         self.edit_song(|song| {
+            // 押していたノートは末尾近くにある (`held_recorded_note` と同じ理由で後ろから引く)。
             if let Some(notes) = song.notes_in_clip_mut(key)
-                && let Some(n) = notes.iter_mut().find(|n| n.id == note_id)
+                && let Some(n) = notes.iter_mut().rev().find(|n| n.id == note_id)
             {
                 n.duration_beats = length;
             }

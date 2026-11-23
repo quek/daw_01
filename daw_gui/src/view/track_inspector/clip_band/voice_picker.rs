@@ -22,8 +22,9 @@ pub(super) struct VoicePick<'a> {
     /// いまの声 (キャラ名 / スタイル名。空なら一覧から `speaker` で引く)。`None` = 選んでいるクリップで
     /// 声が割れている。
     pub current: Option<((&'a str, &'a str), u32)>,
-    /// 書き込む先のクリップ (選んでいる同じ種類のクリップ全部)。
-    pub clips: Vec<ClipKey>,
+    /// 書き込む先のクリップ (選んでいる同じ種類のクリップ全部、`AppData::inspector_voice_targets`)。選んだとき
+    /// だけ解決する (描くたびに宛先の列を作らない。`refetch` と同じ形)。
+    pub targets: fn(&AppData) -> Vec<ClipKey>,
     /// 「声の一覧を取り直す」で送る event。
     pub refetch: fn() -> AppEvent,
 }
@@ -73,8 +74,9 @@ pub(super) fn draw_voice_pick(app: &AppData, ui: &mut Ui<'_, AppData>, c: &FormC
         (None, None) => None,
     };
     if let Some((speaker_id, singer_name, style_name)) = chosen {
-        let clips = v.clips.clone();
+        let targets = v.targets;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            let clips = targets(app);
             app.handle_event(AppEvent::SetClipVoice { clips, speaker_id, singer_name, style_name });
         }));
     }

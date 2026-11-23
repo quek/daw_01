@@ -31,9 +31,7 @@ pub(crate) fn build(
         .map(|(i, s)| LauncherSceneView {
             id: s.id,
             name: Arc::from(s.display_name(i)),
-            color: s
-                .color
-                .map_or_else(|| app.theme.core.accent, track_color::to_renderer),
+            color: track_color::to_renderer(track_color::effective_scene_color(s)),
             follow: s.follow.enabled,
             selected: app.cur.selection.selected_scene_ids.contains(&s.id),
         })

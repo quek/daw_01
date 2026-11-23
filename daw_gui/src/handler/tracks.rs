@@ -366,10 +366,13 @@ impl AppData {
             // v35 (r.md #87): content の張り替えは `all_clips_mut` (= arrangement +
             // launcher のセル) を通す。セルを落とすと、独立複製 (Alt+D) でセルだけが
             // 元トラックと content を共有したまま残り、片方の編集がもう片方へ漏れる。
+            // r.md #159: 置いた時点のコードの記録はクリップ / セルの貼り付けと同じ規則 (`ClipChordBasis::pasted` —
+            // 別の id 空間からは捨てる。セルも捨てる: 読まないが、アレンジへ戻すと効き出す)。
             for c in t.all_clips_mut() {
                 if let Some(&new) = content_remap.get(&c.content_id) {
                     c.content_id = new;
                 }
+                c.chord_basis = std::mem::take(&mut c.chord_basis).pasted(same_project);
             }
             for lane in &mut t.automation_lanes {
                 for ac in lane.all_clips_mut() {
@@ -962,95 +965,6 @@ impl AppData {
         result
     }
 
-    pub(crate) fn swap_tracks(&mut self, a: u32, b: u32) {
-        if a == b {
-            return;
-        }
-        let n = self.cur.song_doc.song().tracks.len() as u32;
-        if a >= n || b >= n {
-            return;
-        }
-        // audio editor の対象が消える編集なので、退避した key で引き直して畳む。
-        let audio_editor_key = self.audio_editor_target_key();
-        self.edit_song(|song| song.tracks.swap(a as usize, b as usize));
-        self.reanchor_audio_editor(audio_editor_key);
-        // PR2.1: plugin_host の chains は `Track::id` ベースなので、
-        // Vec position swap は通知不要。 SwapTracks IPC は削除済。
-        // selected_clip / selected_clips は stable ClipKey 保持なので、 track の
-        // index swap には自動追従する (id 不変、 再マッピング不要)。 旧 index
-        // ベース実装は selected_clips を取りこぼすバグがあったが、 これで解消。
-        // selected_track_ids は id ベースなので track の index swap で
-        // 自動的に追従する (id は変わらないため再マッピング不要)。
-        self.resize_track_peak_display();
-    }
-
-    /// Drag&drop reorder。`order` は新順での `Track.id` 列。order に含まれない
-    /// track は末尾に残す (gui_01 daw_prototype の流儀に合わせ防御的)。
-    pub(crate) fn reorder_tracks(&mut self, order: &[u32]) {
-        if order.is_empty() {
-            return;
-        }
-        // 並びが変化しない場合は no-op
-        let same = order.iter().enumerate().all(|(i, id)| {
-            self.cur.song_doc.song().tracks.get(i).map(|t| t.id) == Some(*id)
-        });
-        if same && order.len() == self.cur.song_doc.song().tracks.len() {
-            return;
-        }
-        let selected_track_id = self
-            .cur.song_doc.song()
-            .tracks
-            .get(self.cursor_track_index().unwrap_or(0))
-            .map(|t| t.id);
-        // audio editor の対象が消える編集なので、退避した key で引き直して畳む。
-        let audio_editor_key = self.audio_editor_target_key();
-        // selected_clips / selected_clip は stable ClipKey 保持なので reorder
-        // (track の index 変化) に自動追従する。 旧実装の id ラウンドトリップ
-        // (抽出 → 並べ替え → index 逆引き) は不要になった。
-
-        // 元順序での index 列を計算 (`order[i]` の id を持つ track の旧 index)。
-        // この `index_order` で（旧設計では専用 IPC を送っていたが、現行は LoadSong 再送で）
-        // plugin host 側で 1 回の `tracks.mutate` (= 1 回の audio thread stop/start)
-        // で chains / params / vocal を新順序に並び替える。
-        let index_order: Vec<u32> = order
-            .iter()
-            .filter_map(|id| {
-                self.cur.song_doc.song()
-                    .tracks
-                    .iter()
-                    .position(|t| t.id == *id)
-                    .map(|p| p as u32)
-            })
-            .collect();
-
-        // song.tracks を新順序に並び替え (= 表示モデル更新)。
-        self.edit_song(|song| {
-            let mut new_tracks = Vec::with_capacity(song.tracks.len());
-            for id in order {
-                if let Some(pos) = song.tracks.iter().position(|t| t.id == *id) {
-                    new_tracks.push(song.tracks.remove(pos));
-                }
-            }
-            new_tracks.append(&mut song.tracks);
-            song.tracks = new_tracks;
-        });
-
-        // selected_track_ids は id ベースなので、 reorder 後も自動的に
-        // 整合 (id は変わらず、 song.tracks の Vec 内 index が変わるだけ
-        // で `cursor_track_index` が再評価される)。 selected_track_id
-        // 局所変数は不要。
-        let _ = selected_track_id;
-        // selected_clips / selected_clip は stable ClipKey 保持のため再構築不要。
-
-        // PR2.1: plugin_host の chains は `Track::id` ベースなので、
-        // Vec position の reorder は通知不要。 ReorderTracks IPC は
-        // 削除済。 LoadSong (flush_song_sync) で song_store
-        // のみ新順序に同期する。
-        let _ = index_order;
-        self.reanchor_audio_editor(audio_editor_key);
-        self.resize_track_peak_display();
-    }
-
     /// トラック面の選択集合を確定する **唯一の口** (r.md #43)。 集合を書き、
     /// last-wins タグを [`EditSurface::Tracks`] にする (= 以後の Delete / Cut /
     /// Copy / D がトラック面を向く)。
@@ -1415,6 +1329,29 @@ mod launcher_track_paste_tests {
         // 別プロジェクトなのでセルの content も新採番 (元 id を持ち込まない)。
         assert_ne!(cell.clip.content_id, cid);
         assert!(dst.clip_contents.contains_key(&cell.clip.content_id));
+    }
+
+    /// r.md #159: 別の id 空間 (別のプロジェクト / 開き直した後) から貼ったトラックは、アレンジのクリップもセルも
+    /// 置いた時点のコードの記録を捨てる (系統の番号が貼り先の無関係な箱を指す)。同じ id 空間なら運ぶ。
+    #[test]
+    fn pasted_tracks_drop_chord_basis_from_another_id_space() {
+        use common::model::{Chord, ChordKind, ClipChordBasis, NoteChordBasis};
+        let (mut src, tid, cid, scenes) = song_with_cell();
+        let basis = ClipChordBasis {
+            notes: vec![NoteChordBasis { note_id: 1, lineage: 3, chord: Chord::new(0, ChordKind::Major) }],
+            audio: Vec::new(),
+        };
+        let track = src.track_by_id_mut(tid).unwrap();
+        track.clips.push(Clip { id: 2, content_id: cid, length_beats: 4.0, chord_basis: basis.clone(), ..Clip::default() });
+        track.session_clips[0].clip.chord_basis = basis.clone();
+        let copies = copies_of(&src, tid, cid, &scenes);
+        for same in [false, true] {
+            let mut dst = if same { src.clone() } else { Song::default() };
+            let built = AppData::build_pasted_tracks(&mut dst, &copies.tracks, same, false, None, &common::model::MediaRemap::default());
+            let t = &built[0].1;
+            let want = if same { basis.clone() } else { ClipChordBasis::default() };
+            assert_eq!((&t.clips[0].chord_basis, &t.session_clips[0].clip.chord_basis), (&want, &want), "same={same}");
+        }
     }
 
     #[test]

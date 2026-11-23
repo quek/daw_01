@@ -1,9 +1,10 @@
 //! ノート列からのコード検出 (r.md #157、`docs/plan_chord_track.md`)。
 //!
-//! 使い道は 2 つで、どちらも同じ [`detect_chords`] を通す:
-//! - **コードトラックへの取り込み** (クリップを帯へドラッグ / 「コードを抽出」)。
-//! - **平行移動 / ベースの追従の基準** — 素材がもともと鳴らしているコード ([`source_chord_at`])。
-//!   MIDI はノートから毎回導けるので保存しない (保存すると、ノートを編集するたびに食い違う)。
+//! 使い道は 2 つで、どちらも同じ「鳴り始めで区切ってコードを決める」手順 ([`extract_chords`] の手順 1) を通す:
+//! - **コードトラックへの取り込み** (クリップを帯へドラッグ / 「コードを抽出」、[`extract_chords`])。
+//! - **追従の基準になる自分の和音** (r.md #159、[`own_chords`]) — 素材が **一緒に弾いている** 和音だけ。
+//!   窓で集めた旋律の音 (偶然コードに見えるもの) は和音にしない。MIDI はノートから毎回導けるので保存しない
+//!   (保存すると、ノートを編集するたびに食い違う)。
 //!
 //! オーディオの検出は chroma (pitch class ごとの強さ) を作ったあと、同じ [`match_chord`] に渡す。
 //!
@@ -281,54 +282,11 @@ pub fn extract_chords(notes: &[DetectNote], opts: &DetectOptions) -> Vec<SourceC
         return detect_chords(notes, &opts);
     }
     let sorted = usable_notes(notes, &opts);
-    // 区切り: 鳴り始め (近いものは 1 つ) と、鳴っている音が無くなる位置。
-    let mut bounds: Vec<f64> = Vec::new();
-    let mut max_end = f64::NEG_INFINITY;
-    // 直前の鳴り始め。ずらして弾いた和音 (ストローク / ロール) は、隣どうしが近ければ頭の 1 つにまとめる
-    // (頭からの幅は [`ONSET_GROUP_MAX_BEATS`] まで — 速い連打を 1 つの和音にしない)。
-    let mut prev_onset = f64::NEG_INFINITY;
-    for n in &sorted {
-        if max_end.is_finite() && n.start_beat > max_end + ONSET_EPS_BEATS {
-            bounds.push(max_end);
-        }
-        let joins = n.start_beat - prev_onset <= ONSET_EPS_BEATS
-            && bounds.last().is_some_and(|head| n.start_beat - head <= ONSET_GROUP_MAX_BEATS);
-        if !joins {
-            bounds.push(n.start_beat);
-        }
-        prev_onset = n.start_beat;
-        max_end = max_end.max(n.start_beat + n.len_beats);
-    }
-    if max_end.is_finite() && bounds.last().is_some_and(|l| max_end > *l) {
-        bounds.push(max_end);
-    }
-    let mut found: Vec<(f64, f64, Chord)> = Vec::new();
-    // コードが決まらなかった区間 (つながっていれば 1 つ)。
-    let mut gaps: Vec<(f64, f64)> = Vec::new();
-    let mut active: Vec<&DetectNote> = Vec::new();
-    let mut next = 0usize;
-    for w in bounds.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        while let Some(n) = sorted.get(next).filter(|n| n.start_beat < b) {
-            active.push(n);
-            next += 1;
-        }
-        active.retain(|n| n.start_beat + n.len_beats > a);
-        if active.is_empty() {
-            continue;
-        }
-        match chord_in(&active, a, b, &opts) {
-            Some(chord) => found.push((a, b, chord)),
-            None => match gaps.last_mut() {
-                Some(last) if last.1 == a => last.1 = b,
-                _ => gaps.push((a, b)),
-            },
-        }
-    }
+    let OnsetChords { mut found, gaps } = onset_chords(&sorted, &opts, false);
     // 区間は昇順なので、窓ごとに「窓に掛かるノート」だけを開始順の sweep で渡す (区間ごと・窓ごとに全ノートを
     // 走査しない)。窓の数は全区間の合計で [`MAX_WINDOWS`] まで。
-    active.clear();
-    next = 0;
+    let mut active: Vec<&DetectNote> = Vec::new();
+    let mut next = 0usize;
     let mut budget = MAX_WINDOWS;
     for (g0, g1) in gaps {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -352,6 +310,11 @@ pub fn extract_chords(notes: &[DetectNote], opts: &DetectOptions) -> Vec<SourceC
         }
     }
     found.sort_by(|x, y| x.0.total_cmp(&y.0));
+    merge_runs(found)
+}
+
+/// `(a, b, chord)` の昇順の列を、同じコードが続く区間を 1 つにまとめて [`SourceChord`] の列にする。
+fn merge_runs(found: Vec<(f64, f64, Chord)>) -> Vec<SourceChord> {
     let mut out: Vec<SourceChord> = Vec::with_capacity(found.len());
     for (a, b, chord) in found {
         match out.last_mut() {
@@ -362,6 +325,148 @@ pub fn extract_chords(notes: &[DetectNote], opts: &DetectOptions) -> Vec<SourceC
         }
     }
     out
+}
+
+/// [`onset_chords`] の結果: コードが決まった区間と、決まらなかった区間 (つながっていれば 1 つ)。
+struct OnsetChords {
+    found: Vec<(f64, f64, Chord)>,
+    gaps: Vec<(f64, f64)>,
+}
+
+/// [`extract_chords`] の手順 1: ノートの鳴り始め (と無音の始まり) で区切り、区間ごとにコードを決める
+/// (ずらして弾いた和音は頭にまとめる)。`sorted` は [`usable_notes`] の結果 (開始順)。
+///
+/// `require_together` なら、区間に **一緒に弾いた和音** ([`played_together`]) が無い区間はコードにしない
+/// (r.md #159 の自分の和音 = [`own_chords`] の経路。重ねて弾いた旋律の音を和音と読まない)。
+fn onset_chords(sorted: &[&DetectNote], opts: &DetectOptions, require_together: bool) -> OnsetChords {
+    // 区切り: 鳴り始め (近いものは 1 つ) と、鳴っている音が無くなる位置。
+    let mut bounds: Vec<f64> = Vec::new();
+    let mut max_end = f64::NEG_INFINITY;
+    // 直前の鳴り始め。ずらして弾いた和音 (ストローク / ロール) は、隣どうしが近ければ頭の 1 つにまとめる
+    // (頭からの幅は [`ONSET_GROUP_MAX_BEATS`] まで — 速い連打を 1 つの和音にしない)。
+    let mut prev_onset = f64::NEG_INFINITY;
+    for n in sorted {
+        if max_end.is_finite() && n.start_beat > max_end + ONSET_EPS_BEATS {
+            bounds.push(max_end);
+        }
+        let joins = n.start_beat - prev_onset <= ONSET_EPS_BEATS
+            && bounds.last().is_some_and(|head| n.start_beat - head <= ONSET_GROUP_MAX_BEATS);
+        if !joins {
+            bounds.push(n.start_beat);
+        }
+        prev_onset = n.start_beat;
+        max_end = max_end.max(n.start_beat + n.len_beats);
+    }
+    if max_end.is_finite() && bounds.last().is_some_and(|l| max_end > *l) {
+        bounds.push(max_end);
+    }
+    let mut found: Vec<(f64, f64, Chord)> = Vec::new();
+    // コードが決まらなかった区間 (つながっていれば 1 つ)。
+    let mut gaps: Vec<(f64, f64)> = Vec::new();
+    let mut active: Vec<&DetectNote> = Vec::new();
+    // [`played_together`] の終わりの並べ替えの置き場 (区間ごとに確保しない)。
+    let mut ends: Vec<(f64, u8)> = Vec::new();
+    let mut next = 0usize;
+    for w in bounds.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        while let Some(n) = sorted.get(next).filter(|n| n.start_beat < b) {
+            active.push(n);
+            next += 1;
+        }
+        active.retain(|n| n.start_beat + n.len_beats > a);
+        if active.is_empty() {
+            continue;
+        }
+        let chord =
+            if require_together && !played_together(&active, &mut ends) { None } else { chord_in(&active, a, b, opts) };
+        match chord {
+            Some(chord) => found.push((a, b, chord)),
+            None => match gaps.last_mut() {
+                Some(last) if last.1 == a => last.1 = b,
+                _ => gaps.push((a, b)),
+            },
+        }
+    }
+    OnsetChords { found, gaps }
+}
+
+/// `active` (1 区間に掛かるノート) に **一緒に弾いた和音** があるか: 鳴り始めか終わりが [`ONSET_GROUP_MAX_BEATS`]
+/// 以内に揃った音の組で、pitch class が [`MIN_PITCH_CLASSES`] 以上 (2 つなら [`DYAD_MIN_POLYPHONY`] 音以上)。
+///
+/// 和音 (ブロック / ストローク / 伸ばした分散和音 = 終わりが揃う) と、音を重ねて弾いた旋律 (レガート /
+/// ビブラフォン風に鳴らし続ける旋律 = 始まりも終わりもずれている) を分ける。
+///
+/// `active` は開始順 ([`onset_chords`] の sweep が開始順に足して retain するので崩れない)。終わりは `ends`
+/// (呼び出し側の置き場) へ並べ直す。どちらも窓を 2 本の指で滑らせる O(A) (区間ごとの確保なし)。
+fn played_together(active: &[&DetectNote], ends: &mut Vec<(f64, u8)>) -> bool {
+    if aligned(active.len(), |i| (active[i].start_beat, active[i].pitch)) {
+        return true;
+    }
+    ends.clear();
+    ends.extend(active.iter().map(|n| (n.start_beat + n.len_beats, n.pitch)));
+    ends.sort_by(|a, b| a.0.total_cmp(&b.0));
+    aligned(ends.len(), |i| ends[i])
+}
+
+/// 昇順の端 `edge(0..len)` に、頭から [`ONSET_GROUP_MAX_BEATS`] 以内に揃った音の組で和音になるもの
+/// (pitch class が [`MIN_PITCH_CLASSES`] 以上、2 つなら [`DYAD_MIN_POLYPHONY`] 音以上) があるか。
+fn aligned(len: usize, edge: impl Fn(usize) -> (f64, u8)) -> bool {
+    let mut counts = [0u32; 12];
+    let mut distinct = 0u32;
+    let mut end = 0usize;
+    for head in 0..len {
+        let (t0, _) = edge(head);
+        while end < len && edge(end).0 - t0 <= ONSET_GROUP_MAX_BEATS {
+            let pc = usize::from(edge(end).1 % 12);
+            distinct += u32::from(counts[pc] == 0);
+            counts[pc] += 1;
+            end += 1;
+        }
+        if distinct >= MIN_PITCH_CLASSES || (distinct == 2 && end - head >= DYAD_MIN_POLYPHONY) {
+            return true;
+        }
+        let pc = usize::from(edge(head).1 % 12);
+        counts[pc] -= 1;
+        distinct -= u32::from(counts[pc] == 0);
+    }
+    false
+}
+
+/// 素材が **自分で弾いている和音** の区間 (r.md #159、追従の基準)。位置はノートと同じ拍 (MIDI の content-local)。
+///
+/// [`extract_chords`] と同じ区切り (鳴り始めと無音) で、区間に一緒に弾いた和音 ([`played_together`]) があるものだけ
+/// (分散和音の窓 = 手順 2 は通さない — 窓で集めた旋律の音を和音にしない)。設定は既定に固定する (経路ごとに違う
+/// 基準を引かない)。区間は昇順・非交差で、同じコードが続けば 1 つにまとまる。
+#[must_use]
+pub fn own_chords(notes: &[DetectNote]) -> Vec<SourceChord> {
+    let opts = DetectOptions::default();
+    let sorted = usable_notes(notes, &opts);
+    merge_runs(onset_chords(&sorted, &opts, true).found)
+}
+
+/// 自分の和音の区間を引くときの許容幅 (拍。ノートの位置の浮動小数の丸めで、区間の終わりの数 ulp 手前に
+/// 始まるノートを前の和音に入れない)。
+const OWN_EPS_BEATS: f64 = 1e-6;
+
+/// 拍 `beat` (ノートの頭) で鳴っている自分の和音の区間 (覆うもの。前の区間を持ち越さない)。`spans` は
+/// [`own_chords`] の結果。
+///
+/// RT 安全 (二分探索、確保なし)。
+#[must_use]
+pub fn own_chord_at(spans: &[SourceChord], beat: f64) -> Option<&SourceChord> {
+    let i = spans.partition_point(|s| s.start_beat <= beat + OWN_EPS_BEATS);
+    spans.get(i.checked_sub(1)?).filter(|s| beat + OWN_EPS_BEATS < s.start_beat + s.len_beats)
+}
+
+/// 頭が和音の区間の外にあるノート `[start, end)` が属する自分の和音の区間: ノートが **鳴っている間に重なる** か、
+/// **隙間なく接する** 最初の区間 (伸ばして弾いた分散和音の 1 音目 / ブンチャッのベース音は和音のパートとして一緒に
+/// 動く)。離れた和音には属さない — 旋律の途中に和音が 1 つ混ざっても、旋律全体を和音のパートにしない。
+///
+/// RT 安全 (二分探索、確保なし)。
+#[must_use]
+pub fn own_chord_touching(spans: &[SourceChord], start: f64, end: f64) -> Option<&SourceChord> {
+    let i = spans.partition_point(|s| s.start_beat + s.len_beats < start - OWN_EPS_BEATS);
+    spans.get(i).filter(|s| s.start_beat <= end + OWN_EPS_BEATS)
 }
 
 /// 窓 `cell` (を区間 `gap` で切ったもの) のコードを `out` に足す。前半と後半で別のコードが出るか、窓全体では
@@ -451,24 +556,29 @@ pub fn detect_chords(notes: &[DetectNote], opts: &DetectOptions) -> Vec<SourceCh
         .collect()
 }
 
-/// 拍 `beat` で素材が鳴らしているコード: `beat` を覆う区間、無ければ直前の区間、それも無ければ最初の区間。
-/// `spans` は `start_beat` 昇順。空なら `None` (呼び出し側は `crate::chord_follow::fallback_source_root` に倒す)。
+/// 音源のフレーム `frame` を **覆う**、和音を弾いている区間 (`AudioChordSpan::chordal`) のコード (r.md #159 の
+/// オーディオの自分の和音)。前の区間を持ち越さない。`spans` は `Song.audio_chords[source_id]` (`start_frame` 昇順)。
 ///
 /// RT 安全 (二分探索、確保なし)。
 #[must_use]
-pub fn source_chord_at(spans: &[SourceChord], beat: f64) -> Option<&Chord> {
-    let i = spans.partition_point(|s| s.start_beat <= beat);
-    spans.get(i.saturating_sub(1)).map(|s| &s.chord)
+pub fn audio_own_chord_at(spans: &[AudioChordSpan], frame: u64) -> Option<&Chord> {
+    let i = spans.partition_point(|s| s.start_frame <= frame);
+    spans.get(i.checked_sub(1)?).filter(|s| s.chordal && frame < s.end_frame).map(|s| &s.chord)
 }
 
-/// 音源のフレーム `frame` でオーディオ素材が鳴らしているコード ([`source_chord_at`] のオーディオ版: 覆う区間、
-/// 無ければ直前、それも無ければ最初)。`spans` は `Song.audio_chords[source_id]` (`start_frame` 昇順)。
-///
-/// RT 安全 (二分探索、確保なし)。
+/// 音源フレームの範囲 `[a, b)` と重なりがいちばん長い、和音を弾いている区間のコード (同じ長さなら先)。
+/// コードの箱 1 つの下では基準を 1 つに決める (箱の途中で減衰・休符の窓に入っても音程を跳ねさせない)。
 #[must_use]
-pub fn audio_chord_at(spans: &[AudioChordSpan], frame: u64) -> Option<&Chord> {
-    let i = spans.partition_point(|s| s.start_frame <= frame);
-    spans.get(i.saturating_sub(1)).map(|s| &s.chord)
+pub fn audio_longest_own_in(spans: &[AudioChordSpan], a: u64, b: u64) -> Option<(&Chord, u64)> {
+    let i = spans.partition_point(|s| s.end_frame <= a);
+    let mut best: Option<(&Chord, u64)> = None;
+    for s in spans[i..].iter().take_while(|s| s.start_frame < b).filter(|s| s.chordal) {
+        let overlap = s.end_frame.min(b).saturating_sub(s.start_frame.max(a));
+        if overlap > 0 && best.is_none_or(|(_, o)| overlap > o) {
+            best = Some((&s.chord, overlap));
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -505,9 +615,32 @@ mod tests {
                 (6.0, 2.0, 7, ChordKind::Dominant7, None),
             ]
         );
-        // 単音の区間 (拍 9) は直前のコードを基準にする。
-        assert_eq!(source_chord_at(&spans, 9.0).map(|c| c.root), Some(7));
-        assert_eq!(source_chord_at(&[], 0.0), None);
+    }
+
+    /// r.md #159: 自分の和音は **一緒に弾いた** 音だけ。ブロック・ストローク・伸ばした分散和音 (終わりが揃う)・
+    /// 3 音のパワーコードは和音、重ねずに並べた旋律・2 声・スタッカートの分散和音・重ねて鳴らし続ける旋律
+    /// (始まりも終わりもずれる) は和音ではない (2 拍の窓に集めれば C になる音でも)。
+    #[test]
+    fn own_chords_are_only_what_is_played_together() {
+        let own = |notes: &[DetectNote]| names(&own_chords(notes));
+        let s = |a: f64, len: f64, name: &str| (a, len, name.to_string());
+        // ブロック / ストローク。
+        assert_eq!(own(&[n(0.0, 2.0, 60), n(0.0, 2.0, 64), n(0.0, 2.0, 67)]), vec![s(0.0, 2.0, "C")]);
+        assert_eq!(own(&[n(0.0, 2.0, 60), n(0.05, 1.95, 64), n(0.1, 1.9, 67)]), vec![s(0.0, 2.0, "C")]);
+        // 伸ばした分散和音: 1 音目から和音の区間に入る (1 音目の位置は C だけなので和音の区間は 2 音目から)。
+        let held = own(&[n(0.0, 4.0, 60), n(1.0, 3.0, 64), n(2.0, 2.0, 67)]);
+        assert_eq!(held, vec![s(2.0, 2.0, "C")]);
+        // パワーコード (3 音 = 2 pitch class)。
+        assert_eq!(own(&[n(0.0, 2.0, 40), n(0.0, 2.0, 47), n(0.0, 2.0, 52)]), vec![s(0.0, 2.0, "E5")]);
+        // 旋律 (C E G を重ねずに)。窓で集めると C になる音。
+        let melody = [n(0.0, 0.5, 72), n(0.5, 0.5, 76), n(1.0, 0.5, 79), n(1.5, 0.5, 76)];
+        assert_eq!(names(&detect_chords(&melody, &DetectOptions::default())), vec![s(0.0, 2.0, "C")]);
+        assert!(own(&melody).is_empty());
+        // 2 声 (3 度で重ねた旋律)・スタッカートの分散和音。
+        assert!(own(&[n(0.0, 1.0, 64), n(0.0, 1.0, 67), n(1.0, 1.0, 65), n(1.0, 1.0, 69)]).is_empty());
+        assert!(own(&[n(0.0, 0.25, 48), n(0.5, 0.25, 52), n(1.0, 0.25, 55), n(1.5, 0.25, 52)]).is_empty());
+        // 重ねて鳴らし続ける旋律 (各音 3 拍、1 拍おき): 重なりは 3 音になるが一緒に弾いていない。
+        assert!(own(&[n(0.0, 3.0, 76), n(1.0, 3.0, 79), n(2.0, 3.0, 84), n(3.0, 3.0, 83)]).is_empty());
     }
 
     /// 同じコードが続く窓は 1 つの区間にまとまり、テンションは設定を入れたときだけ付く。

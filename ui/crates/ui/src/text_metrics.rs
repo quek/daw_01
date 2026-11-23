@@ -15,10 +15,29 @@ use daw_ui_renderer::DEFAULT_FONT_FAMILY;
 // `Align` は `Buffer::set_text` の 5 番目引数 (cosmic-text 0.18 から導入)。
 // 1 行 measure では align 不要なので `None` を渡す。
 
+/// 測った幅の cache の 1 件。
+#[derive(Debug, Clone, Copy)]
+struct Measured {
+    advance: f32,
+    /// 最後に引いた (または測った) フレーム ([`TextMetrics::end_frame`] が数える)。
+    last_seen: u64,
+}
+
+/// 何フレーム引かれなかった entry を捨てるか (renderer の `GlyphPipeline` と同じ方式)。
+const EVICT_AFTER_FRAMES: u64 = 300;
+
 /// text shape による 1 行テキストの advance 計算器。`UiHost` が 1 つ持つ。
 ///
 /// FontSystem は保持せず measure ごとに `&mut FontSystem` を受ける。`measure_advance` は
 /// 0 以上の f32 を返す (空文字列なら 0.0)。
+///
+/// 測った幅は `(font_size, text)` で cache する。cosmic-text の `Buffer::set_text` は同じ文字列でも毎回
+/// 行を作り直してフル shaping する (shape-run-cache は既定で無効) ので、即時モードで毎フレーム同じラベルを
+/// 測ると、そのたびに shaping が走っていた。幅は `(text, font_size, FontSystem の font DB)` だけで決まる純関数で、
+/// 書体は [`DEFAULT_FONT_FAMILY`] 固定・実行中に font DB を変える呼び出しも無いので、cache は正確。引くときは
+/// 確保しない (`&str` のまま引く。確保は初めて測る文字列だけ)。大きさは [`Self::end_frame`] が
+/// [`EVICT_AFTER_FRAMES`] 使われなかったものを捨てて抑える (text_input が 1 文字ずつ prefix を測っても、
+/// 頭打ちは「直近のフレームで測った種類の数」)。
 pub struct TextMetrics {
     /// re-use する scratch buffer (毎呼び出しで `set_text` し直す)。注入 FontSystem で
     /// 初回に lazy 生成する (FontSystem を所有しないため construct 時には作れない)。
@@ -26,6 +45,10 @@ pub struct TextMetrics {
     /// 省略記号文字列。 描画フォントで `…` (U+2026) が実字形を持てば `"…"`、
     /// 無ければ ASCII `"..."`。 初回 [`Self::ellipsis`] 呼び出し時に shape して 1 度だけ確定。
     ellipsis: Option<&'static str>,
+    /// 測った幅: `font_size.to_bits()` → 文字列 → 幅。
+    measured: std::collections::HashMap<u32, std::collections::HashMap<Box<str>, Measured>>,
+    /// [`Self::end_frame`] を呼んだ回数 (= 今のフレームの番号)。
+    frame: u64,
 }
 
 impl Default for TextMetrics {
@@ -43,7 +66,23 @@ impl std::fmt::Debug for TextMetrics {
 impl TextMetrics {
     #[must_use]
     pub fn new() -> Self {
-        Self { scratch: None, ellipsis: None }
+        Self { scratch: None, ellipsis: None, measured: std::collections::HashMap::new(), frame: 0 }
+    }
+
+    /// フレームの末尾 (`UiHost` が scenegraph の掃除と並べて呼ぶ): [`EVICT_AFTER_FRAMES`] 引かれなかった幅を捨てる。
+    pub fn end_frame(&mut self) {
+        let frame = self.frame;
+        for by_text in self.measured.values_mut() {
+            by_text.retain(|_, m| frame.saturating_sub(m.last_seen) < EVICT_AFTER_FRAMES);
+        }
+        self.measured.retain(|_, by_text| !by_text.is_empty());
+        self.frame = frame.wrapping_add(1);
+    }
+
+    /// cache に持っている幅の数 (テスト用)。
+    #[cfg(test)]
+    fn cached_len(&self) -> usize {
+        self.measured.values().map(std::collections::HashMap::len).sum()
     }
 
     /// 注入された `FontSystem` で scratch buffer を lazy 生成し `&mut` を返す。
@@ -100,11 +139,23 @@ impl TextMetrics {
     /// 空文字列なら 0.0。
     ///
     /// line_height は advance 計算に影響しないが、cosmic-text の API 上必要。font_size の
-    /// 1.2 倍を使う (ui 内で固定の慣用値)。
+    /// 1.2 倍を使う (ui 内で固定の慣用値)。同じ `(font_size, text)` は cache から返す (型の doc)。
     pub fn measure_advance(&mut self, font_system: &mut FontSystem, text: &str, font_size: f32) -> f32 {
         if text.is_empty() {
             return 0.0;
         }
+        let frame = self.frame;
+        if let Some(m) = self.measured.get_mut(&font_size.to_bits()).and_then(|by_text| by_text.get_mut(text)) {
+            m.last_seen = frame;
+            return m.advance;
+        }
+        let advance = self.shape_advance(font_system, text, font_size);
+        self.measured.entry(font_size.to_bits()).or_default().insert(text.into(), Measured { advance, last_seen: frame });
+        advance
+    }
+
+    /// `text` を shape して幅を測る (cache を通らない)。
+    fn shape_advance(&mut self, font_system: &mut FontSystem, text: &str, font_size: f32) -> f32 {
         let metrics = Metrics::new(font_size, font_size * 1.2);
         let scratch = self.scratch_mut(font_system);
         scratch.set_metrics(font_system, metrics);
@@ -159,6 +210,28 @@ mod tests {
         let big = m.measure_advance(&mut fs, "hello", 28.0);
         // 同じ text なら font_size 大の方が advance も大きい (font 種別に依存しない普遍テスト)。
         assert!(big > small, "size 28 should be wider than 10: small={small} big={big}");
+    }
+
+    /// 同じ `(font_size, text)` は cache から同じ幅を返し (大きさが違えば別に測る)、しばらく測られなかった幅は
+    /// `end_frame` で捨てる (測り直しても同じ幅)。
+    #[test]
+    fn measured_widths_are_cached_per_size_and_evicted_when_unused() {
+        let mut fs = FontSystem::new();
+        let mut m = TextMetrics::new();
+        let a = m.measure_advance(&mut fs, "Rack", 12.0);
+        assert_eq!(m.measure_advance(&mut fs, "Rack", 12.0), a, "2 回目は cache の同じ値");
+        assert_eq!(m.cached_len(), 1);
+        let big = m.measure_advance(&mut fs, "Rack", 24.0);
+        assert!(big > a, "大きさが違えば別に測る: {a} / {big}");
+        assert_eq!(m.cached_len(), 2);
+        // 12px だけ毎フレーム測り続け、24px は測らない → 24px だけが捨てられる。
+        for i in 0..=EVICT_AFTER_FRAMES {
+            assert_eq!(m.cached_len(), 2, "{i} フレームまでは残る");
+            m.measure_advance(&mut fs, "Rack", 12.0);
+            m.end_frame();
+        }
+        assert_eq!(m.cached_len(), 1, "使われなかった幅は捨てる");
+        assert_eq!(m.measure_advance(&mut fs, "Rack", 24.0), big, "測り直しても同じ幅");
     }
 
     #[test]

@@ -5,16 +5,18 @@
 //! JSON text として書く (`Ui::set_clipboard_text` / `Ui::take_clipboard_paste`)。
 //! paste 側は trial-decode をやめ、`ClipboardPayload` の variant で分岐する。
 //!
-//! `source_project_id` は copy 元の `Song.project_id`。paste 時に現在の song と
-//! 一致すれば clip/track は **リンク共有** (content_id 流用)、不一致なら inline
-//! payload から **独立コピー** (新 content_id 採番) する。
+//! `source_project_id` は copy 元の `Song.project_id`、`source_session` は copy 元の文書の開き方
+//! (`SongDoc::id_session`)。paste 時に **両方** が現在の文書と一致すれば (`AppData::paste_source`)
+//! clip/track は **リンク共有** (content_id 流用、id の参照を保つ)、不一致なら inline payload から
+//! **独立コピー** (新 content_id 採番、外の id は捨てる) する。project id だけでは足りない — 保存せずに
+//! 閉じた / Revert した / Save As で分けた版は、同じ project id のまま採番が戻って同じ id が別の物を指す。
 //!
 //! 外部 (他アプリ / 改竄) clipboard text を信用しないため、deserialize 後に
 //! 値域を sanitize する (NaN/Inf/範囲外を model に入れない)。
 
 use common::model::MediaManifest;
 use common::model::{
-    AudioEvent, AutomationCurve, ClipContent, ContentId, Note, Track,
+    AudioEvent, AutomationCurve, Clip, ClipChordBasis, ClipContent, ContentId, Note, Track,
 };
 use serde::{Deserialize, Serialize};
 
@@ -45,8 +47,11 @@ pub const CLIPBOARD_BLOB_BUDGET: usize = 4 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardEnvelope {
     pub magic: String,
-    /// copy 元の `Song.project_id`。同一なら clip/track paste はリンク共有。
+    /// copy 元の `Song.project_id`。`source_session` と両方同一なら clip/track paste はリンク共有。
     pub source_project_id: u64,
+    /// copy 元の文書の開き方 (`SongDoc::id_session`)。旧 JSON (欠けている) は 0 = どの開き方とも一致しない。
+    #[serde(default)]
+    pub source_session: u64,
     pub payload: ClipboardPayload,
     /// `payload` の content が参照する媒体 (音源 / 映像 / 画像) の写し (パスは絶対)。
     /// 別プロジェクトへ貼るとき `Song::import_media` で取り込む。`Time` は
@@ -257,6 +262,62 @@ pub struct ClipCopy {
     /// JSON との互換のため serde default (`None`)。
     #[serde(default)]
     pub talk: Option<common::model::TalkParams>,
+    /// r.md #159: 素材の置いた時点のコードの記録 (`Clip::chord_basis`、箱の系統と組)。貼るときの規則は
+    /// [`ClipChordBasis::pasted`] (同じ id 空間なら運ぶ。note id / take は content の写しで保たれる)。旧 clipboard
+    /// JSON との互換のため serde default (空)。
+    #[serde(default)]
+    pub chord_basis: ClipChordBasis,
+}
+
+impl ClipCopy {
+    /// クリップ `clip` の写し (content は `content`、共有名は `name`)。位置 (`track_offset` / `start_beat`) は
+    /// 呼び出し側が選択群の基準から決める。clipboard へ載せる口はここだけ (載せるフィールドを経路ごとに写さない)。
+    #[must_use]
+    pub fn of(clip: &Clip, content: ClipContent, name: Option<String>, track_offset: i64, start_beat: f64) -> Self {
+        Self {
+            track_offset,
+            start_beat,
+            length_beats: clip.length_beats,
+            color: clip.color,
+            muted: clip.muted,
+            content_id: clip.content_id,
+            // r.md #44: trim で決まった「content のどこを見せるか」も運ぶ。
+            content_offset_beats: clip.content_offset_beats,
+            content,
+            name,
+            speaker_id: clip.speaker_id,
+            singer_name: clip.singer_name.clone(),
+            style_name: clip.style_name.clone(),
+            talk: clip.talk,
+            chord_basis: clip.chord_basis.clone(),
+        }
+    }
+
+    /// 貼るクリップ (id は 0 = 置く側が採番、content は `content_id`)。clipboard から戻す口はここだけ。
+    /// `same_project` (同じ id 空間、`AppData::paste_source`) でなければコードの記録を捨てる ([`Self::chord_basis`])。
+    #[must_use]
+    pub fn to_clip(&self, start_beat: f64, content_id: ContentId, same_project: bool) -> Clip {
+        Clip {
+            id: 0,
+            start_beat,
+            length_beats: self.length_beats,
+            content_id,
+            content_offset_beats: self.content_offset_beats,
+            // 新規クリップにクロスフェードの張り出しは無い。
+            xfade_lead_beats: 0.0,
+            xfade_tail_beats: 0.0,
+            color: self.color,
+            // paste した clip は派生データではなくユーザーの持ち物 (`auto_lipsync` は運ばない — 上の doc)。
+            auto_lipsync: false,
+            lipsync_gen: 0,
+            muted: self.muted,
+            speaker_id: self.speaker_id,
+            singer_name: self.singer_name.clone(),
+            style_name: self.style_name.clone(),
+            talk: self.talk,
+            chord_basis: self.chord_basis.clone().pasted(same_project),
+        }
+    }
 }
 
 /// 正規化済みオートメーションクリップ (= lane 内の 1 curve clip)。`start_beat` は
@@ -348,10 +409,19 @@ pub struct ContentEntry {
 }
 
 impl ClipboardEnvelope {
-    pub fn new(source_project_id: u64, payload: ClipboardPayload) -> Self {
+    /// copy 元の `(Song.project_id, SongDoc::id_session)` (貼る側は `AppData::paste_source` で同じ id 空間かを決める)。
+    #[must_use]
+    pub fn source(&self) -> (u64, u64) {
+        (self.source_project_id, self.source_session)
+    }
+
+    /// `source` = copy 元の `(Song.project_id, SongDoc::id_session)` (`AppData::clipboard_source`)。
+    pub fn new(source: (u64, u64), payload: ClipboardPayload) -> Self {
+        let (source_project_id, source_session) = source;
         Self {
             magic: CLIPBOARD_MAGIC.to_string(),
             source_project_id,
+            source_session,
             payload,
             media: MediaManifest::default(),
         }
@@ -746,7 +816,7 @@ mod tests {
     #[test]
     fn envelope_roundtrip_notes() {
         let env = ClipboardEnvelope::new(
-            42,
+            (42, 5),
             ClipboardPayload::Notes(vec![note(0.0, 1.0, 60, 100)]),
         );
         let json = env.to_json().unwrap();
@@ -770,7 +840,7 @@ mod tests {
             common::model::PluginInstance::new("test.comp".into(), PluginFormat::Clap);
         inst.state = Some(std::sync::Arc::from(&b"knob"[..]));
         let env = ClipboardEnvelope::new(
-            7,
+            (7, 1),
             ClipboardPayload::Devices(vec![DeviceCopy {
                 order: 0,
                 source_track: 3,
@@ -823,7 +893,7 @@ mod tests {
         };
         let copy_of = |track: common::model::Track| {
             ClipboardEnvelope::new(
-                3,
+                (3, 1),
                 ClipboardPayload::Tracks(TracksCopy { tracks: vec![TrackCopy { order: 0, track, contents: Vec::new() }], scenes: Vec::new() }),
             )
         };
@@ -919,6 +989,7 @@ mod tests {
             singer_name: String::new(),
             style_name: String::new(),
             talk: None,
+            chord_basis: common::model::ClipChordBasis::default(),
         };
         let out = sanitize_clips(vec![
             mk(4.0, 0.0),          // valid
@@ -964,7 +1035,7 @@ mod tests {
     #[test]
     fn envelope_roundtrip_automation_clips() {
         let env = ClipboardEnvelope::new(
-            7,
+            (7, 1),
             ClipboardPayload::AutomationClips(vec![AutomationClipCopy {
                 start_beat: 1.5,
                 length_beats: 4.0,

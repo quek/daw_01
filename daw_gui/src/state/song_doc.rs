@@ -181,6 +181,12 @@ pub struct SongDoc {
     /// 「Song の中身が変わった」世代 (子プロセス sync が読む)。`edit_epoch` が進む
     /// ときは必ず進み、加えて [`SongDoc::edit_playback`] でも進む。
     sync_epoch: u64,
+    /// この文書の **開き方** の識別子 (乱数)。作ったとき / Song を差し替えたとき (New / Open / 保存版に戻す /
+    /// recovery の復元) に新しくなる。id の採番 (`Song.ids`) はファイルに保存した時点の値へ戻りうるので、
+    /// `Song::project_id` が同じでも開き方が違う写し (保存せずに閉じた後 / Revert した後 / Save As で分けた版)
+    /// の id は別の物を指しうる — clipboard の「同じ id 空間か」はこれと project id の両方で決める
+    /// (`AppData::paste_source`)。
+    id_session: u64,
     /// live の **id 構造** (トラック / device node / lane / 変調 / binding の id と束縛。範囲は
     /// [`StructureWatch`] の doc) の観測。編集後の不変条件の回復は、これが変わった編集でだけ回す。
     structure: StructureWatch,
@@ -257,6 +263,7 @@ impl SongDoc {
             saved_state_id: 1,
             next_state_id: 2,
             sync_epoch: 1,
+            id_session: common::model::fresh_nonzero_id(),
             structure,
             structure_epoch: 1,
             nodes,
@@ -576,6 +583,11 @@ impl SongDoc {
         self.sync_epoch
     }
 
+    /// この文書の開き方の識別子 (`id_session` の doc)。
+    pub fn id_session(&self) -> u64 {
+        self.id_session
+    }
+
     /// dirty = 「最後に保存した epoch から編集が進んだ」 の O(1) 派生。
     pub fn is_dirty(&self) -> bool {
         self.state_id != self.saved_state_id
@@ -777,6 +789,7 @@ impl SongDoc {
         self.last_gesture = None;
         self.state_id = self.alloc_state_id();
         self.saved_state_id = self.state_id;
+        self.id_session = common::model::fresh_nonzero_id();
         self.bump_edit_epoch();
     }
 

@@ -25,7 +25,7 @@ use mouth_rebuild::{rebuild_mouth_clip, rebuild_mouth_containers, split_spans_by
 /// セルは曲の位置を持たないので曲の基準値の移調だけ (`TrackTranspose::key`)。
 /// 範囲外を 0 に丸めない — 0 は VOICEVOX で休符と衝突する。
 fn sung_pitch(transpose: &TrackTranspose<'_>, clip: &Clip, in_song: bool, note: &common::model::Note) -> Option<u8> {
-    transpose.key(clip.content_id, note, in_song.then(|| clip.content_to_song_beat(note.start_beat)))
+    transpose.key(clip, note, in_song.then(|| clip.content_to_song_beat(note.start_beat)))
 }
 
 /// 口パクの入力 clip / セル 1 つを fingerprint へ混ぜる
@@ -545,7 +545,8 @@ impl AppData {
             let transpose = if self.baking_vocal_track() == Some(track.id) {
                 TrackTranspose::written(song)
             } else {
-                TrackTranspose::of(song, track.id)
+                // 自分の和音は世代キャッシュから (flush のたびに検出し直さない)。
+                self.track_transpose(track.id)
             };
             let entries: Vec<common::plugin_metadata::NoteMetadata> = clips
                 .iter()

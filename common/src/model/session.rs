@@ -896,9 +896,9 @@ mod tests {
         song.clip_contents
             .insert(song.tracks[0].clips[0].content_id, ClipContent::Midi(MidiContent::default()));
 
-        song.normalize_after_load();
+        song.normalize_after_load().unwrap();
         let once = song.clone();
-        song.normalize_after_load();
+        song.normalize_after_load().unwrap();
         assert_eq!(song, once, "2 回目の正規化で Song が変わると『開いただけで *』になる");
     }
 

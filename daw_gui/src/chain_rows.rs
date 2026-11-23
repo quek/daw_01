@@ -44,7 +44,8 @@ pub struct ChainEntry {
     /// パラアウト (`docs/plan_paraout.md`): host が報告した aux 出力 port 数。 1 以上の device にだけ
     /// `Out▾` を出す (行の直下に出力のパネル、 r.md #158)。
     pub aux_output_count: u8,
-    /// aux 出力が 1 port でも配線済み (= 展開済み、 `Out▾` の強調)。
+    /// aux 出力が 1 port でも配線済み (= 展開済み、 `Out▾` の強調)。規則は開いた出力のパネルと同じ
+    /// `handler::view_model::wired_aux_outputs` の 1 本。
     pub aux_out_wired: bool,
 }
 

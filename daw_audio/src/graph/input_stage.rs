@@ -17,14 +17,23 @@ use common::model::Song;
 pub type InputPlan = Vec<(u32, u16, u16)>;
 
 /// `song` のオーディオ入力のトラックの組 (モニターの on / off や録音待機は含めない — 切り替えるたびに
-/// 受け皿を作り直さない)。
+/// 受け皿を作り直さない)。入るのは音声入力が **そのトラックで効く** ものだけ
+/// ([`common::model::InputRules::effective_input`]、インスペクタの入力の帯と録音と同じ規則): 画像 / 字幕を置いた
+/// トラックや、グループのバス / リターン / パラアウトの宛先になったトラックは、音声入力を保存したままでも
+/// 受け皿を持たない = モニターも入力メーターも出ない (中身が変われば組が変わり、受け皿は作り直される)。
 #[must_use]
 pub fn input_plan(song: &Song) -> InputPlan {
+    // 規則の表は曲全体を歩くので、音声入力のトラックが 1 本も無い曲 (ほとんどの便) では作らない。
+    if !song.tracks.iter().any(|t| t.input.audio_channels().is_some()) {
+        return InputPlan::new();
+    }
+    let rules = common::model::InputRules::new(song);
     song.tracks
         .iter()
         .enumerate()
+        .filter(|(_, t)| t.input.audio_channels().is_some())
         .filter_map(|(i, t)| {
-            let (l, r) = t.input.audio_channels()?;
+            let (l, r) = rules.effective_input(t)?.audio_channels()?;
             Some((u32::try_from(i).ok()?, l, r))
         })
         .collect()

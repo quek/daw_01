@@ -219,24 +219,7 @@ fn paste_one(
             let id = track.alloc_clip_id();
             track.put_session_clip(common::model::SessionClip {
                 scene_id,
-                clip: Clip {
-                    id,
-                    start_beat: 0.0,
-                    length_beats: c.length_beats,
-                    content_id,
-                    content_offset_beats: c.content_offset_beats,
-                    // 新規クリップにクロスフェードの張り出しは無い。
-                    xfade_lead_beats: 0.0,
-                    xfade_tail_beats: 0.0,
-                    color: c.color,
-                    auto_lipsync: false,
-                    lipsync_gen: 0,
-                    muted: c.muted,
-                    speaker_id: c.speaker_id,
-                    singer_name: c.singer_name.clone(),
-                    style_name: c.style_name.clone(),
-                    talk: c.talk,
-                },
+                clip: Clip { id, ..c.to_clip(0.0, content_id, same_project) },
                 launch: cc.launch.clone(),
             });
             Some(LauncherCellKey::Track(common::model::ClipKey { track_id, clip_id: id }))
@@ -299,21 +282,8 @@ fn track_cell_payload(song: &common::model::Song, k: ClipKey) -> Option<Launcher
     let c = song.track_by_id(k.track_id)?.session_clip_by_id(k.clip_id)?;
     // 写しから content を作る貼り付けは、audio の take を元の編集から始める (`AudioEvent::take_origins`)。
     let content = song.clip_contents.get(&c.clip.content_id)?.copied_from(song.project_id, c.clip.content_id);
-    Some(LauncherCellPayload::Track(ClipCopy {
-        track_offset: 0,
-        start_beat: 0.0,
-        length_beats: c.clip.length_beats,
-        color: c.clip.color,
-        muted: c.clip.muted,
-        content_id: c.clip.content_id,
-        content_offset_beats: c.clip.content_offset_beats,
-        content,
-        name: song.clip_content_names.get(&c.clip.content_id).cloned(),
-        speaker_id: c.clip.speaker_id,
-        singer_name: c.clip.singer_name.clone(),
-        style_name: c.clip.style_name.clone(),
-        talk: c.clip.talk,
-    }))
+    let name = song.clip_content_names.get(&c.clip.content_id).cloned();
+    Some(LauncherCellPayload::Track(ClipCopy::of(&c.clip, content, name, 0, 0.0)))
 }
 
 /// オートメーションレーン行のセル → clipboard 表現。点は **clip の窓ローカル +

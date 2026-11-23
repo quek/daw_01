@@ -140,14 +140,17 @@ impl AppData {
     /// 保存 / 破棄 / 閉じるまではそれが唯一の控え (復元直後に落ちてもまた復元できる)。 同じ理由で
     /// 復元した文書は未保存 (`*`) にする — clean にすると確認なしで閉じられ、 控えごと消える。
     pub(crate) fn restore_recovery(&mut self, autosave_path: PathBuf) {
-        let Ok(loaded) = common::project::load_project(&autosave_path) else {
-            tracing::error!(
-                path = %autosave_path.display(),
-                "failed to load recovery file"
-            );
-            self.ui_ephemeral.status_message =
-                format!("復元失敗: {}", autosave_path.display());
-            return;
+        let loaded = match common::project::load_project(&autosave_path) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                tracing::error!(
+                    path = %autosave_path.display(),
+                    error = %format!("{e:#}"),
+                    "failed to load recovery file"
+                );
+                self.ui_ephemeral.status_message = format!("復元失敗: {}: {e:#}", autosave_path.display());
+                return;
+            }
         };
         let (mut song, view, loop_region, hidden_lanes) =
             (loaded.song, loaded.view, loaded.loop_region, loaded.hidden_automation_lanes);

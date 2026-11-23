@@ -106,6 +106,7 @@ impl AppData {
         self.cur.peph.audio_editor_clip = None;
         self.cur.peph.automation_editor_clip = None;
         self.cur.peph.automation_editor_hover_beat = None;
+        self.cur.peph.automation_editor_px_per_beat = None;
         self.cur.peph.editing_automation_point = None;
         self.cur.peph.armed_mod_source = None;
         self.cur.peph.expanded_mod_sources.clear();

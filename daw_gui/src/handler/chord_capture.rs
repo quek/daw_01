@@ -61,7 +61,7 @@ impl AppData {
             let end = self.chord_capture_beat().max(start + MIN_RECORDED_LEN);
             let mut placed = None;
             self.edit_song(|song| {
-                placed = song.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: end - start, chord, color: None });
+                placed = song.place_chord(ChordEvent::new(start, end - start, chord));
             });
             self.cur.chord_tools.capture.last_recorded = placed;
         }
@@ -83,7 +83,7 @@ impl AppData {
             && let Some(chord) = chord_from_keys(&self.cur.chord_tools.capture.chord_notes, &self.cur.chord_tools.view.detect)
         {
             let len = (playhead - start).max(MIN_RECORDED_LEN);
-            self.edit_song(|song| song.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: len, chord, color: None }));
+            self.edit_song(|song| song.place_chord(ChordEvent::new(start, len, chord)));
         }
     }
 

@@ -6,6 +6,15 @@
 
 use super::*;
 
+/// 0 でない乱数の識別子 (プロジェクトの同一性 [`Song::project_id`] / GUI の文書の開き方の識別子)。
+#[must_use]
+pub fn fresh_nonzero_id() -> u64 {
+    // `Uuid::as_u128` の下位 64 bit (v4 の乱数部)。
+    #[allow(clippy::cast_possible_truncation)]
+    let id = uuid::Uuid::new_v4().as_u128() as u64;
+    id.max(1)
+}
+
 impl Song {
     /// Clamp persisted scalar fields into valid ranges. The persistence
     /// layer is the trust boundary where data crosses back in from disk /
@@ -88,10 +97,7 @@ impl Song {
     /// (別起動・別マシンでも衝突しない。`0` sentinel は引き直す)。
     pub fn ensure_project_id(&mut self) {
         if self.project_id == 0 {
-            self.project_id = uuid::Uuid::new_v4().as_u128() as u64;
-            if self.project_id == 0 {
-                self.project_id = 1;
-            }
+            self.project_id = fresh_nonzero_id();
         }
     }
 
@@ -104,9 +110,16 @@ impl Song {
     /// 返り値は **クリップの重なりを解消したか** (= 開いた時点で `*` を立てるべきか)。
     /// それ以外の正規化はすべて冪等な no-op になるよう作られているので、
     /// 「開いただけで `*`」 が立つ理由はここ 1 つに絞られる。
-    pub fn normalize_after_load(&mut self) -> bool {
+    ///
+    /// `Err` は外から指される id 空間の番号が上限に近すぎるファイル (このアプリは作らない) で、読み込みを拒む
+    /// ([`Self::ensure_id_headroom`])。
+    pub fn normalize_after_load(&mut self) -> Result<bool, IdSpaceExhausted> {
         self.ensure_project_id();
         self.sanitize_ranges();
+        // 採番の counter を使用中の最大 + 1 以上へ上げ、上限に近い id 空間を詰め直す / 拒む。後段の採番
+        // (未採番 / 重複の採り直し) は counter が上限から遠い前提で数えるので、それより先。要素の無い空間は
+        // ここでは拒まず、dangling な参照を掃除した後の 2 回目で `1` へ戻す (`id_headroom` の module doc)。
+        self.ensure_id_headroom(super::id_headroom::EmptySpace::Defer)?;
         self.ensure_clip_contents();
         self.ensure_audio_source_ids();
         self.ensure_video_source_ids();
@@ -117,14 +130,17 @@ impl Song {
         // 正規化の後 (track id の remap / routing id / device id が確定してから解決する) でなければならない。
         self.prune_dangling_refs();
         self.normalize_session();
+        self.ensure_id_headroom(super::id_headroom::EmptySpace::Reset)?;
         self.ensure_scale_changes_sorted();
+        self.compact_chord_ids_if_saturated();
         self.normalize_chords();
+        self.normalize_chord_basis();
         self.ensure_automation_points_sorted();
         // 重なり解消は id 採番の後 (分割断片に id を振るため)、 overlay の
         // カバレッジ補完の前 (窓を縮めてから覆う長さを決めるため)。
         let resolved = self.resolve_clip_overlaps();
         self.ensure_overlay_event_coverage();
-        resolved
+        Ok(resolved)
     }
 
     /// 全トラックのクリップの重なりを上書き規則で解消する

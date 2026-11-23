@@ -404,9 +404,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     //       下り (b<a) で bend=+0.5 → k≈1.414 → `u^k < u` → 直線より a 寄り = 画面上。
     for (point_key, rect) in &resp.automation_point_rects {
         let key = *point_key;
+        let zoom_x = app.cur.view.arrange_zoom_x;
         ui.context_menu_for(*rect, &CURVE_MENU_ITEMS, move |idx, ui| {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                apply_curve_menu_choice(app, key, idx);
+                apply_curve_menu_choice(app, key, idx, zoom_x);
             }));
         });
     }
@@ -872,7 +873,12 @@ pub(crate) fn apply_curve_menu_choice(
     app: &mut AppData,
     key: crate::widgets::arrangement::AutomationPointKey,
     idx: usize,
+    zoom_x: f32,
 ) {
+    if idx == CURVE_MENU_QUANTIZE {
+        quantize_from_point_menu(app, key, zoom_x);
+        return;
+    }
     let point_idx = key.point_idx as usize;
     if point_idx == 0 {
         return;
@@ -911,8 +917,23 @@ pub(crate) fn apply_curve_menu_choice(
 }
 
 /// 点の右クリックメニュー。index の意味は [`apply_curve_menu_choice`] が持つ
-/// (レーンと Automation Editor で同じ 4 択)。
-pub(crate) const CURVE_MENU_ITEMS: [&str; 4] = ["階段", "直線", "曲線", "S 字"];
+/// (レーンと Automation Editor で同じ。区間の形 4 択 + 格子に揃える)。
+pub(crate) const CURVE_MENU_ITEMS: [&str; 5] = ["階段", "直線", "曲線", "S 字", "格子に揃える"];
+/// [`CURVE_MENU_ITEMS`] の「格子に揃える」。
+const CURVE_MENU_QUANTIZE: usize = 4;
+
+/// 点の右クリック「格子に揃える」: 右クリックした点が選択に入っていれば選択全部を、入っていなければ
+/// その点だけを選び直して寄せる (Ctrl+U と同じ handler)。`zoom_x` = 点が描かれている面の px/拍
+/// (`Adaptive` の段)。
+fn quantize_from_point_menu(app: &mut AppData, key: crate::widgets::arrangement::AutomationPointKey, zoom_x: f32) {
+    let Some(grid_beats) = app.automation_point_quantize_grid(zoom_x) else { return };
+    let clicked = crate::widgets::arrangement::point_key_to_model(key);
+    if !app.cur.selection.selected_automation_points.contains(&clicked) {
+        let prev = app.cur.selection.selected_automation_points.clone();
+        app.handle_event(AppEvent::SelectAutomationPoints { prev, next: vec![clicked] });
+    }
+    app.handle_event(AppEvent::QuantizeSelectedAutomationPoints { grid_beats });
+}
 
 fn render_clip_create_menu_overlay(app: &AppData, ui: &mut Ui<'_, AppData>) {
     let Some((track, beat, pos)) = app.cur.peph.clip_create_menu else {

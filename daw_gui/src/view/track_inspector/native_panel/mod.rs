@@ -26,6 +26,31 @@ use crate::view::native_device::ParamOwner;
 
 pub(super) use limiter::draw_limiter_panel;
 
+/// スクロールの viewport の中にカーブを描いた EQ / Tone EQ の Par (描いた順 = Rack の上から、
+/// [`MAX_DEVICE_SCOPES`](common::device_scope_bridge::MAX_DEVICE_SCOPES) 個まで)。engine にスペクトラムを計算させる
+/// のは、実際に見える所に描いたものだけ (`AppData::wanted_device_scopes`): 帯を畳んだ / インスペクタを隠した /
+/// スクロールで外れた Par は描かれない (外れた) ので要求しない。上限は「一度に描ける EQ の数」なので、画面の外の
+/// Par が見えている Par の枠を奪うことも無い。描画は状態を書かず、集めたものを `track_inspector::draw` が
+/// 1 回だけ公開する (Q の宛先と同じ)。
+#[derive(Default)]
+pub(super) struct EqScopes(std::cell::RefCell<Vec<u64>>);
+
+impl EqScopes {
+    /// EQ `id` のカーブを `rect` に描いた (いまの scissor = viewport と重なっていれば見えている)。
+    fn note_drawn(&self, ui: &Ui<'_, AppData>, id: u64, rect: Rect) {
+        let visible = ui.current_clip_rect().is_none_or(|clip| !clip.intersect(rect).is_empty());
+        let mut ids = self.0.borrow_mut();
+        if visible && ids.len() < common::device_scope_bridge::MAX_DEVICE_SCOPES && !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+
+    /// 集めた id (描き終えたとき)。
+    pub(super) fn take(&self) -> Vec<u64> {
+        self.0.take()
+    }
+}
+
 /// Par 1 枚を描く文脈。
 pub(super) struct PanelCtx<'a> {
     /// Song の値 (構造 / bypass の静的な状態)。
@@ -38,6 +63,8 @@ pub(super) struct PanelCtx<'a> {
     pub rect: Rect,
     /// Par の面の色 (つまみのリングのくり抜き色)。
     pub bg: Color,
+    /// スペクトラムを要求する EQ を集める (EQ / Tone EQ のカーブが描いたときに積む)。
+    pub eq_scopes: &'a EqScopes,
 }
 
 /// `ctx.dev` の種類の Par を描く。

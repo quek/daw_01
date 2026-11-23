@@ -599,116 +599,6 @@ impl AppData {
         });
     }
 
-    /// Phase 3: `selected_automation_points` を grid (`1/div` beat) に snap。
-    /// piano roll の [`Self::quantize_selected_notes`] と同 idiom。 sort
-    /// invariant を維持するため snap 後に各 clip 内 point 列を sort し直し、
-    /// `selected_automation_points` も新 idx で再構築する。 selection 再
-    /// 構築は `(snapped_time, value)` で lookup する (point に stable id
-    /// が無いので、 同 frame 内の値ペアで identify)。 同 clip 内に snap
-    /// 結果が同位置になる point が複数いれば最初の一致を採用。
-    pub(crate) fn quantize_selected_automation_points(&mut self, div: u8) {
-        if self.cur.selection.selected_automation_points.is_empty() {
-            return;
-        }
-        let div = div.max(1) as f64;
-        let snap = |b: f64| ((b * div).round() / div).max(0.0);
-        let selected = self.cur.selection.selected_automation_points.clone();
-
-        // `content_id` ごとに、 quantize 対象 idx 群と、 selection lookup 用の
-        // `(snapped_time, value)` ペア群を集める。 ペアは selection の現順序
-        // を維持するため Vec で持つ。
-        #[derive(Clone, Copy)]
-        struct Owner {
-            track_id: u32,
-            lane_id: u32,
-            clip_id: u32,
-        }
-        struct ContentBuckets {
-            owner: Owner,
-            idxs: Vec<u32>,
-            lookups: Vec<(f64, f64)>,
-        }
-        let mut by_content: std::collections::HashMap<
-            common::model::ContentId,
-            ContentBuckets,
-        > = std::collections::HashMap::new();
-        for k in &selected {
-            let Some(lane) = self.cur.song_doc.song().automation_lane_by_key(k.track_id, k.lane_id) else {
-                continue;
-            };
-            let Some(clip) = lane.clip_by_id(k.clip_id) else {
-                continue;
-            };
-            let content_id = clip.content_id;
-            let Some(common::model::ClipContent::Automation(a)) =
-                self.cur.song_doc.song().clip_contents.get(&content_id)
-            else {
-                continue;
-            };
-            let Some(p) = a.points.get(k.point_idx as usize) else {
-                continue;
-            };
-            let entry = by_content.entry(content_id).or_insert_with(|| ContentBuckets {
-                owner: Owner {
-                    track_id: k.track_id,
-                    lane_id: k.lane_id,
-                    clip_id: k.clip_id,
-                },
-                idxs: Vec::new(),
-                lookups: Vec::new(),
-            });
-            entry.idxs.push(k.point_idx);
-            entry.lookups.push((snap(p.time_beat), p.value));
-        }
-
-        let cap = selected.len();
-        let Some(new_selection) = self.edit_song(move |song| {
-            let mut new_selection: Vec<AutomationPointKeyRef> = Vec::with_capacity(cap);
-            for (content_id, bucket) in by_content {
-                let ContentBuckets {
-                    owner,
-                    idxs,
-                    lookups,
-                } = bucket;
-                let Some(common::model::ClipContent::Automation(a)) =
-                    song.clip_contents.get_mut(&content_id)
-                else {
-                    continue;
-                };
-                // snap 対象 point の time_beat を書き換え。 重複 idx は HashSet
-                // で除去せず、 set_mut が冪等なのでそのまま再代入。
-                for idx in &idxs {
-                    if let Some(p) = a.points.get_mut(*idx as usize) {
-                        p.time_beat = snap(p.time_beat);
-                    }
-                }
-                a.points.sort_by(|p1, p2| {
-                    p1.time_beat
-                        .partial_cmp(&p2.time_beat)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                // 新 idx を `(snapped_time, value)` で lookup。
-                for (st, sv) in &lookups {
-                    if let Some(new_idx) = a.points.iter().position(|p| {
-                        (p.time_beat - st).abs() < 1e-9 && (p.value - sv).abs() < 1e-9
-                    }) {
-                        new_selection.push(AutomationPointKeyRef {
-                            track_id: owner.track_id,
-                            lane_id: owner.lane_id,
-                            clip_id: owner.clip_id,
-                            point_idx: new_idx as u32,
-                        });
-                    }
-                }
-            }
-            new_selection
-        }) else {
-            return;
-        };
-
-        self.cur.selection.selected_automation_points = new_selection;
-    }
-
     // 点の copy / paste は `handler::automation_points_clipboard`。
 
     // -------- audio event clipboard --------
@@ -749,7 +639,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.cur.song_doc.song().project_id,
+            self.clipboard_source(),
             crate::clipboard::ClipboardPayload::AudioEvents(copied),
         )
         .to_json()?;
@@ -870,25 +760,8 @@ impl AppData {
             let content =
                 song.clip_contents.get(&c.content_id).map(|x| x.copied_from(song.project_id, c.content_id)).unwrap_or_default();
             let name = self.cur.song_doc.song().clip_content_names.get(&c.content_id).cloned();
-            clips.push(crate::clipboard::ClipCopy {
-                track_offset: (*ti as i64) - (min_track as i64),
-                start_beat: c.start_beat - base,
-                length_beats: c.length_beats,
-                color: c.color,
-                // clip-level mute も clipboard へ。
-                muted: c.muted,
-                content_id: c.content_id,
-                // r.md #44: trim で決まった「content のどこを見せるか」も clipboard へ。
-                content_offset_beats: c.content_offset_beats,
-                content,
-                name,
-                // per-clip 声を clipboard へ。
-                speaker_id: c.speaker_id,
-                singer_name: c.singer_name.clone(),
-                style_name: c.style_name.clone(),
-                // (talk) per-clip 読み上げスケールも clipboard へ。
-                talk: c.talk,
-            });
+            let track_offset = (*ti as i64) - (min_track as i64);
+            clips.push(crate::clipboard::ClipCopy::of(c, content, name, track_offset, c.start_beat - base));
         }
         let envelope = self.envelope_with_media(crate::clipboard::ClipboardPayload::Clips(clips));
         Some((envelope, base, min_track))
@@ -967,30 +840,9 @@ impl AppData {
                     continue;
                 };
                 let to_track_id = to_track.id;
-                let new_clip_id = to_track.place_clip(common::model::Clip {
-                    id: 0,
-                    start_beat: (at_beat + cc.start_beat).max(0.0),
-                    length_beats: cc.length_beats,
-                    content_id,
-                    // clipboard が運んできた窓をそのまま復元 (r.md #44)。
-                    content_offset_beats: cc.content_offset_beats,
-                    // 新規クリップにクロスフェードの張り出しは無い。
-                    xfade_lead_beats: 0.0,
-                    xfade_tail_beats: 0.0,
-                    color: cc.color,
-                    // paste した clip は派生データではなくユーザーの持ち物
-                    // (clipboard は `auto_lipsync` を運ばない — clipboard.rs 参照)。
-                    auto_lipsync: false,
-                    lipsync_gen: 0,
-                    // clipboard の clip-level mute を paste 先 clip へ引き継ぐ。
-                    muted: cc.muted,
-                    // clipboard の per-clip 声を paste 先 clip へ引き継ぐ。
-                    speaker_id: cc.speaker_id,
-                    singer_name: cc.singer_name.clone(),
-                    style_name: cc.style_name.clone(),
-                    // (talk) per-clip 読み上げスケールも引き継ぐ。
-                    talk: cc.talk,
-                });
+                // clipboard が運んできた窓・声・mute・コードの記録 (同じプロジェクトだけ) を復元する (`ClipCopy::to_clip`)。
+                let start = (at_beat + cc.start_beat).max(0.0);
+                let new_clip_id = to_track.place_clip(cc.to_clip(start, content_id, same_project));
                 // 住所は **安定 id**。 index (`target_idx` / `clips.len()`) で組むと
                 // paste 直後の選択が別のクリップを指す (= 貼った先ではないものが
                 // 選択され、 続く操作がそちらに当たる)。
@@ -1063,7 +915,7 @@ impl AppData {
         }
         let count = out.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.cur.song_doc.song().project_id,
+            self.clipboard_source(),
             crate::clipboard::ClipboardPayload::AutomationClips(out),
         )
         .to_json()?;

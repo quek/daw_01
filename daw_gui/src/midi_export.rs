@@ -168,7 +168,7 @@ fn build_midi_track(song: &Song, track: &common::model::Track) -> Option<Vec<Tra
             }
             // content-local beat → song-domain beat → tick。 Off は clip 末端 clamp。
             let on_beat = clip.content_to_song_beat(note.start_beat);
-            let Some(key) = transpose.key(clip.content_id, note, Some(on_beat)) else {
+            let Some(key) = transpose.key(clip, note, Some(on_beat)) else {
                 continue;
             };
             let off_beat = (on_beat + note.duration_beats).min(clip_end_beats);

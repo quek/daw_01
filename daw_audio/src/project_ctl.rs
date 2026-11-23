@@ -216,6 +216,9 @@ pub struct BundlePublisher {
     last_compiled_frames: Option<u32>,
     /// 直近の便の song から作った索引 / 曲の範囲 / テンポ表 ([`Self::song_derived`])。
     derived: Option<SongDerived>,
+    /// r.md #159: 索引を作り直すたびに、鳴らすノートが前と同じトラック / セルの自分の和音を使い回す
+    /// (`SongIndex::build_with`。編集のたび / フェーダーのドラッグ中は毎フレーム新しい song が来る)。
+    own_chords: common::chord_follow::OwnChordsMemo,
     /// r.md #156: RT へ渡してある入力の受け皿の組 (`RtBundle::input_stage`)。
     delivered_input_plan: crate::graph::input_stage::InputPlan,
 }
@@ -248,6 +251,7 @@ impl BundlePublisher {
             mod_plans: ModPlanPublisher::default(),
             last_compiled_frames: None,
             derived: None,
+            own_chords: common::chord_follow::OwnChordsMemo::default(),
             delivered_input_plan: Vec::new(),
         }
     }
@@ -282,10 +286,11 @@ impl BundlePublisher {
                 let default_song = common::model::Song::default();
                 let s = song.map_or(&default_song, |s| &**s);
                 let tempo_map = Arc::new(common::tempo_map::TempoMap::from_song(s));
+                let memo = &mut self.own_chords;
                 *slot = Some(SongDerived {
                     song: song.cloned(),
                     sample_rate,
-                    index: Arc::new(song.map_or_else(SongIndex::default, |s| SongIndex::build(s))),
+                    index: Arc::new(song.map_or_else(SongIndex::default, |s| SongIndex::build_with(s, memo))),
                     bounds: SongBounds::of(song.map(|s| &**s), sample_rate, &tempo_map),
                     tempo_map,
                 });
@@ -443,17 +448,27 @@ pub struct ProjectCtl {
     pub chord_audition: crate::chord_audition::ChordAuditionCtl,
 }
 
-/// `SetDeviceScopes` の device id 列を slot 表にする: 0 と重複を除き、先頭 [`MAX_DEVICE_SCOPES`] 個に切り詰める。
-fn device_scope_watch(device_ids: &[u64]) -> [u64; MAX_DEVICE_SCOPES] {
-    let mut watch = [0u64; MAX_DEVICE_SCOPES];
-    let mut n = 0;
+/// `SetDeviceScopes` の device id 列を slot 表にする: 0 と重複を除き、先頭 [`MAX_DEVICE_SCOPES`] 個まで。
+///
+/// **残った device は前の slot に据え置く** (`prev` = いまの表): 外れた device の slot だけを空け (0)、新しい
+/// device は空いた slot へ入れる。詰め直すと、インスペクタのスクロールで上の EQ が外れるたびに下の見え続けている
+/// EQ の slot が動き、slot の header が変わって読み手が積んだスペクトラムを捨てる (見えているのに途切れる)。
+fn device_scope_watch(prev: &[u64; MAX_DEVICE_SCOPES], device_ids: &[u64]) -> [u64; MAX_DEVICE_SCOPES] {
+    let mut wanted: Vec<u64> = Vec::with_capacity(MAX_DEVICE_SCOPES);
     for &id in device_ids {
-        if n == MAX_DEVICE_SCOPES {
+        if wanted.len() == MAX_DEVICE_SCOPES {
             break;
         }
-        if id != 0 && !watch[..n].contains(&id) {
-            watch[n] = id;
-            n += 1;
+        if id != 0 && !wanted.contains(&id) {
+            wanted.push(id);
+        }
+    }
+    let mut watch = prev.map(|id| if wanted.contains(&id) { id } else { 0 });
+    for id in wanted {
+        if !watch.contains(&id)
+            && let Some(free) = watch.iter_mut().find(|slot| **slot == 0)
+        {
+            *free = id;
         }
     }
     watch
@@ -1040,7 +1055,7 @@ pub fn handle_project_command(
             }
         }
         AudioCommand::SetDeviceScopes { device_ids, .. } => {
-            ctl.device_scope_watch = device_scope_watch(&device_ids);
+            ctl.device_scope_watch = device_scope_watch(&ctl.device_scope_watch, &device_ids);
             ctl.republish(engine_shared, session_sample_rate, phase_tables);
         }
         // MIDI Capture の試聴 (`docs/plan_global_sampler.md`)。
@@ -1290,6 +1305,23 @@ mod tests {
             input_stage: None,
             audio_take: None,
         }
+    }
+
+    /// device scope の slot は device ごとに据え置く: 外れた device の slot だけ空き、残った device は動かず、
+    /// 新しい device は空いた slot に入る (詰め直すと、見え続けている EQ の slot が動いてスペクトラムが途切れる)。
+    #[test]
+    fn device_scope_slots_stay_put_for_devices_that_remain() {
+        let empty = [0u64; MAX_DEVICE_SCOPES];
+        let a = device_scope_watch(&empty, &[0, 7, 7, 9, 11]);
+        assert_eq!(&a[..4], &[7, 9, 11, 0], "0 と重複を除いて空きから詰める");
+        // 上の 7 が外れ、下に 13 が入った (スクロール): 9 / 11 は同じ slot のまま、13 は 7 の空きへ。
+        let b = device_scope_watch(&a, &[9, 11, 13]);
+        assert_eq!(&b[..4], &[13, 9, 11, 0]);
+        assert_eq!(device_scope_watch(&b, &[]), empty, "何も要らなければ全部空く");
+        // 上限を超えたぶんは捨てる。
+        let many: Vec<u64> = (1..=MAX_DEVICE_SCOPES as u64 + 3).collect();
+        let full = device_scope_watch(&empty, &many);
+        assert!(full.iter().all(|&id| id != 0) && !full.contains(&(MAX_DEVICE_SCOPES as u64 + 1)));
     }
 
     /// 不変条件 4: RT は共有面の `ArcSwap` を load しない。ループ / 録音中の lane / device scope の対象と、

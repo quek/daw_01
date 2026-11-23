@@ -178,7 +178,8 @@ pub(crate) fn paste_from_clipboard(
     let Some(env) = crate::clipboard::ClipboardEnvelope::from_json(text) else {
         return; // 他アプリ text / 旧 format → 黙って無視
     };
-    let source_project_id = env.source_project_id;
+    // 同じ id 空間の写しかは project id と文書の開き方の両方で決める (違えば別プロジェクトとして貼る)。
+    let source_project_id = app.paste_source(env.source());
     // 別プロジェクトからの貼り付けで取り込む媒体の写し (音源 / 映像 / 画像)。
     let media = env.media;
     let peph = &app.cur.peph;
@@ -313,16 +314,15 @@ pub(crate) fn paste_time(ui: &mut Ui<'_, AppData>, text: &str) {
     let Some(env) = crate::clipboard::ClipboardEnvelope::from_json(text) else {
         return;
     };
-    let src_pid = env.source_project_id;
+    let source = env.source();
     match env.payload {
         crate::clipboard::ClipboardPayload::Time(copy) => {
             // 外部入力 (OS clipboard) なので値域を検証してから (他の payload の sanitize_* と同じ)。
             let Some(copy) = copy.sanitized() else { return };
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::PasteTime {
-                    copy: Box::new(copy),
-                    source_project_id: src_pid,
-                });
+                // 同じ id 空間の写しかは project id と文書の開き方の両方で決める (`AppData::paste_source`)。
+                let source_project_id = app.paste_source(source);
+                app.handle_event(AppEvent::PasteTime { copy: Box::new(copy), source_project_id });
             }));
         }
         _ => ui.push_edit(Edit::mutate(|app: &mut AppData| {

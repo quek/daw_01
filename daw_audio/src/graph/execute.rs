@@ -1639,7 +1639,7 @@ mod render_master_tests {
                 })
             })
             .collect();
-        song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: Chord::new(9, ChordKind::Minor), color: None });
+        song.place_chord(ChordEvent::new(0.0, 4.0, Chord::new(9, ChordKind::Minor)));
         let render = |song: &Song| {
             let mut schedule = compile_schedule_for_test(song, 48_000, 0).unwrap();
             let mut scratch: Vec<TrackScratch> = song.tracks.iter().map(|_| TrackScratch::new()).collect();

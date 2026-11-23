@@ -233,6 +233,16 @@ fn tall_synth(h: &mut Harness) -> u32 {
     synth
 }
 
+/// 選択の帯の種類 (帯が無ければ `None`)。
+fn band_kind(app: &AppData) -> Option<ClipBandKind> {
+    app.inspector_selection().band.map(|b| b.kind)
+}
+
+/// インスペクタのタイトル (描くときと同じく、選択を 1 回だけ導いて作る)。
+fn title_of(app: &AppData) -> daw_gui::handler::inspector_title::InspectorTitle {
+    app.inspector_title(&app.inspector_selection())
+}
+
 fn place(app: &mut AppData, track: u32, start: f64, content: ClipContent, name: &str) -> ClipKey {
     let name = name.to_string();
     let clip_id = app
@@ -319,18 +329,19 @@ fn band_folds_are_shared_per_kind() {
 
     h.app.handle_event(AppEvent::SelectClip { target: a, additive: false });
     let scene = h.settle();
-    assert_eq!(h.app.inspector_clip_band().map(|(k, _)| k), Some(ClipBandKind::Audio));
+    assert_eq!(band_kind(&h.app), Some(ClipBandKind::Audio));
     h.click(center(&one(&h, &scene, audio_band)));
     assert!(!h.app.inspector_band_open(InspectorBand::Clip(ClipBandKind::Audio)));
 
     h.app.handle_event(AppEvent::SelectClip { target: b, additive: false });
     h.settle();
-    assert_eq!(h.app.inspector_clip_band(), Some((ClipBandKind::Audio, "B".to_string())));
+    assert_eq!(band_kind(&h.app), Some(ClipBandKind::Audio));
+    assert_eq!(h.app.inspector_clip_band_target(&h.app.inspector_selection()), "B");
     assert!(!h.app.inspector_band_open(InspectorBand::Clip(ClipBandKind::Audio)), "別の音声クリップでも畳まれたまま");
 
     h.app.handle_event(AppEvent::SelectClip { target: img, additive: false });
     h.settle();
-    assert_eq!(h.app.inspector_clip_band().map(|(k, _)| k), Some(ClipBandKind::Image));
+    assert_eq!(band_kind(&h.app), Some(ClipBandKind::Image));
     assert!(h.app.inspector_band_open(InspectorBand::Clip(ClipBandKind::Image)), "画像クリップの帯は開いている");
 
     // トラックの帯: 1 本目で Rack を畳む → 2 本目でも畳まれたまま (中身が描かれない)。
@@ -343,6 +354,31 @@ fn band_folds_are_shared_per_kind() {
     let scene = h.settle();
     assert!(!h.app.inspector_band_open(InspectorBand::Rack));
     assert!(find(&scene, 360.0, vocab::ADD_PLUGIN).is_none(), "別のトラックでも Rack は畳まれたまま");
+}
+
+/// スペクトラムを要求するのは見える所に描いた EQ / Tone EQ の Par だけ (Comp 系の Par は数えない): Par を沢山
+/// 開いて EQ の Par が viewport の下に押し出されていれば要求せず、末尾までスクロールして見えたら要求する。
+#[test]
+fn spectra_are_requested_only_for_eq_panels_drawn_in_view() {
+    let mut h = Harness::new(None);
+    let synth = tall_synth(&mut h);
+    for _ in 0..6 {
+        h.app.handle_event(AppEvent::Device(DeviceEvent::AddNative {
+            chain: common::model::ChainRef::Track(synth),
+            kind: NativeKind::Reverb,
+            open_panel: true,
+        }));
+    }
+    let song = h.app.cur.song_doc.song();
+    let eq = song.builtin_native(synth, NativeKind::Eq).expect("組み込み EQ").id;
+    let comp = song.builtin_native(synth, NativeKind::Comp).expect("組み込み Comp").id;
+    h.app.handle_event(AppEvent::Device(DeviceEvent::ToggleRackPanel(RackPanelKey::Device(comp))));
+    let scene = h.settle();
+    let eq_row = glyphs_left_of(&scene, 360.0).into_iter().filter(|g| g.text == "EQ").map(|g| g.top).fold(f32::MIN, f32::max);
+    assert!(eq_row > H as f32, "前提: EQ の行は viewport の下 ({eq_row})");
+    assert!(h.app.wanted_device_scopes().is_empty(), "viewport の外の EQ の Par は要求しない");
+    h.settle_at_end();
+    assert_eq!(h.app.wanted_device_scopes(), vec![eq], "スクロールして見えたら要求する (Comp の Par は数えない)");
 }
 
 /// 畳んだ帯 / 隠したインスペクタは Q の宛先を残さず、見えない EQ にスペクトラムを要求しない。
@@ -383,7 +419,9 @@ fn hidden_or_collapsed_bands_leave_no_hover_scopes_or_popups() {
     // 入力元の dropdown (効果だけのトラックなので、既定の MIDI は「未選択」と出ている — 警告にしない)。
     let input = one(&h, &scene, daw_gui::handler::audio_rec::INPUT_UNSET);
     assert!(
-        !glyphs_left_of(&scene, 360.0).iter().any(|g| g.text.contains("録れない")),
+        !glyphs_left_of(&scene, 360.0)
+            .iter()
+            .any(|g| g.text.contains(daw_gui::handler::audio_rec::INPUT_NOT_RECORDABLE)),
         "何も触っていない状態に「録れない」を出さない"
     );
     h.click(center(&input));
@@ -466,7 +504,7 @@ fn multi_track_selection_shows_who_each_band_applies_to() {
     let cursor = h.app.cursor_track_id().expect("カーソル");
     let cursor_name = h.app.cur.song_doc.song().track_display_name(cursor).into_owned();
     let scene = h.settle();
-    assert_eq!(h.app.inspector_title().main, vocab::n_tracks(3));
+    assert_eq!(title_of(&h.app).main, vocab::n_tracks(3));
     let input_target = vocab::target_selected_tracks(3);
     let cursor_only = vocab::target_cursor_only(&cursor_name);
     for text in [vocab::n_tracks(3), input_target, cursor_only] {
@@ -836,7 +874,7 @@ fn title_and_band_targets_name_the_right_track() {
     h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
     h.select(t1);
     assert_eq!(h.app.inspector_target_refs(), vec![clip], "クリップの選択は残る");
-    let title = h.app.inspector_title();
+    let title = title_of(&h.app);
     assert_eq!(title.main, "Lead");
     assert!(title.sub.ends_with(&vocab::track_label(&a_name)), "2 行目はクリップの居るトラック: {}", title.sub);
     assert_eq!(
@@ -848,7 +886,7 @@ fn title_and_band_targets_name_the_right_track() {
     // 名前の無いセル。
     let row = daw_gui::event_launcher::LauncherRow::Track(t0);
     h.app.handle_event(AppEvent::Launcher(daw_gui::event_launcher::LauncherEvent::CreateCell { row, scene_index: 0 }));
-    let title = h.app.inspector_title();
+    let title = title_of(&h.app);
     assert_eq!(title.main, vocab::UNNAMED_CLIP);
     let kind = vocab::clip_band_title(ClipBandKind::Midi);
     let expected = [kind, vocab::PLACE_CELL, &vocab::track_label(&a_name)].join(vocab::SEP);
@@ -869,8 +907,9 @@ fn title_and_band_targets_name_the_right_track() {
     h.select(t1);
     h.add_to_selection(t2);
     assert_eq!(h.app.cursor_track_id(), Some(t2));
-    assert_eq!(h.app.input_target_track_ids(), vec![t1]);
-    assert_eq!(h.app.inspector_track_band_target(true), b_name, "入力の帯の対象は書き込み先の 1 本");
+    let targets = h.app.input_targets();
+    assert_eq!(targets.iter().map(|t| t.track.id).collect::<Vec<_>>(), vec![t1]);
+    assert_eq!(h.app.input_band_target(&targets), b_name, "入力の帯の対象は書き込み先の 1 本");
 }
 
 /// 歌声の声と読み上げのスケールは、選んでいる同じ種類のクリップ全部へ 1 undo step で書く。値が割れていれば欄は「—」。
@@ -923,12 +962,128 @@ fn text_clip_without_visible_lines_settles_its_edit_buffers() {
     h.add_builtin(t0, SUBTITLE_ID);
     let clip = place(&mut h.app, t0, 0.0, ClipContent::Text(TextContent { events: Vec::new() }), "");
     h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
-    h.settle();
+    let scene = h.settle();
     assert_eq!(h.app.cur.peph.clip_edit_buffer_target, Some(clip), "対象はそのクリップに揃う");
+    // 書く先の片が無いので本文の欄は出さない (打っても確定で黙って消える欄を残さない)。
+    assert_eq!(count(&h, &scene, vocab::FIELD_TEXT) + count(&h, &scene, vocab::FIELD_LINE), 0, "本文の欄が無い");
     let idle = PointerFrame { pos: Some((W as f32 - 5.0, H as f32 - 5.0)), ..PointerFrame::default() };
     let mut scene = Scene::new();
     let edits = h.host.frame_to_edits(&h.app, &mut scene, SCREEN, FrameInput { pointer: idle, ..FrameInput::default() }, |app, ui| {
         daw_gui::view::root::build_root(app, ui, SCREEN);
     });
     assert!(edits.is_empty(), "落ち着いたフレームは Edit を積まない ({} 件)", edits.len());
+}
+
+/// 種類の違うクリップを一緒に選ぶと、タイトルと帯の見出しは代表の種類を名乗らず「種類の違うクリップ」、帯の対象は
+/// 種類ごとの内訳、代表の種類の欄の上には「… だけに効く」が出る。種類が揃っていれば今までどおり。
+#[test]
+fn mixed_kind_selection_does_not_claim_the_representative_kind() {
+    let mut h = Harness::new(None);
+    let t0 = h.track(0);
+    let audio = place(&mut h.app, t0, 0.0, ClipContent::Audio(AudioContent::default()), "A");
+    let midi = place(&mut h.app, t0, 8.0, ClipContent::Midi(MidiContent::default()), "M");
+    h.app.handle_event(AppEvent::SelectClip { target: audio, additive: false });
+    assert!(!title_of(&h.app).sub.contains(vocab::KIND_MIXED), "1 種類なら代表の種類");
+    h.app.handle_event(AppEvent::SelectClip { target: midi, additive: true });
+    let sel = h.app.inspector_selection();
+    let band = sel.band.expect("選択の帯");
+    assert!(band.mixed() && band.kind == ClipBandKind::Audio, "代表は先に始まる音声クリップ");
+    assert!(title_of(&h.app).sub.starts_with(vocab::KIND_MIXED), "タイトルの種類の語: {}", title_of(&h.app).sub);
+    let breakdown = h.app.inspector_clip_band_target(&sel);
+    assert_eq!(breakdown, vocab::clip_kind_counts(&band.counts));
+    let scene = h.settle();
+    assert_eq!(count(&h, &scene, vocab::KIND_MIXED), 1, "帯の見出しも混在の語");
+    assert!(find(&scene, 360.0, &breakdown).is_some(), "帯の対象は種類ごとの内訳: {breakdown}");
+    let only = vocab::only_kind(ClipBandKind::Audio, 1, 2);
+    assert!(find(&scene, 360.0, &only).is_some(), "音声の欄の上に `{only}`");
+}
+
+/// 離散値の欄 (逆再生 / 伸縮) もミュートと同じく選んでいる全部を畳む: 割れていればトグルは消灯・dropdown は空、
+/// トグルを押すと全部をオンに揃える。
+#[test]
+fn split_discrete_values_fold_like_mute() {
+    let mut h = Harness::new(None);
+    let t0 = h.track(0);
+    let ev = |reversed: bool, stretch_mode: common::model::StretchMode| AudioEvent {
+        event_length_beats: 4.0,
+        reversed,
+        stretch_mode,
+        ..AudioEvent::default()
+    };
+    let content = |e: AudioEvent| ClipContent::Audio(AudioContent { events: vec![e], ..AudioContent::default() });
+    let a = place(&mut h.app, t0, 0.0, content(ev(true, common::model::StretchMode::Stretch)), "A");
+    let b = place(&mut h.app, t0, 8.0, content(ev(false, common::model::StretchMode::Raw)), "B");
+    h.app.handle_event(AppEvent::SelectClip { target: a, additive: false });
+    h.app.handle_event(AppEvent::SelectClip { target: b, additive: true });
+    let scene = h.settle();
+    assert!(find(&scene, 360.0, "Stretch").is_none() && find(&scene, 360.0, "Raw").is_none(), "割れた伸縮は空");
+    // 逆再生のトグル (代表 A は逆再生だが、割れているので消灯) を押す → 2 本とも逆再生。
+    h.click(center(&one(&h, &scene, vocab::TOGGLE_REVERSE)));
+    let reversed = |k: ClipKey| h.app.audio_first_event(k, |e| e.reversed);
+    assert_eq!((reversed(a), reversed(b)), (Some(true), Some(true)), "割れていれば押すと全部オン");
+}
+
+/// 読み上げの「+ 字幕デバイス」は、クリップの居るトラックに足す (クリップを選んだまま別のトラックのヘッダを押して
+/// いても、カーソルのトラックには足さない)。1 undo step。
+#[test]
+fn add_subtitle_device_goes_to_the_clip_track() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    h.add_builtin(t0, BUILTIN_ID_VOICEVOX);
+    let line = TextEvent { text: "あ".to_string(), event_length_beats: 4.0, ..TextEvent::default() };
+    let clip = place(&mut h.app, t0, 0.0, ClipContent::Text(TextContent { events: vec![line] }), "");
+    h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
+    h.app.cur.selection.selected_track_ids.clear();
+    h.app.handle_event(AppEvent::AddInstrumentTrack);
+    let t1 = h.app.cursor_track_id().expect("足したトラック");
+    assert_eq!(h.app.inspector_target_refs(), vec![clip], "クリップの選択は残る");
+    let scene = h.settle();
+    let undo = h.app.cur.song_doc.undo_depth();
+    h.click(center(&one(&h, &scene, vocab::ADD_SUBTITLE_DEVICE)));
+    let song = h.app.cur.song_doc.song();
+    let has = |id: u32| song.track_by_id(id).is_some_and(common::model::Track::has_subtitle_device);
+    assert!(has(t0), "クリップの居るトラックに足す");
+    assert!(!has(t1), "カーソルのトラックには足さない");
+    assert_eq!(h.app.cur.song_doc.undo_depth(), undo + 1, "1 undo step");
+}
+
+/// クリップの帯の数値欄の変調 (◉ を待ち受けて欄をドラッグ) は、値の書き込み先と同じ代表クリップの居るトラックに付く
+/// (クリップを選んだまま別のトラックのヘッダを押していても、カーソルのトラックには付かない)。
+#[test]
+fn clip_field_modulation_belongs_to_the_clip_track_not_the_cursor() {
+    let mut h = Harness::new(None);
+    let t0 = h.track(0);
+    h.app.handle_event(AppEvent::AddInstrumentTrack);
+    let t1 = h.app.cursor_track_id().expect("足したトラック");
+    assert_ne!(t0, t1);
+    let image = ImageEvent { x: 0.25, event_length_beats: 4.0, ..ImageEvent::default() };
+    let clip = place(&mut h.app, t0, 0.0, ClipContent::Image(ImageContent { events: vec![image] }), "Img");
+    h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
+    h.select(t1);
+    assert_eq!(h.app.cursor_track_id(), Some(t1));
+    h.app.handle_event(AppEvent::AddModSource { kind: ModSourceKindTag::Lfo });
+    let sid = h.app.mod_source_display().last().expect("足した LFO").id;
+    h.app.handle_event(AppEvent::SetArmedModSource(Some(sid)));
+    let scene = h.settle();
+    let at = center(&field_value(&h, &scene, vocab::FIELD_X, "0.250"));
+    let frame = |h: &mut Harness, pos: (f32, f32), jp: bool, pressed: bool, jr: bool| {
+        let p = PointerFrame {
+            pos: Some(pos),
+            primary_pressed: pressed,
+            primary_just_pressed: jp,
+            primary_just_released: jr,
+            ..PointerFrame::default()
+        };
+        h.frame_with(p, false);
+    };
+    frame(&mut h, at, true, true, false);
+    for i in 1..=5 {
+        frame(&mut h, (at.0 + 10.0 * i as f32, at.1), false, true, false);
+    }
+    frame(&mut h, (at.0 + 50.0, at.1), false, false, true);
+    let song = h.app.cur.song_doc.song();
+    let x = common::model::AutomationTarget::ImageBuiltin(common::model::ImageBuiltinParam::X);
+    let on = |id: u32| song.track_by_id(id).is_some_and(|t| t.mod_routings.iter().any(|r| r.target == x && r.source_id == sid));
+    assert!(on(t0), "変調はクリップの居るトラックに付く");
+    assert!(!on(t1), "カーソルのトラックには付かない");
 }

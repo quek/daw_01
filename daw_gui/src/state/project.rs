@@ -420,6 +420,9 @@ pub struct ProjectEphemeral {
     /// r.md #129: plugin の Par の param 行の世代キャッシュ ([`PluginParamsPanelCache`])。
     /// `arr_label_cache` と同じく view から (`&self`) 更新するので `RefCell`。
     pub(crate) plugin_params_panels: std::cell::RefCell<PluginParamsPanelCache>,
+    /// r.md #159: 自分の和音の世代キャッシュ (`AppData::own_chords`。ピアノロールが毎フレーム引く)。
+    /// `arr_label_cache` と同じく view から (`&self`) 更新するので `RefCell`。
+    pub(crate) own_chords_cache: std::cell::RefCell<crate::handler::chord_follow_view::OwnChordsCache>,
     /// GPU-side video thumbnail textures keyed by `VideoSourceId`.
     /// Written by the runner (P3.5) after a successful texture upload;
     /// read by `arrangement_view.rs` (P3.6) and passed to
@@ -519,6 +522,10 @@ pub struct ProjectEphemeral {
     /// r.md #129 (§11.2): 直近 `AudioCommand::SetDeviceScopes` で engine に送った device id
     /// (差分送信用)。respawn で clear し、次のフレームで再送する。session-only。
     pub device_scopes_sent: Vec<u64>,
+    /// r.md #158: 前フレームにインスペクタが **見える所に** カーブを描いた EQ / Tone EQ の Par (上から、
+    /// `MAX_DEVICE_SCOPES` まで)。書くのは `track_inspector::draw` だけ (変わったフレームだけ、lag-by-one)、
+    /// 読むのは `AppData::wanted_device_scopes`。
+    pub inspector_visible_eq_scopes: Vec<u64>,
     /// r.md #129 (§7.6): パラメーターのジェスチャーの**在席印**。所有者の面がこのフレームも
     /// 同じ param を描いたら入る。フレーム末の `view::param_gesture::sweep_param_gestures` が
     /// 見て、入っていない (= 描かれなくなった) gesture を閉じる (`scrub_gesture_seen` と同じ作り)。
@@ -600,6 +607,9 @@ pub struct ProjectEphemeral {
     /// Automation Editor の本体上のポインタ位置 (窓ローカル拍、スナップ済み)。貼り付けの基準。
     /// 本体の外では `None`。
     pub automation_editor_hover_beat: Option<f64>,
+    /// Automation Editor の本体の px/拍 (前のフレームに描いた値)。`Ctrl+U` の点の格子の `Adaptive` の段に使う
+    /// (エディタの右クリックの「格子に揃える」と同じ段)。閉じたら `None`。
+    pub automation_editor_px_per_beat: Option<f32>,
     /// ピアノロールの**対象 (target) クリップ**の focus ヒント。
     ///
     /// 選択そのものではない (選択の SSoT は `SelectionState::time` 1 本) —
@@ -717,12 +727,6 @@ pub struct ProjectEphemeral {
     pub section_rename_id: Option<u32>,
     /// 上記改名の編集中文字列。
     pub section_rename_text: String,
-    /// Transport BPM 入力欄の編集中文字列。 commit (Enter) で parse + clamp +
-    /// `song.bpm` に反映、 song を切り替える際 (open / new / undo / redo) は
-    /// `resync_song_edit_texts` で formatted な現値に書き戻す。
-    pub bpm_edit_text: String,
-    /// Transport time_sig numerator 入力欄の編集中文字列。 同上。
-    pub time_sig_num_edit_text: String,
     /// 現 buffer がどの clip 用にロードされているか。 `selected_clip` が
     /// 変わったら view 側が `AppEvent::ResyncClipEditBuffers(target)` を
     /// 発火して `resync_clip_audio_event_edit_buffers` で再生成。 `None`
@@ -859,8 +863,6 @@ impl ProjectState {
     #[must_use]
     pub fn from_song(key: ProjectKey, song: Song) -> Self {
         let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
-        let initial_bpm = song.bpm;
-        let initial_time_sig_num = song.time_sig.0;
         Self {
             key,
             // r.md #54: 解析はセッション限りなので既定 (Idle / レポート無し)。
@@ -1007,6 +1009,7 @@ impl ProjectState {
                 arr_label_cache: std::cell::RefCell::default(),
                 tempo_map_cache: std::cell::RefCell::default(),
                 plugin_params_panels: std::cell::RefCell::default(),
+                own_chords_cache: std::cell::RefCell::default(),
                 loaded_project_id: 0,
                 video_texture_cache: std::collections::HashMap::new(),
                 image_texture_cache: std::collections::HashMap::new(),
@@ -1028,6 +1031,7 @@ impl ProjectState {
                 sc_listen_device: None,
                 delta_devices: Vec::new(),
                 device_scopes_sent: Vec::new(),
+                inspector_visible_eq_scopes: Vec::new(),
                 param_gesture_seen: std::collections::HashSet::new(),
                 pianoroll_hover_beat: None,
                 pianoroll_hover_beat_song_raw: None,
@@ -1043,6 +1047,7 @@ impl ProjectState {
                 audio_editor_clip: None,
                 automation_editor_clip: None,
                 automation_editor_hover_beat: None,
+                automation_editor_px_per_beat: None,
                 pianoroll_focus_clip: None,
                 audio_editor_hover_beat_in_clip: None,
                 audio_editor_zoom_x: 0.0,
@@ -1071,8 +1076,6 @@ impl ProjectState {
                 section_menu_open: false,
                 section_rename_id: None,
                 section_rename_text: String::new(),
-                bpm_edit_text: format!("{initial_bpm:.1}"),
-                time_sig_num_edit_text: initial_time_sig_num.to_string(),
                 clip_edit_buffer_target: None,
                 scrub_gesture: None,
                 scrub_gesture_seen: false,

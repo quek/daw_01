@@ -176,7 +176,8 @@ pub(super) fn draw_native_expansions(app: &AppData, ui: &mut Ui<'_, AppData>, ct
         expansion_rule(app, ui, ("par", key), full);
     }
     let rect = expansion_inset(full);
-    let panel = PanelCtx { dev, live: app.live_native_device(ctx.scope, owner, dev), owner, scope: ctx.scope, rect, bg };
+    let live = app.live_native_device(ctx.scope, owner, dev);
+    let panel = PanelCtx { dev, live, owner, scope: ctx.scope, rect, bg, eq_scopes: ctx.eq_scopes };
     native_panel::draw_native_panel(app, ui, &panel);
 }
 

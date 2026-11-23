@@ -16,6 +16,7 @@ use crate::scale::ScaleChange;
 mod audio_take;
 mod automation;
 mod bounce_ops;
+mod chord_basis;
 mod chord_ops;
 mod chords;
 mod clip_window;
@@ -25,6 +26,7 @@ mod content;
 mod content_split;
 mod event_window;
 mod device;
+mod id_headroom;
 mod ids;
 mod lineage;
 mod load_normalize;
@@ -50,6 +52,7 @@ mod window_edit;
 pub use audio_take::TAKE_ORIGIN_DEPTH;
 pub use automation::*;
 pub use bounce_ops::*;
+pub use chord_basis::{AudioBasisSpan, AudioEventBasis};
 pub use chords::*;
 pub use record_ops::RecordedWav;
 pub use clip_window::*;
@@ -59,7 +62,9 @@ pub use content::*;
 pub use content_split::split_boundaries;
 pub use event_window::{TimedEvent, event_piece, join_pieces, split_pieces};
 pub use device::*;
+pub use id_headroom::IdSpaceExhausted;
 pub use ids::*;
+pub use load_normalize::fresh_nonzero_id;
 pub use midi_bind::*;
 pub use modulation::*;
 pub use native::*;
@@ -352,7 +357,12 @@ pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, ru
 /// [`ChordEvent`]) とトラックの追従モード (`Track::follow_chords`、[`ChordFollow`])。旧ファイルは
 /// `serde(default)` の「箱なし / 追従しない」で読める (migration 不要)。新ファイルを旧ビルドで開くとコードと
 /// 追従が黙って捨てられ、追従していたトラックが書いた音で鳴る (保存し直すと消える) ので、版を上げて gate で弾く。
-pub const CURRENT_VERSION: u32 = 47;
+///
+/// v48 (r.md #159): 素材の置いた時点のコードの記録 (`Clip::chord_basis`、[`ClipChordBasis`])、箱の系統
+/// (`ChordEvent::lineage`。旧ファイルは `normalize_chords` が id で埋める)、オーディオの検出結果の「和音を弾いているか」
+/// (`AudioChordSpan::chordal`)。旧ファイルは記録なし (= コードを置いたままの状態) で開く。旧ファイルの `audio_chords` は「和音を弾いているか」を持たないので捨てる (`project::SONG_MIGRATIONS`)。
+/// 新ファイルを旧ビルドで開くと記録が黙って捨てられ、書き換えで動いていたメロディーが書いた音で鳴るので、版を上げる。
+pub const CURRENT_VERSION: u32 = 48;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -640,7 +650,7 @@ pub struct Song {
     #[serde(default)]
     pub midi_bindings: Vec<MidiBinding>,
     /// Phase 7 B5 (`docs/plan_scale.html`): タイムライン上の root + scale 変化点。
-    /// `beat` 昇順で保持 (= `scale_at(beat)` が rev-find で動く invariant)。
+    /// `beat` 昇順で保持 (= `scale_at(beat)` の二分探索の前提)。
     /// 空 Vec なら Scale 機能 OFF (chromatic 互換、 既存 project と完全互換)。
     /// 単一キーの楽曲なら `beat = 0` の event 1 件、 転調は 2 件目以降を追加。
     /// v10 file は `#[serde(default)]` で空 Vec で forward-migrate。
@@ -956,20 +966,23 @@ impl Song {
     /// Phase 7 B5 (`docs/plan_scale.html`): 指定 beat における active な
     /// `ScaleChange` を返す。 該当 event が無ければ `None` (= Scale 機能 OFF /
     /// chromatic 扱い)。 `scale_changes` は beat 昇順 invariant 前提で、
-    /// `rev().find()` で「該当 beat 直前の最新 event」 を取る。
+    /// 二分探索で「該当 beat 直前の最新 event」 を取る (RT のコード追従がノートの頭ごとに引く)。
+    #[must_use]
     pub fn scale_at(&self, beat: f64) -> Option<&ScaleChange> {
-        self.scale_changes
-            .iter()
-            .rev()
-            .find(|c| c.beat <= beat)
+        self.scale_changes.get(self.scale_index_at(beat)?)
     }
 
-    /// Phase 7 B5: `scale_changes` を beat 昇順に保つ。 同 beat の
-    /// duplicate は許容 (上書きするかは caller 判断)。 scale_changes を
+    /// [`Self::scale_at`] の位置 (同じ beat に重複があれば最後の 1 つ)。RT 安全 (二分探索)。
+    #[must_use]
+    pub fn scale_index_at(&self, beat: f64) -> Option<usize> {
+        self.scale_changes.partition_point(|c| c.beat <= beat).checked_sub(1)
+    }
+
+    /// Phase 7 B5: `scale_changes` を beat 昇順に保つ (二分探索の前提。`total_cmp` なので NaN が混じっても
+    /// 順序が崩れない)。 同 beat の duplicate は許容 (上書きするかは caller 判断)。 scale_changes を
     /// 変更したあと (event 追加 / move) に呼ぶ。
     pub fn ensure_scale_changes_sorted(&mut self) {
-        self.scale_changes
-            .sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap_or(std::cmp::Ordering::Equal));
+        self.scale_changes.sort_by(|a, b| a.beat.total_cmp(&b.beat));
     }
 
     /// Re-establish the time-ascending sort invariant on every automation
@@ -995,6 +1008,8 @@ impl Song {
     /// on a clone from `project::save` (does not mutate the live song).
     pub fn normalize_for_save(&mut self) {
         self.gc_clip_contents();
+        // r.md #159: もう無いノート / take の記録を捨てる (content の GC の後)。
+        self.normalize_chord_basis();
         self.gc_audio_sources();
         self.gc_video_sources();
         self.gc_image_sources();

@@ -62,7 +62,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = ClipboardEnvelope::new(
-            self.cur.song_doc.song().project_id,
+            self.clipboard_source(),
             ClipboardPayload::AutomationPoints(copied),
         )
         .to_json()?;

@@ -25,7 +25,8 @@ impl AppData {
         if !origin.is_finite() {
             return None;
         }
-        Some(picked.into_iter().map(|c| ChordEvent { id: 0, start_beat: c.start_beat - origin, ..c.clone() }).collect())
+        // 貼った箱は新しい系統 (`Song::place_chords`、r.md #159) なので系統は運ばない。
+        Some(picked.into_iter().map(|c| ChordEvent { id: 0, lineage: 0, start_beat: c.start_beat - origin, ..c.clone() }).collect())
     }
 
     /// Ctrl+C: 選んでいる箱を clipboard envelope (JSON) にする。`(json, 個数)`。
@@ -33,7 +34,7 @@ impl AppData {
     pub(crate) fn copy_chords_clip(&self) -> Option<(String, usize)> {
         let chords = self.selected_chords_relative()?;
         let n = chords.len();
-        let json = ClipboardEnvelope::new(self.cur.song_doc.song().project_id, ClipboardPayload::Chords(chords)).to_json()?;
+        let json = ClipboardEnvelope::new(self.clipboard_source(), ClipboardPayload::Chords(chords)).to_json()?;
         Some((json, n))
     }
 

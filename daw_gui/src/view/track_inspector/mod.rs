@@ -47,6 +47,7 @@ use daw_ui_renderer::Rect;
 use crate::app::{AppData, AppEvent, ClipKey, InspectorScrubField, ScrubGesture};
 use crate::event_inspector::InspectorEvent;
 use crate::handler::bypass_target::BypassTarget;
+use crate::handler::inspector_selection::InspectorSelection;
 use crate::state::ModRackHover;
 use crate::state::inspector_view::{InspectorBand, InspectorScrollFloor};
 use crate::view::modulation::{self as mod_widget, build_mod, scrub_field_mod, ModBuild};
@@ -122,23 +123,30 @@ pub(crate) fn push_scrub_bracket(
     crate::view::scrub_gesture::push(ui, app, ScrubGesture::Inspector(key), active);
 }
 
+/// [`scrub_field`] の 1 欄ぶんの中身。
+struct ScrubFieldSpec<'a> {
+    /// 選んでいる全部を畳んだ値 (割れていれば `None` = 「—」)。
+    value: Option<f64>,
+    /// dblclick で戻す値。
+    default: f64,
+    fmt: ScrubableNumberFormat,
+    style: &'a ScrubableNumberStyle,
+    /// undo の bracket の**所有者を名指しする鍵** ([`ScrubGesture::Inspector`](crate::state::ScrubGesture) の中身)。
+    key: InspectorScrubField,
+    /// 変調の持ち主のトラック = 代表クリップの居るトラック (`clip_band::ClipFields::mod_owner`)。
+    mod_owner: u32,
+}
+
 /// audio / image / text inspector
 /// の数値 field を 1 行ぶん描く共通 helper。 `ui.scrubable_number_at` を呼び、
 /// on_change で `make_event(v)` が返す `AppEvent` を全 event に broadcast、
 /// drag / text 編集の一連を [`push_scrub_bracket`] で undo 1 step に bracket する。
-/// `scrub_key` はその bracket の**所有者を名指しする鍵**
-/// ([`ScrubGesture::Inspector`](crate::state::ScrubGesture) の中身)。
-#[allow(clippy::too_many_arguments)]
 fn scrub_field(
     ui: &mut Ui<'_, AppData>,
     app: &AppData,
     id: impl std::hash::Hash,
     rect: Rect,
-    value: Option<f64>,
-    default: f64,
-    fmt: ScrubableNumberFormat,
-    style: &ScrubableNumberStyle,
-    scrub_key: InspectorScrubField,
+    spec: &ScrubFieldSpec<'_>,
     make_event: impl Fn(ClipKey, f64) -> AppEvent + Clone + Send + Sync + 'static,
 ) {
     // 複数選択時は inspector_target_refs 全体へ broadcast する。 値が
@@ -146,6 +154,7 @@ fn scrub_field(
     // 開始で base = default に戻る)。 `mutate_*_events_in_clip` は variant-safe なので、
     // broadcast 先に種別違いのクリップが混ざっても no-op で安全 (= その field を
     // 持つクリップにだけ適用される)。
+    let (value, default, scrub_key) = (spec.value, spec.default, spec.key);
     let base = value.unwrap_or(default);
     let placeholder = if value.is_none() { Some("\u{2014}") } else { None };
 
@@ -154,11 +163,13 @@ fn scrub_field(
     // modulation overlay + arm 中の depth-drag を組む。`build_mod` が image / text /
     // (回転含む) を 1 経路で扱う。clip-level field (gain / pan / pitch / fades) は
     // `scrub_field_mod` が `None` を返すので従来どおり overlay なし。
-    // inspector の image/text field は cursor track の clip に属する。
-    let cursor_track = app.cursor_track_id().unwrap_or(common::model::MASTER_TRACK_ID);
+    // 持ち主は代表クリップの居るトラック (値の broadcast 先・「A」のレーン・`*_automated` と同じ。compose は
+    // クリップのトラックの mod_routings を読む)。カーソルのトラックにすると、クリップを選んだまま別のトラックの
+    // ヘッダを押した状態で、変調がそのトラックへ付いて効かない。
+    let owner_track = spec.mod_owner;
     let mod_spec = scrub_field_mod(scrub_key);
     let mod_build = mod_spec.as_ref().and_then(|(target, domain)| {
-        let owner = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), cursor_track)?;
+        let owner = crate::view::native_device::ParamOwner::resolve(app.cur.song_doc.song(), owner_track)?;
         Some(build_mod(app, target.clone(), base, *domain, owner))
     });
     let modulation = mod_build.as_ref().map(ModBuild::modulation);
@@ -168,8 +179,8 @@ fn scrub_field(
         rect,
         base,
         default,
-        fmt,
-        style,
+        spec.fmt,
+        spec.style,
         move |v| {
             let make_event = make_event.clone();
             Edit::mutate(move |app: &mut AppData| {
@@ -192,7 +203,7 @@ fn scrub_field(
             ui,
             app,
             crate::app::ParamSurface::Rack,
-            cursor_track,
+            owner_track,
             target,
             resp.mod_dragging,
         );
@@ -210,11 +221,12 @@ pub fn panel_width(app: &AppData) -> f32 {
     }
 }
 
-/// インスペクタを描き、Q の宛先 (Rack の行 / モジュレーター) を **ここ 1 か所で** 公開する。
+/// インスペクタを描き、Q の宛先 (Rack の行 / モジュレーター) と、スペクトラムを要求する EQ (見える所に描いた
+/// Par) を **ここ 1 か所で** 公開する。
 ///
 /// 宛先を描画の途中で書くと、帯を畳んだ / インスペクタを隠したフレームで誰も消さず、見えない行が
 /// `Q` で切り替わる (マスターパネルの §18-AB と同じ)。描画は宛先を返すだけにして、どの経路で抜けても
-/// 毎フレーム必ずここを通す。
+/// 毎フレーム必ずここを通す。どれも変わったフレームだけ書く (毎フレーム書くとアイドルの再描画が止まらない)。
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let hover = draw_panel(app, ui, area);
     if app.cur.peph.inspector_hovered_row != hover.row {
@@ -225,13 +237,18 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
         let module = hover.module;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| app.cur.peph.inspector_hovered_mod = module));
     }
+    if app.cur.peph.inspector_visible_eq_scopes != hover.eq_scopes {
+        let scopes = hover.eq_scopes;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| app.cur.peph.inspector_visible_eq_scopes = scopes));
+    }
 }
 
-/// 帯の中身が返す Q の宛先。描かれなかった帯は `None` のまま。
+/// 帯の中身が返す Q の宛先と、見える所に描いた EQ。描かれなかった帯は空のまま。
 #[derive(Default)]
 struct InspectorHover {
     row: Option<BypassTarget>,
     module: Option<ModRackHover>,
+    eq_scopes: Vec<u64>,
 }
 
 fn draw_panel(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> InspectorHover {
@@ -255,7 +272,9 @@ fn draw_panel(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> InspectorH
     ui.panel("inspector_edge", Rect { x: area.x + area.w - 1.0, y: area.y, w: 1.0, h: area.h }, p.border, 0.0);
     let content = Rect { w: (area.w - RESIZE_HANDLE_W).max(1.0), ..area };
 
-    let title = app.inspector_title();
+    // 選択はここで 1 回だけ導き、タイトル・帯・欄・スクロールの主語が同じものを読む (引き直さない)。
+    let sel = app.inspector_selection();
+    let title = app.inspector_title(&sel);
     title::draw_title(app, ui, Rect { h: TITLE_H, ..content }, &title);
 
     // ---- 帯を縦スクロール領域に積む ------------------------------------------
@@ -266,7 +285,7 @@ fn draw_panel(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> InspectorH
     // scroll_area が offset を詰めて押した見出しが下へずれることが無い。
     let body_top = content.y + TITLE_H;
     let vp = Rect { x: content.x, y: body_top, w: content.w, h: (area.y + area.h - body_top).max(0.0) };
-    let subject = app.inspector_subject();
+    let subject = app.inspector_subject(&sel);
     let prev_floor = app.cur.peph.inspector_scroll_floor.as_ref();
     let floor = InspectorScrollFloor::floor_for(prev_floor, &subject).unwrap_or(0.0);
     let content_h = app.cur.peph.inspector_body_h.max(floor).max(1.0);
@@ -274,7 +293,7 @@ fn draw_panel(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> InspectorH
     let mut hover = InspectorHover::default();
     let offset = ui.scroll_area("inspector_body", vp, (vp.w, content_h), |ui, scroll_off| {
         let top = body_top - scroll_off.1;
-        let y = draw_bands(app, ui, content, top + BAND_GAP, &title.main, &mut hover);
+        let y = draw_bands(app, ui, &sel, content, top + BAND_GAP, &title.main, &mut hover);
         measured_body_h.set(y - top);
     });
     // 測定した本文の実高さと床を次フレーム用に保存 (変化時のみ edit を積む)。
@@ -284,8 +303,7 @@ fn draw_panel(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> InspectorH
             app.cur.peph.inspector_body_h = measured;
         }));
     }
-    let next_floor = InspectorScrollFloor::next(prev_floor, subject, measured, offset.1 + vp.h);
-    if prev_floor != Some(&next_floor) {
+    if let Some(next_floor) = InspectorScrollFloor::next(prev_floor, subject, measured, offset.1 + vp.h) {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.cur.peph.inspector_scroll_floor = Some(next_floor);
         }));
@@ -297,46 +315,57 @@ fn draw_panel(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> InspectorH
 /// モジュレーション。中身は各セクションの `(app, ui, area, pad, y) -> y` 契約の関数 (Rack とモジュレーションは
 /// Q の宛先も返す)。帯の対象がタイトルの 1 行目 (`title_main`) と同じ語なら省く — 1 本のトラックを選んだだけで
 /// トラック名が 4 回並ばない (複数選択の「選択中の N トラック」/「… のみ」は 1 行目と違うので残る)。
+#[allow(clippy::too_many_arguments)]
 fn draw_bands(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
+    sel: &InspectorSelection<'_>,
     area: Rect,
     mut y: f32,
     title_main: &str,
     hover: &mut InspectorHover,
 ) -> f32 {
-    let shown = |target: &str| -> String { if target == title_main { String::new() } else { target.to_string() } };
-    // ---- 選んでいるクリップ / セル ----
-    if let Some((kind, target)) = app.inspector_clip_band() {
-        let target = shown(&target);
-        let head = BandHead::new(InspectorBand::Clip(kind), vocab::clip_band_title(kind), &target);
-        y = band::band(app, ui, area, y, &head, |ui, y| clip_band::draw_clip_band_body(app, ui, area, PAD, y))
+    fn shown<'t>(target: &'t str, title_main: &str) -> &'t str {
+        if target == title_main { "" } else { target }
+    }
+    // ---- 選んでいるクリップ / セル (種類が混ざっていれば見出しは「種類の違うクリップ」、対象は内訳) ----
+    if let Some(clip_band) = sel.band {
+        let target = app.inspector_clip_band_target(sel);
+        let title = vocab::clip_kind_label(clip_band.kind, clip_band.mixed());
+        let head = BandHead::new(InspectorBand::Clip(clip_band.kind), title, shown(&target, title_main));
+        y = band::band(app, ui, area, y, &head, |ui, y| clip_band::draw_clip_band_body(app, ui, sel, area, PAD, y))
             + BAND_GAP;
     }
     // ---- 選んでいる列 (シーン) ----
-    if let Some(target) = app.inspector_scene_band_target() {
-        let head = BandHead::new(InspectorBand::Scene, vocab::BAND_SCENE, &target);
+    if let Some(target) = sel.scene_names.as_deref() {
+        let head = BandHead::new(InspectorBand::Scene, vocab::BAND_SCENE, target);
         y = band::band(app, ui, area, y, &head, |ui, y| clip_band::draw_scene_launch(app, ui, area, PAD, y))
             + BAND_GAP;
     }
     // ---- 入力 (選択中の全トラックに効く。録れる入力が 1 つも無いトラック (master / グループのバス /
-    // 画像・映像のトラック) だけなら出さない — 仕様 14) ----
-    if input_section::input_band_shown(app) {
-        let target = shown(&app.inspector_track_band_target(true));
-        let head = BandHead::new(InspectorBand::Input, vocab::BAND_INPUT, &target);
-        y = band::band(app, ui, area, y, &head, |ui, y| input_section::draw_input_section(app, ui, area, PAD, y))
-            + BAND_GAP;
+    // 画像・映像のトラック) だけなら出さない — 仕様 14)。対象・有無・中身が 1 回だけ作った結果を共有する ----
+    let input_targets = app.input_targets();
+    if !input_targets.is_empty() {
+        let target = app.input_band_target(&input_targets);
+        let head = BandHead::new(InspectorBand::Input, vocab::BAND_INPUT, shown(&target, title_main));
+        y = band::band(app, ui, area, y, &head, |ui, y| {
+            input_section::draw_input_section(app, ui, area, PAD, y, &input_targets)
+        }) + BAND_GAP;
     }
     let Some(cursor) = app.cursor_track_id() else {
         return y;
     };
     // ---- Rack (カーソルのトラック 1 本) ----
-    let cursor_only = shown(&app.inspector_track_band_target(false));
-    let target = if app.cur.song_doc.song().track_effectively_enabled(cursor) {
-        cursor_only.clone()
+    let cursor_target = app.cursor_band_target();
+    let cursor_only = shown(&cursor_target, title_main);
+    // 無効なトラックは「無効中」を添える (Rack 固有: chain は host に居ないので窓を開けない)。タイトルの 1 行目と
+    // 同じ名前は省いたまま添える (1 本だけ選んだときに名前を 2 回並べない)。
+    let target: std::borrow::Cow<'_, str> = if app.cur.song_doc.song().track_effectively_enabled(cursor) {
+        cursor_only.into()
+    } else if cursor_only.is_empty() {
+        vocab::DISABLED.into()
     } else {
-        let name = app.inspector_track_band_target(false);
-        format!("{name}{}{}", vocab::SEP, vocab::DISABLED)
+        format!("{cursor_only}{}{}", vocab::SEP, vocab::DISABLED).into()
     };
     // 読み込みに失敗した plugin の数は見出しに出す (畳んだ Rack / Parallel / 選んでいない chain の中でも
     // 気付ける。理由と [再読込] は各 plugin 行の中、仕様 2: トリガの近く)。
@@ -344,20 +373,21 @@ fn draw_bands(
     let warn = if failed > 0 { vocab::failed_loads(failed) } else { String::new() };
     let head = BandHead { warn: &warn, ..BandHead::new(InspectorBand::Rack, vocab::BAND_RACK, &target) };
     y = band::band(app, ui, area, y, &head, |ui, y| {
-        let (y, row) = chain_list::draw_chain_list(app, ui, area, PAD, y);
-        hover.row = row;
-        y
+        let out = chain_list::draw_chain_list(app, ui, area, PAD, y);
+        hover.row = out.row;
+        hover.eq_scopes = out.eq_scopes;
+        out.y
     }) + BAND_GAP;
     // ---- 口パク (このトラックを口パク出力先にしている歌声トラックがあるとき) ----
     if mouth_map_section::mouth_map_shown(app) {
-        let head = BandHead::new(InspectorBand::MouthMap, vocab::BAND_MOUTH, &cursor_only);
+        let head = BandHead::new(InspectorBand::MouthMap, vocab::BAND_MOUTH, cursor_only);
         y = band::band(app, ui, area, y, &head, |ui, y| mouth_map_section::draw_mouth_map_section(app, ui, area, PAD, y))
             + BAND_GAP;
     }
     // ---- モジュレーション (見出しの右端に追加メニュー。畳んでいても見える) ----
     let head = BandHead {
         actions_w: BAND_ADD_W,
-        ..BandHead::new(InspectorBand::Modulation, vocab::BAND_MODULATION, &cursor_only)
+        ..BandHead::new(InspectorBand::Modulation, vocab::BAND_MODULATION, cursor_only)
     };
     let out = band::head(app, ui, area, y, &head);
     modulation_rack::draw_add_source_menu(ui, out.actions);

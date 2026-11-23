@@ -536,12 +536,6 @@ impl AppData {
             AppEvent::LoopSelectedClipToggle { automation, sections } => {
                 self.loop_selected_clip_toggle(automation, sections);
             }
-            AppEvent::BpmEditChanged(s) => {
-                self.cur.peph.bpm_edit_text = s;
-            }
-            AppEvent::CommitBpmEdit => {
-                self.commit_bpm_edit();
-            }
             AppEvent::SetSongBpmFromScrub(next) => {
                 let clamped = next.clamp(1.0, 400.0);
                 if (self.cur.song_doc.song().bpm - clamped).abs() > f32::EPSILON {
@@ -551,7 +545,6 @@ impl AppData {
                     // 同じ step に入るよう、 event の scope ごと張る。
                     self.cur.song_doc.use_stream_scope(StreamGesture::BpmScrub);
                     self.edit_song(|song| song.bpm = clamped);
-                    self.cur.peph.bpm_edit_text = format!("{:.1}", clamped);
                     // Raw audio clip を秒固定スケール (r.md #7)。Raw clip があれば
                     // LoadSong (decode 再利用で軽量) で再生 window を追従させ、
                     // 無ければ従来の軽量 SetSongBpm で済ます。
@@ -565,18 +558,11 @@ impl AppData {
                 if self.cur.song_doc.song().time_sig.0 != clamped {
                     self.cur.song_doc.use_stream_scope(StreamGesture::TimeSigScrub);
                     self.edit_song(|song| song.time_sig.0 = clamped);
-                    self.cur.peph.time_sig_num_edit_text = clamped.to_string();
                     self.send_audio(AudioCommand::SetSongTimeSigNumerator { project: self.pk(), num: clamped });
                 }
             }
             AppEvent::SetSongTranspose(semitones) => self.set_song_transpose(semitones),
             AppEvent::SetTracksFollowTranspose { track_ids, follow } => self.set_tracks_follow_transpose(&track_ids, follow),
-            AppEvent::TimeSigNumEditChanged(s) => {
-                self.cur.peph.time_sig_num_edit_text = s;
-            }
-            AppEvent::CommitTimeSigNumEdit => {
-                self.commit_time_sig_num_edit();
-            }
             AppEvent::SetSongTimeSigDenominator(den) => {
                 self.set_song_time_sig_denominator(den);
             }
@@ -653,12 +639,7 @@ impl AppData {
             }
             // r.md #29: 履歴リストの行 click → その state へ一発 Undo/Redo。
             AppEvent::JumpHistory(index) => self.jump_history_to(index),
-            AppEvent::QuantizeSelectedNotes(div) => {
-                self.quantize_selected_notes(div);
-            }
-            AppEvent::SetNoteVelocity { note, velocity } => {
-                self.set_note_velocity(note, velocity);
-            }
+            AppEvent::QuantizeSelectedNotes { grid_beats } => self.quantize_selected_notes(grid_beats),
             AppEvent::SetNoteVelocities(updates) => {
                 self.set_note_velocities(&updates);
             }
@@ -755,12 +736,6 @@ impl AppData {
             AppEvent::CloneAutomationClipsIndependent { deltas } => {
                 self.clone_automation_clips_independent(&deltas)
             }
-            AppEvent::DuplicateAutomationClipsShared(keys) => {
-                self.duplicate_automation_clips_shared(&keys);
-            }
-            AppEvent::DuplicateAutomationClipsUnique(keys) => {
-                self.duplicate_automation_clips_unique(&keys);
-            }
             AppEvent::ResizeAutomationClips { deltas } => {
                 self.resize_automation_clips(&deltas)
             }
@@ -785,8 +760,8 @@ impl AppData {
                 }
                 self.cur.selection.selected_automation_points = next;
             }
-            AppEvent::QuantizeSelectedAutomationPoints(div) => {
-                self.quantize_selected_automation_points(div);
+            AppEvent::QuantizeSelectedAutomationPoints { grid_beats } => {
+                self.quantize_selected_automation_points(grid_beats);
             }
             AppEvent::MakeAutomationClipUnique(key) => {
                 self.make_automation_clip_unique(key);
@@ -905,9 +880,6 @@ impl AppData {
             AppEvent::SetTracksEnabled { track_ids, enabled } => self.set_tracks_enabled(track_ids, enabled),
             AppEvent::DuplicateTracksShared(track_ids) => self.duplicate_tracks(track_ids, true),
             AppEvent::DuplicateTracksUnique(track_ids) => self.duplicate_tracks(track_ids, false),
-            AppEvent::MoveTrackUp(idx) => self.swap_tracks(idx, idx.saturating_sub(1)),
-            AppEvent::MoveTrackDown(idx) => self.swap_tracks(idx, idx + 1),
-            AppEvent::ReorderTracks(order) => self.reorder_tracks(&order),
             AppEvent::BeginRenameTrack(track_id) => {
                 self.begin_rename_track(track_id);
             }
@@ -993,11 +965,7 @@ impl AppData {
                 self.cur.recording.midi_learn_target = None;
                 self.ui_ephemeral.status_message = "MIDI Learn cancel".to_string();
             }
-            AppEvent::RemoveMidiBinding(idx) => {
-                if idx < self.cur.song_doc.song().midi_bindings.len() {
-                    self.edit_song(|song| song.midi_bindings.remove(idx));
-                }
-            }
+            AppEvent::RemoveMidiBinding(binding) => self.remove_midi_binding(&binding),
             AppEvent::MidiInputOpened(name) => {
                 let label = name.clone().unwrap_or_default();
                 self.cur.recording.midi_input_label = label.clone();
@@ -1070,9 +1038,6 @@ impl AppData {
             AppEvent::ClearNoteSelection => self.clear_note_selection(),
             AppEvent::AddNote { key, start_beat, duration, pitch } => {
                 self.add_note(key, start_beat, duration, pitch);
-            }
-            AppEvent::ResizeNote { key, note, duration } => {
-                self.resize_note(key, note, duration);
             }
             AppEvent::SetNotePositions(entries) => {
                 self.set_note_positions(&entries);
@@ -1587,16 +1552,6 @@ impl AppData {
                     self.perform_guard_action(action);
                 }
             }
-            AppEvent::ExportMp4 { output_path, audio_wav, range_beats, dims } => {
-                #[cfg(windows)]
-                self.action_export_mp4(output_path, audio_wav, range_beats, dims);
-                #[cfg(not(windows))]
-                {
-                    let _ = (output_path, audio_wav, range_beats, dims);
-                    self.ui_ephemeral.status_message =
-                        "Video export は Windows 専用 (WMF 経由) です".into();
-                }
-            }
             AppEvent::ExportProgress { done, total, .. } => {
                 self.cur.transport.export_stage = Some(ExportStage::VideoRender { done, total });
             }
@@ -1637,10 +1592,6 @@ impl AppData {
             AppEvent::ResetAutomationLaneClipColors { lane } => {
                 self.reset_automation_lane_clip_colors(lane);
             }
-            AppEvent::SetClipMuted { target, muted } => {
-                // clip-level mute の SSoT (`Clip.muted`)。 content type を問わない。
-                self.set_clip_muted(target, muted);
-            }
             AppEvent::SetClipsMuted { targets, muted } => {
                 // `q` で選択 clip / カーソル直下 clip を一括 toggle した結果。
                 let _ = self.edit_song(|song| {
@@ -1660,9 +1611,6 @@ impl AppData {
             AppEvent::SetNotesMuted { notes, muted } => {
                 // `q` で選択 note / カーソル直下 note (packed id) を一括 toggle。
                 self.set_notes_muted(&notes, muted);
-            }
-            AppEvent::SetClipStretchMode { target, mode } => {
-                self.set_clip_audio_event_stretch_mode(target, mode);
             }
             AppEvent::ResyncClipEditBuffers(target) => {
                 // 数値 buffer は撤去済み。 text section と共有する
@@ -1693,20 +1641,6 @@ impl AppData {
                     self.set_clip_image_event_fade_out_beats(target, beats);
                 } else {
                     self.set_clip_audio_event_fade_out_beats(target, beats);
-                }
-            }
-            AppEvent::SetClipFadeInCurve { target, curve } => {
-                if self.is_image_clip(target) {
-                    self.set_clip_image_event_fade_in_curve(target, curve);
-                } else {
-                    self.set_clip_audio_event_fade_in_curve(target, curve);
-                }
-            }
-            AppEvent::SetClipFadeOutCurve { target, curve } => {
-                if self.is_image_clip(target) {
-                    self.set_clip_image_event_fade_out_curve(target, curve);
-                } else {
-                    self.set_clip_audio_event_fade_out_curve(target, curve);
                 }
             }
             AppEvent::SetClipImageX { target, value } => {
@@ -1755,32 +1689,8 @@ impl AppData {
             AppEvent::SetClipTextContent { target, value } => {
                 self.set_clip_text_event_content(target, value);
             }
-            AppEvent::SetClipTextFontFamily { target, value } => {
-                self.set_clip_text_event_font_family(target, value);
-            }
-            AppEvent::SetClipTextAlign { target, value } => {
-                self.set_clip_text_event_align(target, value);
-            }
-            AppEvent::SetClipTextFadeInCurve { target, curve } => {
-                self.set_clip_text_event_fade_in_curve(target, curve);
-            }
-            AppEvent::SetClipTextFadeOutCurve { target, curve } => {
-                self.set_clip_text_event_fade_out_curve(target, curve);
-            }
             AppEvent::SetClipTextNumField { target, field, value } => {
                 self.set_clip_text_num_field(target, field, value);
-            }
-            AppEvent::ClipTextContentEditChanged(s) => {
-                self.cur.peph.clip_text_content_edit_text = s;
-            }
-            AppEvent::ClipTextFontFamilyEditChanged(s) => {
-                self.cur.peph.clip_text_font_family_edit_text = s;
-            }
-            AppEvent::CommitClipTextContentEdit => {
-                self.commit_clip_text_content_edit();
-            }
-            AppEvent::CommitClipTextFontFamilyEdit => {
-                self.commit_clip_text_font_family_edit();
             }
             AppEvent::ResyncClipTextEditBuffers(target) => {
                 self.resync_clip_text_event_edit_buffers(target);

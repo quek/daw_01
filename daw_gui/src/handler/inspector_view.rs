@@ -58,11 +58,4 @@ impl AppData {
     pub fn inspector_band_open(&self, band: InspectorBand) -> bool {
         self.cur.view.inspector_folds.band_open(band)
     }
-
-    /// Rack の行が画面に描かれているか (インスペクタが出ていて、Rack の帯が開いている)。
-    /// 見えない Par に engine の仕事 (EQ のスペクトラム) をさせないための判定。
-    #[must_use]
-    pub fn inspector_rack_visible(&self) -> bool {
-        self.ui_prefs.inspector_open && self.inspector_band_open(InspectorBand::Rack)
-    }
 }

@@ -94,13 +94,7 @@ fn place(app: &mut AppData, start: f64, len: f64, root: u8) -> u32 {
     let mut id = 0;
     app.edit_song(|song| {
         id = song
-            .place_chord(ChordEvent {
-                id: 0,
-                start_beat: start,
-                len_beats: len,
-                chord: Chord::new(root, ChordKind::Major),
-                color: None,
-            })
+            .place_chord(ChordEvent::new(start, len, Chord::new(root, ChordKind::Major)))
             .unwrap();
     });
     id
@@ -111,19 +105,21 @@ fn layout(app: &AppData) -> Vec<(f64, f64, u8)> {
     app.cur.song_doc.song().chords.iter().map(|c| (c.start_beat, c.len_beats, c.chord.root)).collect()
 }
 
-/// 空きのダブルクリックで 1 小節 (4/4 = 4 拍) の箱ができ、選ばれてポップアップが開く。
+/// 空きのダブルクリックで 1 小節 (4/4 = 4 拍) の置く前の箱でポップアップが開く。r.md #159: 曲はまだ変わらない
+/// (箱が入るのはコードを選んだ時点。選ぶ / 閉じるは `tests/chord_popup.rs`)。
 #[test]
-fn double_click_on_empty_creates_a_bar_and_opens_the_popup() {
+fn double_click_on_empty_opens_the_popup_on_a_bar_draft() {
     let (mut app, _a, _p) = build_app();
     let mut host = UiHost::no_redraw();
     let x = 2.0 * ZOOM;
+    let depth = app.cur.song_doc.undo_depth();
     for p in [press(x, UPPER_Y, none()), release(x, UPPER_Y, none()), press(x, UPPER_Y, none()), release(x, UPPER_Y, none())] {
         drive(&mut host, &mut app, p);
     }
-    assert_eq!(layout(&app), vec![(2.0, 4.0, 0)], "拍 2 から 1 小節の箱 (キーが無いので C)");
-    let id = app.cur.song_doc.song().chords[0].id;
-    assert_eq!(app.cur.selection.selected_chord_ids, vec![id]);
-    assert_eq!(app.cur.peph.chord_band.popup.as_ref().map(|p| p.chord_id), Some(id));
+    assert!(layout(&app).is_empty(), "選ぶまで曲に箱は無い");
+    assert_eq!(app.cur.song_doc.undo_depth(), depth);
+    let draft = app.cur.peph.chord_band.popup.as_ref().and_then(|p| p.draft()).expect("置く前の箱で開く");
+    assert_eq!((draft.start_beat, draft.len_beats, draft.chord.root), (2.0, 4.0, 0), "拍 2 から 1 小節 (キーが無いので C)");
 }
 
 /// 中央のドラッグで移動、Ctrl+ドラッグで複製 (元は残る)。

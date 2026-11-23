@@ -108,7 +108,7 @@ impl AppData {
                     origins.entry(note.id).or_default().push(origin);
                 }
             }
-            n = content.split_notes(
+            let pairs = content.split_notes(
                 |note| {
                     let end = note.start_beat + note.duration_beats;
                     origins.get(&note.id).map_or_else(Vec::new, |os| {
@@ -117,6 +117,13 @@ impl AppData {
                 },
                 MIN_NOTE_LEN_BEATS,
             );
+            let mut split: Vec<u32> = pairs.iter().map(|(from, _)| *from).collect();
+            split.dedup();
+            n = split.len();
+            // r.md #159: 後ろの片も元のノートと同じく置いた時点のコードで鳴る (この content を見る全クリップ)。
+            if let Some(content_id) = song.clip_by_key(key).map(|c| c.content_id) {
+                song.copy_note_basis(content_id, &pairs);
+            }
             n > 0
         });
         n
@@ -380,8 +387,9 @@ impl AppData {
 /// を通したもの) で割り、片の `ClipKey` を先頭から返す (先頭 = 元のクリップ。 割れなければ空)。
 ///
 /// **content は切り口で 1 回だけ切り、窓を割る** (`docs/plan_range_selection.md` §10)。 跨ぐ
-/// note / event は [`Song::split_content_at_points`] が割る (共有されている MIDI は 1 回だけ fork
-/// するので linked clip は無傷。 時間軸を持つ event は切っても鳴り方が変わらないので共有のまま)。
+/// note / event は [`Song::split_clip_content_at`] が割る (共有されている MIDI は 1 回だけ fork
+/// するので linked clip は無傷。 時間軸を持つ event は切っても鳴り方が変わらないので共有のまま。割ったノートの
+/// 片へ置いた時点のコードの記録を写す)。
 /// 片は**同じ content を別の窓で見る**ので、窓の外に隠れていた
 /// 素材は失われない。 後ろの片は口パク自動生成の再生成対象から外す (手で割った片を
 /// 再生成で消さない)。
@@ -398,12 +406,17 @@ pub(crate) fn split_clip_window(song: &mut Song, key: ClipKey, cuts: &[f64]) -> 
     let off = clip.content_offset_beats;
     // 切る位置は **content-local** 拍 (= 窓の offset ぶん進んだ位置)。
     let local: Vec<f64> = cuts.iter().map(|c| off + (c - start)).collect();
-    let content_id = song.split_content_at_points(clip.content_id, &local);
+    // content を切って front を張り替え、割ったノートの片へ記録を写す (r.md #159)。片は写した後の front から作る。
+    let Some(content_id) = song.split_clip_content_at(key, &local) else {
+        return Vec::new();
+    };
+    let Some(clip) = song.clip_by_key(key).cloned() else {
+        return Vec::new();
+    };
     let Some(track) = song.track_by_id_mut(key.track_id) else {
         return Vec::new();
     };
     if let Some(front) = track.clip_by_id_mut(key.clip_id) {
-        front.content_id = content_id;
         front.length_beats = first - start;
         front.clear_overhang(false, true);
     }

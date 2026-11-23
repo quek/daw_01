@@ -35,7 +35,8 @@ impl AppData {
     /// 化する特例 (`source = Vocal`) は維持する。
     pub(crate) fn select_plugin_from_db(&mut self, id: String, keep_open: bool, open_gui: bool) {
         // picker を開いた chain は **picker が開いている間だけ** の挿入先。閉じた後に同じ event で足す口
-        // (インスペクタの「+ 字幕デバイス」) が、前に picker を開いた chain へ挿さないようにする。
+        // (picker の外から送るテスト / smoke test) が、前に picker を開いた chain へ挿さないようにする。
+        // 宛先を決めて足す口は `DeviceEvent::AddPlugin` (インスペクタの「+ 字幕デバイス」)。
         let picker_target =
             if self.ui_ephemeral.is_plugin_picker_open { self.ui_ephemeral.plugin_picker_target } else { None };
         // 無修飾 / Shift は選択で閉じる。 Ctrl (keep_open) は開いたまま連続追加
@@ -43,12 +44,37 @@ impl AppData {
         if !keep_open {
             self.ui_ephemeral.is_plugin_picker_open = false;
         }
+        // 知らない id で挿す先 (トラックが 1 本も無ければ足すトラック) を作らない。
+        if !self.is_addable_device_id(&id) {
+            return;
+        }
+        let Some(dest) = self.plugin_insert_chain(picker_target) else { return };
+        self.add_plugin_from_db(&id, dest, open_gui);
+    }
+
+    /// `id` を足せるか: Parallel / 内蔵 device の picker id か、plugin DB にある id。
+    fn is_addable_device_id(&self, id: &str) -> bool {
+        if id == common::plugin_db::PARALLEL_PICKER_ID || common::model::NativeKind::from_picker_id(id).is_some() {
+            return true;
+        }
+        let Some(db) = self.ipc.plugin_db.as_ref() else {
+            tracing::warn!(id, "plugin_db not available");
+            return false;
+        };
+        let found = db.find_by_id(id).is_some();
+        if !found {
+            tracing::error!(id, "picked plugin id not in database");
+        }
+        found
+    }
+
+    /// `DeviceEvent::AddPlugin` / picker の選択: `id` を chain `dest` の既定位置 (r.md #129 Q6: 組み込みの手前) に
+    /// 挿す。音源トラック化 / Transform の既定値 / 有効かどうかは、**挿す chain の持ち主** のトラックで決める。
+    pub(crate) fn add_plugin_from_db(&mut self, id: &str, dest: common::model::ChainRef, open_gui: bool) {
         // r.md #110: 「Parallel」 は plugin ではなく container、 r.md #129 (Q8): 内蔵 4 種は daw_audio が
-        // in-process で処理する device。 どちらも DB を引かず、 picker を開いた chain の既定位置 (Q6) に挿す。
-        // 内蔵は Shift なし (= GUI を開く) なら Par を開く。
-        let native = common::model::NativeKind::from_picker_id(&id);
+        // in-process で処理する device。 どちらも DB を引かない。内蔵は Shift なし (= GUI を開く) なら Par を開く。
+        let native = common::model::NativeKind::from_picker_id(id);
         if id == common::plugin_db::PARALLEL_PICKER_ID || native.is_some() {
-            let Some(dest) = self.plugin_insert_chain(picker_target) else { return };
             let ev = match native {
                 Some(kind) => DeviceEvent::AddNative { chain: dest, kind, open_panel: open_gui },
                 None => DeviceEvent::AddParallel { chain: dest, at: InsertAt::Default },
@@ -60,8 +86,8 @@ impl AppData {
             tracing::warn!(id, "plugin_db not available");
             return;
         };
-        let Some(entry) = db.find_by_id(&id) else {
-            tracing::error!(id, "picked plugin id not in database");
+        let Some(entry) = db.find_by_id(id) else {
+            tracing::error!(id, "plugin id not in database");
             return;
         };
         let entry_id = entry.id.clone();
@@ -70,10 +96,8 @@ impl AppData {
         // daw_audio に運ぶ (= daw_audio が DB なしに役割を導出できる SSoT)。
         let ports = port_config_of(entry);
         let is_voicevox = entry_id.as_str() == common::plugin_db::BUILTIN_ID_VOICEVOX;
-        // r.md #110: 挿入先は picker を開いた chain (`+ プラグイン` の行が指す chain)。無指定 / 消えていれば cursor
-        // track (master なら `Song.master_fx_chain`)。音源トラック化 / Transform の既定値 / 有効かどうかは、cursor では
-        // なく **挿す chain の持ち主** のトラックで決める (picker を別トラックの chain で開いていても取り違えない)。
-        let Some(dest) = self.plugin_insert_chain(picker_target) else { return };
+        // 音源トラック化 / Transform の既定値 / 有効かどうかは、cursor ではなく **挿す chain の持ち主** のトラックで
+        // 決める (picker を別トラックの chain で開いていても、宛先を持つ `AddPlugin` でも取り違えない)。
         let Some(owner) = self.cur.song_doc.song().chain_owner_track(dest) else { return };
 
         // 内蔵映像効果は GUI 描画パスで処理する device。plugin_host に

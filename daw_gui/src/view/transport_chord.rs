@@ -89,7 +89,7 @@ mod tests {
 
             app.edit_song(|s| {
                 for (start, chord) in [(0.0, Chord::new(9, ChordKind::Minor)), (8.0, Chord::new(5, ChordKind::Major))] {
-                    s.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: 4.0, chord, color: None });
+                    s.place_chord(ChordEvent::new(start, 4.0, chord));
                 }
             });
             app.cur.transport.playhead_beat = Some(1.0);

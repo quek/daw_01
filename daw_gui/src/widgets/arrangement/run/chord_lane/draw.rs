@@ -72,6 +72,15 @@ fn draw_boxes(hctx: &mut HeavyCtx<'_, '_, AppData>, app: &AppData, f: &Arrangeme
             preview(hctx, box_rect(b.start + delta, b.len, f), style);
         }
     }
+    // ポップアップの置く前の箱 (r.md #159、曲にはまだ無い): ゴーストの枠に、入力欄に出しているコードを淡く。
+    if let Some(d) = app.cur.peph.chord_band.popup.as_ref().and_then(|p| p.draft()) {
+        let r = box_rect(d.start_beat, d.len_beats, f);
+        preview(hctx, r, style);
+        if r.w > 8.0 {
+            let text = app.chord_label(&d.chord, d.start_beat);
+            label(hctx, r, &text, style.arranger_label_color, style);
+        }
+    }
 }
 
 /// 半透明のゴースト (複製先 / 範囲)。
