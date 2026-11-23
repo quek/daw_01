@@ -721,12 +721,6 @@ pub struct ProjectEphemeral {
     pub section_rename_id: Option<u32>,
     /// 上記改名の編集中文字列。
     pub section_rename_text: String,
-    /// Transport BPM 入力欄の編集中文字列。 commit (Enter) で parse + clamp +
-    /// `song.bpm` に反映、 song を切り替える際 (open / new / undo / redo) は
-    /// `resync_song_edit_texts` で formatted な現値に書き戻す。
-    pub bpm_edit_text: String,
-    /// Transport time_sig numerator 入力欄の編集中文字列。 同上。
-    pub time_sig_num_edit_text: String,
     /// 現 buffer がどの clip 用にロードされているか。 `selected_clip` が
     /// 変わったら view 側が `AppEvent::ResyncClipEditBuffers(target)` を
     /// 発火して `resync_clip_audio_event_edit_buffers` で再生成。 `None`
@@ -863,8 +857,6 @@ impl ProjectState {
     #[must_use]
     pub fn from_song(key: ProjectKey, song: Song) -> Self {
         let initial_peak_display = vec![(0.0, 0.0); song.tracks.len()];
-        let initial_bpm = song.bpm;
-        let initial_time_sig_num = song.time_sig.0;
         Self {
             key,
             // r.md #54: 解析はセッション限りなので既定 (Idle / レポート無し)。
@@ -1076,8 +1068,6 @@ impl ProjectState {
                 section_menu_open: false,
                 section_rename_id: None,
                 section_rename_text: String::new(),
-                bpm_edit_text: format!("{initial_bpm:.1}"),
-                time_sig_num_edit_text: initial_time_sig_num.to_string(),
                 clip_edit_buffer_target: None,
                 scrub_gesture: None,
                 scrub_gesture_seen: false,

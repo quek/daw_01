@@ -1681,7 +1681,7 @@ struct SectionDragSession {
 // `crate::widgets::ruler_ops` に extract (piano_roll と共有)。
 
 /// M10 Phase 46 / M14 Phase 63c (#016): track header drag&drop session。 release frame で
-/// **drop target に応じて `ReorderTracks` (sibling) と `SetTrackParent` (parent 変更) を振り分け** る。
+/// **drop target に応じた `SetTrackParent`** (sibling の並べ替えは parent 不変 + `anchor_after`、parent 変更も同じ variant) を出す。
 /// multi-select 時は `source_track_ids` に selected_tracks をそのまま乗せて一括移動する。
 #[derive(Clone, Debug)]
 struct TrackReorderSession {

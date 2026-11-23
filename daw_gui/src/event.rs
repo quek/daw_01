@@ -80,27 +80,16 @@ pub enum AppEvent {
     /// `sections` = **選択アレンジパート (section)** の範囲を対象にする (r.md #128:
     /// ポインタが Arranger の上にあるとき)。 `automation` より優先。
     LoopSelectedClipToggle { automation: bool, sections: bool },
-    /// Transport BPM 入力欄の文字列が変わった (commit ではなく途中入力)。
-    /// Undo 対象外。
-    BpmEditChanged(String),
-    /// BPM 入力欄で Enter (commit)。 parse + clamp(1.0..=400.0) + Song.bpm 反映 +
-    /// `bpm_edit_text` を formatted な現値に書き戻す。 Undo 対象。
-    CommitBpmEdit,
-    /// time_sig numerator 入力欄の文字列が変わった。 Undo 対象外。
-    TimeSigNumEditChanged(String),
-    /// numerator 入力欄で Enter (commit)。 parse + clamp(1..=32) + 反映。 Undo 対象。
-    CommitTimeSigNumEdit,
     /// time_sig denominator dropdown で選択された (2/4/8/16 のみ valid)。 Undo 対象。
     SetSongTimeSigDenominator(u8),
     /// Phase 5 Step 5.1 follow-up (gui_01 #035): transport の BPM
     /// scrubable_number drag 中に流れる連続 BPM 変化。 widget 内で 1.0..=400.0
-    /// に clamp 済前提だが defensive で再 clamp。 `bpm_edit_text` も同期して
-    /// text input mode の表示を追随させる。 Undo 対象外 (= 連続発火、
-    /// release edge の ParamGestureEnd で 1 step Undo 化を別途検討)。
+    /// に clamp 済前提だが defensive で再 clamp。 連続する値は stream gesture
+    /// (`StreamGesture::BpmScrub`) で 1 undo step に畳む。
     /// 軽量 IPC `AudioCommand::SetSongBpm` で audio engine 即時反映。
     SetSongBpmFromScrub(f32),
     /// Phase 5 Step 5.1 follow-up: TimeSig numerator scrub。 1..=32 clamp、
-    /// `time_sig_num_edit_text` 同期、 軽量 IPC `AudioCommand::SetSongTimeSigNumerator`。
+    /// 軽量 IPC `AudioCommand::SetSongTimeSigNumerator`。
     SetSongTimeSigNumFromScrub(u8),
     /// r.md #130: transport の Transpose 欄 (縦ドラッグ / 入力 / ダブルクリックで 0) が流す移調の基準値 (半音)。
     /// handler が ±24 に丸め、連続する値は 1 undo step に畳み、軽量 IPC `AudioCommand::SetSongTranspose` で
@@ -165,7 +154,6 @@ pub enum AppEvent {
     /// `pitch` は今フレームの押下 pitch (`None` = release / 鍵盤外)。 handler が前回
     /// `preview_note` と差分して note-on/off IPC を送る。 Undo 対象外。
     PreviewPitchChanged { track_id: u32, pitch: Option<u8> },
-    SetNoteVelocity { note: u32, velocity: u8 },
     /// gui_01 #018 (M14 Phase 64): velocity lane drag で 1 batch 更新。
     /// `selected_clip` の note を `(id, velocity)` で一括書き換え。 1 drag =
     /// 1 Undo step。
@@ -365,14 +353,6 @@ pub enum AppEvent {
     /// 既に独立 clip の場合は status_message で通知。MIDI clip 用
     /// `MakeClipUnique(ClipKey)` と同 idiom の lane 版。
     MakeAutomationClipUnique(common::model::AutomationClipKey),
-    /// D shortcut: 選択中の automation clip 群をまとめて共有コピー。
-    /// automation lane 版のブロック複製。 選択ブロック span
-    /// だけ後ろにずらして複製し、 新 key 群を `selected_automation_clips` に
-    /// 上書きする (D 連打で後方連鎖)。
-    DuplicateAutomationClipsShared(Vec<common::model::AutomationClipKey>),
-    /// Alt+D shortcut: 選択中の automation clip 群をまとめて独立コピー
-    /// (content を deep clone + 新 ContentId)。 配置・選択は shared 版と同じ。
-    DuplicateAutomationClipsUnique(Vec<common::model::AutomationClipKey>),
     /// gui_01 #028 §7.3: parameter touch 通知。inspector の knob drag /
     /// plugin GUI の knob 操作 (Phase 2+ で IPC 経由) で発火し、
     /// `last_touched_param` を更新。`A` キー shortcut の source になる。
@@ -581,11 +561,6 @@ pub enum AppEvent {
     /// group child を単独複製した場合は同じ group 内に残る (parent 継承)。
     DuplicateTracksShared(Vec<u32>),
     DuplicateTracksUnique(Vec<u32>),
-    MoveTrackUp(u32),
-    MoveTrackDown(u32),
-    /// 新順での `Track.id` 列で `song.tracks` を並び替える (drag&drop reorder)。
-    /// order に含まれない track はそのまま末尾に残す。
-    ReorderTracks(Vec<u32>),
     /// 引数は rename 対象 track の **安定 ID** (positional index ではない)。
     BeginRenameTrack(u32),
     RenameTrackChanged(String),
@@ -735,11 +710,6 @@ pub enum AppEvent {
     },
     SetNotePositions(Vec<(u32, f64, u8)>),
     SetNoteSelection(Vec<u32>),
-    ResizeNote {
-        key: ClipKey,
-        note: u32,
-        duration: f64,
-    },
     ResizeNotes(Vec<(u32, f64, f64)>),
     DeleteSelectedNotes,
     /// ピアノロールで選択中ノートを複製 (D キー)。選択範囲ぶん後ろにずらして
@@ -1385,8 +1355,8 @@ pub enum AppEvent {
 
     /// File menu → "Export Video..." (`docs/plan_video.md` P8). Opens
     /// a save dialog for the output mp4 path + a second open dialog
-    /// (cancelable) for an optional audio WAV to mux in. Forwards to
-    /// `AppEvent::ExportMp4` once the user picks paths.
+    /// (cancelable) for an optional audio WAV to mux in. The picked paths
+    /// come back as `FileDialogResult { kind: FileDialogKind::ExportMp4 }`.
     OpenExportMp4Dialog,
 
     /// 別スレッドで開いた native file dialog の結果。 `kind` で振り分け、 `paths`
@@ -1405,19 +1375,6 @@ pub enum AppEvent {
         path: Option<PathBuf>,
     },
 
-    /// Background mp4 render at `output_path`, optionally muxing the
-    /// PCM Float32 WAV at `audio_wav` as an AAC stream. v12
-    /// (`docs/plan_video.md` P8). `range_beats` restricts the
-    /// rendered window to `[start_beat, end_beat)` (`None` = whole song);
-    /// the muxed `audio_wav` is already trimmed to the same window.
-    /// `dims` = picker で選んだ出力解像度 `(w, h)` と fps の
-    /// per-export override (`None` = プロジェクト値)。
-    ExportMp4 {
-        output_path: PathBuf,
-        audio_wav: Option<PathBuf>,
-        range_beats: Option<(f64, f64)>,
-        dims: Option<((u32, u32), f32)>,
-    },
     /// 映像 render thread が発火（`done` / `total` フレーム）。`export_stage` を
     /// `VideoRender` に更新して進捗オーバーレイに反映。非 undoable。
     /// `project` = 書き出しているタブ。daw_audio 発の `AudioEvent::ExportWavComplete` は
@@ -1773,10 +1730,8 @@ impl AppEvent {
         use AppEvent as E;
         match self {
             // ---- テンポ / 拍子 ----
-            E::CommitBpmEdit | E::SetSongBpmFromScrub(..) => "テンポ変更",
-            E::CommitTimeSigNumEdit
-            | E::SetSongTimeSigDenominator(..)
-            | E::SetSongTimeSigNumFromScrub(..) => "拍子変更",
+            E::SetSongBpmFromScrub(..) => "テンポ変更",
+            E::SetSongTimeSigDenominator(..) | E::SetSongTimeSigNumFromScrub(..) => "拍子変更",
             E::SetSongTranspose(..) => "移調変更",
             E::SetTracksFollowTranspose { .. } => "移調への追従を切替",
 
@@ -1785,12 +1740,10 @@ impl AppEvent {
             E::SetNotePositions(..)
             | E::NudgeSelectedNoteTime { .. }
             | E::NudgeSelectedNotePitch { .. } => "ノート移動",
-            E::ResizeNote { .. }
-            | E::ResizeNotes(..)
-            | E::NudgeSelectedNoteLength { .. } => "ノート長さ変更",
+            E::ResizeNotes(..) | E::NudgeSelectedNoteLength { .. } => "ノート長さ変更",
             E::DeleteSelectedNotes => "ノート削除",
             E::DuplicateSelectedNotes | E::CopyNotes(..) => "ノート複製",
-            E::SetNoteVelocity { .. } | E::SetNoteVelocities(..) => "ベロシティ変更",
+            E::SetNoteVelocities(..) => "ベロシティ変更",
             E::SetNotesMuted { .. } => "ノートミュート",
             E::SetNoteLyrics { .. } => "歌詞編集",
             E::QuantizeSelectedNotes(..) => "ノートをクオンタイズ",
@@ -1862,7 +1815,6 @@ impl AppEvent {
             E::SetTracksEnabled { enabled: false, .. } => "トラック無効化",
             E::SetTracksEnabled { enabled: true, .. } => "トラック有効化",
             E::DuplicateTracksShared(..) | E::DuplicateTracksUnique(..) => "トラック複製",
-            E::MoveTrackUp(..) | E::MoveTrackDown(..) | E::ReorderTracks(..) => "トラック並べ替え",
             E::CommitRenameTrack => "トラック名変更",
             E::SetTrackColor { .. } => "トラック色変更",
             E::ResetTrackClipColors { .. } => "クリップ色リセット",
@@ -1940,9 +1892,6 @@ impl AppEvent {
             E::ResizeAutomationClips { .. } => "オートメーションクリップ長さ変更",
             E::DeleteAutomationClips { .. } => "オートメーションクリップ削除",
             E::CloneAutomationClipsLinked { .. } | E::CloneAutomationClipsIndependent { .. } => {
-                "オートメーションクリップ複製"
-            }
-            E::DuplicateAutomationClipsShared(..) | E::DuplicateAutomationClipsUnique(..) => {
                 "オートメーションクリップ複製"
             }
             E::MakeAutomationClipUnique(..) => "オートメーションクリップを独立化",

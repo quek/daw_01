@@ -24,7 +24,7 @@ pub const MIN_CLIP_LEN_BEATS: f64 = 1.0 / 32.0;
 ///
 /// r.md #68 同件: [`MIN_CLIP_LEN_BEATS`] と同じ理由で **preview と commit の共通下限**。
 /// widget 側 (`piano_roll` の resize preview) が `0.05`、handler 側
-/// (`AppData::resize_notes` / `resize_note`) が `0.0625` と割れていたため、
+/// (`AppData::resize_notes`) が `0.0625` と割れていたため、
 /// snap off (Alt) で 1/16 未満まで縮めるとゴーストより長く確定していた。
 /// `ResizeLeft` ではさらに悪く、start は見えたとおりに確定するのに長さだけ伸ばされる
 /// ので、**固定していたはずの右端が動く**。

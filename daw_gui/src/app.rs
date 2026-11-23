@@ -536,12 +536,6 @@ impl AppData {
             AppEvent::LoopSelectedClipToggle { automation, sections } => {
                 self.loop_selected_clip_toggle(automation, sections);
             }
-            AppEvent::BpmEditChanged(s) => {
-                self.cur.peph.bpm_edit_text = s;
-            }
-            AppEvent::CommitBpmEdit => {
-                self.commit_bpm_edit();
-            }
             AppEvent::SetSongBpmFromScrub(next) => {
                 let clamped = next.clamp(1.0, 400.0);
                 if (self.cur.song_doc.song().bpm - clamped).abs() > f32::EPSILON {
@@ -551,7 +545,6 @@ impl AppData {
                     // 同じ step に入るよう、 event の scope ごと張る。
                     self.cur.song_doc.use_stream_scope(StreamGesture::BpmScrub);
                     self.edit_song(|song| song.bpm = clamped);
-                    self.cur.peph.bpm_edit_text = format!("{:.1}", clamped);
                     // Raw audio clip を秒固定スケール (r.md #7)。Raw clip があれば
                     // LoadSong (decode 再利用で軽量) で再生 window を追従させ、
                     // 無ければ従来の軽量 SetSongBpm で済ます。
@@ -565,18 +558,11 @@ impl AppData {
                 if self.cur.song_doc.song().time_sig.0 != clamped {
                     self.cur.song_doc.use_stream_scope(StreamGesture::TimeSigScrub);
                     self.edit_song(|song| song.time_sig.0 = clamped);
-                    self.cur.peph.time_sig_num_edit_text = clamped.to_string();
                     self.send_audio(AudioCommand::SetSongTimeSigNumerator { project: self.pk(), num: clamped });
                 }
             }
             AppEvent::SetSongTranspose(semitones) => self.set_song_transpose(semitones),
             AppEvent::SetTracksFollowTranspose { track_ids, follow } => self.set_tracks_follow_transpose(&track_ids, follow),
-            AppEvent::TimeSigNumEditChanged(s) => {
-                self.cur.peph.time_sig_num_edit_text = s;
-            }
-            AppEvent::CommitTimeSigNumEdit => {
-                self.commit_time_sig_num_edit();
-            }
             AppEvent::SetSongTimeSigDenominator(den) => {
                 self.set_song_time_sig_denominator(den);
             }
@@ -655,9 +641,6 @@ impl AppData {
             AppEvent::JumpHistory(index) => self.jump_history_to(index),
             AppEvent::QuantizeSelectedNotes(div) => {
                 self.quantize_selected_notes(div);
-            }
-            AppEvent::SetNoteVelocity { note, velocity } => {
-                self.set_note_velocity(note, velocity);
             }
             AppEvent::SetNoteVelocities(updates) => {
                 self.set_note_velocities(&updates);
@@ -754,12 +737,6 @@ impl AppData {
             }
             AppEvent::CloneAutomationClipsIndependent { deltas } => {
                 self.clone_automation_clips_independent(&deltas)
-            }
-            AppEvent::DuplicateAutomationClipsShared(keys) => {
-                self.duplicate_automation_clips_shared(&keys);
-            }
-            AppEvent::DuplicateAutomationClipsUnique(keys) => {
-                self.duplicate_automation_clips_unique(&keys);
             }
             AppEvent::ResizeAutomationClips { deltas } => {
                 self.resize_automation_clips(&deltas)
@@ -905,9 +882,6 @@ impl AppData {
             AppEvent::SetTracksEnabled { track_ids, enabled } => self.set_tracks_enabled(track_ids, enabled),
             AppEvent::DuplicateTracksShared(track_ids) => self.duplicate_tracks(track_ids, true),
             AppEvent::DuplicateTracksUnique(track_ids) => self.duplicate_tracks(track_ids, false),
-            AppEvent::MoveTrackUp(idx) => self.swap_tracks(idx, idx.saturating_sub(1)),
-            AppEvent::MoveTrackDown(idx) => self.swap_tracks(idx, idx + 1),
-            AppEvent::ReorderTracks(order) => self.reorder_tracks(&order),
             AppEvent::BeginRenameTrack(track_id) => {
                 self.begin_rename_track(track_id);
             }
@@ -1070,9 +1044,6 @@ impl AppData {
             AppEvent::ClearNoteSelection => self.clear_note_selection(),
             AppEvent::AddNote { key, start_beat, duration, pitch } => {
                 self.add_note(key, start_beat, duration, pitch);
-            }
-            AppEvent::ResizeNote { key, note, duration } => {
-                self.resize_note(key, note, duration);
             }
             AppEvent::SetNotePositions(entries) => {
                 self.set_note_positions(&entries);
@@ -1585,16 +1556,6 @@ impl AppData {
                     && let Some(action) = self.ui_ephemeral.guard_after_save.take()
                 {
                     self.perform_guard_action(action);
-                }
-            }
-            AppEvent::ExportMp4 { output_path, audio_wav, range_beats, dims } => {
-                #[cfg(windows)]
-                self.action_export_mp4(output_path, audio_wav, range_beats, dims);
-                #[cfg(not(windows))]
-                {
-                    let _ = (output_path, audio_wav, range_beats, dims);
-                    self.ui_ephemeral.status_message =
-                        "Video export は Windows 専用 (WMF 経由) です".into();
                 }
             }
             AppEvent::ExportProgress { done, total, .. } => {

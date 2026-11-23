@@ -52,17 +52,18 @@ fn 新しいトラックは未命名で上からの番号を表示し並べ替�
     assert_eq!(mixer_labels(&app), ["1", "2", "3"]);
 
     let before = track_ids(&app);
-    let reversed: Vec<u32> = before.iter().rev().copied().collect();
-    app.handle_event(AppEvent::ReorderTracks(reversed.clone()));
-    assert_eq!(track_ids(&app), reversed);
+    // ヘッダのドラッグで一番上の行を一番下の行の後ろへ落とす。
+    app.handle_event(AppEvent::SetTrackParent { track_ids: vec![before[0]], parent_id: None, anchor_after: Some(before[2]) });
+    let moved = track_ids(&app);
+    assert_eq!(moved, [before[1], before[2], before[0]]);
     assert_eq!(app.cur.song_doc.song().track_display_name(before[0]), "3", "一番上の行を一番下へ動かすと 3");
     assert_eq!(mixer_labels(&app), ["1", "2", "3"], "番号は行の位置に付く");
 
-    app.handle_event(AppEvent::DeleteTracks(vec![reversed[1]]));
+    app.handle_event(AppEvent::DeleteTracks(vec![moved[1]]));
     let song = app.cur.song_doc.song();
     assert_eq!(mixer_labels(&app), ["1", "2"]);
-    assert_eq!(song.track_display_name(reversed[2]), "2", "上の行を消すと番号が詰まる");
-    assert_eq!(song.track_display_name(reversed[1]), "(削除済み)");
+    assert_eq!(song.track_display_name(moved[2]), "2", "上の行を消すと番号が詰まる");
+    assert_eq!(song.track_display_name(moved[1]), "(削除済み)");
     assert_eq!(song.track_display_name(MASTER_TRACK_ID), "Master");
 }
 

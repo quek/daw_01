@@ -991,7 +991,7 @@ struct NoteDragSession {
 const NOTE_CREATE_DRAG_PX: f32 = 4.0;
 
 /// r.md #68 同件: ノート長の下限は **model と共有** する
-/// (`AppData::add_note` / `resize_notes` / `resize_note` の clamp と同じ値)。
+/// (`AppData::add_note` / `resize_notes` の clamp と同じ値)。
 /// widget 側だけ別リテラル (旧: `0.05`) を持つと、 snap off (Alt) の端 drag /
 /// ドラッグ作成で「ゴーストより長く確定する」 = preview ≠ commit になる。
 const MIN_NOTE_LEN: f64 = common::model::MIN_NOTE_LEN_BEATS;
