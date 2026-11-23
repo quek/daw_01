@@ -129,7 +129,7 @@ impl<'a> TransposeCurve<'a> {
 ///
 /// r.md #157 / #159: コードトラックへの追従 ([`crate::chord_follow::TrackChordFollow`]) もここに相乗りする
 /// (順序は 追従 → 移調。engine の `daw_audio::pitch_map` と同じ)。基準の自分の和音は、作るときにトラックの content
-/// ごとに 1 回だけ検出しておく ([`crate::chord_follow::collect_own_chords`])。書かれたときのコードはクリップの記録。
+/// ごとに 1 回だけ検出しておく ([`crate::chord_follow::collect_own_chords`])。置いた時点のコードはクリップの記録。
 #[derive(Debug, Clone)]
 pub struct TrackTranspose<'a> {
     curve: TransposeCurve<'a>,
@@ -165,13 +165,8 @@ impl<'a> TrackTranspose<'a> {
     pub fn key(&self, clip: &Clip, note: &Note, song_beat: Option<f64>) -> Option<u8> {
         let followed = match song_beat {
             Some(beat) if self.chords.is_active() => {
-                let src = NoteSource {
-                    own: self.own.get(&clip.content_id).map_or(&[][..], Vec::as_slice),
-                    basis: &clip.chord_basis.notes,
-                    note_id: note.id,
-                    start_beat: note.start_beat,
-                };
-                self.chords.key(note.pitch, beat, &src)?
+                let own = self.own.get(&clip.content_id).map_or(&[][..], Vec::as_slice);
+                self.chords.key(note.pitch, beat, &NoteSource::of(own, &clip.chord_basis.notes, note))?
             }
             _ => note.pitch,
         };
@@ -284,7 +279,7 @@ mod tests {
         song.clip_contents.insert(content_id, ClipContent::Midi(MidiContent { notes: notes.clone(), next_note_id: 4 }));
         let clip = Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id, ..Clip::default() };
         song.tracks = vec![Track { id: 1, follow_chords: ChordFollow::Parallel, clips: vec![clip.clone()], ..Track::default() }];
-        song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: Chord::new(2, ChordKind::Minor), color: None });
+        song.place_chord(ChordEvent::new(0.0, 4.0, Chord::new(2, ChordKind::Minor)));
         // Am → Dm は +5 (最短の向き)、それから移調 +2。
         let of = TrackTranspose::of(&song, 1);
         assert_eq!(notes.iter().map(|n| of.key(&clip, n, Some(0.0))).collect::<Vec<_>>(), [Some(64), Some(67), Some(71)]);

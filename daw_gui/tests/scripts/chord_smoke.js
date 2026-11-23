@@ -57,8 +57,8 @@ expectEq(names(), [[0, 4, "C"], [4, 2, "Am7"], [6, 4, "Fmaj7"], [10, 6, "G7/B"]]
 expectEq(pianoKeys(), [60, 64, 67], "Off は書いた音");
 chordEvent({ ChordFollow: { SetTracks: { track_ids: [2, 3], mode: "Parallel" } } });
 expectEq(JSON.parse(daw.inspectSongJson()).tracks[1].follow_chords, "Parallel", "トラックのモード");
-// 拍 0-4 は C の箱: ピアノの和音 (C) は収まっているので動かない。メロディーも置いただけでは動かない。
-expectEq(pianoKeys(), [60, 64, 67], "和音が箱のコードに収まっていれば動かない");
+// 拍 0-4 は C の箱: ピアノの和音 (C) は自分の和音 C → C で動かない。メロディーも置いただけでは動かない。
+expectEq(pianoKeys(), [60, 64, 67], "和音のパートは自分の和音から箱のコードへ (C → C)");
 expectEq(melodyKeys(), [76, 77, 79, 81], "置いただけではメロディーは動かない");
 // C の箱を Dm に書き換える: ピアノは自分の和音 C → Dm、メロディーは書き換える前の C → Dm の差 (+2)。
 const firstId = JSON.parse(daw.chordsJson())[0].id;

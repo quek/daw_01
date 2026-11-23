@@ -406,12 +406,12 @@ impl AppData {
                 }
                 // 元クリップの content を置換 (= flat 化)。同じ窓を見る linked clip も追従し、別の窓を見る
                 // 分割の片は元の content のまま (`Song::replace_window_content`)。
+                // r.md #159: 張り替える linked clip ごとに、それぞれの位置で素材が動いていた基準を写す (置き換える前に)。
                 BounceMode::InPlace => {
-                    let baked = song.clip_by_key(source).cloned().map(|c| song.baked_chord_basis(&[source], &c, &event));
-                    song.replace_window_content(source_content_id, (offset, offset + length), content)?;
-                    if let (Some(basis), Some(clip)) = (baked, song.clip_by_key_mut(source)) {
-                        clip.chord_basis = basis;
-                    }
+                    let content_window = (offset, offset + length);
+                    let bases = song.baked_window_bases(source_content_id, content_window, &event);
+                    song.replace_window_content(source_content_id, content_window, content)?;
+                    song.set_chord_bases(bases);
                 }
             }
             Some(source_id)

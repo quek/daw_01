@@ -1511,7 +1511,7 @@ mod tests {
             clips: vec![Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id: cid, ..Clip::default() }],
             ..Track::default()
         });
-        song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: Chord::new(9, ChordKind::Minor), color: None });
+        song.place_chord(ChordEvent::new(0.0, 4.0, Chord::new(9, ChordKind::Minor)));
         song.media.audio_sources.insert(7, crate::model::AudioSource {
             path: crate::model::AudioSourcePath::Absolute("x.wav".into()),
             sample_rate: 48_000,

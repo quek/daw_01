@@ -87,7 +87,11 @@ impl AppData {
         let file = ChordPresetFile {
             version: PRESET_VERSION,
             key_root: song.scale_at(origin).map(|k| k.root),
-            chords: picked.into_iter().map(|c| ChordEvent { id: 0, start_beat: c.start_beat - origin, ..c.clone() }).collect(),
+            // 系統 (r.md #159) はプロジェクトの中の番号なので書き出さない (挿入は新しく置く箱 = 新しい系統)。
+            chords: picked
+                .into_iter()
+                .map(|c| ChordEvent { id: 0, lineage: 0, start_beat: c.start_beat - origin, ..c.clone() })
+                .collect(),
         };
         let n = file.chords.len();
         let result = serde_json::to_vec_pretty(&file)
@@ -144,7 +148,7 @@ mod tests {
                 ScaleChange { beat: 16.0, root: 7, scale: Scale::Major },
             ];
             for (s, root, kind) in [(0.0, 0, ChordKind::Major), (2.0, 9, ChordKind::Minor7)] {
-                song.place_chord(ChordEvent { id: 0, start_beat: s, len_beats: 2.0, chord: Chord::new(root, kind), color: None });
+                song.place_chord(ChordEvent::new(s, 2.0, Chord::new(root, kind)));
             }
         });
         let ids: Vec<u32> = app.cur.song_doc.song().chords.iter().map(|c| c.id).collect();

@@ -42,7 +42,7 @@ fn populate(app: &mut AppData) -> u32 {
             (8.0, Chord::new(7, ChordKind::Dominant7), Some([0.05, 0.07, 0.25])),
         ];
         for (i, (s, chord, color)) in boxes.into_iter().enumerate() {
-            let id = song.place_chord(ChordEvent { id: 0, start_beat: s, len_beats: 4.0, chord, color }).unwrap();
+            let id = song.place_chord(ChordEvent { color, ..ChordEvent::new(s, 4.0, chord) }).unwrap();
             if i == 0 {
                 first = id;
             }

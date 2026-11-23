@@ -74,14 +74,19 @@ impl Song {
         self.chords.retain(|c| c.len_beats > MIN_CHORD_LEN_BEATS);
         let mut seen = std::collections::HashSet::new();
         let mut next = self.ids.next_chord_id.max(1);
+        // 系統 (r.md #159) も同じ番号の空間から採るので、採番は id と系統の両方より先へ進める (消えた系統の番号を
+        // 新しい箱へ振り直さない — 残っている記録が無関係な箱で効く)。
         for c in &self.chords {
-            next = next.max(c.id.saturating_add(1));
+            next = next.max(c.id.saturating_add(1)).max(c.lineage.saturating_add(1));
         }
         for c in &mut self.chords {
             if c.id == 0 || !seen.insert(c.id) {
                 c.id = next;
                 next = next.saturating_add(1);
                 seen.insert(c.id);
+            }
+            if c.lineage == 0 {
+                c.lineage = c.id;
             }
         }
         self.ids.next_chord_id = next;
@@ -158,6 +163,9 @@ impl Song {
 
     /// 箱を置く (上書き規則)。置いた箱の id を返す (`id == 0` なら採番する)。
     /// 値域が不正 (非有限 / 長さ 0 以下) なら何もせず `None`。
+    ///
+    /// 系統 (r.md #159): `id == 0` (新しく置く箱) は新しい系統 (自分の id)。`id != 0` (既存の箱を置き直す = 伸縮 /
+    /// 範囲の変更) は渡された系統を保つ。
     pub fn place_chord(&mut self, mut ev: ChordEvent) -> Option<u32> {
         if !ev.start_beat.is_finite() || !ev.len_beats.is_finite() {
             return None;
@@ -171,6 +179,10 @@ impl Song {
         }
         if ev.id == 0 {
             ev.id = self.alloc_chord_id();
+            ev.lineage = ev.id;
+        }
+        if ev.lineage == 0 {
+            ev.lineage = ev.id;
         }
         ev.chord = ev.chord.sanitized();
         let id = ev.id;
@@ -183,7 +195,8 @@ impl Song {
 
     /// 箱の列をまとめて置く: [`Self::place_chord`] を列の順に呼んだのと同じ結果 (上書き規則。列の後ろの箱ほど勝ち、
     /// 削られた箱の左側が元の id を残し、割れた右側は新しい id) を、正規化 1 回で出す (O(n log n)。
-    /// `place_chord` を n 回呼ぶと 1 回ごとに全体を正規化するので O(n² log n))。id は全部振り直す。
+    /// `place_chord` を n 回呼ぶと 1 回ごとに全体を正規化するので O(n² log n))。id は全部振り直し、置く箱は全部
+    /// 新しい系統 (r.md #159: 貼り付け / プリセット / 抽出は「置く」)。
     /// 置けた箱が 1 つでもあれば `true` (値域が不正な箱は `place_chord` と同じく飛ばす)。
     pub fn place_chords(&mut self, evs: impl IntoIterator<Item = ChordEvent>) -> bool {
         // 上塗りの順位 = 並びの位置 (既存の箱は互いに重ならないので先頭に並べるだけでよい)。
@@ -201,6 +214,7 @@ impl Song {
                 continue;
             }
             ev.id = self.alloc_chord_id();
+            ev.lineage = ev.id;
             ev.chord = ev.chord.sanitized();
             items.push(ev);
         }
@@ -295,7 +309,7 @@ impl Song {
         self.place_chord(ChordEvent { start_beat: start, len_beats: len, ..old }).is_some()
     }
 
-    /// 選んだ箱を `delta` 拍ずらした位置に複製する。複製の新 id を元と同じ順で返す。
+    /// 選んだ箱を `delta` 拍ずらした位置に複製する。複製の新 id を元と同じ順で返す。複製は新しく置く箱 (新しい系統)。
     pub fn duplicate_chords(&mut self, ids: &[u32], delta: f64) -> Vec<u32> {
         if !delta.is_finite() {
             return Vec::new();
@@ -310,6 +324,7 @@ impl Song {
         let mut placed: Vec<ChordEvent> = Vec::with_capacity(copies.len());
         for mut c in copies {
             c.id = self.alloc_chord_id();
+            c.lineage = c.id;
             out.push(c.id);
             placed.push(c);
         }
@@ -371,12 +386,19 @@ impl Song {
     }
 
     /// 写し (`a` からの相対位置) を `at` 基準で置く。**置く範囲は空いている前提** (時間操作が ripple で
-    /// 空けた直後に呼ぶ) なので削らず、id だけ採番して足す。呼び出し側が `normalize_chords` を通す。
-    pub(crate) fn push_chords_at(&mut self, at: f64, chords: &[ChordEvent]) {
+    /// 空けた直後に呼ぶ) なので削らず、id を採番して足す。呼び出し側が `normalize_chords` を通す。
+    ///
+    /// 系統 (r.md #159) は写しの系統ごとに新しく振り、その表 (写しの系統 → 貼った系統) を返す。同じ箱から割れた
+    /// 片は貼った先でも 1 つの系統のまま。呼び出し側は貼ったクリップの記録を同じ表で付け替える
+    /// (`Song::relineage_clip_basis` — 貼った区間は元と同じ音で鳴り、以後は元の区間と独立する)。
+    pub(crate) fn push_chords_at(&mut self, at: f64, chords: &[ChordEvent]) -> HashMap<u32, u32> {
+        let mut table: HashMap<u32, u32> = HashMap::new();
         for c in chords {
             let id = self.alloc_chord_id();
-            self.chords.push(ChordEvent { id, start_beat: at + c.start_beat, ..c.clone() });
+            let lineage = *table.entry(c.lineage).or_insert(id);
+            self.chords.push(ChordEvent { id, start_beat: at + c.start_beat, lineage, ..c.clone() });
         }
+        table
     }
 
     /// トラックの**実効の**追従モード: 曲全体のスイッチ ([`Song::chord_follow_enabled`]) が切れていれば
@@ -402,7 +424,7 @@ mod tests {
     use super::*;
 
     fn ev(start: f64, len: f64, root: u8) -> ChordEvent {
-        ChordEvent { id: 0, start_beat: start, len_beats: len, chord: Chord::new(root, ChordKind::Major), color: None }
+        ChordEvent::new(start, len, Chord::new(root, ChordKind::Major))
     }
 
     /// `(start, len, root)` の列 (位置順)。
@@ -497,10 +519,10 @@ mod tests {
     #[test]
     fn normalize_repairs_broken_chords_and_is_idempotent() {
         let chords = vec![
-            ChordEvent { id: 3, start_beat: 4.0, len_beats: 4.0, chord: Chord::new(0, ChordKind::Major), color: Some([2.0, -1.0, 0.5]) },
-            ChordEvent { id: 3, start_beat: 2.0, len_beats: 4.0, chord: Chord { root: 14, ..Chord::default() }, color: Some([f32::NAN, 0.0, 0.0]) },
-            ChordEvent { id: 0, start_beat: -1.0, len_beats: 2.0, chord: Chord::default(), color: None },
-            ChordEvent { id: 9, start_beat: f64::NAN, len_beats: 1.0, chord: Chord::default(), color: None },
+            ChordEvent { id: 3, color: Some([2.0, -1.0, 0.5]), ..ChordEvent::new(4.0, 4.0, Chord::new(0, ChordKind::Major)) },
+            ChordEvent { id: 3, color: Some([f32::NAN, 0.0, 0.0]), ..ChordEvent::new(2.0, 4.0, Chord { root: 14, ..Chord::default() }) },
+            ChordEvent::new(-1.0, 2.0, Chord::default()),
+            ChordEvent { id: 9, ..ChordEvent::new(f64::NAN, 1.0, Chord::default()) },
         ];
         let span = |a: u64, b: u64, root: u8| AudioChordSpan { start_frame: a, end_frame: b, chord: Chord::new(root, ChordKind::Major), chordal: false };
         let mut song = Song { chords, ..Song::default() };

@@ -79,7 +79,7 @@ fn click(host: &mut UiHost<AppData>, app: &mut AppData, x: f32, y: f32) {
 fn place(app: &mut AppData, start: f64, len: f64, chord: Chord) -> u32 {
     let mut id = 0;
     app.edit_song(|song| {
-        id = song.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: len, chord, color: None }).unwrap();
+        id = song.place_chord(ChordEvent::new(start, len, chord)).unwrap();
     });
     id
 }

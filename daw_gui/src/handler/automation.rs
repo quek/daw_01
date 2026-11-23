@@ -950,8 +950,9 @@ impl AppData {
                     continue;
                 };
                 let to_track_id = to_track.id;
-                // clipboard が運んできた窓・声・mute・コードの記録をそのまま復元する (`ClipCopy::to_clip`)。
-                let new_clip_id = to_track.place_clip(cc.to_clip((at_beat + cc.start_beat).max(0.0), content_id));
+                // clipboard が運んできた窓・声・mute・コードの記録 (同じプロジェクトだけ) を復元する (`ClipCopy::to_clip`)。
+                let start = (at_beat + cc.start_beat).max(0.0);
+                let new_clip_id = to_track.place_clip(cc.to_clip(start, content_id, same_project));
                 // 住所は **安定 id**。 index (`target_idx` / `clips.len()`) で組むと
                 // paste 直後の選択が別のクリップを指す (= 貼った先ではないものが
                 // 選択され、 続く操作がそちらに当たる)。

@@ -357,7 +357,7 @@ impl AppData {
             beats_per_bar: common::model::beats_per_bar(song.time_sig),
             now_ns: wall_clock_ns(),
         };
-        let Some((notes, length_beats)) = build_clip_notes(&self.midi_capture, win) else {
+        let Some((mut notes, length_beats)) = build_clip_notes(&self.midi_capture, win) else {
             self.ui_ephemeral.status_message = "MIDI Capture: 選択範囲にノートがありません".into();
             return;
         };
@@ -371,6 +371,13 @@ impl AppData {
             .unwrap_or(self.cur.transport.playhead_beat.unwrap_or(0.0) as f64)
             .max(0.0);
         let cell_index = crate::handler::media::import_cell_index(target, 0);
+        // r.md #159 Q2: 最寄りのコード音 / スケールで追従するトラックのアレンジへ置くなら、置く位置のコードへ寄せた音を
+        // 書く (書いたノートに記録は無いので、再生は書いた音のまま)。セル / 新しいトラックは弾いた音のまま。
+        if let Some(track_id) = dest.filter(|_| cell_index.is_none()).and_then(|i| song.tracks.get(i)).map(|t| t.id) {
+            for n in &mut notes {
+                n.pitch = self.live_input_key_at(track_id, n.pitch, start_beat + n.start_beat);
+            }
+        }
         let name = format!("Capture_{}", chrono_stamp());
         let n_notes = notes.len();
         let applied = self.edit_song(|song| {

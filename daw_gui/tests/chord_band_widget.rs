@@ -94,13 +94,7 @@ fn place(app: &mut AppData, start: f64, len: f64, root: u8) -> u32 {
     let mut id = 0;
     app.edit_song(|song| {
         id = song
-            .place_chord(ChordEvent {
-                id: 0,
-                start_beat: start,
-                len_beats: len,
-                chord: Chord::new(root, ChordKind::Major),
-                color: None,
-            })
+            .place_chord(ChordEvent::new(start, len, Chord::new(root, ChordKind::Major)))
             .unwrap();
     });
     id

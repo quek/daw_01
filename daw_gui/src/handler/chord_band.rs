@@ -150,7 +150,7 @@ mod tests {
     use crate::event_chord::ChordToolEvent;
 
     fn ev(start: f64) -> ChordEvent {
-        ChordEvent { id: 0, start_beat: start, len_beats: 4.0, chord: Chord::new(0, ChordKind::Major), color: None }
+        ChordEvent::new(start, 4.0, Chord::new(0, ChordKind::Major))
     }
 
     /// 曲を差し替えると、箱の選択・ポップアップ・メニューは前の曲の id なので捨てる (id は曲ごとに 1 から振るので、

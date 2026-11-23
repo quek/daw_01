@@ -551,7 +551,7 @@ const CHORD_LANE_H: f32 = 18.0;
 
 fn place_chord(app: &mut AppData, start: f64, len: f64, chord: common::model::Chord, color: Option<[f32; 3]>) {
     app.edit_song(|s| {
-        s.place_chord(common::model::ChordEvent { id: 0, start_beat: start, len_beats: len, chord, color });
+        s.place_chord(common::model::ChordEvent { color, ..common::model::ChordEvent::new(start, len, chord) });
     });
 }
 
@@ -701,8 +701,9 @@ fn chord_fit_marks_and_guide_rows_contrast_on_light_and_dark_clips() {
     }
 }
 
-/// 鳴る音の薄い枠: 追従するトラック (最寄りのコード音) で G を Am の箱の上に書くと、鳴る A の行に枠が出る
-/// (書いた G はそのまま)。枠線は grid の地に対して 3:1 以上。追従しないトラックには出ない。
+/// 鳴る音の薄い枠: 追従するトラック (最寄りのコード音) で C の和音を Am の箱の上に書くと、G が鳴る A の行に枠が出る
+/// (書いた G はそのまま。r.md #159: 和音のパートは置いただけでも帯のコードへ合わせる)。枠線は grid の地に対して
+/// 3:1 以上。追従しないトラックには出ない。
 #[test]
 fn following_track_overlays_the_sounding_note_frame() {
     use common::model::{Chord, ChordFollow, ChordKind};
@@ -710,7 +711,7 @@ fn following_track_overlays_the_sounding_note_frame() {
         for follow in [ChordFollow::Narrow, ChordFollow::Off] {
             let (mut app, _a, _p) = build_app();
             app.handle_event(daw_gui::app::AppEvent::SetTheme(theme.to_string()));
-            setup_clip(&mut app, 1, 10, vec![mk_note(67, 0.0, 1.0, 100)]);
+            setup_clip(&mut app, 1, 10, vec![mk_note(67, 0.0, 1.0, 100), mk_note(60, 0.0, 1.0, 100), mk_note(64, 0.0, 1.0, 100)]);
             app.edit_song(|s| s.tracks[0].follow_chords = follow);
             place_chord(&mut app, 0.0, 4.0, Chord::new(9, ChordKind::Minor), None);
             let mut host = UiHost::<AppData>::no_redraw();

@@ -2049,7 +2049,7 @@ mod bundle_install_tests {
             b.chord_audition = Arc::new(ChordAuditionPlan::build(Some(song), Some(1), Voicing::Basic));
             b
         };
-        let chord = ChordEvent { id: 0, start_beat: 0.0, len_beats: 8.0, chord: Chord::new(0, ChordKind::Major), color: None };
+        let chord = ChordEvent::new(0.0, 8.0, Chord::new(0, ChordKind::Major));
 
         let mut s1 = Song::default();
         s1.tracks.push(track(1));
@@ -2171,7 +2171,7 @@ mod bundle_install_tests {
         use common::model::{Chord, ChordEvent, ChordKind, Voicing};
         let with_chord = |tracks: Vec<Track>| {
             let mut s = Song { tracks, ..Song::default() };
-            s.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 8.0, chord: Chord::new(0, ChordKind::Major), color: None });
+            s.place_chord(ChordEvent::new(0.0, 8.0, Chord::new(0, ChordKind::Major)));
             Arc::new(s)
         };
         let bundle_for = |song: &Arc<Song>, audition: Option<u32>| {

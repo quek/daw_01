@@ -59,11 +59,28 @@ impl AppData {
         self.transposed_preview_key(track_id, self.live_input_key(track_id, pitch))
     }
 
-    /// トラック `track_id` で弾いた音 `pitch` を、playhead の位置のコードへ寄せた鍵盤 (書いた音の空間、移調の前)。
-    /// 演奏のモニター ([`Self::preview_key`]) と録音 (書くノートの音程) が同じこれを通す。
+    /// トラック `track_id` で弾いた音 `pitch` を、playhead の位置で寄せた鍵盤 (書いた音の空間、移調の前)。
+    /// 演奏のモニター ([`Self::preview_key`]) と録音 (書くノートの音程) が同じこれを通す (聴いた音 = 録れた音)。
+    ///
+    /// - 録音中で Snap Live Input が入っていれば、まずキーのスケールへ寄せる (`docs/plan_scale.html` §5.2。録音して
+    ///   いないときは音を聴いて探すので寄せない)。
+    /// - 追従するトラックは、さらにコードへ寄せる ([`Self::live_input_key_at`])。
     pub(crate) fn live_input_key(&self, track_id: u32, pitch: u8) -> u8 {
+        let beat = self.preview_beat();
+        let pitch = if self.cur.recording.live && self.cur.recording.snap_live_input {
+            self.cur.song_doc.song().scale_at(beat).map_or(pitch, |sc| sc.snap(pitch))
+        } else {
+            pitch
+        };
+        self.live_input_key_at(track_id, pitch, beat)
+    }
+
+    /// [`Self::live_input_key`] の、寄せるコードを曲の拍 `song_beat` で引く版。弾いた音を playhead ではない位置へ
+    /// 書く入力 (ステップ入力 = ステップカーソル、MIDI Capture = 置く位置) は、書く位置のコードへ寄せる (再生で
+    /// その位置の書いた音のまま鳴るので、寄せずに書くと #157 で再生が寄せていた音と変わる)。
+    pub(crate) fn live_input_key_at(&self, track_id: u32, pitch: u8, song_beat: f64) -> u8 {
         let song = self.cur.song_doc.song();
-        common::chord_follow::TrackChordFollow::of(song, track_id).live_key(pitch, self.preview_beat())
+        common::chord_follow::TrackChordFollow::of(song, track_id).live_key(pitch, song_beat)
     }
 
     /// 既にあるノート (トラック `track_id` のクリップ `clip_id` の `note`) の試聴で **いま鳴らす鍵盤**: ノートの位置の

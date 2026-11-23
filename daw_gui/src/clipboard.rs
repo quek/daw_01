@@ -14,7 +14,7 @@
 
 use common::model::MediaManifest;
 use common::model::{
-    AudioEvent, AutomationCurve, Clip, ClipContent, ContentId, Note, Track,
+    AudioEvent, AutomationCurve, Clip, ClipChordBasis, ClipContent, ContentId, Note, Track,
 };
 use serde::{Deserialize, Serialize};
 
@@ -257,9 +257,10 @@ pub struct ClipCopy {
     /// JSON との互換のため serde default (`None`)。
     #[serde(default)]
     pub talk: Option<common::model::TalkParams>,
-    /// r.md #159: 素材が書かれたときのコードの記録 (`Clip::chord_basis`)。コピーは素材の事実を運ぶ (貼った先でも
-    /// 書かれたときのコードから今のコードへ合わせて鳴る。note id / take は content の写しで保たれる)。旧 clipboard
-    /// JSON との互換のため serde default (空)。
+    /// r.md #159: 素材の置いた時点のコードの記録 (`Clip::chord_basis`、箱の系統と組)。同じプロジェクトへ貼るときだけ
+    /// 運ぶ (同じ系統の箱の下へ貼れば元と同じ音、別の箱の下なら書いた音。note id / take は content の写しで保たれる)。
+    /// 別のプロジェクトへは運ばない (系統の番号の空間が違う、[`Self::to_clip`])。旧 clipboard JSON との互換のため
+    /// serde default (空)。
     #[serde(default)]
     pub chord_basis: common::model::ClipChordBasis,
 }
@@ -289,8 +290,9 @@ impl ClipCopy {
     }
 
     /// 貼るクリップ (id は 0 = 置く側が採番、content は `content_id`)。clipboard から戻す口はここだけ。
+    /// `same_project` でなければコードの記録を捨てる ([`Self::chord_basis`])。
     #[must_use]
-    pub fn to_clip(&self, start_beat: f64, content_id: ContentId) -> Clip {
+    pub fn to_clip(&self, start_beat: f64, content_id: ContentId, same_project: bool) -> Clip {
         Clip {
             id: 0,
             start_beat,
@@ -310,7 +312,7 @@ impl ClipCopy {
             style_name: self.style_name.clone(),
             talk: self.talk,
             // 外 (OS の clipboard) から来た値は並びが崩れていうる (記録は二分探索で引く)。
-            chord_basis: self.chord_basis.clone().normalized(),
+            chord_basis: if same_project { self.chord_basis.clone().normalized() } else { ClipChordBasis::default() },
         }
     }
 }

@@ -378,7 +378,7 @@ mod tests {
     fn song() -> Song {
         let mut s = Song { tracks: vec![Track { id: 7, ..Track::default() }], ..Song::default() };
         for (start, len, root) in [(0.0, 4.0, 0), (4.0, 2.0, 9), (8.0, 4.0, 7)] {
-            s.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: len, chord: Chord::new(root, ChordKind::Major), color: None });
+            s.place_chord(ChordEvent::new(start, len, Chord::new(root, ChordKind::Major)));
         }
         s
     }
@@ -476,7 +476,7 @@ mod tests {
         use common::model::Tensions;
         let mut s = Song { tracks: vec![Track { id: 7, ..Track::default() }], ..Song::default() };
         let full = Chord { tensions: Tensions(0x1FF), ..Chord::new(0, ChordKind::Dominant7) };
-        s.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: full, color: None });
+        s.place_chord(ChordEvent::new(0.0, 4.0, full));
         let plan = ChordAuditionPlan::build(Some(&s), Some(7), Voicing::Basic);
         let want = common::chord_voicing::chord_pitches(&full, Voicing::Basic, common::chord_voicing::DEFAULT_VOICING_BASE);
         assert!(want.len() > 12, "{want:?}");

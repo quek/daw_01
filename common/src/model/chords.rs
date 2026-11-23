@@ -289,9 +289,21 @@ pub struct ChordEvent {
     /// 箱の塗り色 (RGB、`0.0..=1.0`)。`None` = テーマの既定色。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[f32; 3]>,
+    /// v48 (r.md #159): 箱の **系統** — 素材の記録 ([`ClipChordBasis`]) が「どの箱の下で書かれたか」を指す安定 id。
+    /// 新しく置いた箱 (置く / 貼る / 複製 / 抽出 / 時間ごと貼る) は新しい系統 (自分の id)、同じ箱の変形 (移動 /
+    /// 伸縮) は保ち、割れた片 (上書きで削られた右側 / 時間操作の境界) は元の系統を継ぐ。`0` = 未設定
+    /// (`Song::normalize_chords` が id で埋める)。規則の正本は `crate::model::chord_basis` の module doc。
+    #[serde(default, skip_serializing_if = "super::is_zero_u32")]
+    pub lineage: u32,
 }
 
 impl ChordEvent {
+    /// 新しく置く箱 (id と系統は置く側が採番する、色は既定)。
+    #[must_use]
+    pub fn new(start_beat: f64, len_beats: f64, chord: Chord) -> Self {
+        Self { id: 0, start_beat, len_beats, chord, color: None, lineage: 0 }
+    }
+
     /// 終端拍 (= `start_beat + len_beats`)。
     #[must_use]
     pub fn end_beat(&self) -> f64 {
@@ -327,18 +339,19 @@ pub struct AudioChordSpan {
     pub chordal: bool,
 }
 
-/// クリップ 1 つの **書かれたときのコード** の記録 (r.md #159、`Clip::chord_basis`)。
+/// クリップ 1 つの **置いた時点のコード** の記録 (r.md #159、`Clip::chord_basis`)。
 ///
 /// 和音を持たない素材 (メロディー / ベースライン / 歌声) の追従の基準。コードの箱を **書き換えた** とき
-/// (`Song::set_chord` / `Song::transpose_chords`) にだけ、その箱の下にあって記録の無い素材へ、書き換える前の
-/// コードを書く。記録の無い素材は今のコードが基準 = 動かない (置いただけでは動かない)。規則の正本は
-/// `crate::model::chord_basis` の module doc。
+/// (`Song::set_chord` / `Song::transpose_chords`) にだけ、その箱の下にあって (その箱の系統で) 記録の無い素材へ、
+/// 書き換える前のコードを書く。記録は箱の系統 ([`ChordEvent::lineage`]) と組で、同じ系統の箱の下でだけ効く —
+/// 記録の無い素材、別の箱の下へ動かした / 写した素材は、今のコードが基準 = 動かない (置いただけでは動かない)。
+/// 規則の正本は `crate::model::chord_basis` の module doc。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ClipChordBasis {
-    /// note id (clip の content の `Note::id`) 昇順・重複なし。
+    /// `(note_id, lineage)` 昇順・重複なし。note id は clip の content の `Note::id`。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<NoteChordBasis>,
-    /// `(take, start_frame)` 昇順。同じ take の中は互いに重ならない。
+    /// `(take, lineage, start_frame)` 昇順。同じ `(take, lineage)` の中は互いに重ならない。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio: Vec<AudioChordBasis>,
 }
@@ -350,17 +363,20 @@ impl ClipChordBasis {
     }
 }
 
-/// ノート 1 つが書かれたときのコード。
+/// ノート 1 つが系統 `lineage` の箱の下で置かれた時点のコード。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct NoteChordBasis {
     pub note_id: u32,
+    pub lineage: u32,
     pub chord: Chord,
 }
 
-/// オーディオの take (`AudioEvent::take_key`) の音源フレーム `[start_frame, end_frame)` が書かれたときのコード。
+/// オーディオの take (`AudioEvent::take_key`) の音源フレーム `[start_frame, end_frame)` が、系統 `lineage` の箱の下で
+/// 置かれた時点のコード。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct AudioChordBasis {
     pub take: u32,
+    pub lineage: u32,
     pub start_frame: u64,
     pub end_frame: u64,
     pub chord: Chord,

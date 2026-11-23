@@ -436,20 +436,15 @@ pub fn own_chord_at(spans: &[SourceChord], beat: f64) -> Option<&SourceChord> {
     spans.get(i.checked_sub(1)?).filter(|s| beat + OWN_EPS_BEATS < s.start_beat + s.len_beats)
 }
 
-/// `[a, b)` (コードの箱の範囲) と重なりがいちばん長い自分の和音の区間 (同じ長さなら先)。
+/// 頭が和音の区間の外にあるノート `[start, end)` が属する自分の和音の区間: ノートが **鳴っている間に重なる** か、
+/// **隙間なく接する** 最初の区間 (伸ばして弾いた分散和音の 1 音目 / ブンチャッのベース音は和音のパートとして一緒に
+/// 動く)。離れた和音には属さない — 旋律の途中に和音が 1 つ混ざっても、旋律全体を和音のパートにしない。
 ///
-/// RT 安全 (二分探索と、範囲に掛かる区間だけの走査)。
+/// RT 安全 (二分探索、確保なし)。
 #[must_use]
-pub fn longest_own_in(spans: &[SourceChord], a: f64, b: f64) -> Option<&SourceChord> {
-    let i = spans.partition_point(|s| s.start_beat + s.len_beats <= a);
-    let mut best: Option<(&SourceChord, f64)> = None;
-    for s in spans[i..].iter().take_while(|s| s.start_beat < b) {
-        let overlap = (s.start_beat + s.len_beats).min(b) - s.start_beat.max(a);
-        if overlap > 1e-9 && best.is_none_or(|(_, o)| overlap > o + 1e-9) {
-            best = Some((s, overlap));
-        }
-    }
-    best.map(|(s, _)| s)
+pub fn own_chord_touching(spans: &[SourceChord], start: f64, end: f64) -> Option<&SourceChord> {
+    let i = spans.partition_point(|s| s.start_beat + s.len_beats < start - OWN_EPS_BEATS);
+    spans.get(i).filter(|s| s.start_beat <= end + OWN_EPS_BEATS)
 }
 
 /// 窓 `cell` (を区間 `gap` で切ったもの) のコードを `out` に足す。前半と後半で別のコードが出るか、窓全体では

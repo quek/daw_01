@@ -46,9 +46,7 @@ impl AppData {
             return;
         }
         self.edit_song_checked(|song| match ev {
-            ChordTrackEvent::Place { start, len, chord } => song
-                .place_chord(ChordEvent { id: 0, start_beat: start, len_beats: len, chord, color: None })
-                .is_some(),
+            ChordTrackEvent::Place { start, len, chord } => song.place_chord(ChordEvent::new(start, len, chord)).is_some(),
             // 正規化は 1 回 (`Song::place_chords`)。1 箱ずつ `place_chord` すると大量の貼り付けで固まる。
             ChordTrackEvent::PlaceMany { at, chords } => {
                 song.place_chords(chords.into_iter().map(|c| ChordEvent { id: 0, start_beat: at + c.start_beat, ..c }))
@@ -111,7 +109,7 @@ mod tests {
     fn place(app: &mut AppData, start: f64, len: f64) -> u32 {
         let mut id = 0;
         app.edit_song(|song| {
-            let ev = ChordEvent { id: 0, start_beat: start, len_beats: len, chord: Chord::new(0, ChordKind::Major), color: None };
+            let ev = ChordEvent::new(start, len, Chord::new(0, ChordKind::Major));
             id = song.place_chord(ev).expect("置ける");
         });
         id

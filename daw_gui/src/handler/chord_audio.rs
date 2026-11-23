@@ -328,7 +328,7 @@ fn chords_on_clip(
         for s in spans {
             let (a, b) = (to_beat(s.start_frame).max(vis_start), to_beat(s.end_frame).min(vis_end));
             if b - a > 1e-6 {
-                out.push(ChordEvent { id: 0, start_beat: a, len_beats: b - a, chord: s.chord, color: None });
+                out.push(ChordEvent::new(a, b - a, s.chord));
             }
         }
     }

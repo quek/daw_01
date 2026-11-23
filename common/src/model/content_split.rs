@@ -62,7 +62,7 @@ impl MidiContent {
     /// - pitch / velocity / muted は全片が継ぐ。 片同士は隣接するだけなので同じ音程の
     ///   重なりは作らない (重なり解消は要らない)。
     ///
-    /// 返り値は後ろの片ごとの `(元のノートの id, 片の id)` (r.md #159: 書かれたときのコードの記録を片へ写す
+    /// 返り値は後ろの片ごとの `(元のノートの id, 片の id)` (r.md #159: 置いた時点のコードの記録を片へ写す
     /// `Song::copy_note_basis` に渡す)。割ったノートの数は元の id の数。
     pub fn split_notes(&mut self, mut cuts: impl FnMut(&Note) -> Vec<f64>, min_piece: f64) -> Vec<(u32, u32)> {
         let mut pieces: Vec<Note> = Vec::new();
@@ -197,7 +197,7 @@ impl Song {
     }
 
     /// クリップ `key` の content を content-local 拍 `ats` で切り ([`Self::split_content_at_points`])、クリップを
-    /// 切り終えた content へ張り替え、割ったノートの後ろの片へ書かれたときのコードの記録を写す (r.md #159。
+    /// 切り終えた content へ張り替え、割ったノートの後ろの片へ置いた時点のコードの記録を写す (r.md #159。
     /// 共有している MIDI を fork したときは、張り替えた後でないと写す先のクリップが無い)。切り終えた content の id
     /// を返す (クリップが無ければ `None`)。
     pub fn split_clip_content_at(&mut self, key: ClipKey, ats: &[f64]) -> Option<ContentId> {

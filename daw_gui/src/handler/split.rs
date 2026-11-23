@@ -120,7 +120,7 @@ impl AppData {
             let mut split: Vec<u32> = pairs.iter().map(|(from, _)| *from).collect();
             split.dedup();
             n = split.len();
-            // r.md #159: 後ろの片も元のノートと同じく書かれたときのコードで鳴る (この content を見る全クリップ)。
+            // r.md #159: 後ろの片も元のノートと同じく置いた時点のコードで鳴る (この content を見る全クリップ)。
             if let Some(content_id) = song.clip_by_key(key).map(|c| c.content_id) {
                 song.copy_note_basis(content_id, &pairs);
             }

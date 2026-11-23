@@ -219,7 +219,7 @@ fn paste_one(
             let id = track.alloc_clip_id();
             track.put_session_clip(common::model::SessionClip {
                 scene_id,
-                clip: Clip { id, ..c.to_clip(0.0, content_id) },
+                clip: Clip { id, ..c.to_clip(0.0, content_id, same_project) },
                 launch: cc.launch.clone(),
             });
             Some(LauncherCellKey::Track(common::model::ClipKey { track_id, clip_id: id }))

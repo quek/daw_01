@@ -18,7 +18,7 @@ pub struct ClipSoundingKeys<'a> {
     clip: &'a Clip,
     /// 基準の自分の和音 (このクリップの content の、content-local 拍)。
     own: Vec<SourceChord>,
-    /// 書かれたときのコードの記録 (既定はクリップの記録。[`Self::with`] で差し替える)。
+    /// 置いた時点のコードの記録 (既定はクリップの記録。[`Self::with`] で差し替える)。
     basis: &'a [NoteChordBasis],
 }
 
@@ -51,7 +51,7 @@ impl<'a> ClipSoundingKeys<'a> {
     /// `None`。コードはノートの開始位置で決まる。
     #[must_use]
     pub fn key(&self, note: &Note) -> Option<u8> {
-        let src = NoteSource { own: &self.own, basis: self.basis, note_id: note.id, start_beat: note.start_beat };
+        let src = NoteSource::of(&self.own, self.basis, note);
         self.follow.key(note.pitch, self.clip.content_to_song_beat(note.start_beat), &src)
     }
 }

@@ -399,6 +399,10 @@ impl AppData {
         } else {
             cursor
         };
+        // r.md #159 Q2: 最寄りのコード音 / スケールで追従するトラックは、書く位置 (カーソル) のコードへ寄せた音を書く
+        // (書いたノートに記録は無いので、再生は書いた音のまま)。セルは曲の位置を持たないので弾いた音のまま。
+        let in_song = self.cur.song_doc.song().track_by_id(target.track_id).is_some_and(|t| t.clip_index_by_id(target.clip_id).is_some());
+        let pitch = if in_song { self.live_input_key_at(target.track_id, pitch, clip.content_to_song_beat(cursor)) } else { pitch };
         let Some(Some(selected)) = self.edit_song(|song| {
             let content =
                 midi_content_in_clip_mut(song, target)?;
@@ -447,24 +451,21 @@ impl AppData {
         if playhead < 0.0 {
             return;
         }
-        // Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input。 step input は別 path
-        // (`step_input_note_on`) を経由するのでここの snap は録音時のみ。
         // 押している台帳は **弾いた鍵盤** で引く (下)。 寄せた音程は書いたノートの側にある — 寄せた音程で引くと、
         // 押している間に転調 / コードの箱の境界を越えたときに note_off が別の鍵で引いて見つからず、2 つの鍵が
         // 同じ音へ寄ると台帳が上書きされた。
         let played = pitch;
-        let snapped = if self.cur.recording.snap_live_input {
-            self.cur.song_doc.song()
-                .scale_at(playhead)
-                .map(|sc| sc.snap(pitch))
-                .unwrap_or(pitch)
-        } else {
-            pitch
-        };
         for &track_id in tracks {
-            // r.md #159 Q2: 最寄りのコード音 / スケールで追従するトラックは、モニターと同じく playhead の位置の
-            // コードへ寄せた音を書く (聴いた音 = 録れた音 = 再生の音。モードはトラックごと)。
-            let pitch = self.live_input_key(track_id, snapped);
+            // Phase 7 B5 (`docs/plan_scale.html` §5.2) の Snap Live Input と r.md #159 Q2 (最寄りのコード音 / スケールで
+            // 追従するトラックはコードへ寄せる) を、モニターと同じ口で通す (聴いた音 = 録れた音 = 再生の音)。
+            // step input は別 path (`step_input_note_on`) なので Snap Live Input は録音時のみ。
+            let pitch = self.live_input_key(track_id, played);
+            // 別の鍵が同じ音へ寄って押されたまま (Snap Live Input / コードへ寄せた 2 つの鍵) なら、新しいノートを書かずに
+            // そのノートを一緒に押さえる (同じ音程の重なったノートを作らない)。長さは最後に離した鍵で決まる。
+            if let Some(held) = self.held_recorded_note(track_id, pitch) {
+                self.cur.recording.midi_recording_active_notes.insert((track_id, played), held);
+                continue;
+            }
             self.ensure_midi_clip_at_playhead(track_id, playhead);
             let Some(key) = self.find_midi_clip_at_playhead(track_id, playhead) else {
                 continue;
@@ -502,6 +503,15 @@ impl AppData {
                     .insert((track_id, played), (playhead, note_id));
             }
         }
+    }
+
+    /// トラック `track_id` で押されたまま録っているノートのうち、書いた音程が `pitch` のもの (台帳の値)。
+    fn held_recorded_note(&self, track_id: u32, pitch: u8) -> Option<(f64, u32)> {
+        let song = self.cur.song_doc.song();
+        self.cur.recording.midi_recording_active_notes.iter().filter(|((t, _), _)| *t == track_id).find_map(|(_, &(start, id))| {
+            let clip = song.clip_by_key(self.find_midi_clip_containing_beat(track_id, start)?)?;
+            song.clip_notes(clip).iter().any(|n| n.id == id && n.pitch == pitch).then_some((start, id))
+        })
     }
 
     /// Phase 7 B4 Step D: 録音中の note_off 処理。 `active_notes` から

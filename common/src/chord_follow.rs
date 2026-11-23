@@ -13,10 +13,13 @@
 //! **基準 (r.md #159)** — 何から何へ合わせるか ([`Basis`]):
 //!
 //! - **自分の和音** (素材がその位置で一緒に弾いている和音、`crate::chord_detect::own_chords`) があれば、
-//!   その和音から今のコードへ合わせる (#157 と同じ)。ただし和音が今のコードに収まっていれば動かさない
-//!   (帯へ抽出しただけ・合うコードを置いただけでは動かない)。
-//! - 無ければ **書かれたときのコード** (`Clip::chord_basis`、箱を書き換えたときだけ記録する) から今のコードへ。
+//!   その和音から今のコードへ合わせる (和音のパートは #157 と同じ式、確定仕様「和音のパートは今どおり」)。
+//! - 無ければ **置いた時点のコード** (`Clip::chord_basis` の、ノートの頭の箱の系統の記録。箱を書き換えたときだけ
+//!   記録する、`crate::model::chord_basis`) から今のコードへ。
 //! - どちらも無ければ動かさない (置いただけでは動かない)。
+//!
+//! どの素材が和音のパートかは、役割のフラグではなくその位置の音から決める (同時に弾いた和音と、それに重なる /
+//! 隙間なく接するノート、`crate::chord_detect::own_chord_touching`)。
 //!
 //! コードはノートの**開始位置**で決まり、伸びているノートは途中のコード変更で鳴り直さない
 //! (Studio One と同じ)。オーディオの移動量は buffer ごとの今の位置で決まる。
@@ -87,8 +90,8 @@ fn rotate12(mask: u16, root: u8) -> u16 {
     (((m << r) | (m >> (12 - r))) & 0x0FFF) as u16
 }
 
-/// 追従の基準 (r.md #159、module doc)。`own` = 素材が自分で弾いている和音、`placed` = 書かれたときのコード
-/// (`Clip::chord_basis` の記録)。どちらも無ければ動かない。
+/// 追従の基準 (r.md #159、module doc)。`own` = 素材が自分で弾いている和音、`placed` = 置いた時点のコード
+/// (`Clip::chord_basis` の、今の箱の系統の記録)。`own` が優先し、どちらも無ければ動かない。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Basis<'a> {
     pub own: Option<&'a Chord>,
@@ -105,47 +108,38 @@ impl<'a> Basis<'a> {
         Basis { own: Some(chord), placed: None }
     }
 
-    /// 書かれたときのコードだけ。
+    /// 置いた時点のコードだけ。
     #[must_use]
     pub const fn placed(chord: &'a Chord) -> Self {
         Basis { own: None, placed: Some(chord) }
     }
 }
 
-/// [`Basis`] を今のコード `target` に対して 1 つに決めたもの。
+/// [`Basis`] を 1 つに決めたもの。
 enum Resolved<'a> {
     /// 動かさない。
     Unchanged,
     /// 自分の和音から今のコードへ (#157 と同じ式)。
     Own(&'a Chord),
-    /// 書かれたときのコードから今のコードへ (r.md #159 Q1: 平行移動 / ベースは差だけ、最寄りのコード音 /
+    /// 置いた時点のコードから今のコードへ (r.md #159 Q1: 平行移動 / ベースは差だけ、最寄りのコード音 /
     /// スケールは元のコードの構成音 / スケールの音だけを寄せる)。
     Placed(&'a Chord),
 }
 
-/// `outer` の構成音とベース音が、`inner` の構成音とベース音を全部含むか。
-fn covers(outer: &Chord, inner: &Chord) -> bool {
-    let tones = |c: &Chord| c.pitch_class_mask() | (1 << c.bass_pc());
-    tones(inner) & !tones(outer) == 0
-}
-
-/// 自分の和音が今のコードに収まっていれば動かさない (抽出しただけ / 合うコードを置いただけ)。収まっていなくても、
-/// 書かれたときのコードに収まっていれば (書き換える前のコードで弾いていた)、書かれたときのコードから動かす。
-fn resolve<'a>(basis: Basis<'a>, target: &Chord) -> Resolved<'a> {
+/// 自分の和音があればそれ (和音のパートは今どおり)、無ければ記録、どちらも無ければ動かさない。
+fn resolve(basis: Basis<'_>) -> Resolved<'_> {
     match (basis.own, basis.placed) {
-        (Some(own), _) if covers(target, own) => Resolved::Unchanged,
-        (Some(own), Some(placed)) if covers(placed, own) => Resolved::Placed(placed),
         (Some(own), _) => Resolved::Own(own),
         (None, Some(placed)) => Resolved::Placed(placed),
         (None, None) => Resolved::Unchanged,
     }
 }
 
-/// `basis` を今のコード `target` に対して決めた、実際に動かす元のコード (動かさないなら `None`)。焼き込み (バウンス) が
-/// 焼いた音源へ写す基準 (`Song::baked_chord_basis`) — 写した記録から動かすと、元の素材と同じ量だけ動く。
+/// `basis` の、実際に動かす元のコード (動かさないなら `None`)。焼き込み (バウンス) が焼いた音源へ写す基準
+/// (`Song::baked_chord_basis`) — 写した記録から動かすと、元の素材と同じ量だけ動く (平行移動 / ベース)。
 #[must_use]
-pub fn effective_basis<'a>(basis: Basis<'a>, target: &Chord) -> Option<&'a Chord> {
-    match resolve(basis, target) {
+pub fn effective_basis(basis: Basis<'_>) -> Option<&Chord> {
+    match resolve(basis) {
         Resolved::Unchanged => None,
         Resolved::Own(chord) | Resolved::Placed(chord) => Some(chord),
     }
@@ -154,11 +148,11 @@ pub fn effective_basis<'a>(basis: Basis<'a>, target: &Chord) -> Option<&'a Chord
 /// オーディオクリップ (と、ノートの平行移動 / ベース) の移動量 (半音)。
 ///
 /// `target` = その位置のコードトラックのコード、`basis` = 素材の基準。オーディオは全体を動かすだけなので、
-/// `Narrow` / `Scale` は `Parallel` と同じくルートの差で動かす — ただし書かれたときのコードから動かすときは、
+/// `Narrow` / `Scale` は `Parallel` と同じくルートの差で動かす — ただし置いた時点のコードから動かすときは、
 /// 寄せ先 (構成音 / スケール) が変わらなければ動かさない (ノートの `Narrow` / `Scale` が動かないのと揃える)。
 #[must_use]
 pub fn follow_shift(mode: ChordFollow, target: &Chord, basis: Basis<'_>, key: Option<&ScaleChange>) -> i32 {
-    match (mode, resolve(basis, target)) {
+    match (mode, resolve(basis)) {
         (ChordFollow::Off, _) | (_, Resolved::Unchanged) => 0,
         (ChordFollow::Bass, Resolved::Own(own)) => nearest_delta(own.root, target.bass_pc()),
         (_, Resolved::Own(own)) => nearest_delta(own.root, target.root),
@@ -196,7 +190,7 @@ pub fn follow_pitch(
         ChordFollow::Parallel | ChordFollow::Bass => {
             u8::try_from(i32::from(pitch) + follow_shift(mode, target, basis, key)).ok().filter(|k| *k <= 127)
         }
-        ChordFollow::Narrow => Some(match resolve(basis, target) {
+        ChordFollow::Narrow => Some(match resolve(basis) {
             Resolved::Unchanged => pitch,
             Resolved::Own(_) => snap_to_mask(pitch, target.pitch_class_mask()),
             // 元のコードの構成音だけを寄せる (経過音は動かさない)。
@@ -205,7 +199,7 @@ pub fn follow_pitch(
         }),
         ChordFollow::Scale => {
             let to = chord_scale_mask(target, key);
-            Some(match resolve(basis, target) {
+            Some(match resolve(basis) {
                 Resolved::Unchanged => pitch,
                 Resolved::Own(_) => snap_to_mask(pitch, to),
                 // 元のコードのスケールの音だけを寄せる (スケールの外の音は動かさない)。
@@ -220,7 +214,7 @@ pub fn follow_pitch(
 
 /// **演奏入力のリアルタイム変換** (r.md #157 / #159 Q2、Cubase の Live Input): 弾いた音 `pitch` を今のコード
 /// `target` へ寄せた鍵盤。寄せるのは最寄りのコード音 / スケールだけで、平行移動 / ベースは弾いた音のまま
-/// (弾いた音に書かれたときのコードは無い = 基準は今のコード)。聴いた音と録れる音はこれで揃える。
+/// (弾いた音に記録は無い = 基準は今のコード)。聴いた音と録れる音はこれで揃える。
 #[must_use]
 pub fn live_pitch(mode: ChordFollow, pitch: u8, target: &Chord, key: Option<&ScaleChange>) -> u8 {
     match mode {
@@ -262,10 +256,11 @@ pub fn collect_own_chords(
     }
 }
 
-/// クリップの記録 `basis` (note id 昇順) のうち note `note_id` が書かれたときのコード。RT 安全 (二分探索)。
+/// クリップの記録 `basis` (`(note_id, lineage)` 昇順) のうち、note `note_id` が系統 `lineage` の箱の下で置かれた時点の
+/// コード。RT 安全 (二分探索)。
 #[must_use]
-pub fn note_basis_at(basis: &[NoteChordBasis], note_id: u32) -> Option<&Chord> {
-    basis.binary_search_by_key(&note_id, |b| b.note_id).ok().map(|i| &basis[i].chord)
+pub fn note_basis_at(basis: &[NoteChordBasis], note_id: u32, lineage: u32) -> Option<&Chord> {
+    basis.binary_search_by_key(&(note_id, lineage), |b| (b.note_id, b.lineage)).ok().map(|i| &basis[i].chord)
 }
 
 /// ノート 1 つの基準を引く材料 ([`TrackChordFollow::key`])。
@@ -273,11 +268,21 @@ pub fn note_basis_at(basis: &[NoteChordBasis], note_id: u32) -> Option<&Chord> {
 pub struct NoteSource<'a> {
     /// content の自分の和音 ([`note_own_chords`]、content-local 拍)。
     pub own: &'a [SourceChord],
-    /// クリップの記録 (`Clip::chord_basis.notes`)。
+    /// クリップの記録 (`Clip::chord_basis.notes`。ランチャーのセルは空 = 記録を読まない)。
     pub basis: &'a [NoteChordBasis],
     pub note_id: u32,
     /// ノートの開始 (content-local 拍)。
     pub start_beat: f64,
+    /// ノートの長さ (拍)。
+    pub len_beats: f64,
+}
+
+impl<'a> NoteSource<'a> {
+    /// ノート `note` の材料 (自分の和音 `own`、記録 `basis`)。
+    #[must_use]
+    pub fn of(own: &'a [SourceChord], basis: &'a [NoteChordBasis], note: &crate::model::Note) -> Self {
+        Self { own, basis, note_id: note.id, start_beat: note.start_beat, len_beats: note.duration_beats }
+    }
 }
 
 /// 自分の和音が箱の境界の直前で始まるとき、次の箱の和音として扱う幅 (拍)。食って入る和音 (小節の頭の
@@ -326,8 +331,9 @@ impl<'a> TrackChordFollow<'a> {
 
     /// 曲の拍 `song_beat` で始まるノート `pitch` の鳴らす鍵盤 (書いた音の空間)。
     ///
-    /// 基準 ([`Basis`]): ノートの頭で鳴っている自分の和音、無ければノートの頭の箱の範囲でいちばん長く鳴っている
-    /// 自分の和音 (ベース音のあとに和音を刻む伴奏のベース音も和音のパートとして一緒に動く)、と、クリップの記録。
+    /// 基準 ([`Basis`]): ノートの頭で鳴っている自分の和音、無ければノートに重なる / 隙間なく接する自分の和音
+    /// (伸ばした分散和音の 1 音目、ベース音のあとに和音を刻む伴奏のベース音も和音のパートとして一緒に動く)。
+    /// どちらも無ければ、ノートの頭の箱の系統のクリップの記録。
     #[must_use]
     pub fn key(&self, pitch: u8, song_beat: f64, src: &NoteSource<'_>) -> Option<u8> {
         if self.mode.is_off() {
@@ -344,17 +350,16 @@ impl<'a> TrackChordFollow<'a> {
         let onset_box = self.song.chord_at_onset(song_beat)?;
         // content-local 拍 + `to_song` = 曲の拍 (このノートの置かれた位置での換算)。
         let to_song = song_beat - src.start_beat;
-        let (own, ev) = match crate::chord_detect::own_chord_at(src.own, src.start_beat) {
-            Some(span) => {
-                let (a, b) = (span.start_beat + to_song, span.start_beat + span.len_beats + to_song);
-                (Some(&span.chord), self.anticipated(onset_box, a, b))
-            }
-            None => {
-                let (a, b) = (onset_box.start_beat - to_song, onset_box.end_beat() - to_song);
-                (crate::chord_detect::longest_own_in(src.own, a, b).map(|s| &s.chord), onset_box)
-            }
-        };
-        Some((ev, Basis { own, placed: note_basis_at(src.basis, src.note_id) }))
+        if let Some(span) = crate::chord_detect::own_chord_at(src.own, src.start_beat) {
+            let (a, b) = (span.start_beat + to_song, span.start_beat + span.len_beats + to_song);
+            return Some((self.anticipated(onset_box, a, b), Basis::own(&span.chord)));
+        }
+        let end = src.start_beat + src.len_beats.max(0.0);
+        if let Some(span) = crate::chord_detect::own_chord_touching(src.own, src.start_beat, end) {
+            return Some((onset_box, Basis::own(&span.chord)));
+        }
+        let placed = note_basis_at(src.basis, src.note_id, onset_box.lineage);
+        Some((onset_box, Basis { own: None, placed }))
     }
 
     /// 自分の和音の区間 `[a, b)` (曲の拍) が従う箱: 頭の箱 `onset_box`。ただし区間が次の箱の頭の直前
@@ -380,8 +385,8 @@ impl<'a> TrackChordFollow<'a> {
         live_pitch(self.mode, pitch, &ev.chord, self.song.scale_at(song_beat.max(ev.start_beat)))
     }
 
-    /// 曲の拍 `song_beat` でのオーディオの移動量 (半音)。`basis` は呼び出し側が素材から引いたもの
-    /// (engine は箱ごとに compile 時に決めた値、`crate::model::chord_basis`)。
+    /// 曲の拍 `song_beat` でのオーディオの移動量 (半音)。`basis` は呼び出し側が素材から引いたもの (ランチャーのセルは
+    /// 自分の和音だけ — 記録を読まない)。アレンジのオーディオは [`Self::audio_shift`]。
     #[must_use]
     pub fn shift(&self, song_beat: f64, basis: Basis<'_>) -> i32 {
         if self.mode.is_off() {
@@ -389,6 +394,21 @@ impl<'a> TrackChordFollow<'a> {
         }
         let Some(ev) = self.song.chord_at(song_beat) else { return 0 };
         follow_shift(self.mode, &ev.chord, basis, self.song.scale_at(song_beat))
+    }
+
+    /// アレンジのオーディオ event の、曲の拍 `song_beat` での移動量 (半音)。`own` はその位置で鳴っている音源の
+    /// 和音 (`crate::chord_detect::audio_own_chord_at`)、`basis` は event の記録を曲の拍へ写したもの
+    /// (`Song::audio_event_basis`、engine は compile で 1 回作る)。拍は event の見えている範囲へ寄せて評価する
+    /// (クロスフェードの張り出しは窓の端の箱と記録で鳴る — 張り出しの間だけ音程が戻らない)。RT 安全。
+    #[must_use]
+    pub fn audio_shift(&self, song_beat: f64, own: Option<&Chord>, basis: &crate::model::AudioEventBasis) -> i32 {
+        if self.mode.is_off() {
+            return 0;
+        }
+        let at = basis.clamp(song_beat);
+        let Some(ev) = self.song.chord_at(at) else { return 0 };
+        let placed = basis.placed_at(ev.lineage, at);
+        follow_shift(self.mode, &ev.chord, Basis { own, placed }, self.song.scale_at(at))
     }
 }
 

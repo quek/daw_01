@@ -80,7 +80,7 @@ pub fn collect_row_midi<'p>(
             id => match index.track_cell(song, track_idx as usize, id) {
                 // r.md #157: セルのノートのコードは曲の playhead の位置で引く (区間の中では実効拍と曲の拍が同じ速さで
                 // 進むので、区間の差を足せばノートの開始の曲の拍になる。差は発火拍からの閉じた式 — buffer ごとに揺れない)。
-                Some(cell) => (std::slice::from_ref(&cell.clip), None, pitch.with_song_beat_offset(segment_offset(src, seg, playhead_beats, bpf))),
+                Some(cell) => (std::slice::from_ref(&cell.clip), None, pitch.for_cell(segment_offset(src, seg, playhead_beats, bpf))),
                 None => return,
             },
         };
@@ -141,7 +141,7 @@ pub fn render_row_audio<'p>(
         // r.md #157: セルのコードは曲の playhead の位置で引く (`collect_row_midi` と同じ)。
         let seg_pitch = match seg.cell_clip_id {
             0 => pitch,
-            _ => pitch.with_song_beat_offset(segment_offset(src, seg, playhead_beats, bpf)),
+            _ => pitch.for_cell(segment_offset(src, seg, playhead_beats, bpf)),
         };
         render_audio_events(
             renderer,
@@ -598,7 +598,7 @@ mod tests {
         song.clip_contents.insert(cid, ClipContent::Midi(triads_at(&[0.0, 2.0])));
         song.tracks[0].follow_chords = ChordFollow::Narrow;
         for (start, root, kind) in [(8.0, 9, ChordKind::Minor), (10.0, 5, ChordKind::Major)] {
-            song.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: 2.0, chord: Chord::new(root, kind), color: None });
+            song.place_chord(ChordEvent::new(start, 2.0, Chord::new(root, kind)));
         }
         let index = SongIndex::build(&song);
         let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(8.0));
@@ -628,6 +628,36 @@ mod tests {
         assert_eq!(chords, vec![vec![60, 64, 69], vec![60, 65, 69]]);
     }
 
+    /// r.md #159: セルはクリップの記録 (置いた時点のコード) を読まない — 曲の位置を持たないので「どの箱の下で置いたか」が
+    /// 無い。アレンジで書き換えを経験したクリップをセルへ運んで、記録と同じ系統の箱の下で撃っても、旋律は書いた音のまま。
+    #[test]
+    fn セルはクリップの記録を読まない() {
+        use common::model::{Chord, ChordEvent, ChordFollow, ChordKind, NoteChordBasis};
+        let mut song = song_with_cell();
+        let cid = song.tracks[0].session_clips[0].clip.content_id;
+        let melody = Note { id: 1, start_beat: 0.0, duration_beats: 1.0, pitch: 64, ..Note::default() };
+        song.clip_contents.insert(cid, ClipContent::Midi(MidiContent { notes: vec![melody], next_note_id: 2 }));
+        song.tracks[0].follow_chords = ChordFollow::Parallel;
+        let id = song.place_chord(ChordEvent::new(8.0, 4.0, Chord::new(2, ChordKind::Major))).expect("box");
+        let lineage = song.chord_by_id(id).expect("box").lineage;
+        song.tracks[0].session_clips[0].clip.chord_basis.notes =
+            vec![NoteChordBasis { note_id: 1, lineage, chord: Chord::new(0, ChordKind::Major) }];
+        let index = SongIndex::build(&song);
+        let src = RowTimeSource::uniform(RowKey::track(1), cell_phase(8.0));
+        let mut active = NoteLedger::default();
+        let mut out = Vec::with_capacity(256);
+        let pitch = crate::pitch_map::PitchMap::for_track(&song, &index, 0, 0);
+        collect_row_midi(Some(&song), &index, 0, src, 48_000, 8.0, 120.0, 512, pitch, &mut out, &mut active);
+        let ons: Vec<u8> = out
+            .iter()
+            .filter_map(|e| match e.event {
+                crate::sequencer::NoteTransition::On { key, .. } => Some(key),
+                crate::sequencer::NoteTransition::Off { .. } => None,
+            })
+            .collect();
+        assert_eq!(ons, vec![64], "記録 (C → D なら 66) を読まない");
+    }
+
     /// r.md #157: 3 連符の量子化で撃ったセル (発火拍が 2/3 拍の端数を持つ) でも、コードの箱の境界ちょうどに始まる
     /// ノートは 1 回だけ鳴る。コードを引く拍を buffer ごとの「曲の拍 − 実効拍」から作っていたときは、引き算の丸めで
     /// 箱の境界の前後を行き来し、伸びている間に鳴り直していた (20 回のはずが 21 / 43 / 113 回)。
@@ -643,7 +673,7 @@ mod tests {
         song.tracks[0].follow_chords = ChordFollow::Parallel;
         for b in 0..160u32 {
             let root = if b % 2 == 0 { 0 } else { 2 };
-            song.place_chord(ChordEvent { id: 0, start_beat: f64::from(b), len_beats: 1.0, chord: Chord::new(root, ChordKind::Major), color: None });
+            song.place_chord(ChordEvent::new(f64::from(b), 1.0, Chord::new(root, ChordKind::Major)));
         }
         let index = SongIndex::build(&song);
         let bpf = 512.0 * 120.0 / (60.0 * 48_000.0);

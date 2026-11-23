@@ -5,6 +5,8 @@
 //! Song から読み直す。「鳴る音で確定」はピアノロールの薄い枠と同じ読み口 (`handler::chord_follow_view`) で
 //! 書き換える。
 
+use std::collections::{HashMap, HashSet};
+
 use common::model::{ChordFollow, Song};
 
 use crate::app::ClipKey;
@@ -163,14 +165,14 @@ fn set_modes(song: &mut Song, track_ids: &[u32], mode: ChordFollow) -> bool {
 /// - 他のクリップ (別の位置の linked clip / セル) と content を共有していれば、先に複製してから書き換える
 ///   (鳴る音は位置のコードで決まるので、共有したまま書くと別の位置のクリップの音が変わる)。
 /// - 追従で 0..=127 を外れて鳴っていなかったノートは、音程を残してミュートする (確定しても鳴らないまま)。
-/// - r.md #159: 確定したノートの **書かれたときのコードの記録を消す** (確定した音 = 今のコードに対して書いた音。
-///   記録が残ると、確定した音がもう一度「書かれたときのコード → 今のコード」の差だけ動く)。
+/// - r.md #159: 確定したノートの **置いた時点のコードの記録を系統を問わず消す** (確定した音 = 今のコードに対して
+///   書いた音。記録が残ると、確定した音がもう一度「置いた時点のコード → 今のコード」の差だけ動く)。
 /// - トラックの追従モードは変えない (確定した音がそのまま鳴る: 記録の無い旋律は書いた音のまま、和音のパートは
-///   確定した和音がもう今のコードに収まっている)。ただし `verify` なら確定した後の鳴る音を確定前と全ノートで比べ、
+///   確定した和音の根音がもう今のコードの根音 / 構成音にある)。ただし `verify` なら確定した後の鳴る音を確定前と全ノートで比べ、
 ///   1 つでも違うクリップは確定しない (和音の一部の音だけを確定すると、残りの音の和音の読みが変わる)。トラック全体を
 ///   確定して追従を切る [`ChordFollowEvent::FreezeTracks`] は、切った後は書いた音で鳴るので比べない。
 fn freeze_clips(song: &mut Song, targets: &[FreezeTarget], verify: bool) -> (bool, usize) {
-    type Plan = ((u32, u32), Vec<(u32, Option<u8>)>, Vec<u32>);
+    type Plan = ((u32, u32), Changes, Vec<u32>);
     let mut refused = 0usize;
     let plans: Vec<Plan> = targets
         .iter()
@@ -182,16 +184,17 @@ fn freeze_clips(song: &mut Song, targets: &[FreezeTarget], verify: bool) -> (boo
                 return None;
             }
             let notes = song.clip_contents.get(&clip.content_id)?.notes()?;
-            let picked = |n: &&common::model::Note| note_ids.is_empty() || note_ids.contains(&n.id);
-            let changes: Vec<(u32, Option<u8>)> = notes
+            // 1 万ノートのクリップを丸ごと確定しても線形で済むよう、id の照合は集合で引く。
+            let wanted: HashSet<u32> = note_ids.iter().copied().collect();
+            let frozen: HashSet<u32> = notes.iter().map(|n| n.id).filter(|id| wanted.is_empty() || wanted.contains(id)).collect();
+            let changes: Changes = notes
                 .iter()
-                .filter(picked)
+                .filter(|n| frozen.contains(&n.id))
                 .filter_map(|n| {
                     let key = keys.key(n);
                     (key != Some(n.pitch) && !(key.is_none() && n.muted)).then_some((n.id, key))
                 })
                 .collect();
-            let frozen: Vec<u32> = notes.iter().filter(picked).map(|n| n.id).collect();
             let forgets = clip.chord_basis.notes.iter().any(|b| frozen.contains(&b.note_id));
             if changes.is_empty() && !forgets {
                 return None;
@@ -200,7 +203,7 @@ fn freeze_clips(song: &mut Song, targets: &[FreezeTarget], verify: bool) -> (boo
                 refused += 1;
                 return None;
             }
-            Some(((track_id, clip_id), changes, frozen))
+            Some(((track_id, clip_id), changes, frozen.into_iter().collect()))
         })
         .collect();
     if plans.is_empty() {
@@ -227,11 +230,14 @@ fn freeze_clips(song: &mut Song, targets: &[FreezeTarget], verify: bool) -> (boo
     (true, refused)
 }
 
-/// 確定の書き換え `changes` (`(note id, 鳴る鍵盤)`、鳴らないノートは `None` = ミュート) をノート列へ当てる。
-fn apply_freeze(notes: &mut [common::model::Note], changes: &[(u32, Option<u8>)]) {
+/// 確定の書き換え: note id → 鳴る鍵盤 (鳴らないノートは `None` = ミュート)。
+type Changes = HashMap<u32, Option<u8>>;
+
+/// 確定の書き換え `changes` をノート列へ当てる。
+fn apply_freeze(notes: &mut [common::model::Note], changes: &Changes) {
     for n in notes.iter_mut() {
-        match changes.iter().find(|(id, _)| *id == n.id).map(|(_, key)| *key) {
-            Some(Some(key)) => n.pitch = key,
+        match changes.get(&n.id) {
+            Some(Some(key)) => n.pitch = *key,
             Some(None) => n.muted = true,
             None => {}
         }
@@ -244,8 +250,8 @@ fn keeps_the_sound(
     track_id: u32,
     clip: &common::model::Clip,
     before: &ClipSoundingKeys<'_>,
-    changes: &[(u32, Option<u8>)],
-    frozen: &[u32],
+    changes: &Changes,
+    frozen: &HashSet<u32>,
 ) -> bool {
     let notes = song.clip_notes(clip);
     let mut after_notes = notes.to_vec();
@@ -295,7 +301,7 @@ mod tests {
                 track.clips.push(Clip { id, start_beat: start, length_beats: 4.0, content_id, ..Clip::default() });
             }
             for (start, root, kind) in [(0.0, 9, ChordKind::Minor), (8.0, 5, ChordKind::Major)] {
-                song.place_chord(ChordEvent { id: 0, start_beat: start, len_beats: 4.0, chord: Chord::new(root, kind), color: None });
+                song.place_chord(ChordEvent::new(start, 4.0, Chord::new(root, kind)));
             }
         });
         (track_id, [901, 902])
@@ -390,7 +396,7 @@ mod tests {
             let mut app = crate::test_support::headless_app();
             let (piano, melody) = piano_and_melody(&mut app, mode);
             app.edit_song(|song| {
-                song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: Chord::new(0, ChordKind::Major), color: None });
+                song.place_chord(ChordEvent::new(0.0, 4.0, Chord::new(0, ChordKind::Major)));
             });
             let id = app.cur.song_doc.song().chords[0].id;
             app.handle_event(AppEvent::Chord(crate::event_chord::ChordTrackEvent::SetChord { ids: vec![id], chord: Chord::new(2, ChordKind::Minor) }));
@@ -422,7 +428,7 @@ mod tests {
         let mut app = crate::test_support::headless_app();
         let (piano, _) = piano_and_melody(&mut app, ChordFollow::Parallel);
         app.edit_song(|song| {
-            song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: Chord::new(9, ChordKind::Minor), color: None });
+            song.place_chord(ChordEvent::new(0.0, 4.0, Chord::new(9, ChordKind::Minor)));
         });
         let depth = app.cur.song_doc.undo_depth();
         app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezePitch {
@@ -501,7 +507,8 @@ mod tests {
     }
 
     /// r.md #159 Q2: 最寄りのコード音で追従するトラックで録ると、モニターで聴いた (寄せた) 音が録れ、再生でもその音で
-    /// 鳴る。押している間にコードの箱をまたいでも、離した鍵盤 (弾いた鍵盤) でノートの長さが確定する。
+    /// 鳴る。押している間にコードの箱をまたいでも、離した鍵盤 (弾いた鍵盤) でノートの長さが確定する。同じ音へ寄る
+    /// 2 つ目の鍵は、同じ音程の重なったノートを作らず 1 つのノートを一緒に押さえる (長さは最後に離した鍵)。
     #[test]
     fn recording_writes_the_note_heard_in_the_monitor() {
         let mut app = crate::test_support::headless_app();
@@ -511,22 +518,44 @@ mod tests {
                 t.armed = t.id == track_id;
                 t.follow_chords = if t.id == track_id { ChordFollow::Narrow } else { ChordFollow::Off };
             }
-            song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 2.0, chord: Chord::new(9, ChordKind::Minor), color: None });
-            song.place_chord(ChordEvent { id: 0, start_beat: 2.0, len_beats: 2.0, chord: Chord::new(5, ChordKind::Major), color: None });
+            song.place_chord(ChordEvent::new(0.0, 2.0, Chord::new(9, ChordKind::Minor)));
+            song.place_chord(ChordEvent::new(2.0, 2.0, Chord::new(5, ChordKind::Major)));
         });
         app.cur.recording.live = true;
         app.cur.transport.playhead_beat = Some(0.0);
         // Am の上の D (62) は同距離の C / E のうち上の E へ寄って聞こえる。
         assert_eq!(app.preview_key(track_id, 62), Some(64));
         app.handle_event(AppEvent::MidiNoteOn { channel: 0, pitch: 62, velocity: 100 });
-        app.cur.transport.playhead_beat = Some(3.0); // F の箱へ (F の上なら D は寄らない)
+        // F (65) も Am の上では E へ寄る (同じ音)。
+        app.cur.transport.playhead_beat = Some(0.5);
+        app.handle_event(AppEvent::MidiNoteOn { channel: 0, pitch: 65, velocity: 100 });
+        app.cur.transport.playhead_beat = Some(1.0);
         app.handle_event(AppEvent::MidiNoteOff { channel: 0, pitch: 62 });
+        app.cur.transport.playhead_beat = Some(3.0); // F の箱へ (F の上なら D は寄らない)
+        app.handle_event(AppEvent::MidiNoteOff { channel: 0, pitch: 65 });
         let song = app.cur.song_doc.song();
         let clip = song.track_by_id(track_id).and_then(|t| t.clips.first()).expect("録ったクリップ");
         let notes = song.clip_notes(clip);
         assert_eq!(notes.iter().map(|n| (n.pitch, n.duration_beats)).collect::<Vec<_>>(), vec![(64, 3.0)]);
         let keys = app.clip_sounding_keys(track_id, clip.id).expect("keys");
         assert_eq!(keys.key(&notes[0]), Some(64), "再生でも聴いた音");
+    }
+
+    /// r.md #159 Q2: ステップ入力も、最寄りのコード音で追従するトラックでは書く位置 (ステップカーソル) のコードへ寄せた
+    /// 音を書き、再生でもその音で鳴る (playhead のコードではない)。
+    #[test]
+    fn step_input_writes_the_note_snapped_at_the_cursor() {
+        let mut app = crate::test_support::headless_app();
+        let (track_id, clips) = linked_triads(&mut app, ChordFollow::Narrow);
+        app.cur.transport.playhead_beat = Some(0.0); // Am の上 (D は E へ寄る)
+        app.set_clip_selection(vec![crate::app::ClipKey { track_id, clip_id: clips[1] }]);
+        app.cur.recording.step_cursor_beat = 3.0; // 拍 11 = F の箱 (D は C へ寄る)
+        app.step_input_note_on(62, 100);
+        let song = app.cur.song_doc.song();
+        let clip = song.track_by_id(track_id).and_then(|t| t.clip_by_id(clips[1])).expect("clip");
+        let note = song.clip_notes(clip).iter().find(|n| n.start_beat == 3.0).expect("書いたノート").clone();
+        assert_eq!(note.pitch, 60);
+        assert_eq!(app.clip_sounding_keys(track_id, clips[1]).expect("keys").key(&note), Some(60));
     }
 
     /// 既にあるノートの試聴 (↑↓ で音程を動かしたとき) は playhead ではなく **そのノートの位置のコード** で鳴る

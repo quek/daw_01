@@ -193,9 +193,9 @@ pub struct RenderedEvent {
     /// dedup 済)。 Stretch mode のスペクトル render が `warp_source_frame` で
     /// 非一様タイムストレッチに使う (r.md #8 B12)。 < 2 件なら uniform stretch。
     pub beat_markers: Vec<common::model::BeatMarker>,
-    /// r.md #159: コードの箱ごとの追従の基準 (アレンジの event でトラックが追従するときだけ、`Song::audio_event_bases`、
-    /// 曲の拍の昇順)。箱の下では基準を 1 つに決める (`crate::pitch_map::PitchMap::audio_semitones`)。
-    pub chord_bases: Vec<common::model::AudioBoxBasis>,
+    /// r.md #159: クリップの「置いた時点のコード」の記録を曲の拍へ写したもの (アレンジの event でトラックが追従する
+    /// ときだけ、`Song::audio_event_basis`。`crate::pitch_map::PitchMap::audio_semitones` が引く)。
+    pub chord_basis: common::model::AudioEventBasis,
 }
 
 /// Wait-free snapshot of "what audio events should the audio thread
@@ -402,8 +402,11 @@ pub fn compile_audio_schedule(
     let follows = song.follows_transpose_mask();
     // r.md #157: コードトラックに追従するトラックも移動されうる (箱もスイッチも無い曲は 1 基も増やさない)。
     let chords_apply = song.chord_follow_can_apply();
+    // r.md #159: 記録を曲の拍へ写す写像は compile で 1 回だけ作る (event ごとに作らない)。
+    let chord_tempo = chords_apply.then(|| common::audio_render::TempoMap::from_song(song));
     for (track_idx, track) in song.tracks.iter().enumerate().filter(|&(i, _)| enabled[i]) {
         let follows_chords = chords_apply && !song.track_chord_follow(track.id).is_off();
+        let chord_tempo = chord_tempo.as_ref().filter(|_| follows_chords);
         let transposable = (may_transpose && follows[track_idx]) || follows_chords;
         // 隣接の突き合わせ表は張り出しを要求するクリップがあるトラックだけ作る (要求ゼロが普通)。
         let neighbors = track
@@ -429,7 +432,7 @@ pub fn compile_audio_schedule(
                 track_idx,
                 clip,
                 engine_sample_rate,
-                ClipPlacement { cell_clip_id: 0, xfade: (lead, tail), transposable, follows_chords },
+                ClipPlacement { cell_clip_id: 0, xfade: (lead, tail), transposable, follows_chords, chord_tempo },
             );
         }
         // r.md #87: ランチャーのセルも同じ schedule に載せる。`clip.start_beat` は
@@ -445,7 +448,7 @@ pub fn compile_audio_schedule(
                 track_idx,
                 &cell.clip,
                 engine_sample_rate,
-                ClipPlacement { cell_clip_id: id, xfade: (0.0, 0.0), transposable, follows_chords },
+                ClipPlacement { cell_clip_id: id, xfade: (0.0, 0.0), transposable, follows_chords, chord_tempo: None },
             );
         }
     }
@@ -479,13 +482,15 @@ pub fn compile_audio_schedule(
 /// `xfade` は隣接クリップとのクロスフェードで窓の外へ鳴らし進める量 `(先頭側, 末尾側)` (拍)
 /// で、**隣が実在するときだけ**非ゼロで渡ってくる。
 /// `transposable` / `follows_chords` はトラックの event が移動されうるか / コードに追従するか
-/// ([`RenderedEvent::transposable`] / [`RenderedEvent::follows_chords`])。
+/// ([`RenderedEvent::transposable`] / [`RenderedEvent::follows_chords`])。`chord_tempo` は記録を曲の拍へ写す写像
+/// (追従するアレンジのクリップだけ。セルは記録を読まないので `None`)。
 #[derive(Clone, Copy)]
-struct ClipPlacement {
+struct ClipPlacement<'t> {
     cell_clip_id: u32,
     xfade: (f64, f64),
     transposable: bool,
     follows_chords: bool,
+    chord_tempo: Option<&'t common::audio_render::TempoMap<'t>>,
 }
 
 /// トラック 1 本のアレンジのクリップの境界 `(拍, clip id)` を拍の昇順に (NaN は載せない)。隣接の突き合わせを
@@ -520,9 +525,9 @@ fn push_clip_events(
     track_idx: usize,
     clip: &common::model::Clip,
     engine_sample_rate: u32,
-    placement: ClipPlacement,
+    placement: ClipPlacement<'_>,
 ) {
-    let ClipPlacement { cell_clip_id, xfade, transposable, follows_chords } = placement;
+    let ClipPlacement { cell_clip_id, xfade, transposable, follows_chords, chord_tempo } = placement;
     let Some(content) = song.clip_contents.get(&clip.content_id) else {
         return;
     };
@@ -644,11 +649,7 @@ fn push_clip_events(
             stretch_mode: event.stretch_mode,
             onsets: onsets_sorted,
             beat_markers: warp_markers,
-            chord_bases: if follows_chords && cell_clip_id == 0 {
-                song.audio_event_bases(&common::audio_render::TempoMap::from_song(song), clip, event)
-            } else {
-                Vec::new()
-            },
+            chord_basis: chord_tempo.map(|t| song.audio_event_basis(t, clip, event)).unwrap_or_default(),
         });
     }
 }
@@ -1770,7 +1771,7 @@ mod render_tests {
             stretch_mode: mode,
             onsets,
             beat_markers: Vec::new(),
-                chord_bases: Vec::new(),
+                chord_basis: Default::default(),
         }];
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));
@@ -1865,7 +1866,7 @@ mod render_tests {
                 stretch_mode: StretchMode::Raw,
                 onsets: Vec::new(),
                 beat_markers: Vec::new(),
-                chord_bases: Vec::new(),
+                chord_basis: Default::default(),
             }];
             let mut sources = HashMap::new();
             sources.insert(1u32, Arc::clone(&source));
@@ -1975,7 +1976,7 @@ mod render_tests {
                 stretch_mode: StretchMode::Raw,
                 onsets: Vec::new(),
                 beat_markers: Vec::new(),
-                chord_bases: Vec::new(),
+                chord_basis: Default::default(),
             }];
             let mut sources = HashMap::new();
             sources.insert(1u32, Arc::clone(&source));
@@ -2396,7 +2397,7 @@ mod render_tests {
             stretch_mode: mode,
             onsets: Vec::new(),
             beat_markers: Vec::new(),
-                chord_bases: Vec::new(),
+                chord_basis: Default::default(),
         }
     }
 
@@ -2746,6 +2747,7 @@ mod render_tests {
             stretch_mode: mode,
             onsets: Vec::new(),
             beat_markers: Vec::new(),
+            chord_basis: Default::default(),
         }];
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));
@@ -3008,7 +3010,7 @@ mod wave_span_binding_tests {
             stretch_mode: event.stretch_mode,
             onsets,
             beat_markers,
-                chord_bases: Vec::new(),
+                chord_basis: Default::default(),
         }];
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));

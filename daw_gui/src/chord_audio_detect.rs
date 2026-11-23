@@ -22,6 +22,13 @@
 //! 倍音列に乗る)、かつ pitch class が 3 つ以上鳴っている窓だけ。倍音列の判定は強さに依らず周波数の比だけで見るので、
 //! 平均律の長 3 度 (第 5 倍音から 14 cent ずれる) や短 3 度は和音として残り、ルートと 5 度だけ (パワーコード) は
 //! 単音と区別できない (和音にしない)。
+//!
+//! 音程が揺れている FFT フレーム (歌声のビブラート / 音の移り変わり。長い FFT の山の幅が広い) は、倍音が広がって
+//! 1 つの倍音列に乗らないので、フレームの中央の短い FFT (1/4 の長さ) で倍音列を測り直す (基音は倍音から最小二乗で
+//! 推め直し、ずれは半ビンまで許す)。揺れていない音 (ピアノ / ギター / シンセ) は長い FFT の厳しい判定のまま — 短い
+//! FFT では、低いベースの上に 2 オクターブ上で弾いた 3 度 (C2 + E4) がベースの第 5 倍音と区別できない。
+//! 実データ (2026-11-23、1 秒の窓): VOICEVOX の歌声の WAV 40 本 (計 419 秒) は、長い FFT だけの判定では 46% の窓が
+//! 和音だったのが 9% になる。Dexed で鳴らしたコード進行 (Piano / Guitar の voicing) は 100% のまま。
 
 use std::sync::Arc;
 
@@ -55,6 +62,11 @@ const MONO_EXPLAINED: f32 = 0.9;
 const HARMONIC_TOLERANCE: f32 = 0.004;
 /// 和音を弾いているとみなすのに要る、同時に鳴る pitch class の数。
 const CHORDAL_VOICES: u32 = 3;
+/// 音程が揺れていない (ビブラート / 音程の移り変わりが無い) とみなす山の幅 (ビン): 強い山 3 つの、半分の高さでの幅の
+/// 中央値がこれ以下 (Hann の主葉は約 2 ビン)。揺れている音は長い FFT の中で倍音が広がり、1 つの倍音列に乗らなくなる。
+const STEADY_PEAK_WIDTH_BINS: usize = 2;
+/// 山の幅を測る周波数の上限 (Hz)。
+const STEADY_PROBE_HZ: f32 = 1_500.0;
 
 /// 1 FFT フレームの解析結果。
 #[derive(Debug, Clone, Copy, Default)]
@@ -185,42 +197,78 @@ fn chord_in(
     Some((match_chord(&chroma, lowest, opts)?, sounding > 0 && chordal * 2 >= sounding))
 }
 
+/// 実数 FFT 1 本 (Hann 窓) と作業用の buffer。
+struct Spectrum {
+    fft: Arc<dyn realfft::RealToComplex<f32>>,
+    window: Vec<f32>,
+    input: Vec<f32>,
+    spectrum: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+    mags: Vec<f32>,
+    bin_hz: f32,
+}
+
+impl Spectrum {
+    fn new(planner: &mut RealFftPlanner<f32>, len: usize, sample_rate: u32) -> Self {
+        let fft = planner.plan_fft_forward(len);
+        let window = (0..len)
+            .map(|j| {
+                #[allow(clippy::cast_precision_loss)]
+                let t = j as f32 / len as f32;
+                0.5 - 0.5 * (std::f32::consts::TAU * t).cos()
+            })
+            .collect();
+        let scratch = fft.make_scratch_vec();
+        #[allow(clippy::cast_precision_loss)]
+        let bin_hz = sample_rate as f32 / len as f32;
+        Self { fft, window, input: vec![0.0; len], spectrum: vec![Complex::new(0.0, 0.0); len / 2 + 1], scratch, mags: vec![0.0; len / 2 + 1], bin_hz }
+    }
+
+    /// `samples` (チャンネルの平均) の `start` から FFT の長さぶんの振幅スペクトルを `mags` に作る。返すのは RMS
+    /// (FFT できなければ `None`)。
+    fn run(&mut self, samples: &[Vec<f32>], start: usize) -> Option<f32> {
+        #[allow(clippy::cast_precision_loss)]
+        let inv_ch = 1.0 / samples.len().max(1) as f32;
+        let mut sq = 0.0f32;
+        for (j, x) in self.input.iter_mut().enumerate() {
+            let s: f32 = samples.iter().map(|ch| ch.get(start + j).copied().unwrap_or(0.0)).sum::<f32>() * inv_ch;
+            sq += s * s;
+            *x = s * self.window[j];
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let rms = (sq / self.input.len() as f32).sqrt();
+        if rms <= 1e-5 || self.fft.process_with_scratch(&mut self.input, &mut self.spectrum, &mut self.scratch).is_err() {
+            return None;
+        }
+        for (m, c) in self.mags.iter_mut().zip(&self.spectrum) {
+            *m = c.norm();
+        }
+        Some(rms)
+    }
+}
+
 /// 全体を `hop` 刻みで解析する。
 fn analyse(samples: &[Vec<f32>], frames: usize, sample_rate: u32, fft_len: usize, hop: usize) -> Vec<Frame> {
     let mut planner = RealFftPlanner::<f32>::new();
-    let fft: Arc<dyn realfft::RealToComplex<f32>> = planner.plan_fft_forward(fft_len);
-    let window: Vec<f32> = (0..fft_len)
-        .map(|j| {
-            #[allow(clippy::cast_precision_loss)]
-            let t = j as f32 / fft_len as f32;
-            0.5 - 0.5 * (std::f32::consts::TAU * t).cos()
-        })
-        .collect();
-    let mut input = vec![0.0f32; fft_len];
-    let mut spectrum = vec![Complex::new(0.0f32, 0.0); fft_len / 2 + 1];
-    let mut scratch = fft.make_scratch_vec();
-    let mut mags = vec![0.0f32; fft_len / 2 + 1];
-    #[allow(clippy::cast_precision_loss)]
-    let inv_ch = 1.0 / samples.len().max(1) as f32;
-    #[allow(clippy::cast_precision_loss)]
-    let bin_hz = sample_rate as f32 / fft_len as f32;
+    let mut long = Spectrum::new(&mut planner, fft_len, sample_rate);
+    // 音程が揺れているフレームの倍音列を測り直す短い FFT (module doc)。
+    let short_len = (fft_len / 4).max(512);
+    let mut short = Spectrum::new(&mut planner, short_len, sample_rate);
     let mut out = Vec::with_capacity(frames / hop + 1);
     let mut start = 0usize;
     while start < frames {
-        let mut sq = 0.0f32;
-        for (j, x) in input.iter_mut().enumerate() {
-            let s: f32 = samples.iter().map(|ch| ch.get(start + j).copied().unwrap_or(0.0)).sum::<f32>() * inv_ch;
-            sq += s * s;
-            *x = s * window[j];
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let rms = (sq / fft_len as f32).sqrt();
-        let mut frame = Frame { rms, ..Frame::default() };
-        if rms > 1e-5 && fft.process_with_scratch(&mut input, &mut spectrum, &mut scratch).is_ok() {
-            for (m, c) in mags.iter_mut().zip(&spectrum) {
-                *m = c.norm();
-            }
-            fill_chroma(&mags, bin_hz, &mut frame);
+        let mut frame = Frame::default();
+        if let Some(rms) = long.run(samples, start) {
+            frame.rms = rms;
+            let peaks = spectral_peaks(&long.mags, long.bin_hz);
+            frame.mono = if is_steady(&long.mags, long.bin_hz) {
+                is_monophonic(&peaks, 0.0, false)
+            } else {
+                let center = (start + fft_len / 2).saturating_sub(short_len / 2);
+                short.run(samples, center).is_some()
+                    && is_monophonic(&spectral_peaks(&short.mags, short.bin_hz), 0.5 * short.bin_hz, true)
+            };
+            fill_chroma(peaks, &mut frame);
         }
         out.push(frame);
         start += hop;
@@ -228,13 +276,12 @@ fn analyse(samples: &[Vec<f32>], frames: usize, sample_rate: u32, fft_len: usize
     out
 }
 
-/// 振幅スペクトル `mags` の山から chroma とベースを作る (倍音を差し引いてから)。
-fn fill_chroma(mags: &[f32], bin_hz: f32, frame: &mut Frame) {
+/// 振幅スペクトル `mags` の山 (周波数, 強さ) を低い順に。最大の山の −40 dB 未満は雑音として捨てる。
+fn spectral_peaks(mags: &[f32], bin_hz: f32) -> Vec<(f32, f32)> {
     let peak_max = mags.iter().copied().fold(0.0f32, f32::max);
     if peak_max <= 0.0 {
-        return;
+        return Vec::new();
     }
-    // 山 (周波数, 強さ) を低い順に。最大の山の −40 dB 未満は雑音として捨てる。
     let floor = peak_max * 0.01;
     let mut peaks: Vec<(f32, f32)> = Vec::new();
     for k in 1..mags.len() - 1 {
@@ -248,8 +295,33 @@ fn fill_chroma(mags: &[f32], bin_hz: f32, frame: &mut Frame) {
             peaks.push((f, c));
         }
     }
+    peaks
+}
+
+/// 音程が揺れていないか: [`STEADY_PROBE_HZ`] 以下の強い山 3 つの、半分の高さでの幅 (ビン) の中央値が
+/// [`STEADY_PEAK_WIDTH_BINS`] 以下。
+fn is_steady(mags: &[f32], bin_hz: f32) -> bool {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let hi = ((STEADY_PROBE_HZ / bin_hz) as usize).min(mags.len().saturating_sub(2));
+    let mut tops: Vec<usize> = (1..hi).filter(|&k| mags[k] > mags[k - 1] && mags[k] >= mags[k + 1]).collect();
+    tops.sort_by(|&a, &b| mags[b].total_cmp(&mags[a]));
+    let mut widths: Vec<usize> = tops
+        .iter()
+        .take(3)
+        .map(|&k| {
+            let half = mags[k] * 0.5;
+            let lo = (0..k).rev().take_while(|&j| mags[j] >= half).last().unwrap_or(k);
+            let hi = (k + 1..mags.len()).take_while(|&j| mags[j] >= half).last().unwrap_or(k);
+            hi - lo + 1
+        })
+        .collect();
+    widths.sort_unstable();
+    widths.get(widths.len() / 2).is_none_or(|&w| w <= STEADY_PEAK_WIDTH_BINS)
+}
+
+/// 山 `peaks` ([`spectral_peaks`]) から chroma とベースを作る (倍音を差し引いてから)。
+fn fill_chroma(mut peaks: Vec<(f32, f32)>, frame: &mut Frame) {
     frame.sounding = !peaks.is_empty();
-    frame.mono = is_monophonic(&peaks);
     // 倍音の差し引き: 低い山から、その 2〜8 倍に当たる山を「基音の強さ / 倍数」(弦・管・鋸歯波の
     // おおよその倍音の減り方) だけ減らす。差し引いた後の山が次の山の基音として働く (低い順なので、
     // 和音の上の音の基音が下の音の倍音と重なっても、残りが上の音として残る)。
@@ -297,24 +369,41 @@ fn fill_chroma(mags: &[f32], bin_hz: f32, frame: &mut Frame) {
 }
 
 /// 山 (周波数, 振幅。低い順) の強さ (振幅の 2 乗) の [`MONO_EXPLAINED`] 以上が、どれか 1 つの山を基音とする倍音列
-/// (整数倍から [`HARMONIC_TOLERANCE`] 以内) に乗るか。基音の候補は、最大の山の 5% 以上ある 1 kHz 以下の山。
-fn is_monophonic(peaks: &[(f32, f32)]) -> bool {
+/// (整数倍から [`HARMONIC_TOLERANCE`] の比、または `abs_tol_hz` の差の広い方以内) に乗るか。基音の候補は、最大の
+/// 山の 5% 以上ある 1 kHz 以下の山。`refine` なら基音を、候補の倍音 (2% 以内、第 16 倍音まで) の周波数から強さで
+/// 重み付けした最小二乗で推め直す (短い FFT は山の位置の誤差がビンの幅に比例して大きい)。
+fn is_monophonic(peaks: &[(f32, f32)], abs_tol_hz: f32, refine: bool) -> bool {
     let total: f32 = peaks.iter().map(|(_, a)| a * a).sum();
     if total <= 0.0 {
         return false;
     }
     let max = peaks.iter().map(|(_, a)| *a).fold(0.0f32, f32::max);
     peaks.iter().filter(|(f, a)| *f <= 1_000.0 && *a >= max * 0.05).any(|&(f0, _)| {
+        let f0 = if refine { refined_fundamental(peaks, f0) } else { f0 };
         let explained: f32 = peaks
             .iter()
-            .filter(|(f, _)| {
+            .filter(|&&(f, _)| {
                 let h = (f / f0).round();
-                h >= 1.0 && (f / (f0 * h) - 1.0).abs() <= HARMONIC_TOLERANCE
+                h >= 1.0 && (f - f0 * h).abs() <= (f * HARMONIC_TOLERANCE).max(abs_tol_hz)
             })
             .map(|(_, a)| a * a)
             .sum();
         explained >= total * MONO_EXPLAINED
     })
+}
+
+/// 基音の候補 `f0` を、その倍音に当たる山 (整数倍から 2% 以内、第 16 倍音まで) の `周波数 / 倍数` を強さ (振幅の 2 乗)
+/// で重み付けした平均で推め直したもの。
+fn refined_fundamental(peaks: &[(f32, f32)], f0: f32) -> f32 {
+    let (mut num, mut den) = (0.0f32, 0.0f32);
+    for &(f, a) in peaks {
+        let h = (f / f0).round();
+        if (1.0..=16.0).contains(&h) && (f / (f0 * h) - 1.0).abs() <= 0.02 {
+            num += a * a * f / h;
+            den += a * a;
+        }
+    }
+    if den > 0.0 { num / den } else { f0 }
 }
 
 /// 放物線補間した山の位置 (ビンからのずれ、−0.5..=0.5)。
@@ -400,6 +489,34 @@ mod tests {
         }
         let spans = detect(triad);
         assert_eq!(spans.iter().map(|s| (s.chord.root, s.chord.kind, s.chordal)).collect::<Vec<_>>(), vec![(0, ChordKind::Major, true)]);
+
+        // 低いベースの上に 2 オクターブ上で弾いた和音 (C2 + E4 G4 C5): E4 がベースの第 5 倍音の近く (14 cent) にあっても
+        // 和音 (揺れていない音は長い FFT の厳しい倍音列の判定)。
+        let mut wide = vec![0.0f32; half * 4];
+        for p in [36u8, 64, 67, 72] {
+            tone(&mut wide, p, &saw);
+        }
+        assert!(detect(wide).iter().all(|s| s.chordal), "C2 + E4 G4 C5");
+    }
+
+    /// r.md #159: ビブラートのかかった歌声のような単音 (±50 cent・5.5 Hz、フォルマントで第 3・第 5 倍音が強い) は、長い FFT
+    /// では倍音が広がって 1 つの倍音列に乗らないが、和音にしない (実データの VOICEVOX の歌声で 46% → 9%)。
+    #[test]
+    fn a_voice_with_vibrato_is_not_chordal() {
+        let sr = 48_000u32;
+        let base = 440.0 * 2f64.powf((57.0 - 69.0) / 12.0);
+        let mut voice = vec![0.0f32; sr as usize * 2];
+        let mut phase = 0.0f64;
+        for (n, s) in voice.iter_mut().enumerate() {
+            let t = n as f64 / f64::from(sr);
+            let f = base * 2f64.powf(0.5 / 12.0 * (std::f64::consts::TAU * 5.5 * t).sin());
+            phase += std::f64::consts::TAU * f / f64::from(sr);
+            let v: f64 = (1..=12u32).map(|h| (phase * f64::from(h)).sin() * if h == 3 || h == 5 { 2.0 } else { 1.0 / f64::from(h) }).sum();
+            *s = (v * 0.05) as f32;
+        }
+        let grid = DetectGrid { origin_frame: 0.0, window_frames: f64::from(sr) };
+        let spans = detect_audio_chords(&[voice], sr, grid, &DetectOptions::default());
+        assert!(spans.iter().all(|s| !s.chordal), "{spans:?}");
     }
 
     /// 無音はコードにしない。

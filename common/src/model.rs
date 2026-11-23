@@ -51,7 +51,7 @@ mod window_edit;
 pub use audio_take::TAKE_ORIGIN_DEPTH;
 pub use automation::*;
 pub use bounce_ops::*;
-pub use chord_basis::AudioBoxBasis;
+pub use chord_basis::{AudioBasisSpan, AudioEventBasis};
 pub use chords::*;
 pub use record_ops::RecordedWav;
 pub use clip_window::*;
@@ -355,9 +355,9 @@ pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, ru
 /// `serde(default)` の「箱なし / 追従しない」で読める (migration 不要)。新ファイルを旧ビルドで開くとコードと
 /// 追従が黙って捨てられ、追従していたトラックが書いた音で鳴る (保存し直すと消える) ので、版を上げて gate で弾く。
 ///
-/// v48 (r.md #159): 素材が書かれたときのコードの記録 (`Clip::chord_basis`、[`ClipChordBasis`]) と、オーディオの
-/// 検出結果の「和音を弾いているか」(`AudioChordSpan::chordal`)。旧ファイルは記録なし (= コードを置いたままの状態)
-/// で開く。旧ファイルの `audio_chords` は「和音を弾いているか」を持たないので捨てる (`project::SONG_MIGRATIONS`)。
+/// v48 (r.md #159): 素材の置いた時点のコードの記録 (`Clip::chord_basis`、[`ClipChordBasis`])、箱の系統
+/// (`ChordEvent::lineage`。旧ファイルは `normalize_chords` が id で埋める)、オーディオの検出結果の「和音を弾いているか」
+/// (`AudioChordSpan::chordal`)。旧ファイルは記録なし (= コードを置いたままの状態) で開く。旧ファイルの `audio_chords` は「和音を弾いているか」を持たないので捨てる (`project::SONG_MIGRATIONS`)。
 /// 新ファイルを旧ビルドで開くと記録が黙って捨てられ、書き換えで動いていたメロディーが書いた音で鳴るので、版を上げる。
 pub const CURRENT_VERSION: u32 = 48;
 

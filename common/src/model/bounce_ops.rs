@@ -97,10 +97,7 @@ impl Song {
     /// content が無ければ `None`。
     pub fn replace_window_content(&mut self, content_id: ContentId, window: (f64, f64), content: ClipContent) -> Option<()> {
         self.clip_contents.get(&content_id)?;
-        let same_window = move |c: &Clip| {
-            let (lo, hi) = c.content_window();
-            c.content_id == content_id && (lo - window.0).abs() <= 1e-9 && (hi - window.1).abs() <= 1e-9
-        };
+        let same_window = move |c: &Clip| shows_window(c, content_id, window);
         let shared_elsewhere =
             self.tracks.iter().flat_map(Track::all_clips).any(|c| c.content_id == content_id && !same_window(c));
         if !shared_elsewhere {
@@ -286,6 +283,13 @@ impl Song {
         };
         self.tracks.iter().rposition(|t| within(t.id))
     }
+}
+
+/// クリップ `c` が content `content_id` を窓 `window` (content-local 拍) で見ているか ([`Song::replace_window_content`] が
+/// 一緒に置き換えるクリップの判定。r.md #159 の記録の写し `Song::baked_window_bases` も同じこれを通す)。
+pub(crate) fn shows_window(c: &Clip, content_id: ContentId, window: (f64, f64)) -> bool {
+    let (lo, hi) = c.content_window();
+    c.content_id == content_id && (lo - window.0).abs() <= 1e-9 && (hi - window.1).abs() <= 1e-9
 }
 
 #[cfg(test)]
