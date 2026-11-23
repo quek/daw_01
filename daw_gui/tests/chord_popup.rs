@@ -185,3 +185,25 @@ fn down_arrow_cycles_the_candidates() {
     assert_eq!(chord_of(&app, b), Some(Chord::new(0, ChordKind::Major)));
     assert_eq!(app.cur.peph.chord_band.popup.as_ref().and_then(|p| p.candidate), Some(0));
 }
+
+/// ポップアップの地 (ボタンでも入力欄でもない所) を押しても、↑↓ はポップアップの候補の巡回のまま (入力欄が
+/// keyboard を持ち続ける)。r.md #159: 外れると ↑↓ が選んだ箱の移調 (書き換え) に落ち、置いている最中の箱の下の
+/// メロディーが動いた。
+#[test]
+fn clicking_the_popup_background_keeps_the_arrows_on_the_popup() {
+    let (mut app, _a, _p) = build_app();
+    place(&mut app, 0.0, 2.0, Chord::new(7, ChordKind::Major));
+    let b = place(&mut app, 2.0, 2.0, Chord::new(2, ChordKind::Minor));
+    let mut h = host();
+    open_on(&mut h, &mut app, 3.0);
+    let lane = app.cur.peph.chord_band.lane;
+    // ポップアップの左下の隅 (ヒントの行より下の余白)。
+    let (x, y) = (lane.x_of(2.0).max(lane.rect.x) + 4.0, lane.rect.y + lane.rect.h + 2.0 + 264.0);
+    click(&mut h, &mut app, x, y);
+    idle(&mut h, &mut app);
+    assert!(app.cur.peph.chord_band.popup.is_some(), "中を押しても閉じない");
+    run(&mut h, &mut app, PointerFrame::default(), vec![key(PhysicalKey::ArrowDown)]);
+    idle(&mut h, &mut app);
+    assert_eq!(chord_of(&app, b), Some(Chord::new(0, ChordKind::Major)), "↓ は候補の巡回のまま");
+    assert_eq!(app.cur.peph.chord_band.popup.as_ref().and_then(|p| p.candidate), Some(0));
+}

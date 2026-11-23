@@ -374,6 +374,18 @@ impl AppData {
         }
     }
 
+    /// ステップ入力の書き先: 選んでいるクリップと、その窓の中へ戻したステップカーソル (content-local 拍)。
+    /// r.md #44: step カーソルは content-local。 clip が見せている窓 `[offset, offset + length)` の中を進み、
+    /// 外れたら窓の先頭へ戻す (`selected_clip` 切替時の 0 初期化も窓外なのでここで吸収される)。ステップ入力の書く位置と
+    /// モニターの寄せる位置 (`AppData::live_input_landing`) が同じこれを通す (戻し方をずらさない)。
+    pub(crate) fn step_input_cursor(&self) -> Option<(crate::app::ClipKey, f64)> {
+        let target = self.selected_clip_ref()?;
+        let clip = self.cur.song_doc.song().clip_by_key(target)?;
+        let cursor = self.cur.recording.step_cursor_beat;
+        let (win_start, win_end) = clip.content_window();
+        Some((target, if cursor < win_start || cursor >= win_end { win_start } else { cursor }))
+    }
+
     /// 既存 step-input mode (= selected_clip + step_cursor_beat に固定 length
     /// で 1 note ずつ手動入力)。 録音を要求していないときだけ走る。
     pub(crate) fn step_input_note_on(&mut self, pitch: u8, velocity: u8) {
@@ -385,24 +397,14 @@ impl AppData {
         if self.reject_write_if_pianoroll_locked(target) {
             return;
         }
-        let cursor = self.cur.recording.step_cursor_beat;
         let step = self.cur.recording.step_size_beats;
-        let Some(clip) = self.cur.song_doc.song().clip_by_key(target) else {
+        let Some((_, cursor)) = self.step_input_cursor() else {
             return;
         };
-        // r.md #44: step カーソルは content-local。 clip が見せている窓
-        // `[offset, offset + length)` の中を進み、外れたら窓の先頭へ戻す
-        // (`selected_clip` 切替時の 0 初期化も窓外なのでここで吸収される)。
-        let (win_start, win_end) = clip.content_window();
-        let cursor = if cursor < win_start || cursor >= win_end {
-            win_start
-        } else {
-            cursor
-        };
-        // r.md #159 Q2: 最寄りのコード音 / スケールで追従するトラックは、書く位置 (カーソル) のコードへ寄せた音を書く
-        // (書いたノートに記録は無いので、再生は書いた音のまま)。セルは曲の位置を持たないので弾いた音のまま。
-        let in_song = self.cur.song_doc.song().track_by_id(target.track_id).is_some_and(|t| t.clip_index_by_id(target.clip_id).is_some());
-        let pitch = if in_song { self.live_input_key_at(target.track_id, pitch, clip.content_to_song_beat(cursor)) } else { pitch };
+        // r.md #159 Q2: 書く音はモニターと同じ口 (`live_input_key` — 最寄りのコード音 / スケールで追従するトラックの
+        // アレンジは書く位置 (カーソル) のコードへ寄せる、セルは弾いた音のまま)。書いたノートに記録は無いので、再生は
+        // 書いた音のまま = 聴いた音 = 書いた音 = 再生の音。
+        let pitch = self.live_input_key(target.track_id, pitch);
         let Some(Some(selected)) = self.edit_song(|song| {
             let content =
                 midi_content_in_clip_mut(song, target)?;
@@ -505,12 +507,16 @@ impl AppData {
         }
     }
 
-    /// トラック `track_id` で押されたまま録っているノートのうち、書いた音程が `pitch` のもの (台帳の値)。
+    /// トラック `track_id` で押されたまま録っているノートのうち、書いた音程が `pitch` のもの (台帳の値)。音程は書いた
+    /// ノートの側を読む (台帳に写さない — 押している間に消された / 音程を変えられたノートに相乗りしない)。
     fn held_recorded_note(&self, track_id: u32, pitch: u8) -> Option<(f64, u32)> {
         let song = self.cur.song_doc.song();
         self.cur.recording.midi_recording_active_notes.iter().filter(|((t, _), _)| *t == track_id).find_map(|(_, &(start, id))| {
             let clip = song.clip_by_key(self.find_midi_clip_containing_beat(track_id, start)?)?;
-            song.clip_notes(clip).iter().any(|n| n.id == id && n.pitch == pitch).then_some((start, id))
+            // id は content の中で一意 (`alloc_note_id`) なので、id で引いた時点で止める。録ったノートは末尾へ足すので、
+            // 押しているノートは後ろにある (長いテイクでも打鍵ごとに全ノートを読まない)。
+            let held = song.clip_notes(clip).iter().rev().find(|n| n.id == id);
+            held.is_some_and(|n| n.pitch == pitch).then_some((start, id))
         })
     }
 
@@ -550,8 +556,9 @@ impl AppData {
         };
         let length = (end - start).max(0.05);
         self.edit_song(|song| {
+            // 押していたノートは末尾近くにある (`held_recorded_note` と同じ理由で後ろから引く)。
             if let Some(notes) = song.notes_in_clip_mut(key)
-                && let Some(n) = notes.iter_mut().find(|n| n.id == note_id)
+                && let Some(n) = notes.iter_mut().rev().find(|n| n.id == note_id)
             {
                 n.duration_beats = length;
             }

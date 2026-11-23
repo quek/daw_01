@@ -336,8 +336,8 @@ struct OnsetChords {
 /// [`extract_chords`] の手順 1: ノートの鳴り始め (と無音の始まり) で区切り、区間ごとにコードを決める
 /// (ずらして弾いた和音は頭にまとめる)。`sorted` は [`usable_notes`] の結果 (開始順)。
 ///
-/// `played_together` が立っていれば、区間に **一緒に弾いた和音** ([`played_together`]) が無い区間はコードに
-/// しない (r.md #159 の自分の和音。重ねて弾いた旋律の音を和音と読まない)。
+/// `require_together` なら、区間に **一緒に弾いた和音** ([`played_together`]) が無い区間はコードにしない
+/// (r.md #159 の自分の和音 = [`own_chords`] の経路。重ねて弾いた旋律の音を和音と読まない)。
 fn onset_chords(sorted: &[&DetectNote], opts: &DetectOptions, require_together: bool) -> OnsetChords {
     // 区切り: 鳴り始め (近いものは 1 つ) と、鳴っている音が無くなる位置。
     let mut bounds: Vec<f64> = Vec::new();
@@ -364,6 +364,8 @@ fn onset_chords(sorted: &[&DetectNote], opts: &DetectOptions, require_together: 
     // コードが決まらなかった区間 (つながっていれば 1 つ)。
     let mut gaps: Vec<(f64, f64)> = Vec::new();
     let mut active: Vec<&DetectNote> = Vec::new();
+    // [`played_together`] の終わりの並べ替えの置き場 (区間ごとに確保しない)。
+    let mut ends: Vec<(f64, u8)> = Vec::new();
     let mut next = 0usize;
     for w in bounds.windows(2) {
         let (a, b) = (w[0], w[1]);
@@ -375,7 +377,8 @@ fn onset_chords(sorted: &[&DetectNote], opts: &DetectOptions, require_together: 
         if active.is_empty() {
             continue;
         }
-        let chord = if require_together && !played_together(&active) { None } else { chord_in(&active, a, b, opts) };
+        let chord =
+            if require_together && !played_together(&active, &mut ends) { None } else { chord_in(&active, a, b, opts) };
         match chord {
             Some(chord) => found.push((a, b, chord)),
             None => match gaps.last_mut() {
@@ -392,22 +395,41 @@ fn onset_chords(sorted: &[&DetectNote], opts: &DetectOptions, require_together: 
 ///
 /// 和音 (ブロック / ストローク / 伸ばした分散和音 = 終わりが揃う) と、音を重ねて弾いた旋律 (レガート /
 /// ビブラフォン風に鳴らし続ける旋律 = 始まりも終わりもずれている) を分ける。
-fn played_together(active: &[&DetectNote]) -> bool {
-    let chordal = |group: &[(f64, u8)]| {
-        let mask = group.iter().fold(0u16, |m, (_, p)| m | (1 << (p % 12)));
-        let pcs = mask.count_ones();
-        pcs >= MIN_PITCH_CLASSES || (pcs == 2 && group.len() >= DYAD_MIN_POLYPHONY)
-    };
-    let aligned = |mut edges: Vec<(f64, u8)>| {
-        edges.sort_by(|a, b| a.0.total_cmp(&b.0));
-        (0..edges.len()).any(|i| {
-            let head = edges[i].0;
-            let len = edges[i..].iter().take_while(|(t, _)| t - head <= ONSET_GROUP_MAX_BEATS).count();
-            chordal(&edges[i..i + len])
-        })
-    };
-    aligned(active.iter().map(|n| (n.start_beat, n.pitch)).collect())
-        || aligned(active.iter().map(|n| (n.start_beat + n.len_beats, n.pitch)).collect())
+///
+/// `active` は開始順 ([`onset_chords`] の sweep が開始順に足して retain するので崩れない)。終わりは `ends`
+/// (呼び出し側の置き場) へ並べ直す。どちらも窓を 2 本の指で滑らせる O(A) (区間ごとの確保なし)。
+fn played_together(active: &[&DetectNote], ends: &mut Vec<(f64, u8)>) -> bool {
+    if aligned(active.len(), |i| (active[i].start_beat, active[i].pitch)) {
+        return true;
+    }
+    ends.clear();
+    ends.extend(active.iter().map(|n| (n.start_beat + n.len_beats, n.pitch)));
+    ends.sort_by(|a, b| a.0.total_cmp(&b.0));
+    aligned(ends.len(), |i| ends[i])
+}
+
+/// 昇順の端 `edge(0..len)` に、頭から [`ONSET_GROUP_MAX_BEATS`] 以内に揃った音の組で和音になるもの
+/// (pitch class が [`MIN_PITCH_CLASSES`] 以上、2 つなら [`DYAD_MIN_POLYPHONY`] 音以上) があるか。
+fn aligned(len: usize, edge: impl Fn(usize) -> (f64, u8)) -> bool {
+    let mut counts = [0u32; 12];
+    let mut distinct = 0u32;
+    let mut end = 0usize;
+    for head in 0..len {
+        let (t0, _) = edge(head);
+        while end < len && edge(end).0 - t0 <= ONSET_GROUP_MAX_BEATS {
+            let pc = usize::from(edge(end).1 % 12);
+            distinct += u32::from(counts[pc] == 0);
+            counts[pc] += 1;
+            end += 1;
+        }
+        if distinct >= MIN_PITCH_CLASSES || (distinct == 2 && end - head >= DYAD_MIN_POLYPHONY) {
+            return true;
+        }
+        let pc = usize::from(edge(head).1 % 12);
+        counts[pc] -= 1;
+        distinct -= u32::from(counts[pc] == 0);
+    }
+    false
 }
 
 /// 素材が **自分で弾いている和音** の区間 (r.md #159、追従の基準)。位置はノートと同じ拍 (MIDI の content-local)。

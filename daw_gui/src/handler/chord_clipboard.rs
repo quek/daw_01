@@ -34,7 +34,7 @@ impl AppData {
     pub(crate) fn copy_chords_clip(&self) -> Option<(String, usize)> {
         let chords = self.selected_chords_relative()?;
         let n = chords.len();
-        let json = ClipboardEnvelope::new(self.cur.song_doc.song().project_id, ClipboardPayload::Chords(chords)).to_json()?;
+        let json = ClipboardEnvelope::new(self.clipboard_source(), ClipboardPayload::Chords(chords)).to_json()?;
         Some((json, n))
     }
 

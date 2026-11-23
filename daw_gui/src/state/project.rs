@@ -420,6 +420,9 @@ pub struct ProjectEphemeral {
     /// r.md #129: plugin の Par の param 行の世代キャッシュ ([`PluginParamsPanelCache`])。
     /// `arr_label_cache` と同じく view から (`&self`) 更新するので `RefCell`。
     pub(crate) plugin_params_panels: std::cell::RefCell<PluginParamsPanelCache>,
+    /// r.md #159: 自分の和音の世代キャッシュ (`AppData::own_chords`。ピアノロールが毎フレーム引く)。
+    /// `arr_label_cache` と同じく view から (`&self`) 更新するので `RefCell`。
+    pub(crate) own_chords_cache: std::cell::RefCell<crate::handler::chord_follow_view::OwnChordsCache>,
     /// GPU-side video thumbnail textures keyed by `VideoSourceId`.
     /// Written by the runner (P3.5) after a successful texture upload;
     /// read by `arrangement_view.rs` (P3.6) and passed to
@@ -1007,6 +1010,7 @@ impl ProjectState {
                 arr_label_cache: std::cell::RefCell::default(),
                 tempo_map_cache: std::cell::RefCell::default(),
                 plugin_params_panels: std::cell::RefCell::default(),
+                own_chords_cache: std::cell::RefCell::default(),
                 loaded_project_id: 0,
                 video_texture_cache: std::collections::HashMap::new(),
                 image_texture_cache: std::collections::HashMap::new(),

@@ -545,7 +545,8 @@ impl AppData {
             let transpose = if self.baking_vocal_track() == Some(track.id) {
                 TrackTranspose::written(song)
             } else {
-                TrackTranspose::of(song, track.id)
+                // 自分の和音は世代キャッシュから (flush のたびに検出し直さない)。
+                self.track_transpose(track.id)
             };
             let entries: Vec<common::plugin_metadata::NoteMetadata> = clips
                 .iter()

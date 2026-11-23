@@ -1,19 +1,23 @@
 //! コードトラックへの追従 (r.md #157 / #159、`docs/plan_chord_track.md`) の評価の SSoT。
 //!
-//! 追従は **非破壊** — ノートのデータは書き換えず、鳴らす音だけを変える。音程を生む全経路 (engine の
-//! ノートとオーディオクリップ、GUI の演奏プレビューとピアノロールの重ね表示、VOICEVOX 歌唱、SMF 書き出し、
-//! 「鳴る音で確定」) はここにある 2 つだけを引く (経路ごとに式を写さない):
+//! 追従は **非破壊** — ノートのデータは書き換えず、鳴らす音だけを変える。音程を生む全経路はここにある 3 つだけを
+//! 引く (経路ごとに式を写さない):
 //!
-//! - **ノートの鍵盤**: [`follow_pitch`] (書いた音 → 鳴る音)。
-//! - **オーディオの移動量**: [`follow_shift`] (半音。全体を平行移動するだけ)。
+//! - **ノートの鍵盤**: [`follow_pitch`] (書いた音 → 鳴る音)。engine のノート、GUI の既にあるノートの試聴 (ナッジ) と
+//!   ピアノロールの重ね表示、VOICEVOX 歌唱、SMF 書き出し、「鳴る音で確定」。
+//! - **オーディオの移動量**: [`follow_shift`] (半音。全体を平行移動するだけ)。engine のオーディオクリップ。
+//! - **演奏入力の鍵盤**: [`live_pitch`] (弾いた音 → 鳴らす / 書く音、読み口は [`TrackChordFollow::live_key`])。
+//!   GUI の演奏プレビュー (MIDI 入力モニター / 仮想鍵盤 / 鍵盤レーン)、録音、ステップ入力、MIDI Capture の配置。
+//!   基準は今のコードで、最寄りのコード音 / スケールだけを寄せる (r.md #159 Q2)。
 //!
-//! どちらも **書いた音の空間** の値を返す。グローバルトランスポーズ (r.md #130) は、その後に
+//! どれも **書いた音の空間** の値を返す。グローバルトランスポーズ (r.md #130) は、その後に
 //! `crate::transpose::sounding_key` で足す (順序は 追従 → 移調。コードも Key も書いた音の空間にある)。
 //!
 //! **基準 (r.md #159)** — 何から何へ合わせるか ([`Basis`]):
 //!
-//! - **自分の和音** (素材がその位置で一緒に弾いている和音、`crate::chord_detect::own_chords`) があれば、
-//!   その和音から今のコードへ合わせる (和音のパートは #157 と同じ式、確定仕様「和音のパートは今どおり」)。
+//! - **自分の和音** (素材がその位置で一緒に弾いている和音、`crate::chord_detect::own_chords`。検出するのは鳴らす
+//!   ノートだけ — トラックのアレンジ / セル 1 つの単位、[`own`]) があれば、その和音から今のコードへ合わせる
+//!   (和音のパートは #157 と同じ式、確定仕様「和音のパートは今どおり」)。
 //! - 無ければ **置いた時点のコード** (`Clip::chord_basis` の、ノートの頭の箱の系統の記録。箱を書き換えたときだけ
 //!   記録する、`crate::model::chord_basis`) から今のコードへ。
 //! - どちらも無ければ動かさない (置いただけでは動かない)。
@@ -26,8 +30,11 @@
 //!
 //! wire に載らないロジックだけを持つ (`common/build.rs` の `WIRE_SOURCES` 対象外)。RT 安全 (確保・ロックなし)。
 
-use crate::model::{Chord, ChordEvent, ChordFollow, ChordKind, NoteChordBasis, Song, SourceChord};
+use crate::model::{Chord, ChordEvent, ChordFollow, ChordKind, Clip, Note, NoteChordBasis, Song, SourceChord};
 use crate::scale::{Scale, ScaleChange};
+
+pub mod own;
+pub use own::{OwnChordsMemo, OwnScope, own_chord_input, own_chords_in, push_sounding_notes};
 
 /// pitch class `from` を `to` へ合わせる最短の移動量 (半音、`-6..=5`)。ちょうど 6 半音は下へ。
 #[must_use]
@@ -99,19 +106,10 @@ pub struct Basis<'a> {
 }
 
 impl<'a> Basis<'a> {
-    /// 基準なし (動かない)。
-    pub const NONE: Basis<'static> = Basis { own: None, placed: None };
-
     /// 自分の和音だけ。
     #[must_use]
     pub const fn own(chord: &'a Chord) -> Self {
         Basis { own: Some(chord), placed: None }
-    }
-
-    /// 置いた時点のコードだけ。
-    #[must_use]
-    pub const fn placed(chord: &'a Chord) -> Self {
-        Basis { own: None, placed: Some(chord) }
     }
 }
 
@@ -154,7 +152,9 @@ pub fn effective_basis(basis: Basis<'_>) -> Option<&Chord> {
 pub fn follow_shift(mode: ChordFollow, target: &Chord, basis: Basis<'_>, key: Option<&ScaleChange>) -> i32 {
     match (mode, resolve(basis)) {
         (ChordFollow::Off, _) | (_, Resolved::Unchanged) => 0,
-        (ChordFollow::Bass, Resolved::Own(own)) => nearest_delta(own.root, target.bass_pc()),
+        // Studio One の Bass: 元のコードのベース音 (無ければ根音) → 今のコードのベース音 (無ければ根音)。自分の和音が
+        // 転回形 (C/E) でも、同じコードの箱の下では動かない。
+        (ChordFollow::Bass, Resolved::Own(own)) => nearest_delta(own.bass_pc(), target.bass_pc()),
         (_, Resolved::Own(own)) => nearest_delta(own.root, target.root),
         (ChordFollow::Bass, Resolved::Placed(placed)) => nearest_delta(placed.bass_pc(), target.bass_pc()),
         (ChordFollow::Scale, Resolved::Placed(placed)) => {
@@ -224,38 +224,6 @@ pub fn live_pitch(mode: ChordFollow, pitch: u8, target: &Chord, key: Option<&Sca
     }
 }
 
-/// MIDI の content (ノート列) が **自分で弾いている和音** の区間 (content-local 拍、`crate::chord_detect::own_chords`)。
-/// engine の索引 (`SongIndex`) と off-RT の読み口 (VOICEVOX / SMF / GUI) が同じこれを通す。ミュートしたノートは
-/// 数えない。
-#[must_use]
-pub fn note_own_chords(notes: &[crate::model::Note]) -> Vec<SourceChord> {
-    let detect: Vec<crate::chord_detect::DetectNote> = notes
-        .iter()
-        .filter(|n| !n.muted)
-        .map(|n| crate::chord_detect::DetectNote { start_beat: n.start_beat, len_beats: n.duration_beats, pitch: n.pitch })
-        .collect();
-    crate::chord_detect::own_chords(&detect)
-}
-
-/// トラック `track` が鳴らす MIDI の content (アレンジのクリップとランチャーのセル) の自分の和音を `out` へ足す
-/// (既にある content は検出し直さない)。engine の索引 (`SongIndex`) と off-RT の読み口
-/// (`crate::transpose::TrackTranspose`) が同じこれで集める。
-pub fn collect_own_chords(
-    song: &Song,
-    track: &crate::model::Track,
-    out: &mut std::collections::HashMap<crate::model::ContentId, Vec<SourceChord>>,
-) {
-    let clips = track.clips.iter().chain(track.session_clips.iter().map(|c| &c.clip));
-    for clip in clips {
-        if out.contains_key(&clip.content_id) {
-            continue;
-        }
-        if let Some(notes) = song.clip_contents.get(&clip.content_id).and_then(|c| c.notes()) {
-            out.insert(clip.content_id, note_own_chords(notes));
-        }
-    }
-}
-
 /// クリップの記録 `basis` (`(note_id, lineage)` 昇順) のうち、note `note_id` が系統 `lineage` の箱の下で置かれた時点の
 /// コード。RT 安全 (二分探索)。
 #[must_use]
@@ -266,22 +234,29 @@ pub fn note_basis_at(basis: &[NoteChordBasis], note_id: u32, lineage: u32) -> Op
 /// ノート 1 つの基準を引く材料 ([`TrackChordFollow::key`])。
 #[derive(Debug, Clone, Copy)]
 pub struct NoteSource<'a> {
-    /// content の自分の和音 ([`note_own_chords`]、content-local 拍)。
+    /// 素材 (ノートのクリップのトラックのアレンジ / セル) の自分の和音 ([`own`]、`Clip::content_to_song_beat` の拍)。
     pub own: &'a [SourceChord],
     /// クリップの記録 (`Clip::chord_basis.notes`。ランチャーのセルは空 = 記録を読まない)。
     pub basis: &'a [NoteChordBasis],
     pub note_id: u32,
-    /// ノートの開始 (content-local 拍)。
+    /// ノートの開始 (`own` と同じ拍)。
     pub start_beat: f64,
-    /// ノートの長さ (拍)。
+    /// ノートの鳴る長さ (拍。窓の末尾で切る — 検出の入力と同じ)。
     pub len_beats: f64,
 }
 
 impl<'a> NoteSource<'a> {
-    /// ノート `note` の材料 (自分の和音 `own`、記録 `basis`)。
+    /// クリップ `clip` のノート `note` の材料 (自分の和音 `own`、記録 `basis`)。窓の外に隠したノートは、鳴らないが
+    /// 書いた長さのまま引く (ピアノロールの表示)。
     #[must_use]
-    pub fn of(own: &'a [SourceChord], basis: &'a [NoteChordBasis], note: &crate::model::Note) -> Self {
-        Self { own, basis, note_id: note.id, start_beat: note.start_beat, len_beats: note.duration_beats }
+    pub fn of(own: &'a [SourceChord], basis: &'a [NoteChordBasis], clip: &Clip, note: &Note) -> Self {
+        Self {
+            own,
+            basis,
+            note_id: note.id,
+            start_beat: clip.content_to_song_beat(note.start_beat),
+            len_beats: clip.sounding_note_len(note).unwrap_or(note.duration_beats),
+        }
     }
 }
 
@@ -348,7 +323,7 @@ impl<'a> TrackChordFollow<'a> {
     #[must_use]
     pub fn note_basis<'s>(&self, song_beat: f64, src: &NoteSource<'s>) -> Option<(&'a ChordEvent, Basis<'s>)> {
         let onset_box = self.song.chord_at_onset(song_beat)?;
-        // content-local 拍 + `to_song` = 曲の拍 (このノートの置かれた位置での換算)。
+        // 自分の和音の拍 + `to_song` = 曲の拍 (アレンジは 0、セルは行の拍から曲の playhead への差)。
         let to_song = song_beat - src.start_beat;
         if let Some(span) = crate::chord_detect::own_chord_at(src.own, src.start_beat) {
             let (a, b) = (span.start_beat + to_song, span.start_beat + span.len_beats + to_song);

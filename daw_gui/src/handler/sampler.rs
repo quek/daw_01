@@ -309,8 +309,9 @@ impl AppData {
         let now = wall_clock_ns();
         let sr = f64::from(self.ipc.sample_rate.max(1));
         let ns_to_frames = |ns: u64| (ns as f64 * sr / 1e9).round() as u64;
-        // r.md #130: 試聴は弾いたときと同じ音 (移調込みの鍵盤、範囲外は鳴らさない)。engine は送った鍵盤で
-        // on / off を組むので、ここで鍵盤に直して送る。
+        // r.md #130: 試聴は移調込みの鍵盤 (範囲外は鳴らさない)。engine は送った鍵盤で on / off を組むので、ここで
+        // 鍵盤に直して送る。r.md #159: コードへは寄せない — 置く位置も置くトラックもまだ決まっていない (置いたときに
+        // 置く位置のコードへ寄る、`midi_capture_drop`)。
         let mut notes: Vec<PreviewNote> = self
             .midi_capture
             .notes_in(start_ns, end_ns, now)
@@ -320,7 +321,7 @@ impl AppData {
                 Some(PreviewNote {
                     offset_frames: ns_to_frames(on),
                     duration_frames: ns_to_frames(off - on).max(1),
-                    pitch: self.preview_key(track_id, n.pitch)?,
+                    pitch: self.transposed_preview_key(track_id, n.pitch)?,
                     velocity: n.velocity,
                 })
             })

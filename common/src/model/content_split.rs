@@ -6,7 +6,13 @@
 //! - ピアノロールの `E` (カーソルの 1 点) / `Shift+E` (グリッド線) → [`MidiContent::split_notes`]
 //! - オーディオエディタの `E` / `Shift+E` → [`AudioContent::split_events`]
 //! - クリップの分割 (`E` / `Shift+E`) / セクションの境界 (`Song::split_clips_at`) /
-//!   範囲操作の両端 (`handler::range_ops`) → [`Song::split_content_at_points`]
+//!   範囲操作の両端 (`handler::range_ops`) / 窓の端の切り出し (`Song::cut_at_window_edge`) →
+//!   [`Song::split_clip_content_at`] (content を切り、クリップを張り替え、割ったノートの後ろの片へ置いた時点の
+//!   コードの記録を写す — [`Song::copy_note_basis`])
+//!
+//! クリップの上のノートを割る経路は必ず [`Song::split_clip_content_at`] を通す。後ろの片は新しい id なので、
+//! 記録を写さないと帯のコードを書き換えたときに前の片だけが動く。ピアノロールの `E` は
+//! [`MidiContent::split_notes`] を直接呼ぶので、自分で [`Song::copy_note_basis`] を呼ぶ (`handler/split.rs`)。
 //!
 //! **分割は切れ目を入れるだけ** — 分割直後の再生・書き出し・描画は分割前と同じ (r.md #132 残件)。
 //! note は後ろの片を長音「ー」にし、時間軸を持つ event (audio / video / image / text) は元の event の
@@ -15,7 +21,7 @@
 //! クリップの分割で content も切るのは、窓 (クリップ) を割っただけでは「跨いだ note の後半」を
 //! 後半の窓が鳴らせないから (再生側は「発音開始が窓内」の note しか鳴らさない)。 共有されて
 //! いる MIDI content は先に fork するので linked clip は無傷 (時間軸を持つ event は切っても鳴り方が
-//! 変わらないので fork しない、[`Song::split_content_at_points`])。
+//! 変わらないので fork しない、CoW の方針は [`Song::split_content_at_points`] の doc)。
 
 use crate::model::{
     AudioContent, AudioEvent, ClipContent, ClipKey, ContentId, MidiContent, Note, Song, TimedEvent, split_pieces,
@@ -174,6 +180,9 @@ impl Song {
     /// clip の再生・描画・読み上げは 1 sample も変わらないので fork しない (リンクを切らない。 audio は
     /// ARA の編集 = content と take ごとの audio modification も共有したまま続く)。 返り値は「切り終えた
     /// content の id」= 分割後の全片が使う id。 跨ぐ要素が無ければ `content_id` をそのまま返す。
+    ///
+    /// **クリップを張り替えず、置いた時点のコードの記録も写さない低レベルの口** (クリップを持たない content を
+    /// 直接切るテスト用)。クリップの上の content を切るときは [`Self::split_clip_content_at`] を使う。
     pub fn split_content_at_points(&mut self, content_id: ContentId, ats: &[f64]) -> ContentId {
         self.cut_content_at_points(content_id, ats).0
     }

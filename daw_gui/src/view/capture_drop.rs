@@ -123,7 +123,7 @@ fn take_project_transfer_drop(
     // 帯の `LauncherNewTrack` と同じ約束を、タブ間の持ち込みにも通す。
     let below_all_rows = rows.last().is_none_or(|(_, r)| pos.1 >= r.y + r.h);
     tracing::info!(?pos, ?hovered_row, project = app.pk().0, "project transfer dropped");
-    let src_pid = p.envelope.source_project_id;
+    let src_pid = app.paste_source(p.envelope.source());
     let media = p.envelope.media.clone();
     match &p.envelope.payload {
         crate::clipboard::ClipboardPayload::Clips(clips) => {
@@ -314,7 +314,7 @@ fn take_project_transfer_drop_on_launcher(
     let Some(p) = ui.take_drag_payload::<ProjectTransferPayload>(PROJECT_XFER_DRAG_KIND) else {
         return;
     };
-    let src_pid = p.envelope.source_project_id;
+    let src_pid = app.paste_source(p.envelope.source());
     let media = p.envelope.media.clone();
     tracing::info!(?pos, ?row, scene_index, project = app.pk().0, "project transfer dropped on launcher");
     let cells = match &p.envelope.payload {

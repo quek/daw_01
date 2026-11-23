@@ -13,11 +13,11 @@
 //!
 //! wire に載らないロジックだけを持つ (`common/build.rs` の `WIRE_SOURCES` 対象外)。
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::automation::{apply_modulation_over, lane_value_in_clip};
-use crate::chord_follow::{NoteSource, TrackChordFollow};
-use crate::model::{AutomationClip, AutomationLane, AutomationTarget, Clip, ContentId, ModRouting, Note, Song, SourceChord};
+use crate::chord_follow::{NoteSource, OwnScope, TrackChordFollow};
+use crate::model::{AutomationClip, AutomationLane, AutomationTarget, Clip, ModRouting, Note, Song, SourceChord};
 use crate::song_index::CoverIndex;
 
 /// 移調の幅 (半音、`-24..=24`)。値域の SSoT — 正規化 (`automation::target_range`)、読み込みの丸め
@@ -128,45 +128,47 @@ impl<'a> TransposeCurve<'a> {
 /// トラック 1 本のノートが **オフラインで** 鳴らす鍵盤の読み口 (VOICEVOX 歌唱 / 口パク / SMF 書き出し)。
 ///
 /// r.md #157 / #159: コードトラックへの追従 ([`crate::chord_follow::TrackChordFollow`]) もここに相乗りする
-/// (順序は 追従 → 移調。engine の `daw_audio::pitch_map` と同じ)。基準の自分の和音は、作るときにトラックの content
-/// ごとに 1 回だけ検出しておく ([`crate::chord_follow::collect_own_chords`])。置いた時点のコードはクリップの記録。
+/// (順序は 追従 → 移調。engine の `daw_audio::pitch_map` と同じ)。基準の自分の和音はトラックのアレンジが鳴らす
+/// ノートから 1 回だけ検出する ([`crate::chord_follow::own`]。GUI は世代の memo から [`Self::with_own`] で渡す)。
+/// 置いた時点のコードはクリップの記録。
 #[derive(Debug, Clone)]
 pub struct TrackTranspose<'a> {
     curve: TransposeCurve<'a>,
     follows: bool,
     chords: TrackChordFollow<'a>,
-    /// content id → 自分の和音 (content-local 拍)。追従するときだけ埋まる。
-    own: HashMap<ContentId, Vec<SourceChord>>,
+    /// トラックのアレンジの自分の和音 (曲の拍)。追従するときだけ埋まる。
+    own: Arc<[SourceChord]>,
 }
 
 impl<'a> TrackTranspose<'a> {
-    /// `track_id` のトラックの読み口 (追従しないトラックは書いた音のまま)。
+    /// `track_id` のトラックの読み口 (追従しないトラックは書いた音のまま)。自分の和音はここで検出する。
     #[must_use]
     pub fn of(song: &'a Song, track_id: u32) -> Self {
+        Self::with_own(song, track_id, |scope| crate::chord_follow::own_chords_in(song, scope, None).into())
+    }
+
+    /// [`Self::of`] の、自分の和音を `own` から受け取る版 (追従するときだけ呼ぶ。GUI の世代の memo)。
+    #[must_use]
+    pub fn with_own(song: &'a Song, track_id: u32, own: impl FnOnce(OwnScope) -> Arc<[SourceChord]>) -> Self {
         let chords = TrackChordFollow::of(song, track_id);
-        let mut own = HashMap::new();
-        if chords.is_active()
-            && let Some(track) = song.track_by_id(track_id)
-        {
-            crate::chord_follow::collect_own_chords(song, track, &mut own);
-        }
+        let own = if chords.is_active() { own(OwnScope::Arrangement { track_id }) } else { Arc::from([]) };
         Self { curve: TransposeCurve::of(song), follows: song.track_follows_transpose(track_id), chords, own }
     }
 
     /// 移調も追従もしない読み口 (焼き込み = プロジェクトの中に作るものは書いた音、確定仕様 Q8)。
     #[must_use]
     pub fn written(song: &'a Song) -> Self {
-        Self { curve: TransposeCurve::of(song), follows: false, chords: TrackChordFollow::written(song), own: HashMap::new() }
+        Self { curve: TransposeCurve::of(song), follows: false, chords: TrackChordFollow::written(song), own: Arc::from([]) }
     }
 
-    /// クリップ `clip` のノート `note` が鳴らす鍵盤。`song_beat` はノートの開始の曲の拍 (`None` = 曲の位置を
-    /// 持たないランチャーのセル → 移調は [`TransposeCurve::base`]、コードは引けないので追従しない)。範囲外は `None`。
+    /// トラックの **アレンジの** クリップ `clip` のノート `note` が鳴らす鍵盤。`song_beat` はノートの開始の曲の拍
+    /// (`None` = 曲の位置を持たないランチャーのセル → 移調は [`TransposeCurve::base`]、コードは引けないので追従しない)。
+    /// 範囲外は `None`。
     #[must_use]
     pub fn key(&self, clip: &Clip, note: &Note, song_beat: Option<f64>) -> Option<u8> {
         let followed = match song_beat {
             Some(beat) if self.chords.is_active() => {
-                let own = self.own.get(&clip.content_id).map_or(&[][..], Vec::as_slice);
-                self.chords.key(note.pitch, beat, &NoteSource::of(own, &clip.chord_basis.notes, note))?
+                self.chords.key(note.pitch, beat, &NoteSource::of(&self.own, &clip.chord_basis.notes, clip, note))?
             }
             _ => note.pitch,
         };

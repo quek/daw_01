@@ -18,7 +18,23 @@ impl AppData {
         let song = self.cur.song_doc.song();
         let mut media = song.media_manifest_for(payload.clip_contents());
         media.absolutize(self.project_dir().as_deref());
-        crate::clipboard::ClipboardEnvelope::new(song.project_id, payload).with_media(media)
+        crate::clipboard::ClipboardEnvelope::new(self.clipboard_source(), payload).with_media(media)
+    }
+
+    /// 写し (clipboard / タブ間ドラッグ) の出どころ: この文書の `(Song.project_id, SongDoc::id_session)`。
+    #[must_use]
+    pub(crate) fn clipboard_source(&self) -> (u64, u64) {
+        (self.cur.song_doc.song().project_id, self.cur.song_doc.id_session())
+    }
+
+    /// 貼る写しの出どころ `source` (`ClipboardEnvelope::source`) を、この文書から見た **同じ id 空間か** の判定に使う
+    /// project id にしたもの: 同じ開き方 (`SongDoc::id_session`) の写しなら写し元の project id、違えば 0 (どの project
+    /// とも一致しない = 別のプロジェクトとして貼る — content は複製し、外の id の参照とコードの記録は捨てる)。保存せずに
+    /// 閉じた / Revert した / Save As で分けた版の写しは、同じ project id でも採番が戻って同じ id が別の物を指しうる。
+    #[must_use]
+    pub(crate) fn paste_source(&self, source: (u64, u64)) -> u64 {
+        let (project_id, session) = source;
+        if session == self.cur.song_doc.id_session() { project_id } else { 0 }
     }
 
     /// OS クリップボードへ書いた envelope `json` が運ぶ audio の take の Melodyne の編集を、**写した時点の状態** で
@@ -116,5 +132,25 @@ impl AppData {
             self.resize_track_peak_display();
         }
         ids
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::clipboard::{ClipboardEnvelope, ClipboardPayload};
+
+    /// 写した後に Song を差し替える (保存版に戻す / 開き直す) と、同じ project id でも別の id 空間の写しとして貼る
+    /// (採番がファイルの値へ戻り、写しの id が別の物を指しうる)。
+    #[test]
+    fn copies_from_before_the_song_was_replaced_paste_as_another_project() {
+        let mut app = crate::test_support::headless_app();
+        let env = ClipboardEnvelope::new(app.clipboard_source(), ClipboardPayload::Notes(Vec::new()));
+        let env = ClipboardEnvelope::from_json(&env.to_json().expect("json")).expect("envelope");
+        let project_id = app.cur.song_doc.song().project_id;
+        assert_eq!(app.paste_source(env.source()), project_id, "同じ開き方の写しは同じプロジェクト");
+        let song = app.cur.song_doc.song().clone();
+        app.cur.song_doc.replace_song(song);
+        assert_eq!(app.cur.song_doc.song().project_id, project_id);
+        assert_eq!(app.paste_source(env.source()), 0, "差し替えた後は別のプロジェクトとして貼る");
     }
 }

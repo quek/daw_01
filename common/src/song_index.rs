@@ -20,16 +20,31 @@ mod params;
 mod ranges;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub use launcher::{CellIndex, CellSlice, LauncherRow, SessionCells};
 pub use params::{LaneView, ParamStore, ParamStoreIndex, ParamSubject, TargetRoutings};
 pub use ranges::{CoverIndex, EndTree, RangeIndex, Reaching};
 
+use crate::chord_follow::{OwnChordsMemo, OwnScope};
 use crate::model::{
     ChordFollow, ContentId, Device, NativeDevice, Parallel, ParallelChain, ParamStoreAt, Send, SessionClip, Song,
     SourceChord, Track,
 };
 use params::position;
+
+/// トラック `t` の MIDI のセルごとの自分の和音 (`(clip id, 区間)` を id 順に、同じ id は先頭だけ)。
+fn cell_own_chords(song: &Song, t: &Track, memo: &mut OwnChordsMemo) -> Vec<(u32, Arc<[SourceChord]>)> {
+    let mut cells: Vec<(u32, Arc<[SourceChord]>)> = t
+        .session_clips
+        .iter()
+        .filter(|c| song.clip_contents.get(&c.clip.content_id).and_then(|m| m.notes()).is_some())
+        .map(|c| (c.clip.id, memo.own_chords(song, OwnScope::Cell { track_id: t.id, clip_id: c.clip.id })))
+        .collect();
+    cells.sort_by_key(|(id, _)| *id);
+    cells.dedup_by_key(|(id, _)| *id);
+    cells
+}
 
 /// トラック 1 本の索引。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -43,6 +58,11 @@ struct TrackIndex {
     follows_transpose: bool,
     /// r.md #157: コードトラックへの実効の追従モード (曲全体のスイッチ込み。鳴る音が変わりえない曲では全部 `Off`)。
     chord_follow: ChordFollow,
+    /// r.md #159: 追従するトラックのアレンジが鳴らすノートの自分の和音 (`chord_follow::own`、曲の拍)。RT がノートから
+    /// 検出し直さないため。追従しないトラックは `None`。
+    own_chords: Option<Arc<[SourceChord]>>,
+    /// 同じく、MIDI のセルごとの自分の和音 (`(clip id, 行の拍の区間)` を id 順に)。
+    cell_own_chords: Vec<(u32, Arc<[SourceChord]>)>,
     /// `(send id, 位置)` を id 順に (同じ id は先頭だけ)。
     sends: Vec<(u32, u32)>,
     /// アレンジの clip `[start_beat, start_beat + length_beats)`。
@@ -64,9 +84,6 @@ pub struct SongIndex {
     nodes: nodes::NodeIndex,
     /// content id → MIDI の note `[start, start + duration)` / 読み上げの event `[start, start]` (content-local 拍)。
     contents: HashMap<ContentId, RangeIndex>,
-    /// r.md #157 / #159: 追従するトラックが鳴らす MIDI の content の、自分の和音
-    /// (`chord_follow::note_own_chords`、content-local 拍)。RT がノートから検出し直さないため。
-    own_chords: HashMap<ContentId, Vec<SourceChord>>,
     launcher: launcher::LauncherIndex,
 }
 
@@ -87,6 +104,13 @@ impl SongIndex {
     /// off-RT で作る (曲の要素数に比例)。
     #[must_use]
     pub fn build(song: &Song) -> Self {
+        Self::build_with(song, &mut OwnChordsMemo::default())
+    }
+
+    /// [`Self::build`] の、自分の和音の検出を `memo` で使い回す版 (engine が編集のたびに作り直す索引。鳴らすノートが
+    /// 前と同じトラック / セルは検出し直さない — フェーダーのドラッグ中は検出 0 回)。`memo` は呼ぶたびに世代を閉じる。
+    #[must_use]
+    pub fn build_with(song: &Song, memo: &mut OwnChordsMemo) -> Self {
         let follow_applies = song.chord_follow_can_apply();
         // `follow_applies` は曲全体のスイッチを含むので、実効モード (`Song::track_chord_follow`) は手元の `t` の値
         // (id からトラックを引き直すと全トラックで O(T²))。
@@ -101,6 +125,9 @@ impl SongIndex {
                 enabled,
                 follows_transpose,
                 chord_follow: chord_follow(t),
+                own_chords: (!chord_follow(t).is_off())
+                    .then(|| memo.own_chords(song, OwnScope::Arrangement { track_id: t.id })),
+                cell_own_chords: if chord_follow(t).is_off() { Vec::new() } else { cell_own_chords(song, t, memo) },
                 sends: id_positions(t.sends.iter().map(|s| s.id)),
                 clips: RangeIndex::build(t.clips.iter().map(|c| (c.start_beat, c.start_beat + c.length_beats))),
                 cells: CellIndex::build(t.session_clips.iter().map(|c| (c.clip.id, c.scene_id))),
@@ -120,10 +147,7 @@ impl SongIndex {
                 Some((id, ranges))
             })
             .collect();
-        let mut own_chords: HashMap<ContentId, Vec<SourceChord>> = HashMap::new();
-        for t in song.tracks.iter().filter(|t| !chord_follow(t).is_off()) {
-            crate::chord_follow::collect_own_chords(song, t, &mut own_chords);
-        }
+        memo.sweep();
         let mut index = Self {
             song: ParamStoreIndex::build(&song.song_lanes, &song.song_mod_routings),
             tracks,
@@ -131,7 +155,6 @@ impl SongIndex {
             scene_pos: id_positions(song.scenes.iter().map(|s| s.id)),
             nodes: nodes::NodeIndex::build(song),
             contents,
-            own_chords,
             launcher: launcher::LauncherIndex::default(),
         };
         index.launcher = launcher::LauncherIndex::build(song, &index);
@@ -193,10 +216,20 @@ impl SongIndex {
         self.tracks.get(track_idx).map_or(ChordFollow::Off, |t| t.chord_follow)
     }
 
-    /// content の自分の和音 (content-local 拍、追従するトラックの content だけ)。
+    /// `tracks[track_idx]` のアレンジの自分の和音 (曲の拍、追従するトラックだけ)。RT 安全。
     #[must_use]
-    pub fn own_chords(&self, content_id: ContentId) -> &[SourceChord] {
-        self.own_chords.get(&content_id).map_or(&[], Vec::as_slice)
+    pub fn own_chords(&self, track_idx: usize) -> &[SourceChord] {
+        self.tracks.get(track_idx).and_then(|t| t.own_chords.as_deref()).unwrap_or(&[])
+    }
+
+    /// `tracks[track_idx]` のセル `clip_id` の自分の和音 (行の拍、追従するトラックの MIDI のセルだけ)。RT 安全
+    /// (二分探索)。
+    #[must_use]
+    pub fn cell_own_chords(&self, track_idx: usize, clip_id: u32) -> &[SourceChord] {
+        let Some(t) = self.tracks.get(track_idx) else { return &[] };
+        t.cell_own_chords
+            .binary_search_by_key(&clip_id, |(id, _)| *id)
+            .map_or(&[], |i| &t.cell_own_chords[i].1)
     }
 
     /// `tracks[track_idx]` の send id の send。

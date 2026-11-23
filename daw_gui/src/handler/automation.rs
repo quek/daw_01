@@ -749,7 +749,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.cur.song_doc.song().project_id,
+            self.clipboard_source(),
             crate::clipboard::ClipboardPayload::AudioEvents(copied),
         )
         .to_json()?;
@@ -1025,7 +1025,7 @@ impl AppData {
         }
         let count = out.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.cur.song_doc.song().project_id,
+            self.clipboard_source(),
             crate::clipboard::ClipboardPayload::AutomationClips(out),
         )
         .to_json()?;

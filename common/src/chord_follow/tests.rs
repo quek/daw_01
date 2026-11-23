@@ -176,6 +176,80 @@ fn one_chord_in_a_melody_does_not_make_the_whole_melody_a_chord_part() {
     }
 }
 
+/// クリップ `clip` の、窓に頭があって鳴るノートの鍵盤 (書いた順)。
+fn audible(song: &Song, track_id: u32, clip: &Clip) -> Vec<Option<u8>> {
+    let all = heard(song, track_id, clip);
+    song.clip_notes(clip).iter().zip(all).filter(|(n, _)| clip.window_has_onset(n.start_beat)).map(|(_, k)| k).collect()
+}
+
+/// 自分の和音はトラックが **鳴らす** ノートだけから決める: 窓の外に隠れた和音に接する旋律の音も、隠れたベース音と
+/// 終わりが揃う 2 音も、和音のパートにしない (鳴っていない音で動かない)。分割しても鳴る音は変わらない。
+#[test]
+fn hidden_notes_outside_the_window_do_not_make_a_chord_part() {
+    let mut notes: Vec<Note> = [72u8, 74, 76, 77, 79].iter().zip(1u32..).map(|(&p, id)| note(id, f64::from(id - 1), 1.0, p)).collect();
+    notes.extend([note(6, 5.0, 1.0, 60), note(7, 5.0, 1.0, 64), note(8, 5.0, 1.0, 67)]);
+    let mut song = song_with(&[(MELODY, ChordFollow::Parallel, notes)]);
+    song.place_chord(boxed(0.0, 8.0, "Am"));
+    let whole = keys(&[72, 74, 76, 77, 76, 57, 61, 64]);
+    assert_eq!(sounding(&song, MELODY), whole, "和音と、それに接する 79 が動く");
+    let mut split = song.clone();
+    split.split_clips_at(3.0);
+    let track = split.track_by_id(MELODY).expect("track");
+    let pieces: Vec<Option<u8>> = track.clips.iter().flat_map(|c| audible(&split, MELODY, c)).collect();
+    assert_eq!(pieces, whole, "分割の前後で鳴る音は同じ");
+    song.tracks[0].clips[0].length_beats = 5.0;
+    assert_eq!(audible(&song, MELODY, &song.tracks[0].clips[0]), keys(&[72, 74, 76, 77, 79]), "隠れた和音に接しても動かない");
+
+    // 左端を詰めて頭を隠したベース音 C2 と、窓の中の E G (2 音は和音にならない)。
+    let mut song = song_with(&[(MELODY, ChordFollow::Parallel, vec![note(1, 0.0, 4.0, 36), note(2, 1.0, 3.0, 64), note(3, 1.0, 3.0, 67)])]);
+    song.place_chord(boxed(0.0, 8.0, "Am"));
+    assert_eq!(sounding(&song, MELODY), keys(&[33, 61, 64]), "ベース音ごと C の和音として動く");
+    let clip = &mut song.tracks[0].clips[0];
+    (clip.start_beat, clip.content_offset_beats, clip.length_beats) = (1.0, 1.0, 3.0);
+    assert_eq!(audible(&song, MELODY, &song.tracks[0].clips[0]), keys(&[64, 67]), "隠れたベース音で和音にしない");
+}
+
+/// 「箱を置き直す (新しい系統) → 書き換える」を繰り返しても、開いている間の記録は積み増さない (もう効かない系統の
+/// 記録は、記録を足すときに落とす)。鳴る音は最後の書き換えの差だけ。
+#[test]
+fn re_placing_and_rewriting_does_not_pile_up_records() {
+    let mut song = song_with(&[(MELODY, ChordFollow::Parallel, vec![note(1, 0.0, 1.0, 64), note(2, 1.0, 1.0, 67)])]);
+    for _ in 0..4 {
+        song.place_chord(boxed(0.0, 4.0, "C"));
+        assert!(song.set_chord(&[box_at(&song, 0.0)], chord("D")));
+        assert_eq!(song.tracks[0].clips[0].chord_basis.notes.len(), 2, "ノート × 今ある系統");
+    }
+    assert_eq!(sounding(&song, MELODY), keys(&[66, 69]));
+}
+
+/// 書き換えは窓の外へ隠したノートにも記録を書く: 後で窓を広げて出したとき、そこだけ動かないまま残らない。
+#[test]
+fn rewrites_remember_notes_hidden_outside_the_window() {
+    let mut song = song_with(&[(MELODY, ChordFollow::Parallel, vec![note(1, 0.0, 1.0, 64), note(2, 4.0, 1.0, 67)])]);
+    let clip = &mut song.tracks[0].clips[0];
+    (clip.start_beat, clip.content_offset_beats, clip.length_beats) = (4.0, 4.0, 4.0);
+    song.place_chord(boxed(0.0, 4.0, "C"));
+    song.place_chord(boxed(4.0, 4.0, "C"));
+    assert!(song.set_chord(&[box_at(&song, 0.0)], chord("D")), "隠れたノートの下の箱だけを書き換える");
+    let clip = &mut song.tracks[0].clips[0];
+    (clip.start_beat, clip.content_offset_beats, clip.length_beats) = (0.0, 0.0, 8.0);
+    assert_eq!(sounding(&song, MELODY), keys(&[66, 67]), "出したノートも C → D");
+}
+
+/// ベース: 転回形の和音 (C/E) のパートからコードを抽出した直後 (同じコードの箱の下) は動かず、根音がベースの C へ
+/// 書き換えると、ベース音 E → C の差で動く (Studio One: 元のコードのベース音 → 今のコードのベース音)。
+#[test]
+fn an_inverted_chord_part_stays_under_its_own_extracted_chord_in_bass_mode() {
+    let mut song = song_with(&[(PIANO, ChordFollow::Bass, vec![note(1, 0.0, 4.0, 52), note(2, 0.0, 4.0, 55), note(3, 0.0, 4.0, 60)])]);
+    let own = own_chords_in(&song, OwnScope::Arrangement { track_id: PIANO }, None);
+    assert_eq!(own.len(), 1);
+    assert_eq!((own[0].chord.root, own[0].chord.bass_pc()), (0, 4), "C/E と読む");
+    song.place_chord(ChordEvent::new(0.0, 4.0, own[0].chord));
+    assert_eq!(sounding(&song, PIANO), keys(&[52, 55, 60]), "抽出した直後は動かない");
+    song.place_chord(boxed(0.0, 4.0, "C"));
+    assert_eq!(sounding(&song, PIANO), keys(&[48, 51, 56]), "E → C (-4)");
+}
+
 /// ベース音のあとに和音を刻む伴奏 (ブンチャッ) は、ベース音も和音のパートとして一緒に動く。食って入る和音
 /// (小節の頭の半拍前から弾く) は次の箱のコードに従う。
 #[test]
@@ -305,14 +379,57 @@ fn splitting_a_clip_keeps_the_rewritten_sound_of_both_pieces() {
     assert!(song.set_chord(&[id], chord("D")));
     song.split_clips_at(2.0);
     let track = song.track_by_id(MELODY).expect("track");
-    let audible = |clip: &Clip| -> Vec<Option<u8>> {
-        let all = heard(&song, MELODY, clip);
-        song.clip_notes(clip).iter().zip(all).filter(|(n, _)| clip.window_has_onset(n.start_beat)).map(|(_, k)| k).collect()
-    };
     let back = track.clips.iter().find(|c| c.start_beat == 2.0).expect("後ろの片");
     assert_ne!(back.content_id, track.clips.iter().find(|c| c.id == 200).expect("linked").content_id, "fork される");
-    assert_eq!(audible(back), keys(&[66, 78]), "後ろの片も C → D");
-    assert_eq!(audible(&track.clips[0]), keys(&[66, 78]));
+    assert_eq!(audible(&song, MELODY, back), keys(&[66, 78]), "後ろの片も C → D");
+    assert_eq!(audible(&song, MELODY, &track.clips[0]), keys(&[66, 78]));
+}
+
+/// 時間操作で割れた同じ系統の箱の境界 (音源フレームの途中に落ちる: 128 BPM / 44.1 kHz) では、どちらの片を先に
+/// 書き換えても、境界ちょうどから後ろの片の記録を引き、直前は前の片の記録を引く (1 フレームぶん隣の記録を引かない)。
+#[test]
+fn audio_records_meet_exactly_at_a_split_box_boundary() {
+    use crate::model::{AudioContent, AudioSource, AudioSourcePath};
+    for back_first in [false, true] {
+        let mut song = Song { bpm: 128.0, ..Song::default() };
+        song.media.audio_sources.insert(1, AudioSource {
+            path: AudioSourcePath::Absolute("1.wav".into()),
+            sample_rate: 44_100,
+            channels: 1,
+            frames: 165_375,
+            original_bpm: None,
+            root_key: None,
+        });
+        let event = AudioEvent {
+            id: 1,
+            source_id: 1,
+            event_length_beats: 6.0,
+            source_end_frames: 124_031,
+            stretch_mode: crate::model::StretchMode::Raw,
+            ..AudioEvent::default()
+        };
+        song.place_chord(boxed(0.0, 8.0, "C"));
+        assert!(song.delete_time_range(2.0, 4.0).is_some());
+        assert_eq!(song.chords.len(), 2);
+        assert_eq!(song.chords[0].lineage, song.chords[1].lineage, "割れた片は系統を継ぐ");
+        // 素材が無いうちに後ろの片を E へ (記録は付かない)。
+        assert!(song.set_chord(&[box_at(&song, 3.0)], chord("E")));
+        let content_id = song.alloc_content_id();
+        song.clip_contents.insert(content_id, ClipContent::Audio(AudioContent { events: vec![event.clone()], next_event_id: 2 }));
+        let clip = Clip { id: 1, start_beat: 0.0, length_beats: 6.0, content_id, ..Clip::default() };
+        song.tracks.push(Track { id: 1, follow_chords: ChordFollow::Parallel, clips: vec![clip], ..Track::default() });
+        let (front, back) = (box_at(&song, 1.0), box_at(&song, 3.0));
+        let order = if back_first { [(back, "G"), (front, "F")] } else { [(front, "F"), (back, "G")] };
+        for (id, to) in order {
+            assert!(song.set_chord(&[id], chord(to)));
+        }
+        let shifts = |beats: &[f64]| {
+            let basis = song.audio_event_basis(&TempoMap::from_song(&song), &song.tracks[0].clips[0], &event);
+            let f = TrackChordFollow::of(&song, 1);
+            beats.iter().map(|&at| f.audio_shift(at, None, &basis)).collect::<Vec<_>>()
+        };
+        assert_eq!(shifts(&[1.0, 2.0 - 1e-6, 2.0, 2.5]), vec![5, 5, 3, 3], "back_first={back_first}: C → F / E → G");
+    }
 }
 
 /// 120 BPM / 48 kHz / 8 拍の音源 `source_id` を Raw で鳴らす event (クリップの頭から)。1 拍 = 24 000 frame。
@@ -467,12 +584,16 @@ fn the_placed_chord_itself_never_moves_anything() {
                 c.tensions = crate::model::Tensions::NINE;
                 let c = c.sanitized();
                 for mode in MODES {
+                    let placed = Basis { own: None, placed: Some(&c) };
                     for p in 0..=127u8 {
                         for key in [None, Some(&key)] {
-                            assert_eq!(follow_pitch(mode, p, &c, Basis::placed(&c), key), Some(p), "{mode:?} {c:?} {p}");
+                            assert_eq!(follow_pitch(mode, p, &c, placed, key), Some(p), "{mode:?} {c:?} {p}");
                         }
                     }
-                    assert_eq!(follow_shift(mode, &c, Basis::placed(&c), None), 0);
+                    assert_eq!(follow_shift(mode, &c, placed, None), 0);
+                    // 和音のパートも、自分の和音と同じコードの箱の下では全体を動かさない (転回形でも。ベースは
+                    // 元のベース音 → 今のベース音、Studio One の Bass)。
+                    assert_eq!(follow_shift(mode, &c, Basis::own(&c), None), 0, "{mode:?} {c:?}");
                 }
             }
         }
@@ -525,5 +646,5 @@ fn a_note_just_before_a_boundary_takes_the_key_change_on_that_boundary() {
 #[test]
 fn out_of_range_is_silent() {
     assert_eq!(follow_pitch(ChordFollow::Parallel, 2, &chord("G"), Basis::own(&chord("C")), None), None);
-    assert_eq!(follow_pitch(ChordFollow::Parallel, 2, &chord("G"), Basis::placed(&chord("C")), None), None);
+    assert_eq!(follow_pitch(ChordFollow::Parallel, 2, &chord("G"), Basis { own: None, placed: Some(&chord("C")) }, None), None);
 }

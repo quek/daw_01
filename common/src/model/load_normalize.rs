@@ -6,6 +6,15 @@
 
 use super::*;
 
+/// 0 でない乱数の識別子 (プロジェクトの同一性 [`Song::project_id`] / GUI の文書の開き方の識別子)。
+#[must_use]
+pub fn fresh_nonzero_id() -> u64 {
+    // `Uuid::as_u128` の下位 64 bit (v4 の乱数部)。
+    #[allow(clippy::cast_possible_truncation)]
+    let id = uuid::Uuid::new_v4().as_u128() as u64;
+    id.max(1)
+}
+
 impl Song {
     /// Clamp persisted scalar fields into valid ranges. The persistence
     /// layer is the trust boundary where data crosses back in from disk /
@@ -88,10 +97,7 @@ impl Song {
     /// (別起動・別マシンでも衝突しない。`0` sentinel は引き直す)。
     pub fn ensure_project_id(&mut self) {
         if self.project_id == 0 {
-            self.project_id = uuid::Uuid::new_v4().as_u128() as u64;
-            if self.project_id == 0 {
-                self.project_id = 1;
-            }
+            self.project_id = fresh_nonzero_id();
         }
     }
 
@@ -119,6 +125,7 @@ impl Song {
         self.normalize_session();
         self.ensure_scale_changes_sorted();
         self.normalize_chords();
+        self.compact_chord_ids_if_saturated();
         self.normalize_chord_basis();
         self.ensure_automation_points_sorted();
         // 重なり解消は id 採番の後 (分割断片に id を振るため)、 overlay の

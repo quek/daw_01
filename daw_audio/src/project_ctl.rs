@@ -216,6 +216,9 @@ pub struct BundlePublisher {
     last_compiled_frames: Option<u32>,
     /// 直近の便の song から作った索引 / 曲の範囲 / テンポ表 ([`Self::song_derived`])。
     derived: Option<SongDerived>,
+    /// r.md #159: 索引を作り直すたびに、鳴らすノートが前と同じトラック / セルの自分の和音を使い回す
+    /// (`SongIndex::build_with`。編集のたび / フェーダーのドラッグ中は毎フレーム新しい song が来る)。
+    own_chords: common::chord_follow::OwnChordsMemo,
     /// r.md #156: RT へ渡してある入力の受け皿の組 (`RtBundle::input_stage`)。
     delivered_input_plan: crate::graph::input_stage::InputPlan,
 }
@@ -248,6 +251,7 @@ impl BundlePublisher {
             mod_plans: ModPlanPublisher::default(),
             last_compiled_frames: None,
             derived: None,
+            own_chords: common::chord_follow::OwnChordsMemo::default(),
             delivered_input_plan: Vec::new(),
         }
     }
@@ -282,10 +286,11 @@ impl BundlePublisher {
                 let default_song = common::model::Song::default();
                 let s = song.map_or(&default_song, |s| &**s);
                 let tempo_map = Arc::new(common::tempo_map::TempoMap::from_song(s));
+                let memo = &mut self.own_chords;
                 *slot = Some(SongDerived {
                     song: song.cloned(),
                     sample_rate,
-                    index: Arc::new(song.map_or_else(SongIndex::default, |s| SongIndex::build(s))),
+                    index: Arc::new(song.map_or_else(SongIndex::default, |s| SongIndex::build_with(s, memo))),
                     bounds: SongBounds::of(song.map(|s| &**s), sample_rate, &tempo_map),
                     tempo_map,
                 });

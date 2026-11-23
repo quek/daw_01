@@ -12,10 +12,15 @@
 //!   系統 ([`ChordEvent::lineage`]) は箱の安定 id で、記録は **同じ系統の箱の下でだけ** 効く。記録の無い組は
 //!   今のコードが基準 = どのモードでも動かない。だから箱を置く・貼る・複製する・抽出する (新しい系統) と、その下の
 //!   素材は動かず、素材を別の箱の下へ動かす / 写す (系統が違う) と書いた音で鳴る。元の箱の下へ戻せば元どおり。
-//! - **記録を書くのは書き換えだけ** ([`Song::set_chord`] / [`Song::transpose_chords`])。書き換える箱の下にある
-//!   素材のうち、**その系統でまだ記録の無いもの** に、書き換える **前** のコードを書く。同じ `edit_song` の中なので
-//!   undo は 1 段。記録は鳴らし方ではなく素材についての事実なので、追従しないトラック (Off) と曲全体のスイッチが
-//!   切れている間の書き換えも記録する (後で ON にすると、ずっと ON だったときと同じ音で鳴る — A/B で比べられる)。
+//!   書き換えで動いていた素材の上に箱を置く・貼る・複製する・抽出する、または別の箱を移動 / 伸縮で重ねると、その
+//!   部分は書いた音に戻る (同じコードでも — 箱の系統が変わるため)。
+//! - **新しく基準を決めて書くのは書き換えだけ** ([`Song::set_chord`] / [`Song::transpose_chords`])。書き換える箱の
+//!   下にある素材のうち、**その系統でまだ記録の無いもの** に、書き換える **前** のコードを書く。同じ `edit_song` の
+//!   中なので undo は 1 段。記録は鳴らし方ではなく素材についての事実なので、追従しないトラック (Off) と曲全体の
+//!   スイッチが切れている間の書き換えも記録する (後で ON にすると、ずっと ON だったときと同じ音で鳴る — A/B で
+//!   比べられる)。ほかに記録を書くのは、元の素材の基準を新しい素材へ移す経路 (下の引き継ぎ・時間ごとの貼り付け・
+//!   焼き込み・Glue) だけ。1 件は (ノート, 系統) の組で bincode 約 7〜12 B (Note 1 個の約 4 割)、ノートと同じく
+//!   毎回の LoadSong と undo の snapshot に載る。
 //!   - MIDI: ノートの頭 (`Clip::content_to_song_beat`) が書き換える箱にあるもの (ミュートしたノート / 窓の外へ
 //!     隠したノートも書く — 後で出したときに、そこだけ動かないまま残らない)。
 //!   - オーディオ: 見えている event ∩ 箱の範囲を、波形と再生の写像 (`crate::audio_render::event_wave_spans`) で
@@ -23,7 +28,8 @@
 //!     継ぐので、分割しても引き継ぎが要らない)。箱を伸ばして新しく覆った部分は記録が無いので動かない。
 //! - **系統** (`chord_ops.rs`): 新しく置く箱は新しい系統、同じ箱の変形 (移動 / 伸縮 / 範囲の変更) は保つ、割れた片
 //!   (上書きで削られた右側 / 時間操作の境界) は継ぐ。時間ごと貼った箱 (Paste / Duplicate Time、セクションの複製) は
-//!   写しの系統ごとに新しい系統で、貼ったクリップの記録も同じ表で付け替える ([`ClipChordBasis::relineaged`])。
+//!   写しの系統ごとに新しい系統で、貼ったクリップの記録も同じ表で付け替える ([`ClipChordBasis::relineaged`] —
+//!   箱と記録が組で運ばれるので、別のプロジェクトからでも残す。範囲の外の箱の系統の記録だけを捨てる)。
 //! - 書き換えを重ねても記録は最初のコードのまま (C → Dm → Em なら C → Em へ直接写す。差は積み重ならない)。
 //!   元のコードへ書き戻せば動かない。
 //! - 置いている最中の箱 (ダブルクリックで作ってポップアップでコードを決める) のコードを決めるのは書き換えではない
@@ -31,11 +37,18 @@
 //! - **引き継ぎ**: クリップの移動 / 分割 / 複製 / 同じプロジェクトへのコピーは `Clip` ごと運ぶ (note id と take が
 //!   保たれる。行き先が同じ系統の箱の下なら同じ音、別の箱の下なら書いた音)。ノートを割ると後ろの片が新しい id に
 //!   なるので、元の id の記録を写す ([`Song::copy_note_basis`])。ノートの複製・貼り付け・追加・録音は新しい素材
-//!   (記録なし = 書いた音)。別のプロジェクトへ貼るクリップは記録を捨てる (系統の番号の空間が違う)。
+//!   (記録なし = 書いた音)。クリップ / セル / トラックの貼り付けは [`ClipChordBasis::pasted`] を通す: 同じ番号の
+//!   空間 (同じプロジェクトの、同じ開き方のコピー) からなら運び、それ以外 (別のプロジェクト / 保存せずに閉じた・
+//!   Revert した後 / Save As で分けた版) からは捨てる (箱が付いてこないので、系統の番号が別の箱を指しうる)。
+//! - **焼き込み** (Bounce In Place / オーディオの Glue): [`Song::baked_chord_basis`] / [`Song::baked_window_bases`] が、
+//!   元の素材が箱ごとに動いていた基準 (`chord_follow::effective_basis` — 和音のパートは自分の和音、ほかは記録) を、
+//!   焼いた音源の take の記録にその箱の系統で書く。元の記録はまるごと置き換え (take 番号が重なりうるため)、セルは空。
+//! - **MIDI の Glue**: 元のクリップの記録を、振り直した note id へ系統ごと写す (`daw_gui` の `handler/glue.rs`)。
 //! - **鳴る音で確定** したノートの記録は消す ([`Song::forget_note_basis`]、確定した音 = 今のコードに対して書いた音)。
 //! - ランチャーのセルは記録を読まない (曲の位置を持たない)。記録は残す (アレンジへ戻すと元どおり鳴る)。
 //! - 読み込みと保存の前に [`Song::normalize_chord_basis`] で並びと値域を揃え、もう無いノート / take / 系統の記録を
 //!   捨てる (系統の番号は再利用しないので、消えた系統の記録は二度と効かない。undo は Song ごと戻すので記録も戻る)。
+//!   開いている間も、書き換えで記録を足すクリップからはもう無い系統の記録を落とす (積み増さない)。
 
 use super::*;
 use crate::audio_render::{TempoMap, WaveSpan, event_wave_spans};
@@ -48,6 +61,15 @@ struct Rewritten {
     start: f64,
     end: f64,
     chord: Chord,
+}
+
+/// 1 回の書き換え ([`Song::remember_chord_basis`]) の箱の組。
+struct RewriteSet<'a> {
+    /// `start` 昇順。
+    boxes: &'a [Rewritten],
+    by_id: &'a HashMap<u32, Rewritten>,
+    /// ノートの頭がこの外なら、どの書き換える箱にも従わない (`[lo, hi)`)。
+    onset_range: (f64, f64),
 }
 
 /// オーディオ event 1 つの記録を **曲の拍** へ写したもの (engine の compile が event ごとに 1 回作り
@@ -146,6 +168,76 @@ fn overlapping(group: &[AudioChordBasis], f0: u64, f1: u64) -> &[AudioChordBasis
     &group[lo..hi]
 }
 
+/// 記録の端を箱の端へ戻す幅の上限 (拍)。1 フレームを保持する span (warp の退化) は 1 フレームが長い拍になるので、
+/// 遠い箱の端へ寄せない。
+const SNAP_MAX_BEATS: f64 = 1e-3;
+/// 浮動小数の丸めの分の余白 (拍)。
+const SNAP_MARGIN_BEATS: f64 = 1e-9;
+
+/// span `s` の音源 1 フレームの拍の幅 (音源を持たない span は 0)。
+fn beats_per_frame(s: &WaveSpan) -> f64 {
+    let frames = s.source_end.saturating_sub(s.source_start);
+    #[allow(clippy::cast_precision_loss)]
+    if frames == 0 { 0.0 } else { (s.end_beat - s.start_beat).abs() / frames as f64 }
+}
+
+/// event の波形の span を音源フレームで引く索引 (記録ごとに span を全件なめない)。span は warp marker の逆行 /
+/// 1 フレームの保持で音源の上で重なりうるので、`source_end` は単調でない — 開始順に並べ、`source_end` の累積最大で
+/// 「ここより前は全部 `f0` 以前に終わる」位置を二分探索する。
+struct SpansBySource {
+    spans: Vec<WaveSpan>,
+    /// `spans` の添字を `source_start` 昇順に。
+    order: Vec<usize>,
+    /// `order` の順の `source_end` の累積最大。
+    max_end: Vec<u64>,
+}
+
+impl SpansBySource {
+    fn new(spans: Vec<WaveSpan>) -> Self {
+        let mut order: Vec<usize> = (0..spans.len()).collect();
+        order.sort_by_key(|&i| spans[i].source_start);
+        let max_end = order
+            .iter()
+            .scan(0u64, |m, &i| {
+                *m = (*m).max(spans[i].source_end);
+                Some(*m)
+            })
+            .collect();
+        Self { spans, order, max_end }
+    }
+
+    /// 音源フレームの範囲 `[f0, f1)` に掛かりうる span (掛からないものも混ざる — `span_beats` が落とす)。
+    fn touching(&self, f0: u64, f1: u64) -> impl Iterator<Item = &WaveSpan> {
+        let hi = self.order.partition_point(|&i| self.spans[i].source_start < f1);
+        let lo = self.max_end[..hi].partition_point(|&e| e <= f0);
+        self.order[lo..hi].iter().map(|&i| &self.spans[i])
+    }
+}
+
+/// 系統ごとの箱の端 (曲の拍、昇順)。
+struct LineageEdges(HashMap<u32, Vec<f64>>);
+
+impl LineageEdges {
+    fn of(chords: &[ChordEvent]) -> Self {
+        let mut map: HashMap<u32, Vec<f64>> = HashMap::new();
+        for c in chords {
+            map.entry(c.lineage).or_default().extend([c.start_beat, c.end_beat()]);
+        }
+        for edges in map.values_mut() {
+            edges.sort_by(f64::total_cmp);
+        }
+        Self(map)
+    }
+
+    /// `beat` から `tol` 以内に系統 `lineage` の箱の端があればその端、無ければ `beat`。
+    fn snap(&self, lineage: u32, beat: f64, tol: f64) -> f64 {
+        let Some(edges) = self.0.get(&lineage) else { return beat };
+        let i = edges.partition_point(|&e| e < beat);
+        let near = [i.checked_sub(1), Some(i)].into_iter().flatten().filter_map(|j| edges.get(j));
+        near.copied().filter(|e| (e - beat).abs() <= tol).min_by(|a, b| (a - beat).abs().total_cmp(&(b - beat).abs())).unwrap_or(beat)
+    }
+}
+
 impl Song {
     /// オーディオ event `event` (クリップ `clip` の content) の、曲の拍 `[a, b)` が読む音源フレームの範囲の列
     /// (見えている event とクリップの窓で切る)。音源が無ければ空。
@@ -164,42 +256,56 @@ impl Song {
 
     /// 書き換える箱 `boxes` (`start` 昇順) の下にある、その系統で記録の無い素材へ書き換える前のコードを記録する
     /// (module doc の規則)。
+    ///
+    /// 記録が増える唯一の口なので、記録を足すクリップからは、もう効かない系統 (どの箱も持たない — 系統の番号は再利用
+    /// しない) の記録を落とす: 「箱を置き直す → 書き換える」を繰り返しても、開いている間の記録が「ノート × 今ある
+    /// 系統」で頭打ちになる (LoadSong と undo の snapshot に死んだ記録を積み増さない)。消えたノート / take の記録は
+    /// 積み増されないので、保存と読み込みの [`Self::normalize_chord_basis`] に任せる (書き換えのたびに曲の全ノートの
+    /// 集合を作らない)。
     fn remember_chord_basis(&mut self, boxes: &[Rewritten]) {
         if boxes.is_empty() {
             return;
         }
         let tempo = TempoMap::from_song(self);
         let by_id: HashMap<u32, Rewritten> = boxes.iter().map(|b| (b.id, *b)).collect();
+        // 書き換える箱の外枠 (`chord_at_onset` が箱を返す範囲 `[start - eps, end)` を全部含む)。ノートの頭がこの外に
+        // あれば箱を引かずに飛ばす (書き換えのたびに曲の全ノートで箱を二分探索しない)。
+        let lo = boxes.iter().map(|b| b.start).fold(f64::INFINITY, f64::min) - super::chord_ops::CHORD_ONSET_EPS_BEATS;
+        let hi = boxes.iter().map(|b| b.end).fold(f64::NEG_INFINITY, f64::max);
+        let rewrite = RewriteSet { boxes, by_id: &by_id, onset_range: (lo, hi) };
         // (track 位置, clip 位置, 足す記録)。先に全部決めてから書く (Song を読みながら書かない)。
         let mut adds: Vec<(usize, usize, ClipChordBasis)> = Vec::new();
         for (ti, track) in self.tracks.iter().enumerate() {
             for (ci, clip) in track.clips.iter().enumerate() {
-                let add = self.records_to_add(&tempo, boxes, &by_id, clip);
+                let add = self.records_to_add(&tempo, &rewrite, clip);
                 if !add.is_empty() {
                     adds.push((ti, ci, add));
                 }
             }
         }
+        let mut live: Vec<u32> = self.chords.iter().map(|c| c.lineage).collect();
+        live.sort_unstable();
+        live.dedup();
+        let alive = |lineage: u32| live.binary_search(&lineage).is_ok();
         for (ti, ci, add) in adds {
             let basis = &mut self.tracks[ti].clips[ci].chord_basis;
+            basis.notes.retain(|b| alive(b.lineage));
+            basis.audio.retain(|b| alive(b.lineage));
             basis.notes.extend(add.notes);
             basis.audio.extend(add.audio);
             *basis = std::mem::take(basis).normalized();
         }
     }
 
-    /// クリップ `clip` の素材のうち、書き換える箱 `boxes` (`by_id` は id で引く表) の下にあって記録の無いものへ足す記録。
-    fn records_to_add(
-        &self,
-        tempo: &TempoMap<'_>,
-        boxes: &[Rewritten],
-        by_id: &HashMap<u32, Rewritten>,
-        clip: &Clip,
-    ) -> ClipChordBasis {
+    /// クリップ `clip` の素材のうち、書き換える箱 `rewrite` の下にあって記録の無いものへ足す記録。
+    fn records_to_add(&self, tempo: &TempoMap<'_>, rewrite: &RewriteSet<'_>, clip: &Clip) -> ClipChordBasis {
         match self.clip_contents.get(&clip.content_id) {
-            Some(ClipContent::Midi(m)) => ClipChordBasis { notes: self.note_records_to_add(by_id, clip, &m.notes), audio: Vec::new() },
+            Some(ClipContent::Midi(m)) => {
+                ClipChordBasis { notes: self.note_records_to_add(rewrite, clip, &m.notes), audio: Vec::new() }
+            }
             Some(ClipContent::Audio(content)) => {
-                let audio = content.events.iter().flat_map(|e| self.audio_records_to_add(tempo, boxes, clip, e)).collect();
+                let audio =
+                    content.events.iter().flat_map(|e| self.audio_records_to_add(tempo, rewrite.boxes, clip, e)).collect();
                 ClipChordBasis { notes: Vec::new(), audio }
             }
             _ => ClipChordBasis::default(),
@@ -207,11 +313,18 @@ impl Song {
     }
 
     /// [`Self::records_to_add`] の MIDI: ノートの頭が書き換える箱にあるもの (再生と同じ `chord_at_onset` で箱を引く)。
-    fn note_records_to_add(&self, by_id: &HashMap<u32, Rewritten>, clip: &Clip, notes: &[Note]) -> Vec<NoteChordBasis> {
+    /// クリップの窓では絞らない (窓の外へ隠したノートにも書く、module doc)。ノートの並びは順不同なので全件を見るが、
+    /// 外枠の外のノートは比較 1 つで飛ばす。
+    fn note_records_to_add(&self, rewrite: &RewriteSet<'_>, clip: &Clip, notes: &[Note]) -> Vec<NoteChordBasis> {
+        let (lo, hi) = rewrite.onset_range;
         notes
             .iter()
             .filter_map(|n| {
-                let b = by_id.get(&self.chord_at_onset(clip.content_to_song_beat(n.start_beat))?.id)?;
+                let at = clip.content_to_song_beat(n.start_beat);
+                if !(lo..hi).contains(&at) {
+                    return None;
+                }
+                let b = rewrite.by_id.get(&self.chord_at_onset(at)?.id)?;
                 crate::chord_follow::note_basis_at(&clip.chord_basis.notes, n.id, b.lineage).is_none().then_some(
                     NoteChordBasis { note_id: n.id, lineage: b.lineage, chord: b.chord },
                 )
@@ -315,7 +428,7 @@ impl Song {
             let clips = track.clips.iter_mut().chain(track.session_clips.iter_mut().map(|c| &mut c.clip));
             for clip in clips.filter(|c| c.content_id == content_id && !c.chord_basis.notes.is_empty()) {
                 let basis = &mut clip.chord_basis.notes;
-                let copies: Vec<NoteChordBasis> = pairs
+                let mut copies: Vec<NoteChordBasis> = pairs
                     .iter()
                     .flat_map(|&(from, to)| {
                         let lo = basis.partition_point(|b| b.note_id < from);
@@ -326,9 +439,14 @@ impl Song {
                 if copies.is_empty() {
                     continue;
                 }
-                basis.retain(|b| !copies.iter().any(|c| c.note_id == b.note_id && c.lineage == b.lineage));
+                // 写す先に同じ `(note, 系統)` の古い記録があれば写しで置き換える (写す先は新しく採番した id なので通常は
+                // 何も消えないが、残すと二分探索で引く区間に同じ鍵が 2 件入る)。`to` は一意 (`split_notes` が保証)。
+                // 引くのは二分探索 (グリッドで割ると片も記録も数千になる — 総当たりは二乗)。
+                let key = |b: &NoteChordBasis| (b.note_id, b.lineage);
+                copies.sort_by_key(key);
+                basis.retain(|b| copies.binary_search_by_key(&key(b), key).is_err());
                 basis.extend(copies);
-                basis.sort_by_key(|b| (b.note_id, b.lineage));
+                basis.sort_by_key(key);
             }
         }
     }
@@ -377,6 +495,8 @@ impl Song {
         };
         let mut spans = Vec::new();
         event_wave_spans(event, source.sample_rate, tempo, visible, &mut spans);
+        let spans = SpansBySource::new(spans);
+        let edges = LineageEdges::of(&self.chords);
         let (lo, hi) = (event.source_start_frames, event.source_end_frames);
         let mut placed = Vec::new();
         let mut i = 0;
@@ -384,9 +504,14 @@ impl Song {
             let g = group(records, records[i].take, records[i].lineage);
             i += g.len().max(1);
             for r in overlapping(g, lo, hi) {
-                for s in &spans {
+                for s in spans.touching(r.start_frame, r.end_frame) {
                     let Some((b0, b1)) = span_beats(s, r.start_frame, r.end_frame) else { continue };
                     let (b0, b1) = ((b0 + visible).max(window.0), (b1 + visible).min(window.1));
+                    // 記録の端は書いたときに箱の端を音源フレームへ丸めた (`span_frames` が外へ広げる) ので、箱の端から
+                    // 1 フレーム未満ずれている。同じ系統の箱の端へ戻す — 時間操作で割れた同じ系統の片が隣り合うと、
+                    // 1 フレームぶん隣の片の記録を引いて、その位置から始まる buffer だけ音程が跳ねる。
+                    let tol = beats_per_frame(s).min(SNAP_MAX_BEATS) + SNAP_MARGIN_BEATS;
+                    let (b0, b1) = (edges.snap(r.lineage, b0, tol), edges.snap(r.lineage, b1, tol));
                     if b1 > b0 {
                         placed.push(AudioBasisSpan { lineage: r.lineage, start_beat: b0, end_beat: b1, chord: r.chord });
                     }
@@ -410,9 +535,11 @@ impl Song {
         let tempo = TempoMap::from_song(self);
         // 箱の id → (元のコード, 鳴る長さ) の重み。素材を 1 回ずつなめて足す (箱ごとに素材をなめ直さない)。
         let mut weights: HashMap<u32, Vec<(Chord, f64)>> = HashMap::new();
+        // 自分の和音は素材 (トラックのアレンジ / セル) ごとに 1 回だけ検出する (同じトラックのクリップを束ねる Glue)。
+        let mut own: HashMap<crate::chord_follow::OwnScope, Vec<SourceChord>> = HashMap::new();
         for key in keys {
             if let Some(src) = self.clip_by_key(*key) {
-                self.add_moved_basis(&tempo, key.track_id, src, &mut weights);
+                self.add_moved_basis(&tempo, *key, src, &mut own, &mut weights);
             }
         }
         let mut out = ClipChordBasis::default();
@@ -454,11 +581,23 @@ impl Song {
         out
     }
 
-    /// クリップ `clip` の素材が箱ごとに動いていた元のコードを、鳴る長さ (MIDI はノートの長さ、オーディオは音源
-    /// フレーム) で `weights` (箱の id ごと) に足す。動いていない素材は足さない。
-    fn add_moved_basis(&self, tempo: &TempoMap<'_>, track_id: u32, clip: &Clip, weights: &mut HashMap<u32, Vec<(Chord, f64)>>) {
+    /// クリップ `clip` (`key`) の素材が箱ごとに動いていた元のコードを、鳴る長さ (MIDI はノートの長さ、オーディオは
+    /// 音源フレーム) で `weights` (箱の id ごと) に足す。動いていない素材は足さない。`own` は素材ごとの自分の和音の
+    /// 置き場 (無ければここで検出して入れる)。
+    fn add_moved_basis(
+        &self,
+        tempo: &TempoMap<'_>,
+        key: ClipKey,
+        clip: &Clip,
+        own: &mut HashMap<crate::chord_follow::OwnScope, Vec<SourceChord>>,
+        weights: &mut HashMap<u32, Vec<(Chord, f64)>>,
+    ) {
         let moved: Vec<(u32, Chord, f64)> = match self.clip_contents.get(&clip.content_id) {
-            Some(ClipContent::Midi(m)) => self.moved_note_basis(track_id, clip, &m.notes),
+            Some(ClipContent::Midi(m)) => {
+                let scope = self.own_scope_of(key);
+                let own = own.entry(scope).or_insert_with(|| crate::chord_follow::own_chords_in(self, scope, None));
+                self.moved_note_basis(key.track_id, clip, &m.notes, own)
+            }
             Some(ClipContent::Audio(a)) => {
                 let (w0, w1) = clip.song_window();
                 let first = self.chords.partition_point(|c| c.end_beat() <= w0);
@@ -481,14 +620,13 @@ impl Song {
 
     /// [`Self::add_moved_basis`] の MIDI: ノートごとの (従う箱の id, 動いていた元のコード, ノートの長さ)。モードは問わない
     /// (記録と同じく素材の事実。焼いた音源は元のトラックのモードを継ぐ)。
-    fn moved_note_basis(&self, track_id: u32, clip: &Clip, notes: &[Note]) -> Vec<(u32, Chord, f64)> {
+    fn moved_note_basis(&self, track_id: u32, clip: &Clip, notes: &[Note], own: &[SourceChord]) -> Vec<(u32, Chord, f64)> {
         let follow = crate::chord_follow::TrackChordFollow::of(self, track_id);
-        let own = crate::chord_follow::note_own_chords(notes);
         notes
             .iter()
             .filter(|n| !n.muted && clip.window_has_onset(n.start_beat))
             .filter_map(|n| {
-                let src = crate::chord_follow::NoteSource::of(&own, &clip.chord_basis.notes, n);
+                let src = crate::chord_follow::NoteSource::of(own, &clip.chord_basis.notes, clip, n);
                 let (ev, basis) = follow.note_basis(clip.content_to_song_beat(n.start_beat), &src)?;
                 Some((ev.id, *crate::chord_follow::effective_basis(basis)?, n.duration_beats))
             })
@@ -566,6 +704,14 @@ impl ClipChordBasis {
             .collect();
         Self { notes, audio }.normalized()
     }
+
+    /// 貼るクリップ (クリップ / セル / トラックの貼り付け) の記録。同じ番号の空間 (`same_space` = 同じプロジェクトの
+    /// 同じ開き方のコピー) なら並びと値域を揃えて運び (外の JSON は並びが崩れていうる)、違えば捨てる (箱が付いて
+    /// こないので、系統の番号が別の箱を指す)。
+    #[must_use]
+    pub fn pasted(self, same_space: bool) -> Self {
+        if same_space { self.normalized() } else { Self::default() }
+    }
 }
 
 /// 同じ `(take, lineage)` の記録 `covered` (昇順・非交差) が覆っていない、`[f0, f1)` の部分。
@@ -605,4 +751,35 @@ fn normalize_audio_basis(records: &mut Vec<AudioChordBasis>) {
         out.push(r);
     }
     *records = out;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 音源フレームの索引は、warp の逆行 / 1 フレームの保持で音源の上で重なる span も取りこぼさない (総当たりと同じ組)。
+    #[test]
+    fn spans_by_source_finds_every_overlapping_span() {
+        let span = |source_start, source_end| WaveSpan {
+            start_beat: 0.0,
+            end_beat: 1.0,
+            source_start,
+            source_end,
+            reversed: false,
+            head: false,
+        };
+        // 長い span の後に、その途中へ戻る短い span (逆行) と、1 フレームの保持。
+        let spans = vec![span(0, 1000), span(1000, 2000), span(200, 300), span(1500, 1501), span(2000, 2400), span(50, 3000)];
+        let index = SpansBySource::new(spans.clone());
+        let hits = |s: &&WaveSpan, f0: u64, f1: u64| s.source_start < f1 && s.source_end > f0;
+        for (f0, f1) in [(0, 10), (250, 260), (900, 1100), (1500, 1501), (2100, 2200), (2999, 3500), (3000, 4000)] {
+            let mut got: Vec<(u64, u64)> =
+                index.touching(f0, f1).filter(|s| hits(s, f0, f1)).map(|s| (s.source_start, s.source_end)).collect();
+            let mut want: Vec<(u64, u64)> =
+                spans.iter().filter(|s| hits(s, f0, f1)).map(|s| (s.source_start, s.source_end)).collect();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(got, want, "[{f0}, {f1})");
+        }
+    }
 }

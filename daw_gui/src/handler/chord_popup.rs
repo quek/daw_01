@@ -1,7 +1,9 @@
 //! handler::chord_popup — コードのポップアップ (Q4、Studio One の Chord Selector 型) の操作。
 //!
-//! 変更は即反映 (`ChordTrackEvent::SetChord` を 1 回ずつ = 1 undo step) し、試聴の口
-//! (`audition_chord_box`) を鳴らす。描画は `view::chord_popup`、状態は `ProjectEphemeral::chord_band.popup`。
+//! 変更は即反映し (1 回ずつ = 1 undo step、変化が無ければ積まない)、試聴の口 (`audition_chord_box`) を鳴らす。
+//! このポップアップで作った箱は閉じるまで「置く」(`ChordTrackEvent::Recast`)、ほかの箱は「書き換え」
+//! (`ChordTrackEvent::SetChord`) — 使い分けの規則は `ChordPopup::placing` の doc。描画は `view::chord_popup`、
+//! 状態は `ProjectEphemeral::chord_band.popup`。
 
 use common::chord_name::parse_chord;
 use common::chord_suggest::suggest_next;

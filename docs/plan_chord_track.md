@@ -31,18 +31,28 @@
 - **基準 (r.md #159、Q8)**: 何から今のコードへ合わせるかは素材の音から決める (トラックに役割を持たせない)。
   式の SSoT は `common/src/chord_follow.rs` (`Basis`)、記録の規則の正本は `common/src/model/chord_basis.rs` の module doc。
   - **自分の和音** (素材が一緒に弾いている和音): MIDI はノートから毎回検出する (`chord_detect::own_chords`、保存しない)。
+    検出するのは **鳴らすノートだけ** で、素材の単位はトラックのアレンジ (全クリップを曲の拍で 1 つに) / ランチャーの
+    セル 1 つ (`common/src/chord_follow/own.rs`。窓の外に隠したノートは数えない — 分割・trim・Glue の前後で鳴りが
+    変わらない)。入力が前と同じ素材は検出を使い回す (engine の索引の作り直し / GUI の世代キャッシュ)。
     「コードを抽出」と同じ鳴り始めの区切りで、始まりか終わりが揃った 3 音以上 (2 pitch class なら 3 音以上) の組が
     ある区間だけ — 2 拍の窓に集めた旋律の音は和音にしない。ノートの頭で鳴っていなければ、ノートに重なるか隙間なく
     接する和音 (`own_chord_touching`: 伸ばした分散和音の 1 音目 / ブンチャッのベース音は一緒に動く。離れた和音には
     属さない — 旋律に和音が 1 つ混ざっても旋律全体を和音のパートにしない)。食って入る和音 (箱の頭の半拍前から) は
     次の箱に従う。和音のパートの式は #157 のまま (確定仕様「和音のパートは今どおり」— C の和音の位置に Am7 を置けば
-    平行移動では A へ動く)。
+    平行移動では A へ動く)。ただしベースは、自分の和音のベース音 (無ければ根音) → 今のコードのベース音 (無ければ根音)
+    (Studio One の Bass。#157 は自分の和音の根音から写していたので、転回形 (C/E) の和音のパートからコードを抽出した
+    直後に +4 動いた)。
   - **置いた時点のコード** (`Clip::chord_basis`): 和音を持たない素材の基準。記録 1 件は (素材, 箱の系統
-    `ChordEvent::lineage`) の組で、同じ系統の箱の下でだけ効く。コードを **書き換えた** とき (`Song::set_chord` /
-    `transpose_chords`) にだけ、その箱の下でその系統の記録の無い素材へ書き換える前のコードを記録する。置く・貼る・
-    複製・抽出した箱は新しい系統なので、その下の素材は動かない。素材を別の箱の下へ動かす / 写すと書いた音。
-    記録は素材の事実なので、追従 Off のトラックと曲全体のスイッチ Off の間の書き換えも記録する (ON にすると、
-    ずっと ON だったときと同じ音)。
+    `ChordEvent::lineage`) の組で、同じ系統の箱の下でだけ効く。新しく基準を決めて記録するのはコードを **書き換えた**
+    とき (`Song::set_chord` / `transpose_chords`) だけで、その箱の下でその系統の記録の無い素材へ書き換える前のコードを
+    書く (ほかに記録を書くのは、元の素材の基準を新しい素材へ移す経路 — 分割の写し / 時間ごとの貼り付け / 焼き込み
+    (下の「バウンス」) / Glue)。置く・貼る・複製・抽出した箱は新しい系統なので、その下の素材は動かない。素材を別の箱の
+    下へ動かす / 写すと書いた音。書き換えで動いていた素材の上に箱を置く / 貼る / 重ねると、その部分は書いた音に戻る
+    (同じコードでも — 系統が変わるため)。記録は素材の事実なので、追従 Off のトラックと曲全体のスイッチ Off の間の
+    書き換えも記録する (ON にすると、ずっと ON だったときと同じ音)。1 件は bincode 約 7〜12 B (Note 1 個の約 4 割)
+    で、ノートと同じく毎回の LoadSong と undo の snapshot に載る (書き換えで記録を足すクリップからもう効かない系統の
+    記録を落とすので、開いている間も「ノート × 今ある系統」で頭打ち)。クリップ / セル / トラックの貼り付けは、同じ id 空間 (同じプロジェクトの
+    同じ開き方、`SongDoc::id_session`) からのときだけ記録を運ぶ (`ClipChordBasis::pasted`)。
   - モードごとの式 (Q1 = 1): 平行移動 / ベースは差だけ移調 (呼び名だけの書き換え = 構成音が同じなら動かない)、
     最寄りのコード音 / スケールは元のコードの構成音 / スケールの音だけを寄せ、経過音は動かさない。種類だけの書き換え
     (C → Cm) は平行移動では根音の差が 0 なので、ピアノ (C の和音) もメロディー (E) も動かない。
@@ -77,7 +87,7 @@
 | 置いた時点のコードの記録 (書き換え `set_chord` / `transpose_chords` と置き直し `recast_chords`、引き継ぎ `copy_note_basis` / `forget_note_basis` / `relineaged`、正規化、オーディオの記録を曲の拍へ写す `audio_event_basis`、焼き込み `baked_chord_basis` / `baked_window_bases`)。箱の系統の採番は `chord_ops.rs` | `common/src/model/chord_basis.rs` |
 | 箱の編集 (`place_chord` 上書き規則 / `move_chords` / `resize_chord` / `duplicate_chords` / `delete_chords` / `set_chord` / `transpose_chords` / `set_chord_color` / `split_chords_at` / `normalize_chords`) と参照 (`chord_at` / `next_chord_after` / `chord_by_id` / `track_chord_follow` / `chord_follow_can_apply`) | `common/src/model/chord_ops.rs` |
 | 時間操作への同伴 (ripple / `move_section` / copy・delete・insert・paste time、`TimeRangeCopy.chords`) | `common/src/model/section_ops.rs` / `time_ops.rs` |
-| **追従の評価の SSoT**: `follow_pitch` (ノート) / `follow_shift` (オーディオ) / `TrackChordFollow` (読み口) / `chord_scale_mask` / `snap_to_mask` | `common/src/chord_follow.rs` |
+| **追従の評価の SSoT**: `follow_pitch` (ノート) / `follow_shift` (オーディオ) / `live_pitch` (演奏入力) / `TrackChordFollow` (読み口) / `chord_scale_mask` / `snap_to_mask`。自分の和音の素材と検出の使い回し (`OwnScope` / `OwnChordsMemo`) は `chord_follow/own.rs` | `common/src/chord_follow.rs` |
 | コード名: `format_chord` (音名 / 数字 / ローマ数字) / `parse_chord` / `note_name` / `kind_suffix` | `common/src/chord_name.rs` |
 | 検出: `detect_chords` / `extract_chords` (ノート列 → 区間) / `match_chord` (pitch class の強さ → コード。オーディオの chroma もここへ渡す) / 追従の基準の `own_chords` / `own_chord_at` / `own_chord_touching` / `audio_own_chord_at` | `common/src/chord_detect.rs` |
 | voicing と変換: `chord_pitches` / `Voicing` / `Song::chords_to_clip` / `Song::chords_from_clips` | `common/src/chord_voicing.rs` |
@@ -126,7 +136,8 @@
 
 - **engine (`daw_audio`)**: `sequencer.rs` の note-on の鍵盤 (`sounding_key(note.pitch, transpose)`) を
   「追従 → 移調」に。追従の実効モードは `SongIndex` に焼く (RT で Song を線形走査しない、確保しない)。追従する全モードの
-  自分の和音 (MIDI の content ごとの検出結果) も compile 時に off-RT で索引に焼き、クリップの記録 (r.md #159) は
+  自分の和音 (トラックのアレンジ / セルごとの検出結果、鳴らすノートが前と同じなら使い回す `OwnChordsMemo`) も
+  compile 時に off-RT で索引に焼き、クリップの記録 (r.md #159) は
   sequencer が持っている clip から二分探索で引く (`PitchMap::note_key`、箱の系統で)。発音台帳 (`note_ledger`) は
   送った鍵盤を持つ既存の形のまま。ランチャーのセルは playhead の位置のコードで、記録は読まない (`PitchMap::for_cell`)。
 - **オーディオ**: `audio_clip_renderer.rs` の `transposable` / buffer ごとの移調量に、`follow_shift` を足す。自分の和音は
@@ -136,14 +147,16 @@
 - **オフライン**: VOICEVOX (`handler/voicevox.rs` の `sung_pitch` / 口パクの fingerprint — 開いただけで `*` にならない冪等性)、
   SMF 書き出し (`midi_export.rs`)、バウンス (`bounce_ops.rs` の `isolated_track` で追従を切る)。`TrackTranspose::key` に
   相乗りできるならそこへ (読み口を 1 本に保つ)。
-- **GUI**: 演奏プレビュー (`handler/transpose.rs` の `preview_key`: MIDI 入力モニター / 仮想鍵盤 / 鍵盤レーン /
-  MIDI Capture の試聴) = **演奏入力のリアルタイム変換** (Cubase の Live Input)。最寄りのコード音 / スケールで追従する
-  トラックで弾いた音は playhead の位置のコードへ寄り (`live_input_key`)、r.md #159 Q2 で **寄せた音を録る**
-  (`record_midi_note_on_tracks`。録った音は記録を持たないので再生でもそのまま = 聴いた音 = 録れた音 = 再生の音)。
-  平行移動 / ベースは弾いた音のまま (移調だけ)。録音の台帳は弾いた鍵盤で引き、同じ音へ寄る 2 つ目の鍵は同じノートを
-  一緒に押さえる (重なったノートを作らない)。録音中の Snap Live Input もモニターと録音で同じ口を通す。playhead ではない
-  位置へ書く入力 — ステップ入力 (ステップカーソル) と MIDI Capture (置く位置) — は、書く位置のコードへ寄せた音を書く
-  (`live_input_key_at`)。**既にあるノートの試聴** (ナッジ) は
+- **GUI**: 演奏プレビュー (`handler/transpose.rs` の `preview_key`: MIDI 入力モニター / 仮想鍵盤 / 鍵盤レーン)
+  = **演奏入力のリアルタイム変換** (Cubase の Live Input)。最寄りのコード音 / スケールで追従するトラックで弾いた音は、
+  弾いた音が **行く先** のコードへ寄り (`live_input_key` / `live_input_landing`)、r.md #159 Q2 で **寄せた音を書く**
+  (書いた音は記録を持たないので再生でもそのまま = 聴いた音 = 書いた音 = 再生の音)。行く先は、録音中は playhead
+  (`record_midi_note_on_tracks`)、ステップ入力の先のトラックはステップカーソル (窓へ戻した位置、モニターも同じ)、
+  ランチャーのセルへのステップ入力は寄せない (セルは書いた音のまま鳴るので、モニター・書く音・再生とも弾いた音)、
+  書かれない録音待機トラックのモニターは playhead。平行移動 / ベースは弾いた音のまま (移調だけ)。録音の台帳は弾いた
+  鍵盤で引き、同じ音へ寄る 2 つ目の鍵は同じノートを一緒に押さえる (重なったノートを作らない)。録音中の Snap Live
+  Input もモニターと録音で同じ口を通す。MIDI Capture の試聴は置く位置も置くトラックも決まっていないので弾いた音
+  (移調だけ)、置いたときに置く位置のコードへ寄せた音を書く (`live_input_key_at`)。**既にあるノートの試聴** (ナッジ) は
   playhead ではなくノートの位置のコードで鳴らす (`note_preview_key` = ピアノロールの薄い枠と同じ鍵盤 + 移調)。
 - **ヘッダ** (Q6): `view/track_header_menu.rs` に「コードに追従」(メニューは平坦な文字列リストなので、選ぶとモードの
   メニューを開く 2 段、または `コードに追従: <モード>` を 5 行並べる — 既存の `context_menu` の形で実現できる方)。

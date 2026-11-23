@@ -14,7 +14,10 @@ const MIN_CHORD_LEN_BEATS: f64 = 1e-6;
 
 /// 発音の開始位置で箱を引くときの許容幅 (拍)。浮動小数の丸め (1e-13 程度) より十分大きく、箱の最小の長さより
 /// 小さい (最小の箱を飛び越さない)。48 kHz / 120 BPM の 1 sample は約 4e-5 拍なので、聞こえる差にはならない。
-const CHORD_ONSET_EPS_BEATS: f64 = MIN_CHORD_LEN_BEATS / 4.0;
+pub(super) const CHORD_ONSET_EPS_BEATS: f64 = MIN_CHORD_LEN_BEATS / 4.0;
+
+/// 箱の採番がこれを超えたファイルは読み込みで詰め直す ([`Song::compact_chord_ids_if_saturated`])。
+const CHORD_ID_COMPACT_ABOVE: u32 = u32::MAX / 2;
 
 /// 箱の色を値域へ (`0.0..=1.0` の linear RGB)。非有限の成分があれば既定色 (`None`) に倒す。
 fn sanitize_chord_color(color: Option<[f32; 3]>) -> Option<[f32; 3]> {
@@ -97,6 +100,34 @@ impl Song {
             AudioChordSpan::normalize_spans(spans);
             sources.contains_key(id) && !spans.is_empty()
         });
+    }
+
+    /// 読み込みだけで通す: 箱の採番 (`ids.next_chord_id` — 箱の id と系統の最大 + 1 以上) が飽和に近ければ
+    /// (壊れた / 手で直したファイル。普通の編集では 1 ずつしか進まない)、箱の id を並び順に `1..=n` へ、系統を
+    /// その系統を持つ最初の箱の新しい id へ詰め直し、全クリップ (アレンジとセル) の記録を同じ表で付け替える。
+    /// 飽和したままだと採番が毎回同じ値を返し、新しく置く箱が直前の箱を消す / 同じ id の箱が並ぶ / 無関係な箱が
+    /// 壊れた箱の系統を継ぐ (不変条件 1)。上限より下なら何もしない (冪等 — 開いただけで `*` を立てない)。
+    /// [`Self::normalize_chords`] の後、[`Self::normalize_chord_basis`] の前に呼ぶ (後者はどの箱も持たない系統の
+    /// 記録を捨てるので、付け替えより先に走ると記録が消える)。編集ごとの `normalize_chords` には入れない
+    /// (GUI の選択などが箱の id を持っている)。
+    pub(crate) fn compact_chord_ids_if_saturated(&mut self) {
+        if self.ids.next_chord_id <= CHORD_ID_COMPACT_ABOVE {
+            return;
+        }
+        let mut table: HashMap<u32, u32> = HashMap::new();
+        let mut next = 1u32;
+        for c in &mut self.chords {
+            c.id = next;
+            c.lineage = *table.entry(c.lineage).or_insert(next);
+            next = next.saturating_add(1);
+        }
+        self.ids.next_chord_id = next;
+        for track in &mut self.tracks {
+            let clips = track.clips.iter_mut().chain(track.session_clips.iter_mut().map(|c| &mut c.clip));
+            for clip in clips.filter(|c| !c.chord_basis.is_empty()) {
+                clip.chord_basis = clip.chord_basis.relineaged(&table);
+            }
+        }
     }
 
     /// `beat` を覆う箱 (無ければ `None` = その位置ではどのトラックも追従しない)。
@@ -389,8 +420,8 @@ impl Song {
     /// 空けた直後に呼ぶ) なので削らず、id を採番して足す。呼び出し側が `normalize_chords` を通す。
     ///
     /// 系統 (r.md #159) は写しの系統ごとに新しく振り、その表 (写しの系統 → 貼った系統) を返す。同じ箱から割れた
-    /// 片は貼った先でも 1 つの系統のまま。呼び出し側は貼ったクリップの記録を同じ表で付け替える
-    /// (`Song::relineage_clip_basis` — 貼った区間は元と同じ音で鳴り、以後は元の区間と独立する)。
+    /// 片は貼った先でも 1 つの系統のまま。呼び出し側 ([`Song::paste_time_range`]) は貼ったクリップの記録を同じ表で
+    /// 付け替える ([`ClipChordBasis::relineaged`] — 貼った区間は元と同じ音で鳴り、以後は元の区間と独立する)。
     pub(crate) fn push_chords_at(&mut self, at: f64, chords: &[ChordEvent]) -> HashMap<u32, u32> {
         let mut table: HashMap<u32, u32> = HashMap::new();
         for c in chords {

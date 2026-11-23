@@ -366,10 +366,13 @@ impl AppData {
             // v35 (r.md #87): content の張り替えは `all_clips_mut` (= arrangement +
             // launcher のセル) を通す。セルを落とすと、独立複製 (Alt+D) でセルだけが
             // 元トラックと content を共有したまま残り、片方の編集がもう片方へ漏れる。
+            // r.md #159: 置いた時点のコードの記録はクリップ / セルの貼り付けと同じ規則 (`ClipChordBasis::pasted` —
+            // 別の id 空間からは捨てる。セルも捨てる: 読まないが、アレンジへ戻すと効き出す)。
             for c in t.all_clips_mut() {
                 if let Some(&new) = content_remap.get(&c.content_id) {
                     c.content_id = new;
                 }
+                c.chord_basis = std::mem::take(&mut c.chord_basis).pasted(same_project);
             }
             for lane in &mut t.automation_lanes {
                 for ac in lane.all_clips_mut() {
@@ -1415,6 +1418,29 @@ mod launcher_track_paste_tests {
         // 別プロジェクトなのでセルの content も新採番 (元 id を持ち込まない)。
         assert_ne!(cell.clip.content_id, cid);
         assert!(dst.clip_contents.contains_key(&cell.clip.content_id));
+    }
+
+    /// r.md #159: 別の id 空間 (別のプロジェクト / 開き直した後) から貼ったトラックは、アレンジのクリップもセルも
+    /// 置いた時点のコードの記録を捨てる (系統の番号が貼り先の無関係な箱を指す)。同じ id 空間なら運ぶ。
+    #[test]
+    fn pasted_tracks_drop_chord_basis_from_another_id_space() {
+        use common::model::{Chord, ChordKind, ClipChordBasis, NoteChordBasis};
+        let (mut src, tid, cid, scenes) = song_with_cell();
+        let basis = ClipChordBasis {
+            notes: vec![NoteChordBasis { note_id: 1, lineage: 3, chord: Chord::new(0, ChordKind::Major) }],
+            audio: Vec::new(),
+        };
+        let track = src.track_by_id_mut(tid).unwrap();
+        track.clips.push(Clip { id: 2, content_id: cid, length_beats: 4.0, chord_basis: basis.clone(), ..Clip::default() });
+        track.session_clips[0].clip.chord_basis = basis.clone();
+        let copies = copies_of(&src, tid, cid, &scenes);
+        for same in [false, true] {
+            let mut dst = if same { src.clone() } else { Song::default() };
+            let built = AppData::build_pasted_tracks(&mut dst, &copies.tracks, same, false, None, &common::model::MediaRemap::default());
+            let t = &built[0].1;
+            let want = if same { basis.clone() } else { ClipChordBasis::default() };
+            assert_eq!((&t.clips[0].chord_basis, &t.session_clips[0].clip.chord_basis), (&want, &want), "same={same}");
+        }
     }
 
     #[test]

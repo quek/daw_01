@@ -2,8 +2,8 @@
 //! 鳴らした出力が一致する。
 //!
 //! Song を組んで `compile_audio_schedule` → `render_audio_events` (live と書き出しが共有する経路) で
-//! 鳴らし、分割は model の SSoT (`Song::split_content_at_points` = オーディオエディタの `E` / 範囲操作、
-//! `Song::split_clips_at` = クリップの分割) で入れる。 どの mode でも切り口に掛かる写像 (伸縮・warp・
+//! 鳴らし、分割は model の SSoT (`Song::split_content_at_points` = content を直接切る低レベルの口、範囲操作は
+//! `Song::split_clip_content_at`、`Song::split_clips_at` = クリップの分割) で入れる。 どの mode でも切り口に掛かる写像 (伸縮・warp・
 //! slice・テンポ変化・移調・逆再生・fade・フォルマント・グローバルトランスポーズ) を 1 つずつ含める。
 //!
 //! 許容の根拠:

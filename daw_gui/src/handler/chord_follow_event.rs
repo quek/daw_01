@@ -6,8 +6,10 @@
 //! 書き換える。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use common::model::{ChordFollow, Song};
+use common::chord_follow::OwnScope;
+use common::model::{ChordFollow, Song, SourceChord};
 
 use crate::app::ClipKey;
 use crate::event::AppEvent;
@@ -174,12 +176,16 @@ fn set_modes(song: &mut Song, track_ids: &[u32], mode: ChordFollow) -> bool {
 fn freeze_clips(song: &mut Song, targets: &[FreezeTarget], verify: bool) -> (bool, usize) {
     type Plan = ((u32, u32), Changes, Vec<u32>);
     let mut refused = 0usize;
+    // 自分の和音は素材 (トラックのアレンジ) ごとに 1 回だけ検出する (同じトラックのクリップを束ねて確定する)。
+    let mut own: HashMap<OwnScope, Arc<[SourceChord]>> = HashMap::new();
     let plans: Vec<Plan> = targets
         .iter()
         .filter_map(|FreezeTarget { track_id, clip_id, note_ids }| {
             let (track_id, clip_id) = (*track_id, *clip_id);
             let clip = song.track_by_id(track_id)?.clip_by_id(clip_id)?;
-            let keys = ClipSoundingKeys::of(song, track_id, clip);
+            let keys = ClipSoundingKeys::of(song, track_id, clip, &clip.chord_basis.notes, |scope| {
+                Arc::clone(own.entry(scope).or_insert_with(|| common::chord_follow::own_chords_in(song, scope, None).into()))
+            });
             if !keys.is_active() {
                 return None;
             }
@@ -579,7 +585,69 @@ mod tests {
             .collect();
         // F の上の F はコード音 (65)。playhead の Am で寄せると最寄りの E (64) になる。
         assert_eq!(on, vec![65]);
-        assert_eq!(app.preview_key(track_id, 65), Some(64), "演奏入力は playhead の Am へ寄る");
+        app.set_clip_selection(Vec::new());
+        assert_eq!(app.preview_key(track_id, 65), Some(64), "演奏入力 (ステップ入力の先が無い) は playhead の Am へ寄る");
+    }
+
+    /// r.md #159 Q2: ステップ入力では、モニターで聴く音 = 書く音 = 再生の音 (MIDI 入力でも仮想鍵盤でも): モニターも
+    /// playhead ではなく書く位置 (カーソル) のコードへ寄せる。セルへのステップ入力は 3 つとも弾いた音。
+    #[test]
+    fn step_input_monitors_the_note_it_writes() {
+        use crate::event_virtual_keyboard::VirtualKeyboardEvent;
+        let mut app = crate::test_support::headless_app();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.ipc.audio_tx = Some(tx);
+        let (track_id, clips) = linked_triads(&mut app, ChordFollow::Narrow);
+        app.edit_song(|song| song.tracks.iter_mut().for_each(|t| t.armed = t.id == track_id));
+        app.cur.transport.playhead_beat = Some(0.0); // Am の上 (D は E へ寄る)
+        app.set_clip_selection(vec![crate::app::ClipKey { track_id, clip_id: clips[1] }]);
+        let monitored = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<common::protocol::AudioCommand>| -> Vec<u8> {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|c| match c {
+                    common::protocol::AudioCommand::PreviewNoteOn { pitch, .. } => Some(pitch),
+                    _ => None,
+                })
+                .collect()
+        };
+        let written_at = |app: &AppData, clip_id: u32, beat: f64| -> Note {
+            let song = app.cur.song_doc.song();
+            let clip = song.track_by_id(track_id).and_then(|t| t.clip_by_id(clip_id)).expect("clip");
+            song.clip_notes(clip).iter().find(|n| n.start_beat == beat).expect("書いたノート").clone()
+        };
+        // MIDI 入力: カーソル 3.0 (拍 11 = F の箱) で D (62) → C (60)。
+        app.cur.recording.step_cursor_beat = 3.0;
+        monitored(&mut rx);
+        app.handle_event(AppEvent::MidiNoteOn { channel: 0, pitch: 62, velocity: 100 });
+        app.handle_event(AppEvent::MidiNoteOff { channel: 0, pitch: 62 });
+        let note = written_at(&app, clips[1], 3.0);
+        assert_eq!((monitored(&mut rx), note.pitch), (vec![60], 60), "MIDI 入力: モニター = 書いた音");
+        assert_eq!(app.clip_sounding_keys(track_id, clips[1]).expect("keys").key(&note), Some(60), "再生も同じ");
+        // 仮想鍵盤 (カーソルトラック宛): カーソル 2.0 (拍 10 = F の箱) で B (71) → C (72)。
+        app.cur.recording.step_cursor_beat = 2.0;
+        app.handle_event(AppEvent::VirtualKeyboard(VirtualKeyboardEvent::MousePitch(Some(71))));
+        app.handle_event(AppEvent::VirtualKeyboard(VirtualKeyboardEvent::MousePitch(None)));
+        assert_eq!((monitored(&mut rx), written_at(&app, clips[1], 2.0).pitch), (vec![72], 72), "仮想鍵盤も同じ");
+
+        // セル: 曲の位置を持たないので、モニターも書く音も弾いた音 (再生も書いた音)。
+        let cell_id = 903;
+        app.edit_song(|song| {
+            let scene_id = song.push_scene();
+            let content_id = song.alloc_content_id();
+            song.clip_contents.insert(content_id, ClipContent::Midi(MidiContent { notes: Vec::new(), next_note_id: 1 }));
+            let track = song.track_by_id_mut(track_id).expect("track");
+            track.session_clips.push(common::model::SessionClip {
+                scene_id,
+                clip: Clip { id: cell_id, length_beats: 4.0, content_id, ..Clip::default() },
+                launch: common::model::LaunchSettings::default(),
+            });
+        });
+        let cell = crate::app::ClipKey { track_id, clip_id: cell_id };
+        app.set_launcher_cell_selection(&[crate::event_launcher::LauncherCellKey::Track(cell)]);
+        assert_eq!(app.selected_clip_ref(), Some(cell));
+        app.cur.recording.step_cursor_beat = 1.0;
+        app.handle_event(AppEvent::MidiNoteOn { channel: 0, pitch: 62, velocity: 100 });
+        app.handle_event(AppEvent::MidiNoteOff { channel: 0, pitch: 62 });
+        assert_eq!((monitored(&mut rx), written_at(&app, cell_id, 1.0).pitch), (vec![62], 62), "セルは弾いた音");
     }
 
     /// グループに追従を設定すると、グループ自身ではなく子孫のトラックに入る (グループはクリップを鳴らさないので

@@ -5,7 +5,8 @@
 //!
 //! 分割の実体は 2 本だけ:
 //! - 窓 (クリップ) の分割 = [`common::model::carve_range`] (非重なり規則と同じ 1 本)
-//! - content の分割 = [`common::model::Song::split_content_at_points`] (共有されている MIDI は CoW)
+//! - content の分割 = [`common::model::Song::split_clip_content_at`] (共有されている MIDI は CoW、割ったノートの
+//!   片へ置いた時点のコードの記録を写す)
 
 use crate::event::AppEvent;
 use crate::event_range::{RangeEvent, RangeMoveMode, RowDest};
@@ -62,8 +63,9 @@ fn group_lanes(sel: &TimeSelection) -> LaneGroups {
 ///
 /// 範囲は song 絶対拍で渡し、clip の窓 (`song_to_content_beat`) で content-local へ
 /// 換算する。切ると鳴り方が変わる MIDI の content が共有されていれば
-/// [`Song::split_content_at_points`] が CoW で fork するので、linked clip は切り口の影響を受けない
-/// (audio の切り口は切れ目を入れるだけなので共有のまま)。クリップの `content_id` も貼り替える。
+/// [`Song::split_clip_content_at`] が CoW で fork するので、linked clip は切り口の影響を受けない
+/// (audio の切り口は切れ目を入れるだけなので共有のまま)。同じ口がクリップの `content_id` を貼り替え、割ったノートの
+/// 片へ置いた時点のコードの記録を写す。
 /// 返り値は `(content_id, content-local の範囲)`。
 fn cut_content_at_range(
     song: &mut common::model::Song,
@@ -774,7 +776,7 @@ impl AppData {
         // 媒体の写しは別プロジェクトのフォルダで解けるよう絶対パスに。
         copy.media.absolutize(self.project_dir().as_deref());
         let json = crate::clipboard::ClipboardEnvelope::new(
-            song.project_id,
+            self.clipboard_source(),
             crate::clipboard::ClipboardPayload::Time(copy.clone()),
         )
         .to_json()?;

@@ -96,7 +96,7 @@ impl Harmony {
             .iter()
             .map(|k| {
                 let clip = song.track_by_id(k.track_id)?.clip_by_id(k.clip_id)?;
-                Some((ClipSoundingKeys::of(song, k.track_id, clip), song.clip_notes(clip)))
+                Some((app.clip_sounding_keys(k.track_id, k.clip_id)?, song.clip_notes(clip)))
             })
             .collect();
         let view_end = view.start_beat + view.len_beats;

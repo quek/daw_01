@@ -435,8 +435,9 @@ impl Song {
 
     /// 全トラック clip / track automation clip /
     /// `song_lanes` clip のうち `beat` を**厳密にまたぐ** (`start < beat < start+len`) ものを
-    /// 2 つに分割する。 **content は一切触らず、窓 (`start_beat` / `length_beats` /
-    /// `content_offset_beats`) を 2 つに割るだけ** — 左断片は長さを `beat` まで詰め、
+    /// 2 つに分割する。 跨ぐ note / event は [`Self::split_clip_content_at`] で content 側を切り
+    /// (共有されている MIDI は CoW、割ったノートの片へ置いた時点のコードの記録を写す)、その上で窓
+    /// (`start_beat` / `length_beats` / `content_offset_beats`) を 2 つに割る — 左断片は長さを `beat` まで詰め、
     /// 右断片は `content_offset_beats` を `cut = beat - start` ぶん進める。 両断片は同じ
     /// `content_id` を共有した 2 つの窓になるので、 linked clip の関係も、 窓の外に隠れて
     /// いた素材も壊れない (窓モデル、 `docs/plan_clip_content_window.md`)。 セクション移動の

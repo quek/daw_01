@@ -38,6 +38,8 @@ struct Follow<'a> {
     chords: TrackChordFollow<'a>,
     song: &'a Song,
     index: &'a SongIndex,
+    /// 自分の和音を引くトラックの位置 (`SongIndex::own_chords` / `cell_own_chords`)。
+    track_idx: usize,
     /// コードを引く曲の拍 = 素材の拍 + これ。アレンジは 0、ランチャーのセルは「曲の playhead − セルの実効拍」
     /// (セルの追従は再生時の曲の playhead の位置のコードで決める。`collect_row_midi` が区間ごとに足す)。
     song_beat_offset: f64,
@@ -57,7 +59,8 @@ impl<'a> PitchMap<'a> {
     #[must_use]
     pub fn for_track(song: &'a Song, index: &'a SongIndex, track_idx: usize, transpose: i32) -> Self {
         let chords = TrackChordFollow::with_mode(song, index.chord_follow(track_idx));
-        let follow = chords.is_active().then_some(Follow { chords, song, index, song_beat_offset: 0.0, cell: false });
+        let follow =
+            chords.is_active().then_some(Follow { chords, song, index, track_idx, song_beat_offset: 0.0, cell: false });
         Self { transpose, follow }
     }
 
@@ -72,16 +75,20 @@ impl<'a> PitchMap<'a> {
         self
     }
 
-    /// クリップ `clip` のノート `note` (content-local 拍) が鳴らす鍵盤。`song_beat` はノートの開始の (行の) 拍。
-    /// コードはノートの **開始位置** で決まる。範囲外は `None`。
+    /// クリップ `clip` のノート `note` (content-local 拍) が鳴らす鍵盤。`song_beat` はノートの開始の (行の) 拍
+    /// (`clip.content_to_song_beat(note.start_beat)`)。コードはノートの **開始位置** で決まる。範囲外は `None`。
+    /// 自分の和音はアレンジならトラックのアレンジ、セルならそのセルの検出結果 (索引に焼いたもの)。
     #[must_use]
     pub fn note_key(&self, clip: &Clip, note: &Note, song_beat: f64) -> Option<u8> {
         let followed = match self.follow {
             None => Some(note.pitch),
             Some(f) => {
-                let basis = if f.cell { &[][..] } else { &clip.chord_basis.notes };
-                let src = NoteSource::of(f.index.own_chords(clip.content_id), basis, note);
-                f.chords.key(note.pitch, song_beat + f.song_beat_offset, &src)
+                let (own, basis) = if f.cell {
+                    (f.index.cell_own_chords(f.track_idx, clip.id), &[][..])
+                } else {
+                    (f.index.own_chords(f.track_idx), clip.chord_basis.notes.as_slice())
+                };
+                f.chords.key(note.pitch, song_beat + f.song_beat_offset, &NoteSource::of(own, basis, clip, note))
             }
         };
         followed.and_then(|k| common::transpose::sounding_key(k, self.transpose))

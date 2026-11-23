@@ -62,6 +62,7 @@ pub use content_split::split_boundaries;
 pub use event_window::{TimedEvent, event_piece, join_pieces, split_pieces};
 pub use device::*;
 pub use ids::*;
+pub use load_normalize::fresh_nonzero_id;
 pub use midi_bind::*;
 pub use modulation::*;
 pub use native::*;
@@ -647,7 +648,7 @@ pub struct Song {
     #[serde(default)]
     pub midi_bindings: Vec<MidiBinding>,
     /// Phase 7 B5 (`docs/plan_scale.html`): タイムライン上の root + scale 変化点。
-    /// `beat` 昇順で保持 (= `scale_at(beat)` が rev-find で動く invariant)。
+    /// `beat` 昇順で保持 (= `scale_at(beat)` の二分探索の前提)。
     /// 空 Vec なら Scale 機能 OFF (chromatic 互換、 既存 project と完全互換)。
     /// 単一キーの楽曲なら `beat = 0` の event 1 件、 転調は 2 件目以降を追加。
     /// v10 file は `#[serde(default)]` で空 Vec で forward-migrate。
@@ -963,20 +964,23 @@ impl Song {
     /// Phase 7 B5 (`docs/plan_scale.html`): 指定 beat における active な
     /// `ScaleChange` を返す。 該当 event が無ければ `None` (= Scale 機能 OFF /
     /// chromatic 扱い)。 `scale_changes` は beat 昇順 invariant 前提で、
-    /// `rev().find()` で「該当 beat 直前の最新 event」 を取る。
+    /// 二分探索で「該当 beat 直前の最新 event」 を取る (RT のコード追従がノートの頭ごとに引く)。
+    #[must_use]
     pub fn scale_at(&self, beat: f64) -> Option<&ScaleChange> {
-        self.scale_changes
-            .iter()
-            .rev()
-            .find(|c| c.beat <= beat)
+        self.scale_changes.get(self.scale_index_at(beat)?)
     }
 
-    /// Phase 7 B5: `scale_changes` を beat 昇順に保つ。 同 beat の
-    /// duplicate は許容 (上書きするかは caller 判断)。 scale_changes を
+    /// [`Self::scale_at`] の位置 (同じ beat に重複があれば最後の 1 つ)。RT 安全 (二分探索)。
+    #[must_use]
+    pub fn scale_index_at(&self, beat: f64) -> Option<usize> {
+        self.scale_changes.partition_point(|c| c.beat <= beat).checked_sub(1)
+    }
+
+    /// Phase 7 B5: `scale_changes` を beat 昇順に保つ (二分探索の前提。`total_cmp` なので NaN が混じっても
+    /// 順序が崩れない)。 同 beat の duplicate は許容 (上書きするかは caller 判断)。 scale_changes を
     /// 変更したあと (event 追加 / move) に呼ぶ。
     pub fn ensure_scale_changes_sorted(&mut self) {
-        self.scale_changes
-            .sort_by(|a, b| a.beat.partial_cmp(&b.beat).unwrap_or(std::cmp::Ordering::Equal));
+        self.scale_changes.sort_by(|a, b| a.beat.total_cmp(&b.beat));
     }
 
     /// Re-establish the time-ascending sort invariant on every automation

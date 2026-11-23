@@ -1514,6 +1514,11 @@ mod tests {
             ..Track::default()
         });
         song.place_chord(ChordEvent::new(0.0, 4.0, Chord::new(9, ChordKind::Minor)));
+        song.place_chord(ChordEvent::new(4.0, 4.0, Chord::new(2, ChordKind::Minor)));
+        // v47 は系統を持たない (書かない)。
+        for c in &mut song.chords {
+            c.lineage = 0;
+        }
         song.media.audio_sources.insert(7, crate::model::AudioSource {
             path: crate::model::AudioSourcePath::Absolute("x.wav".into()),
             sample_rate: 48_000,
@@ -1525,17 +1530,58 @@ mod tests {
         song.audio_chords
             .insert(7, vec![AudioChordSpan { start_frame: 0, end_frame: 100, chord: Chord::new(0, ChordKind::Major), chordal: false }]);
         write_project_with_version(&path, &song, 47);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("\"lineage\""), "v47 のファイルは系統の鍵を持たない");
         let loaded = load_project(&path).unwrap();
         assert!(!loaded.overlaps_resolved, "開いただけで `*` にしない");
         let opened = loaded.song;
         assert!(opened.audio_chords.is_empty(), "旧い検出結果は測り直す");
         assert!(opened.tracks[0].clips[0].chord_basis.is_empty(), "記録なし = 置いたまま");
-        assert_eq!(opened.chords.len(), 1);
+        assert_eq!(opened.chords.len(), 2);
+        assert!(opened.chords.iter().all(|c| c.id != 0 && c.lineage == c.id), "旧い箱は自分の id が系統になる");
         save(&path, &opened).unwrap();
         let again = load_project(&path).unwrap();
         assert!(!again.overlaps_resolved);
         // (使っていない音源は保存の GC で消えるので、比べるのはトラックとコード。)
         assert_eq!((&again.song.tracks, &again.song.chords), (&opened.tracks, &opened.chords), "開き直しても同じ");
+    }
+
+    /// r.md #159: 箱の採番が飽和に近いファイル (箱の系統 / id / `next_chord_id` のどれかが u32::MAX 付近) は、読み込みで
+    /// 詰め直す — 新しく置く箱がどれも別の id になり、記録は詰め直した系統へ付け替わり、もう一度通しても変わらない。
+    #[test]
+    fn saturated_chord_ids_are_compacted_on_load() {
+        use crate::model::{Chord, ChordEvent, ChordKind, NoteChordBasis};
+        let c = Chord::new(0, ChordKind::Major);
+        for case in ["lineage", "id", "next"] {
+            let mut song = Song::default();
+            let cid = song.alloc_content_id();
+            let note = Note { id: 1, start_beat: 0.0, duration_beats: 1.0, pitch: 64, velocity: 100, lyric: None, muted: false };
+            song.clip_contents.insert(cid, ClipContent::Midi(MidiContent { notes: vec![note], next_note_id: 2 }));
+            song.tracks.push(Track {
+                id: 1,
+                clips: vec![Clip { id: 1, start_beat: 0.0, length_beats: 8.0, content_id: cid, ..Clip::default() }],
+                ..Track::default()
+            });
+            song.place_chord(ChordEvent::new(0.0, 4.0, c));
+            song.place_chord(ChordEvent::new(4.0, 4.0, Chord::new(2, ChordKind::Minor)));
+            match case {
+                "lineage" => song.chords[0].lineage = u32::MAX,
+                "id" => song.chords[0].id = u32::MAX,
+                _ => song.ids.next_chord_id = u32::MAX,
+            }
+            let lineage = song.chords[0].lineage;
+            song.tracks[0].clips[0].chord_basis.notes = vec![NoteChordBasis { note_id: 1, lineage, chord: c }];
+            song.normalize_after_load();
+            assert!(song.ids.next_chord_id < 100, "{case}: 採番が詰め直される");
+            assert_eq!(song.tracks[0].clips[0].chord_basis.notes[0].lineage, song.chords[0].lineage, "{case}: 記録も付け替える");
+            let once = (song.chords.clone(), song.tracks.clone(), song.ids.next_chord_id);
+            song.normalize_after_load();
+            assert_eq!((song.chords.clone(), song.tracks.clone(), song.ids.next_chord_id), once, "{case}: 冪等");
+            song.place_chord(ChordEvent::new(8.0, 4.0, c));
+            song.place_chord(ChordEvent::new(12.0, 4.0, c));
+            let ids: std::collections::HashSet<u32> = song.chords.iter().map(|c| c.id).collect();
+            assert_eq!((song.chords.len(), ids.len()), (4, 4), "{case}: 新しく置いた箱がどれも残り、id が重ならない");
+            assert!(song.chords[2..].iter().all(|n| n.lineage != song.chords[0].lineage), "{case}: 新しい箱は壊れた箱の系統を継がない");
+        }
     }
 
     /// Text clip 1 つを持つ非 vocal トラック 1 本だけの song (字幕デバイス無し)。

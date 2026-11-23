@@ -4,10 +4,11 @@
 //! engine が publish した変調の値面 / plugin DB) につなぐだけ:
 //!
 //! - 基準値の編集 ([`AppData::set_song_transpose`]) と トラックの追従の切替 ([`AppData::set_tracks_follow_transpose`])
-//! - 演奏プレビュー (MIDI 入力モニター / 仮想鍵盤 / 鍵盤レーン / MIDI Capture の試聴) が鳴らす鍵盤
-//!   ([`AppData::preview_key`]、playhead のコードへ寄せる) と、既にあるノートの試聴 (ナッジ) が鳴らす鍵盤
-//!   ([`AppData::note_preview_key`]、ノートの位置のコード)。**台帳には送った鍵盤を持つ** — 生の pitch を持って
-//!   消音時に移調し直すと、押している間に移調が変わったとき別の鍵盤を止めにいく。
+//! - 演奏プレビュー (MIDI 入力モニター / 仮想鍵盤 / 鍵盤レーン) が鳴らす鍵盤 ([`AppData::preview_key`]。弾いた音が
+//!   行く先のコードへ寄せる — 録音とモニターだけなら playhead、ステップ入力の先ならカーソル、セルなら寄せない:
+//!   [`AppData::live_input_landing`])、MIDI Capture の試聴 (置く位置が決まっていないので移調だけ)、既にあるノートの
+//!   試聴 (ナッジ) が鳴らす鍵盤 ([`AppData::note_preview_key`]、ノートの位置のコード)。**台帳には送った鍵盤を持つ**
+//!   — 生の pitch を持って消音時に移調し直すと、押している間に移調が変わったとき別の鍵盤を止めにいく。
 //! - ヘッダの「追従しない」印 ([`AppData::track_shows_no_transpose_mark`])
 
 use common::model::Track;
@@ -15,6 +16,17 @@ use common::protocol::AudioCommand;
 
 use crate::app_types::{PREVIEW_VELOCITY, PreviewAction, diff_preview};
 use crate::state::{AppData, HeldPreview, StreamGesture};
+
+/// 演奏入力 1 つを寄せるコードの位置 ([`AppData::live_input_landing`])。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum InputLanding {
+    /// playhead の位置のコード (録音 / モニター)。
+    Playhead,
+    /// 曲の拍のコード (ステップ入力の書く位置)。
+    At(f64),
+    /// コードへ寄せない (ランチャーのセルへのステップ入力)。
+    Unsnapped,
+}
 
 impl AppData {
     /// 移調の基準値 (`Song::transpose`) を `semitones` にする (±24 に丸める)。transport の欄のドラッグ / 入力と
@@ -52,32 +64,64 @@ impl AppData {
     /// `common::transpose::transpose_in_clip` を通る。追従しないトラックは弾いた鍵盤のまま、範囲外は `None`。
     ///
     /// r.md #157 / #159 Q2 (演奏入力のリアルタイム変換、Cubase の Live Input): 最寄りのコード音 / スケールで追従する
-    /// トラックで弾いた音は、移調の前に playhead の位置のコードへ寄せる ([`Self::live_input_key`])。録音されるのも
-    /// 寄せた音 (`record_midi_note_on_tracks`) なので、聴いた音 = 録れた音 = 再生の音。平行移動 / ベースは弾いた音の
-    /// まま (弾いた音は今のコードに対して書いた音 = 動かない)。移調は #130 Q2 と同じ移調楽器の扱い (録るのは移調の前)。
+    /// トラックで弾いた音は、移調の前に弾いた音が行く先のコードへ寄せる ([`Self::live_input_key`])。書かれるのも
+    /// 寄せた音 (録音 `record_midi_note_on_tracks` / ステップ入力 `step_input_note_on`) なので、聴いた音 = 書いた音 =
+    /// 再生の音。平行移動 / ベースは弾いた音のまま (弾いた音は今のコードに対して書いた音 = 動かない)。移調は #130 Q2 と
+    /// 同じ移調楽器の扱い (書くのは移調の前)。
     pub(crate) fn preview_key(&self, track_id: u32, pitch: u8) -> Option<u8> {
         self.transposed_preview_key(track_id, self.live_input_key(track_id, pitch))
     }
 
-    /// トラック `track_id` で弾いた音 `pitch` を、playhead の位置で寄せた鍵盤 (書いた音の空間、移調の前)。
-    /// 演奏のモニター ([`Self::preview_key`]) と録音 (書くノートの音程) が同じこれを通す (聴いた音 = 録れた音)。
+    /// トラック `track_id` で弾いた音 `pitch` を、行く先 ([`Self::live_input_landing`]) で寄せた鍵盤 (書いた音の空間、
+    /// 移調の前)。演奏のモニター ([`Self::preview_key`]) と書く音 (録音 / ステップ入力) が同じこれを通す。
     ///
     /// - 録音中で Snap Live Input が入っていれば、まずキーのスケールへ寄せる (`docs/plan_scale.html` §5.2。録音して
     ///   いないときは音を聴いて探すので寄せない)。
     /// - 追従するトラックは、さらにコードへ寄せる ([`Self::live_input_key_at`])。
     pub(crate) fn live_input_key(&self, track_id: u32, pitch: u8) -> u8 {
-        let beat = self.preview_beat();
-        let pitch = if self.cur.recording.live && self.cur.recording.snap_live_input {
-            self.cur.song_doc.song().scale_at(beat).map_or(pitch, |sc| sc.snap(pitch))
-        } else {
-            pitch
+        match self.live_input_landing(track_id) {
+            InputLanding::Playhead => {
+                let beat = self.preview_beat();
+                let pitch = if self.cur.recording.live && self.cur.recording.snap_live_input {
+                    self.cur.song_doc.song().scale_at(beat).map_or(pitch, |sc| sc.snap(pitch))
+                } else {
+                    pitch
+                };
+                self.live_input_key_at(track_id, pitch, beat)
+            }
+            InputLanding::At(beat) => self.live_input_key_at(track_id, pitch, beat),
+            InputLanding::Unsnapped => pitch,
+        }
+    }
+
+    /// トラック `track_id` で弾いた音が **行く先** (どのコードへ寄せるか)。
+    ///
+    /// - 録音中 / 録音を待っている間: playhead (録る位置。待っている間はモニターだけ)。
+    /// - 録音を要求していない間に、ステップ入力の先のトラック ([`Self::step_input_cursor`]): アレンジのクリップなら
+    ///   書く位置 (窓へ戻したカーソル) のコード、ランチャーのセルなら寄せない (曲の位置を持たないので、書いた音のまま
+    ///   鳴る — モニターも書く音も弾いた音)。
+    /// - それ以外 (書かれない録音待機トラックのモニター): playhead。
+    pub(crate) fn live_input_landing(&self, track_id: u32) -> InputLanding {
+        let rec = &self.cur.recording;
+        if rec.live || rec.requested {
+            return InputLanding::Playhead;
+        }
+        let Some((key, cursor)) = self.step_input_cursor().filter(|(k, _)| k.track_id == track_id) else {
+            return InputLanding::Playhead;
         };
-        self.live_input_key_at(track_id, pitch, beat)
+        let song = self.cur.song_doc.song();
+        match song.clip_by_key(key) {
+            Some(clip) if song.track_by_id(track_id).is_some_and(|t| t.clip_index_by_id(key.clip_id).is_some()) => {
+                InputLanding::At(clip.content_to_song_beat(cursor))
+            }
+            _ => InputLanding::Unsnapped,
+        }
     }
 
     /// [`Self::live_input_key`] の、寄せるコードを曲の拍 `song_beat` で引く版。弾いた音を playhead ではない位置へ
     /// 書く入力 (ステップ入力 = ステップカーソル、MIDI Capture = 置く位置) は、書く位置のコードへ寄せる (再生で
-    /// その位置の書いた音のまま鳴るので、寄せずに書くと #157 で再生が寄せていた音と変わる)。
+    /// その位置の書いた音のまま鳴るので、寄せずに書くと #157 で再生が寄せていた音と変わる)。MIDI Capture の試聴は
+    /// 置く位置が決まっていないので寄せず (移調だけ)、置いたときに置く位置のコードへ寄る。
     pub(crate) fn live_input_key_at(&self, track_id: u32, pitch: u8, song_beat: f64) -> u8 {
         let song = self.cur.song_doc.song();
         common::chord_follow::TrackChordFollow::of(song, track_id).live_key(pitch, song_beat)

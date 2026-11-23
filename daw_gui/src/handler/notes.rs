@@ -104,7 +104,7 @@ impl AppData {
         }
         let count = copied.len();
         let json = crate::clipboard::ClipboardEnvelope::new(
-            self.cur.song_doc.song().project_id,
+            self.clipboard_source(),
             crate::clipboard::ClipboardPayload::Notes(copied),
         )
         .to_json()?;
@@ -268,12 +268,7 @@ impl AppData {
         // `scale_at` の semantics に合わせて「playhead 以下の最新 event」
         // を update。 playhead 未満の event が無ければ最初の event を update
         // (Cubase Transport の Chord Track edit と同じ idiom)。
-        let target_idx = self
-            .cur.song_doc.song()
-            .scale_changes
-            .iter()
-            .rposition(|c| c.beat <= playhead)
-            .unwrap_or(0);
+        let target_idx = self.cur.song_doc.song().scale_index_at(playhead).unwrap_or(0);
         self.edit_song(|song| {
             if let Some(ev) = song.scale_changes.get_mut(target_idx) {
                 ev.root = root;

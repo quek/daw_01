@@ -104,6 +104,17 @@ fn text_row(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, (id, rev, typed
     let resp = ui.text_input_at_focused(input_id, input, text, &ui.text_input_style(), |new| {
         Edit::mutate(move |app: &mut AppData| app.chord_popup_typed(new))
     });
+    // 開いている間は欄が keyboard を持つ。ポップアップの地 (ボタンでも欄でもない所) を押すと欄は自分で focus を外すが、
+    // 外したままだと ↑↓ が「候補の巡回」から global の「選んだ箱の移調」(書き換え = 記録を書く。置いている最中の箱の
+    // 下のメロディーが動く) へ落ち、←→ / Tab も効かなくなる。中のボタンは focus を使わないので戻してよい。毎フレーム
+    // 宣言する (宣言の無い release フレームは、誰も focus を取らない click として focus を外す)。外を押したフレームは
+    // 宣言しない (ポップアップは閉じ、押した先の欄が focus を取る)。
+    let ptr = ui.pointer();
+    let pressed_outside = (ptr.primary_just_pressed || ptr.secondary_just_pressed)
+        && !ptr.pos.is_some_and(|(x, y)| rect.contains(x, y));
+    if !pressed_outside {
+        ui.set_focus(wid);
+    }
     if resp.committed {
         ui.push_edit(Edit::mutate(|app: &mut AppData| app.chord_popup_enter()));
     }
