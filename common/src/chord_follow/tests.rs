@@ -277,6 +277,56 @@ fn audio_follows_only_rewrites_unless_it_plays_a_chord() {
     assert_eq!(shifts(&song, 0), vec![5, 2]);
 }
 
+/// 焼き込み (バウンス) は、素材が動いていた元のコードを焼いた音源へ写す: 書き換えで動いたメロディーも、帯のコードへ
+/// 合わせて動いていた和音のパートも、焼いた音が同じ量だけ動く。動いていなかった素材は写さない。
+#[test]
+fn baking_copies_how_the_material_moved() {
+    use crate::audio_render::TempoMap;
+    use crate::model::{AudioEvent, AudioSource, AudioSourcePath, ClipKey};
+    let mut song = piano_and_melody(ChordFollow::Parallel, ChordFollow::Parallel);
+    song.place_chord(boxed(0.0, 4.0, "C"));
+    let id = song.chords[0].id;
+    assert!(song.set_chord(&[id], chord("D")));
+    song.place_chord(boxed(4.0, 4.0, "Am"));
+    if let Some(ClipContent::Midi(m)) = song.clip_contents.get_mut(&song.tracks[0].clips[0].content_id) {
+        m.notes.extend([note(4, 4.0, 4.0, 60), note(5, 4.0, 4.0, 64), note(6, 4.0, 4.0, 67)]);
+    }
+    // 焼いた音源 (8 拍、120 BPM / 48 kHz の Raw)。
+    song.media.audio_sources.insert(9, AudioSource {
+        path: AudioSourcePath::Absolute("baked.wav".into()),
+        sample_rate: 48_000,
+        channels: 2,
+        frames: 192_000,
+        original_bpm: None,
+        root_key: None,
+    });
+    let event = AudioEvent {
+        id: 1,
+        source_id: 9,
+        event_length_beats: 8.0,
+        source_end_frames: 192_000,
+        stretch_mode: crate::model::StretchMode::Raw,
+        ..AudioEvent::default()
+    };
+    let baked = Clip { id: 50, start_beat: 0.0, length_beats: 8.0, ..Clip::default() };
+    let shifts = |track: u32| -> Vec<i32> {
+        let key = ClipKey { track_id: track, clip_id: 100 + track };
+        let clip = Clip { chord_basis: song.baked_chord_basis(&[key], &baked, &event), ..baked.clone() };
+        let bases = song.audio_event_bases(&TempoMap::from_song(&song), &clip, &event);
+        let f = TrackChordFollow::of(&song, track);
+        [1.0, 5.0]
+            .map(|at: f64| {
+                let basis = bases.iter().find(|b| b.start_beat <= at && at < b.end_beat).map_or(Basis::NONE, |b| b.basis());
+                f.shift(at, basis)
+            })
+            .to_vec()
+    };
+    // メロディー: 前半は書き換え C → D (+2)、後半は置いただけ (0)。
+    assert_eq!(shifts(MELODY), vec![2, 0]);
+    // ピアノ: 前半は書き換え C → D (+2)、後半の C の和音は Am へ合わせて動いていた (-3)。
+    assert_eq!(shifts(PIANO), vec![2, -3]);
+}
+
 /// 呼び名だけを変えた書き換え (C6 → Am7、構成音が同じ) ではメロディーは動かない。どのコードでも、書かれたときの
 /// コードと同じコードの下では書いた音のまま。
 #[test]

@@ -141,6 +141,16 @@ fn resolve<'a>(basis: Basis<'a>, target: &Chord) -> Resolved<'a> {
     }
 }
 
+/// `basis` を今のコード `target` に対して決めた、実際に動かす元のコード (動かさないなら `None`)。焼き込み (バウンス) が
+/// 焼いた音源へ写す基準 (`Song::baked_chord_basis`) — 写した記録から動かすと、元の素材と同じ量だけ動く。
+#[must_use]
+pub fn effective_basis<'a>(basis: Basis<'a>, target: &Chord) -> Option<&'a Chord> {
+    match resolve(basis, target) {
+        Resolved::Unchanged => None,
+        Resolved::Own(chord) | Resolved::Placed(chord) => Some(chord),
+    }
+}
+
 /// オーディオクリップ (と、ノートの平行移動 / ベース) の移動量 (半音)。
 ///
 /// `target` = その位置のコードトラックのコード、`basis` = 素材の基準。オーディオは全体を動かすだけなので、
@@ -323,7 +333,15 @@ impl<'a> TrackChordFollow<'a> {
         if self.mode.is_off() {
             return Some(pitch);
         }
-        let Some(onset_box) = self.song.chord_at_onset(song_beat) else { return Some(pitch) };
+        let Some((ev, basis)) = self.note_basis(song_beat, src) else { return Some(pitch) };
+        // 境界の直前で次の箱を引いたら、Key もその箱の頭で引く (同じ拍にある Key 変更の前の Key と組ませない)。
+        follow_pitch(self.mode, pitch, &ev.chord, basis, self.song.scale_at(song_beat.max(ev.start_beat)))
+    }
+
+    /// 曲の拍 `song_beat` で始まるノートが従う箱と基準 ([`Self::key`] の前半)。箱が無ければ `None`。
+    #[must_use]
+    pub fn note_basis<'s>(&self, song_beat: f64, src: &NoteSource<'s>) -> Option<(&'a ChordEvent, Basis<'s>)> {
+        let onset_box = self.song.chord_at_onset(song_beat)?;
         // content-local 拍 + `to_song` = 曲の拍 (このノートの置かれた位置での換算)。
         let to_song = song_beat - src.start_beat;
         let (own, ev) = match crate::chord_detect::own_chord_at(src.own, src.start_beat) {
@@ -336,9 +354,7 @@ impl<'a> TrackChordFollow<'a> {
                 (crate::chord_detect::longest_own_in(src.own, a, b).map(|s| &s.chord), onset_box)
             }
         };
-        let basis = Basis { own, placed: note_basis_at(src.basis, src.note_id) };
-        // 境界の直前で次の箱を引いたら、Key もその箱の頭で引く (同じ拍にある Key 変更の前の Key と組ませない)。
-        follow_pitch(self.mode, pitch, &ev.chord, basis, self.song.scale_at(song_beat.max(ev.start_beat)))
+        Some((ev, Basis { own, placed: note_basis_at(src.basis, src.note_id) }))
     }
 
     /// 自分の和音の区間 `[a, b)` (曲の拍) が従う箱: 頭の箱 `onset_box`。ただし区間が次の箱の頭の直前

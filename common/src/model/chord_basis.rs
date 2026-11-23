@@ -306,6 +306,75 @@ impl Song {
             .collect()
     }
 
+    /// 焼き込み (バウンス / オーディオの Glue) の写し: クリップ `keys` の素材が箱ごとに動いていた元のコード
+    /// (`chord_follow::effective_basis` — 書かれたときのコード、和音のパートは自分の和音。動いていなかった箱は写さない)
+    /// を、焼いた音源のクリップ `baked` の event `event` の音源フレームへ写した記録。焼いた音は書いた音なので、写した記録
+    /// から動かすと元の素材と同じ量だけ動く (焼く前と後で鳴りが変わらない)。箱の下で鳴っていた基準が複数あれば、
+    /// 鳴る長さがいちばん長いもの。追従しないトラックの素材は写さない (記録を書かないのと同じ)。元を置き換える前に呼ぶ。
+    #[must_use]
+    pub fn baked_chord_basis(&self, keys: &[ClipKey], baked: &Clip, event: &AudioEvent) -> ClipChordBasis {
+        let mut out = ClipChordBasis::default();
+        let sources: Vec<(u32, &Clip)> = keys
+            .iter()
+            .filter(|k| !self.track_chord_follow(k.track_id).is_off())
+            .filter_map(|k| Some((k.track_id, self.clip_by_key(*k)?)))
+            .collect();
+        if sources.is_empty() {
+            return out;
+        }
+        let tempo = TempoMap::from_song(self);
+        let (w0, w1) = baked.song_window();
+        let first = self.chords.partition_point(|c| c.end_beat() <= w0);
+        for c in self.chords[first..].iter().take_while(|c| c.start_beat < w1) {
+            let mut weights: Vec<(Chord, f64)> = Vec::new();
+            for (track_id, src) in &sources {
+                self.add_moved_basis(&tempo, *track_id, src, c, &mut weights);
+            }
+            let Some(chord) = weights.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|(chord, _)| chord) else {
+                continue;
+            };
+            for (f0, f1) in self.event_frames(&tempo, baked, event, c.start_beat, c.end_beat()) {
+                out.audio.push(AudioChordBasis { take: event.take_key(), start_frame: f0, end_frame: f1, chord });
+            }
+        }
+        out.normalized()
+    }
+
+    /// クリップ `clip` の素材が箱 `c` の下で動いていた元のコードを、鳴る長さ (MIDI はノートの長さ、オーディオは音源
+    /// フレーム) で `weights` に足す。動いていない素材は足さない。
+    fn add_moved_basis(&self, tempo: &TempoMap<'_>, track_id: u32, clip: &Clip, c: &ChordEvent, weights: &mut Vec<(Chord, f64)>) {
+        let mut add = |chord: Chord, w: f64| match weights.iter_mut().find(|(k, _)| *k == chord) {
+            Some((_, sum)) => *sum += w,
+            None => weights.push((chord, w)),
+        };
+        match self.clip_contents.get(&clip.content_id) {
+            Some(ClipContent::Midi(m)) => {
+                let follow = crate::chord_follow::TrackChordFollow::of(self, track_id);
+                let own = crate::chord_follow::note_own_chords(&m.notes);
+                for n in m.notes.iter().filter(|n| !n.muted && clip.window_has_onset(n.start_beat)) {
+                    let beat = clip.content_to_song_beat(n.start_beat);
+                    let src = crate::chord_follow::NoteSource { own: &own, basis: &clip.chord_basis.notes, note_id: n.id, start_beat: n.start_beat };
+                    let Some((ev, basis)) = follow.note_basis(beat, &src).filter(|(ev, _)| ev.id == c.id) else { continue };
+                    if let Some(chord) = crate::chord_follow::effective_basis(basis, &ev.chord) {
+                        add(*chord, n.duration_beats);
+                    }
+                }
+            }
+            Some(ClipContent::Audio(a)) => {
+                for event in &a.events {
+                    let frames = self.event_frames(tempo, clip, event, c.start_beat, c.end_beat());
+                    let (own, placed) = self.frames_basis(clip, event, &frames);
+                    let basis = crate::chord_follow::Basis { own: own.as_ref(), placed: placed.as_ref() };
+                    if let Some(chord) = crate::chord_follow::effective_basis(basis, &c.chord) {
+                        #[allow(clippy::cast_precision_loss)]
+                        add(*chord, frames.iter().map(|(f0, f1)| (f1 - f0) as f64).sum());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// 音源フレームの範囲 `frames` (event 1 つ・箱 1 つぶん) の基準: いちばん長く重なる、和音を弾いている区間のコードと、
     /// いちばん長く重なる記録のコード。
     fn frames_basis(&self, clip: &Clip, event: &AudioEvent, frames: &[(u64, u64)]) -> (Option<Chord>, Option<Chord>) {

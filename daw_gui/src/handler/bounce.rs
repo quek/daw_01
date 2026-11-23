@@ -388,22 +388,31 @@ impl AppData {
         let gesture = self.cur.song_doc.enter_own_gesture(pending.label);
         let placed = self.edit_song(move |song| {
             let (source_id, content) = song.add_baked_audio(wav, window, offset);
+            let event = content.events.first().cloned()?;
             let content = common::model::ClipContent::Audio(content);
             match mode {
                 BounceMode::WithFx => {
                     let content_id = song.alloc_content(content, content_name);
-                    let clip = common::model::Clip {
+                    let mut clip = common::model::Clip {
                         start_beat: window.0,
                         length_beats: length,
                         content_id,
                         content_offset_beats: offset,
                         ..Default::default()
                     };
+                    // r.md #159: 焼いた音 (= 書いた音) を元の素材と同じ基準で動かす (写すのは元を置き換える前)。
+                    clip.chord_basis = song.baked_chord_basis(&[source], &clip, &event);
                     song.place_bounce_with_fx(source, new_track_name, clip)?;
                 }
                 // 元クリップの content を置換 (= flat 化)。同じ窓を見る linked clip も追従し、別の窓を見る
                 // 分割の片は元の content のまま (`Song::replace_window_content`)。
-                BounceMode::InPlace => song.replace_window_content(source_content_id, (offset, offset + length), content)?,
+                BounceMode::InPlace => {
+                    let baked = song.clip_by_key(source).cloned().map(|c| song.baked_chord_basis(&[source], &c, &event));
+                    song.replace_window_content(source_content_id, (offset, offset + length), content)?;
+                    if let (Some(basis), Some(clip)) = (baked, song.clip_by_key_mut(source)) {
+                        clip.chord_basis = basis;
+                    }
+                }
             }
             Some(source_id)
         });

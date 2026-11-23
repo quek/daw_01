@@ -560,24 +560,29 @@ impl AppData {
         let window = (sel.start_beat, sel.end_beat);
         let name = job.name.clone();
         let clip_ids: Vec<u32> = refs.iter().map(|r| r.clip_id).collect();
+        let refs = refs.to_vec();
         let placed = self.edit_song(move |song| {
             song.track_by_id(track_id)?;
             // 焼き込み結果は範囲ちょうどを覆う 1 event (窓は先頭から)。tail の切り落としと
             // Raw 固定の理由は `Song::add_baked_audio` (bounce と共通の SSoT) が持つ。
             let (source_id, content) = song.add_baked_audio(wav, window, 0.0);
+            let event = content.events.first().cloned()?;
             let content_id = song.alloc_content(ClipContent::Audio(content), name);
-            let track = song.track_by_id_mut(track_id)?;
-            // 住所が id なので「後ろから消して index の詰まりを避ける」儀式は要らない。
-            for id in &clip_ids {
-                track.remove_clip_by_id(*id);
-            }
-            let clip_id = track.place_clip(Clip {
+            let mut clip = Clip {
                 start_beat: start,
                 length_beats: len,
                 content_id,
                 // mute は焼いた音に反映済み (鳴っていた音がそのまま WAV になっている)。
                 ..Clip::default()
-            });
+            };
+            // r.md #159: 焼いた音 (= 書いた音) を元のクリップの素材と同じ基準で動かす (元を消す前に写す)。
+            clip.chord_basis = song.baked_chord_basis(&refs, &clip, &event);
+            let track = song.track_by_id_mut(track_id)?;
+            // 住所が id なので「後ろから消して index の詰まりを避ける」儀式は要らない。
+            for id in &clip_ids {
+                track.remove_clip_by_id(*id);
+            }
+            let clip_id = track.place_clip(clip);
             Some((source_id, ClipKey { track_id, clip_id }))
         })?;
         let (source_id, key) = placed?;
