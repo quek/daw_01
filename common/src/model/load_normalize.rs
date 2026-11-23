@@ -110,9 +110,15 @@ impl Song {
     /// 返り値は **クリップの重なりを解消したか** (= 開いた時点で `*` を立てるべきか)。
     /// それ以外の正規化はすべて冪等な no-op になるよう作られているので、
     /// 「開いただけで `*`」 が立つ理由はここ 1 つに絞られる。
-    pub fn normalize_after_load(&mut self) -> bool {
+    ///
+    /// `Err` は外から指される id 空間の番号が上限に近すぎるファイル (このアプリは作らない) で、読み込みを拒む
+    /// ([`Self::ensure_id_headroom`])。
+    pub fn normalize_after_load(&mut self) -> Result<bool, IdSpaceExhausted> {
         self.ensure_project_id();
         self.sanitize_ranges();
+        // 採番の counter を使用中の最大 + 1 以上へ上げ、上限に近い id 空間を詰め直す / 拒む。後段の採番
+        // (未採番 / 重複の採り直し) は counter が上限から遠い前提で数えるので、それより先。
+        self.ensure_id_headroom()?;
         self.ensure_clip_contents();
         self.ensure_audio_source_ids();
         self.ensure_video_source_ids();
@@ -132,7 +138,7 @@ impl Song {
         // カバレッジ補完の前 (窓を縮めてから覆う長さを決めるため)。
         let resolved = self.resolve_clip_overlaps();
         self.ensure_overlay_event_coverage();
-        resolved
+        Ok(resolved)
     }
 
     /// 全トラックのクリップの重なりを上書き規則で解消する

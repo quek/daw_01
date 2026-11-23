@@ -930,10 +930,12 @@ fn point_menu(ui: &mut Ui<'_, AppData>, fr: &Frame<'_>) {
     let key = point_id
         .and_then(|id| fr.points.iter().position(|p| p.id == id))
         .map(|i| crate::widgets::arrangement::point_key_from_model(fr.point_key(i)));
+    #[allow(clippy::cast_possible_truncation)]
+    let zoom_x = fr.px_per_beat as f32;
     ui.context_menu_at(POINT_MENU_ID, open_at.map(|(pos, _)| pos), &CURVE_MENU_ITEMS, move |idx, ui| {
         if let Some(key) = key {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                apply_curve_menu_choice(app, key, idx);
+                apply_curve_menu_choice(app, key, idx, zoom_x);
             }));
         }
     });

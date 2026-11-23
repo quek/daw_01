@@ -978,8 +978,9 @@ pub fn load_project(path: impl AsRef<Path>) -> Result<LoadedProject> {
     // v5→v6/v6→v7 content & source-id migration, stable id assignment
     // (track/clip/parent_group_id consistency), and the scale-change /
     // automation-point sort invariants. Idempotent — safe if a caller
-    // (e.g. `daw_gui::app::open_project`) re-runs it.
-    let overlaps_resolved = song.normalize_after_load();
+    // (e.g. `daw_gui::app::open_project`) re-runs it. 外から指される id 空間の番号が
+    // 上限に近すぎるファイルはここで拒む (理由は日本語でそのまま Open 失敗の表示に出る)。
+    let overlaps_resolved = song.normalize_after_load()?;
     Ok(LoadedProject { song, view, loop_region, hidden_automation_lanes, overlaps_resolved })
 }
 
@@ -2034,7 +2035,7 @@ mod tests {
         // contents + sanitize + sorts). Apply the same normalization to
         // the original so the round-trip assert compares like-with-like
         // (idempotent — load runs it once more on read).
-        song.normalize_after_load();
+        song.normalize_after_load().unwrap();
         save(&path, &song).unwrap();
         assert_eq!(load(&path).unwrap(), song);
     }

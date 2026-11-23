@@ -534,35 +534,6 @@ impl AppData {
             .unwrap_or(false)
     }
 
-    /// BPM 入力欄を Enter で commit。 parse 成功なら 1.0..=400.0 に clamp して
-    /// `song.bpm` に反映、 parse 失敗なら現値を維持。 どちらも edit_text を
-    /// formatted な現値 (`"{:.1}"`) に書き戻して表示を整える。
-    pub(crate) fn commit_bpm_edit(&mut self) {
-        if let Ok(v) = self.cur.peph.bpm_edit_text.trim().parse::<f32>() {
-            let clamped = v.clamp(1.0, 400.0);
-            if (self.cur.song_doc.song().bpm - clamped).abs() > f32::EPSILON {
-                let old_bpm = self.cur.song_doc.song().bpm;
-                self.edit_song(|song| song.bpm = clamped);
-                // Raw audio clip を秒固定スケール (r.md #7)。LoadSong は edit_song の
-                // epoch bump を runner の frame flush が拾って送るので、ここは model 更新のみ。
-                self.edit_song(|song| song.rescale_raw_clips_for_bpm(old_bpm, clamped));
-            }
-        }
-        self.cur.peph.bpm_edit_text = format!("{:.1}", self.cur.song_doc.song().bpm);
-    }
-
-    /// time_sig numerator 入力欄を Enter で commit。 parse 成功なら 1..=32 に
-    /// clamp、 失敗なら現値維持。 edit_text は現値の string 表現に書き戻す。
-    pub(crate) fn commit_time_sig_num_edit(&mut self) {
-        if let Ok(v) = self.cur.peph.time_sig_num_edit_text.trim().parse::<u8>() {
-            let clamped = v.clamp(1, 32);
-            if self.cur.song_doc.song().time_sig.0 != clamped {
-                self.edit_song(|song| song.time_sig.0 = clamped);
-            }
-        }
-        self.cur.peph.time_sig_num_edit_text = self.cur.song_doc.song().time_sig.0.to_string();
-    }
-
     /// time_sig denominator dropdown で選択された値を反映。 2/4/8/16 以外は無視。
     pub(crate) fn set_song_time_sig_denominator(&mut self, den: u8) {
         if !matches!(den, 2 | 4 | 8 | 16) {
@@ -575,11 +546,9 @@ impl AppData {
     }
 
     /// `self.cur.song_doc.song()` が外部要因 (open / new / undo / redo / autosave 復元 etc.) で
-    /// 差し替わった後に、 transport 入力欄の表示文字列を現値に書き戻す。
+    /// 差し替わった後に、 編集 buffer を現値に書き戻す。
     pub(crate) fn resync_song_edit_texts(&mut self) {
-        self.cur.peph.bpm_edit_text = format!("{:.1}", self.cur.song_doc.song().bpm);
-        self.cur.peph.time_sig_num_edit_text = self.cur.song_doc.song().time_sig.0.to_string();
-        // clip 数値 field は scrubable_number 化され専用 buffer は
+        // transport (BPM / 拍子) と clip の数値 field は scrubable_number 化され専用 buffer は
         // 撤去。 共有 `clip_edit_buffer_target` だけ song 差し替え (open / new
         // / undo / redo) に追従させる。 selected_clip が image / text の場合は
         // 次フレームの view 側 target 不一致検知で正しい resync が走るため、

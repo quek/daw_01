@@ -615,6 +615,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     // Phase 7 B5 (`docs/plan_scale.html` §5.3): Shift+P で選択 clip の
     // note pitch を最寄り in-scale に一括補正。 selected_notes が空なら
     // clip 全 note、 そうでなければ選択 note のみ。
+    // Ctrl+U: 最後に選んだ面 (ノート / オートメーションの点) を格子へ寄せる (last-selection-wins)。
+    if ui.take_shortcut("daw.quantize")
+        && let Some(ev) = app.quantize_selection_event(surface)
+    {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| app.handle_event(ev)));
+    }
     if ui.take_shortcut("daw.quantize_pitches_to_scale") {
         let target = if app.selected_note_ids().is_empty() {
             crate::app::QuantizePitchTarget::SelectedClipAllNotes
@@ -1578,6 +1584,50 @@ mod tests {
             .collect();
         assert_eq!(spans, vec![(4.0, 0.25), (4.25, 0.25), (4.5, 0.25), (4.75, 0.25)]);
         assert_eq!(app.cur.song_doc.history_current() - before, 1, "1 回のキー操作 = 1 undo step");
+    }
+
+    /// Ctrl+U は最後に選んだ面 (ノート / オートメーションの点) だけを格子へ寄せる (last-selection-wins)。
+    /// 格子はスナップ OFF でも選んでいる分割 (ピアノロール 1/4 = 1 拍、アレンジ 1/2 = 2 拍)。
+    #[test]
+    fn ctrl_u_quantizes_the_last_selected_surface() {
+        use common::model::{AutomationClip, AutomationContent, AutomationLane, AutomationPoint, ClipContent};
+        let mut app = app_with_selected_note(4.4);
+        app.cur.view.pianoroll_snap_enabled = false;
+        app.cur.view.pianoroll_snap_choice = 1; // 1/4
+        app.cur.view.arrange_snap_enabled = false;
+        app.cur.view.arrange_snap_choice = 0; // 1/2
+        app.edit_song(|song| {
+            let cid = song.alloc_content_id();
+            let point = AutomationPoint { id: 1, time_beat: 4.6, value: 1.0, ..AutomationPoint::default() };
+            song.clip_contents
+                .insert(cid, ClipContent::Automation(AutomationContent { points: vec![point], next_point_id: 2 }));
+            let target = common::model::AutomationTarget::TrackBuiltin(common::model::TrackBuiltinParam::Volume);
+            song.tracks[0].automation_lanes = vec![AutomationLane {
+                id: 1,
+                clips: vec![AutomationClip { id: 1, start_beat: 0.0, length_beats: 32.0, content_id: cid, ..AutomationClip::default() }],
+                next_clip_id: 2,
+                ..AutomationLane::new(target, 1.0)
+            }];
+        });
+        let point_time = |app: &AppData| {
+            let lane = &app.cur.song_doc.song().tracks[0].automation_lanes[0];
+            app.cur.song_doc.song().clip_contents[&lane.clips[0].content_id].automation_points().expect("points")[0].time_beat
+        };
+        let ctrl = Modifiers { ctrl: true, ..Modifiers::empty() };
+        let point = crate::app::AutomationPointKeyRef { track_id: 1, lane_id: 1, clip_id: 1, point_idx: 0 };
+
+        // 点を選んだ後にノートを選び直す → ノートだけ。
+        app.handle_event(AppEvent::SelectAutomationPoints { prev: Vec::new(), next: vec![point] });
+        app.handle_event(AppEvent::SetNoteSelection(vec![AppData::pack_note_id(0, 0)]));
+        dispatch_arrow(&mut app, PhysicalKey::Char('U'), ctrl, 1);
+        assert!((note_start(&app) - 4.0).abs() < 1e-9, "ノートは 1 拍の格子へ: {}", note_start(&app));
+        assert!((point_time(&app) - 4.6).abs() < 1e-9, "点は動かない");
+
+        // 点を選び直す → 点だけ。
+        app.handle_event(AppEvent::SelectAutomationPoints { prev: vec![point], next: vec![point] });
+        dispatch_arrow(&mut app, PhysicalKey::Char('U'), ctrl, 1);
+        assert!((point_time(&app) - 4.0).abs() < 1e-9, "点は 2 拍の格子へ: {}", point_time(&app));
+        assert!((note_start(&app) - 4.0).abs() < 1e-9);
     }
 
     /// ノートを選んでいなければ矢印は何もしない (ユーザー決定: 再生位置移動等に割り当てない)。

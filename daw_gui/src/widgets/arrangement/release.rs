@@ -742,7 +742,7 @@ pub(super) fn commit_releases(
         // ---- M14 Phase 63c (#016): track header drag release → SetTrackParent ----
         // dist < 16px → click 格下げ (modifier-aware なトラック選択に任せる、 後続 loop の clicked_track 経路)
         // dist >= 16px → 上で計算した `pending_drop` を SetTrackParent として 1 度発行。
-        // 旧 ReorderTracks 経由の sibling reorder も同 variant に統合済 (parent 不変 + anchor_after 指定)。
+        // sibling reorder も同 variant (parent 不変 + anchor_after 指定)。
         // 適用 (実在 / 依存の循環の拒否 / undo) は handler → `Song::move_tracks` 1 本が持つ。
         if let Some((track_ids, parent_id, anchor_after)) = pending_drop {
             ui.push_edit(Edit::mutate(move |app: &mut AppData| {

@@ -1923,6 +1923,8 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
     let toggle_w = 60.0;
     let dropdown_w = 90.0;
     let fit_w = 50.0;
+    // "Quantize" = 8 字 * 12 * 0.527 = 50.6px + 余白。
+    let quantize_w = 66.0;
     let fold_w = 50.0;
     let snap_draw_w = 100.0;
 
@@ -1954,6 +1956,16 @@ fn draw_snap_toolbar(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect) {
         }));
     }
     x += dropdown_w + pad;
+
+    // 選択ノートの始まりを左の分割へ寄せる (Ctrl+U と同じ。スナップ OFF でも選んでいる分割)。
+    ui.button_at("pr_quantize", "Quantize", Rect { x, y, w: quantize_w, h }, || {
+        Edit::mutate(|app: &mut AppData| {
+            if let Some(grid_beats) = app.note_quantize_grid() {
+                app.handle_event(AppEvent::QuantizeSelectedNotes { grid_beats });
+            }
+        })
+    });
+    x += quantize_w + pad;
 
     ui.button_at("pr_fit", "Fit", Rect { x, y, w: fit_w, h }, || {
         Edit::mutate(|app: &mut AppData| {
