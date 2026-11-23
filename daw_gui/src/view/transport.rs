@@ -863,10 +863,11 @@ fn draw_recording_controls(
             _ => "Learn Vol",
         }
     };
+    let learn_rect = Rect { x, y: cy, w: learn_w, h: bh };
     ui.toggle_button_at(
         "transport_midi_learn",
         learn_label,
-        Rect { x, y: cy, w: learn_w, h: bh },
+        learn_rect,
         learn_active,
         &style_rec_mode(&app.theme),
         move |_| {
@@ -879,6 +880,8 @@ fn draw_recording_controls(
             })
         },
     );
+    // 右クリック: 割り当ての一覧 (ボタンの直下)。
+    crate::view::midi_bindings_list::draw(app, ui, learn_rect);
     // PR-V4: 旧「Synth (V)」 ボタンは削除。 builtin VOICEVOX plugin が
     // 歌詞 / notes 変更時に自動 synth する (= sync_vocal_metadata 経由)。
 
@@ -995,5 +998,86 @@ mod tests {
         });
         assert!(label_w + 2.0 <= TRANSPOSE_LABEL_W, "ラベル {label_w}px が枠 {TRANSPOSE_LABEL_W}px に収まる");
         assert!(field_w + style.pad_x * 2.0 <= TRANSPOSE_FIELD_W, "'-24' {field_w}px が欄 {TRANSPOSE_FIELD_W}px に収まる");
+    }
+
+    /// 「Learn」を右クリックすると直下に割り当ての一覧が開き、× で値の一致する 1 件を消す。空なら
+    /// 「割り当てはありません」、Esc / 外クリックで閉じる。
+    #[test]
+    fn learn_right_click_lists_bindings_and_removes_one() {
+        use crate::view::midi_bindings_list::OVERLAY_ID;
+        use common::model::{BindingTarget, MidiBindInput, MidiBinding};
+        use daw_ui_core::PointerFrame;
+        use daw_ui_platform::{ElementState, KeyEvent, PhysicalKey};
+
+        struct Seen {
+            open: bool,
+            anchor: Option<Rect>,
+            learn: Rect,
+        }
+        fn frame(host: &mut UiHost<AppData>, app: &mut AppData, input: FrameInput) -> Seen {
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 1280, height: 720 };
+            let mut seen = Seen { open: false, anchor: None, learn: Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 } };
+            let edits = host.frame_to_edits(app, &mut scene, screen, input, |app, ui| {
+                // 返り値 = Learn の右端 + 12 (Learn は幅 76 で最後に積まれる)。
+                let end = draw_recording_controls(app, ui, 10.0, 4.0, 20.0);
+                seen.learn = Rect { x: end - 12.0 - 76.0, y: 4.0, w: 76.0, h: 20.0 };
+                seen.open = ui.is_overlay_open(OVERLAY_ID);
+                seen.anchor = ui.popup_anchor(("overlay", OVERLAY_ID));
+            });
+            for e in edits {
+                e.apply(app);
+            }
+            seen
+        }
+        let pointer = |pointer: PointerFrame| FrameInput { pointer, ..FrameInput::default() };
+        let right_click = |host: &mut UiHost<AppData>, app: &mut AppData, p: (f32, f32)| {
+            frame(host, app, pointer(PointerFrame { pos: Some(p), secondary_just_pressed: true, ..PointerFrame::default() }));
+            frame(host, app, pointer(PointerFrame { pos: Some(p), secondary_just_released: true, ..PointerFrame::default() }))
+        };
+        let click = |host: &mut UiHost<AppData>, app: &mut AppData, p: (f32, f32)| {
+            frame(host, app, pointer(PointerFrame { pos: Some(p), ..PointerFrame::default() }));
+            let down = PointerFrame { pos: Some(p), primary_just_pressed: true, primary_pressed: true, ..PointerFrame::default() };
+            frame(host, app, pointer(down));
+            frame(host, app, pointer(PointerFrame { pos: Some(p), primary_just_released: true, ..PointerFrame::default() }))
+        };
+
+        let mut app = crate::test_support::headless_app();
+        let cc = |controller, target| MidiBinding {
+            channel: 16,
+            input: MidiBindInput::ControlChange(controller),
+            legacy_controller: None,
+            target,
+        };
+        let (tempo, transpose) = (cc(20, BindingTarget::SongTempo), cc(21, BindingTarget::SongTranspose));
+        let (t, tr) = (tempo.clone(), transpose.clone());
+        app.edit_song(move |song| song.midi_bindings = vec![t, tr]);
+        let mut host: UiHost<AppData> = UiHost::no_redraw();
+        *host.shortcut_map_mut() = crate::view::shortcuts::daw_shortcut_map();
+
+        let learn = frame(&mut host, &mut app, FrameInput::default()).learn;
+        assert!(!frame(&mut host, &mut app, FrameInput::default()).open, "前提: 閉じている");
+        let seen = right_click(&mut host, &mut app, (learn.x + learn.w * 0.5, learn.y + learn.h * 0.5));
+        assert!(seen.open, "Learn の右クリックで開く");
+        let list = seen.anchor.expect("一覧の rect");
+        assert!((list.y - (learn.y + learn.h)).abs() < 4.0 && (list.x - learn.x).abs() < 1.0, "ボタンの直下: {list:?}");
+
+        // 1 行目 (Tempo) の × を押す → その 1 件だけ消える。一覧は開いたまま。
+        let remove = (list.x + list.w - 6.0 - 10.0, list.y + 6.0 + 11.0);
+        assert!(click(&mut host, &mut app, remove).open, "× を押しても開いたまま");
+        assert_eq!(app.cur.song_doc.song().midi_bindings, vec![transpose]);
+
+        // Esc で閉じる。
+        let esc = FrameInput {
+            keyboard: vec![KeyEvent { state: ElementState::Pressed, text: None, physical_key: PhysicalKey::Escape, repeat: false }],
+            ..FrameInput::default()
+        };
+        frame(&mut host, &mut app, esc);
+        assert!(!frame(&mut host, &mut app, FrameInput::default()).open, "Esc で閉じる");
+
+        // 空でも開く (「割り当てはありません」の 1 行)。外クリックで閉じる。
+        app.edit_song(|song| song.midi_bindings.clear());
+        assert!(right_click(&mut host, &mut app, (learn.x + 5.0, learn.y + 5.0)).open, "空でも開く");
+        assert!(!click(&mut host, &mut app, (900.0, 600.0)).open, "外クリックで閉じる");
     }
 }

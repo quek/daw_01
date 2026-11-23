@@ -144,7 +144,7 @@ impl SnapConfig {
             return raw;
         }
         match self.beat_unit(zoom_x_px_per_beat) {
-            Some(unit) => (raw / unit).round() * unit,
+            Some(unit) => round_to_grid(raw, unit),
             None => raw,
         }
     }
@@ -161,6 +161,24 @@ impl Default for SnapConfig {
     fn default() -> Self {
         Self::DEFAULT
     }
+}
+
+/// `raw` (拍) を、曲の拍 0 を原点にした `unit` 拍の格子の最寄りの線へ丸める。スナップ
+/// ([`SnapConfig::snap_beat`]) とクオンタイズ ([`quantize_content_beat`]) が共有する唯一の丸め。
+#[must_use]
+pub fn round_to_grid(raw: f64, unit: f64) -> f64 {
+    (raw / unit).round() * unit
+}
+
+/// クオンタイズ: content-local 拍 `content_beat` (content の原点 = song 拍 `origin`、
+/// `Clip::content_origin_beat`) を、**曲の拍 0 を原点にした** `unit` 拍の格子へ寄せて content-local 拍で返す。
+/// clip が格子の上から始まらなくても、曲の上で格子に載る (ドラッグのスナップと同じ絶対位置)。
+/// 最寄りの線が content の先頭 (local 0 — model が持てる最小位置) より前なら、先頭以降で最初の線。
+#[must_use]
+pub fn quantize_content_beat(content_beat: f64, origin: f64, unit: f64) -> f64 {
+    let snapped = round_to_grid(origin + content_beat, unit);
+    let first_line = (origin / unit).ceil() * unit;
+    (snapped.max(first_line) - origin).max(0.0)
 }
 
 /// グリッド線 `phase + k * unit` (k は整数) のうち、開区間 `(start, end)` に入るものを昇順で返す。

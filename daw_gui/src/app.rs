@@ -639,9 +639,7 @@ impl AppData {
             }
             // r.md #29: 履歴リストの行 click → その state へ一発 Undo/Redo。
             AppEvent::JumpHistory(index) => self.jump_history_to(index),
-            AppEvent::QuantizeSelectedNotes(div) => {
-                self.quantize_selected_notes(div);
-            }
+            AppEvent::QuantizeSelectedNotes { grid_beats } => self.quantize_selected_notes(grid_beats),
             AppEvent::SetNoteVelocities(updates) => {
                 self.set_note_velocities(&updates);
             }
@@ -762,8 +760,8 @@ impl AppData {
                 }
                 self.cur.selection.selected_automation_points = next;
             }
-            AppEvent::QuantizeSelectedAutomationPoints(div) => {
-                self.quantize_selected_automation_points(div);
+            AppEvent::QuantizeSelectedAutomationPoints { grid_beats } => {
+                self.quantize_selected_automation_points(grid_beats);
             }
             AppEvent::MakeAutomationClipUnique(key) => {
                 self.make_automation_clip_unique(key);
@@ -967,11 +965,7 @@ impl AppData {
                 self.cur.recording.midi_learn_target = None;
                 self.ui_ephemeral.status_message = "MIDI Learn cancel".to_string();
             }
-            AppEvent::RemoveMidiBinding(idx) => {
-                if idx < self.cur.song_doc.song().midi_bindings.len() {
-                    self.edit_song(|song| song.midi_bindings.remove(idx));
-                }
-            }
+            AppEvent::RemoveMidiBinding(binding) => self.remove_midi_binding(&binding),
             AppEvent::MidiInputOpened(name) => {
                 let label = name.clone().unwrap_or_default();
                 self.cur.recording.midi_input_label = label.clone();

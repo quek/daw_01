@@ -182,32 +182,6 @@ impl AppData {
         );
     }
 
-    pub(crate) fn quantize_selected_notes(&mut self, div: u8) {
-        // 選択 (packed) を所属クリップごとに分配し、各クリップ内 clip-local start を
-        // 量子化。重なりは edit_clip_notes が解消し選択 (packed) を remap で追従。
-        if self.selected_note_ids().is_empty() {
-            return;
-        }
-        let div = div.max(1) as f64;
-        let selected = self.selected_note_ids();
-        self.for_each_note_clip_group(
-            selected.into_iter().map(|id| (id, ())),
-            |app, slot, r, items| {
-                let locals: Vec<usize> = items.iter().map(|&(local, ())| local).collect();
-                app.edit_clip_notes(slot, r, move |notes| {
-                    let mut winners = Vec::with_capacity(locals.len());
-                    for local in locals {
-                        if let Some(n) = notes.get_mut(local) {
-                            n.start_beat = ((n.start_beat * div).round() / div).max(0.0);
-                            winners.push(local as u32);
-                        }
-                    }
-                    winners
-                });
-            },
-        );
-    }
-
     pub(crate) fn resize_track_peak_display(&mut self) {
         let n = self.cur.song_doc.song().tracks.len();
         self.cur.transport.track_peak_display.resize(n, (0.0, 0.0));

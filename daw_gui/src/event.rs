@@ -146,7 +146,11 @@ pub enum AppEvent {
     /// の 0 始まり index。 その state まで一気に Undo / Redo する (受けた瞬間に行を state の識別子へ直す、
     /// [`crate::state::HistoryJump::ToState`])。 履歴操作自体は Undo 対象外。
     JumpHistory(usize),
-    QuantizeSelectedNotes(u8),
+    /// 選択ノートの**始まり**を `grid_beats` 拍の格子 (曲の拍 0 が原点、clip の位置 / content の
+    /// オフセットに依らない) へ寄せる。長さは変えない。1 undo step。`grid_beats` は送り手が
+    /// [`AppData::note_quantize_grid`](crate::app::AppData::note_quantize_grid) で決める
+    /// (ピアノロールのツールバーで選んでいる分割。スナップ OFF でも同じ)。
+    QuantizeSelectedNotes { grid_beats: f64 },
     /// 鍵盤レーン click のピッチプレビュー (gui_01 #055,
     /// `docs/plan_pianoroll_keyboard_preview.md`)。 piano_roll widget が毎フレーム
     /// `resp.keyboard_active_pitch` を `preview_note` の pitch と比較し、 変化した
@@ -343,11 +347,12 @@ pub enum AppEvent {
         prev: Vec<AutomationPointKeyRef>,
         next: Vec<AutomationPointKeyRef>,
     },
-    /// Phase 3: `selected_automation_points` を grid (`1/div` beat) に snap。
-    /// piano roll の `QuantizeSelectedNotes` と同 idiom。 同 clip 内の
-    /// point は sort 維持のためまとめて sort し直し、 selection も新 idx に
-    /// 再採番する。 `div = 1` で 1 beat 単位、 `4` で 1/4 beat 単位。
-    QuantizeSelectedAutomationPoints(u8),
+    /// `selected_automation_points` の時刻を `grid_beats` 拍の格子へ寄せる (`QuantizeSelectedNotes`
+    /// と同じ規則: アレンジのクリップは曲の拍で、ランチャーのセルはセルの先頭から)。同じ content の点は
+    /// 並びを保つため sort し直し、選択も新しい位置へ付け替える。1 undo step。`grid_beats` は送り手が
+    /// [`AppData::automation_point_quantize_grid`](crate::app::AppData::automation_point_quantize_grid)
+    /// で決める (点のドラッグと同じアレンジのスナップ設定。スナップ OFF でも同じ)。
+    QuantizeSelectedAutomationPoints { grid_beats: f64 },
     /// 右クリック menu「Make Unique」 → 共有中 (`refcount >= 2`) の
     /// automation clip の content を deep clone (新 `ContentId`)、独立化。
     /// 既に独立 clip の場合は status_message で通知。MIDI clip 用
@@ -617,9 +622,10 @@ pub enum AppEvent {
     /// Phase 7 B1-M Step 2 (2026-05-13): Learn cancel (= midi_learn_target を
     /// None に戻す)。 user が誤って Learn を始めた場合の取り消し用。
     CancelMidiLearn,
-    /// Phase 7 B1-M Step 2 (2026-05-13): 既存 MIDI binding の削除。 inspector
-    /// の binding list 等から発火 (= 段階 4 で UI 拡張、 段階 2 では未使用)。
-    RemoveMidiBinding(usize),
+    /// 既存 MIDI 割り当ての削除 (トランスポートの「Learn」を右クリックで開く一覧の ×)。
+    /// 割り当てに id は無いので **値そのもの** で指す (位置で指すと、一覧を開いてから押すまでに
+    /// 割り当てが増減したとき別の割り当てを消す — 不変条件 1)。一致する最初の 1 件を消す。1 undo step。
+    RemoveMidiBinding(common::model::MidiBinding),
     MidiInputOpened(Option<String>),
 
     // -------- Bottom panel -------------------------------------------------
@@ -1746,7 +1752,7 @@ impl AppEvent {
             E::SetNoteVelocities(..) => "ベロシティ変更",
             E::SetNotesMuted { .. } => "ノートミュート",
             E::SetNoteLyrics { .. } => "歌詞編集",
-            E::QuantizeSelectedNotes(..) => "ノートをクオンタイズ",
+            E::QuantizeSelectedNotes { .. } =>"ノートをクオンタイズ",
             E::QuantizePitchesToScale(..) => "ピッチをスケールに補正",
 
             // ---- クリップ ----
@@ -1885,7 +1891,7 @@ impl AppEvent {
             E::MoveAutomationPoints { .. } => "ポイント移動",
             E::DeleteAutomationPoints { .. } => "ポイント削除",
             E::SetAutomationPointValue { .. } => "ポイント値変更",
-            E::QuantizeSelectedAutomationPoints(..) => "ポイントをクオンタイズ",
+            E::QuantizeSelectedAutomationPoints { .. } => "点を格子に揃える",
             E::SetAutomationCurve { .. } => "カーブ変更",
             E::CreateAutomationClip { .. } => "オートメーションクリップ作成",
             E::MoveAutomationClips { .. } => "オートメーションクリップ移動",
