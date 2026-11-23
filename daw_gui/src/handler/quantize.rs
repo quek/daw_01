@@ -81,6 +81,11 @@ impl AppData {
                 })
                 .collect()
         };
+        if targets.is_empty() {
+            self.ui_ephemeral.status_message = "Quantize: ノートを選んでください".into();
+            return;
+        }
+        let mut moved = false;
         self.for_each_note_clip_group(targets, |app, slot, r, items| {
             let moves: Vec<(usize, f64)> = {
                 let song = app.cur.song_doc.song();
@@ -94,6 +99,7 @@ impl AppData {
             if moves.is_empty() {
                 return;
             }
+            moved = true;
             app.edit_clip_notes(slot, r, move |notes| {
                 let mut winners = Vec::with_capacity(moves.len());
                 for (local, start) in moves {
@@ -105,6 +111,10 @@ impl AppData {
                 winners
             });
         });
+        // 押しても何も動かないときに、効いていないのか揃っているのかが分かるように。
+        if !moved {
+            self.ui_ephemeral.status_message = "Quantize: 選んだノートは既に格子の上です".into();
+        }
     }
 
     /// 選択したオートメーションの点の時刻を `grid_beats` 拍の格子へ寄せる。
@@ -146,6 +156,11 @@ impl AppData {
         }
         // どの点も既に格子の上なら何も編集しない (undo step も `*` も積まない)。
         if !moved {
+            self.ui_ephemeral.status_message = if moves.is_empty() {
+                "格子に揃える: 点を選んでください".into()
+            } else {
+                "格子に揃える: 選んだ点は既に格子の上です".into()
+            };
             return;
         }
         // content ごとの「元の位置 → 並べ直した後の位置」。

@@ -732,3 +732,23 @@ fn following_track_overlays_the_sounding_note_frame() {
         }
     }
 }
+
+/// r.md 復旧: ツールバーの「Quantize」ボタンで、選んだノートの始まりがツールバーの分割へ寄る。
+#[test]
+fn quantize_button_snaps_selected_notes() {
+    let (mut app, _a, _p) = build_app();
+    setup_clip(&mut app, 1, 1, vec![mk_note(60, 1.3, 1.0, 100)]);
+    let mut host = UiHost::no_redraw();
+    let (nx, ny) = (beat_x(1.6), pitch_y(60));
+    drive_pointer(&mut host, &mut app, press(nx, ny, no_mods()));
+    drive_pointer(&mut host, &mut app, release(nx, ny, no_mods()));
+    assert_eq!(app.selected_note_ids().len(), 1, "前提: ノートを選んだ");
+    // ツールバー: pad 6 + Snap 60 + pad + 分割 90 + pad = x 168 から幅 66。
+    let (bx, by) = (200.0, 12.0);
+    drive_pointer(&mut host, &mut app, hold(bx, by, no_mods()));
+    drive_pointer(&mut host, &mut app, press(bx, by, no_mods()));
+    drive_pointer(&mut host, &mut app, release(bx, by, no_mods()));
+    drive_pointer(&mut host, &mut app, hold(bx, by, no_mods()));
+    let start = clip_notes(&app, 1, 1)[0].start_beat;
+    assert!((start - 1.3).abs() > 1e-9, "Quantize で動く (start = {start})");
+}
