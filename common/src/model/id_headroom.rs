@@ -9,9 +9,16 @@
 //!    指す) なら `1..=n` へ詰め直し、外 (別の id 空間・`ViewState`・プラグインのアーカイブ) から指されていれば
 //!    読み込みを拒む ([`IdSpaceExhausted`])。外の参照は付け替える口が 1 つに集まっていないので、詰め直すと
 //!    付け替え漏れが無言で別の物を指す。
+//! 3. ただし空間に要素が 1 つも無ければ (使用中の id が無い)、counter が上限に近くても拒まず `1` へ戻す
+//!    ([`EmptySpace`])。戻すのは dangling な参照の掃除 (`prune_dangling_refs` / `normalize_session`) の後の 2 回目
+//!    (掃除の後も空なら、Song の中に指すものは残っていない)。プラグインのアーカイブ (ARA) は中を見られないので、
+//!    アーカイブを持つ曲ではそれが指しうる空間 (クリップの中身・音声素材・音声の event) を戻さない。`ViewState`
+//!    の表示の記録 (行の高さなど) は見方の都合なので、古い記録が新しい要素に付いても中身は壊れない。
 //!
-//! 後段の `ensure_*` (未採番 / 重複の採り直し) は counter が上限から遠いことを前提に数えるので、これを先に通す。
-//! 冪等 (2 回目は何も変えない — 開いただけで `*` を立てない)。コードの箱 (`chords`) は `normalize_chords` が持つ。
+//! 後段の `ensure_*` (未採番 / 重複の採り直し) は counter が上限から遠いことを前提に数えるので、1 回目を先に通す。
+//! 冪等 (2 回目は何も変えない — 開いただけで `*` を立てない)。コードの箱 (`chords`) は別の口
+//! (`Song::compact_chord_ids_if_saturated`、`chord_ops.rs`) が詰め直す — 箱は系統とクリップの記録が一緒に
+//! 付け替わるので、ここの「拒む / 詰め直す」の 2 択に乗らない。
 //!
 //! wire に載らないロジックだけを持つ (`common/build.rs` の `WIRE_SOURCES` 対象外)。
 
@@ -23,11 +30,14 @@ use super::*;
 trait IdNum: Copy + Ord {
     /// counter がこれを超えた空間は上限に近すぎる (1 から 1 つずつ数えて届く数ではない)。
     const LIMIT: Self;
+    /// 空の空間の counter を戻す先 (`0` は未採番 sentinel)。
+    const FIRST: Self;
     fn succ(self) -> Self;
 }
 
 impl IdNum for u32 {
     const LIMIT: Self = u32::MAX / 2;
+    const FIRST: Self = 1;
     fn succ(self) -> Self {
         self.saturating_add(1)
     }
@@ -35,9 +45,19 @@ impl IdNum for u32 {
 
 impl IdNum for u64 {
     const LIMIT: Self = u64::MAX / 2;
+    const FIRST: Self = 1;
     fn succ(self) -> Self {
         self.saturating_add(1)
     }
+}
+
+/// 要素が 1 つも無い空間の counter が上限に近いときの扱い (module doc の 3)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptySpace {
+    /// 拒まず、counter もそのまま (dangling な参照の掃除の前の 1 回目)。
+    Defer,
+    /// counter を `1` へ戻す (掃除の後の 2 回目)。
+    Reset,
 }
 
 /// `counter` を `max_used + 1` 以上へ上げる (下げない)。上げた counter が上限を超えたら `true`。
@@ -46,6 +66,18 @@ fn raise<T: IdNum>(counter: &mut T, max_used: Option<T>) -> bool {
         *counter = (*counter).max(max.succ());
     }
     *counter > T::LIMIT
+}
+
+/// [`raise`] の、空の空間を拒まない版 (module doc の 3)。`archived` = 中を見られないプラグインのアーカイブが
+/// この空間を指しうる (空でも戻さない)。拒むべきなら `true`。
+fn settle<T: IdNum>(counter: &mut T, max_used: Option<T>, empty: EmptySpace, archived: bool) -> bool {
+    if max_used.is_none() && *counter > T::LIMIT && !archived {
+        if empty == EmptySpace::Reset {
+            *counter = T::FIRST;
+        }
+        return false;
+    }
+    raise(counter, max_used)
 }
 
 /// id を並び順に `1..=n` へ振り直し、次の counter (`n + 1`) を返す。
@@ -83,18 +115,21 @@ fn refuse_if(hit: bool, space: impl FnOnce() -> String) -> Result<(), IdSpaceExh
 }
 
 impl Song {
-    /// 全 id 空間の counter を使用中の最大 + 1 以上へ上げ、上限に近い空間を詰め直す / 拒む (module doc)。
-    pub(crate) fn ensure_id_headroom(&mut self) -> Result<(), IdSpaceExhausted> {
-        self.ensure_song_id_headroom()?;
+    /// 全 id 空間の counter を使用中の最大 + 1 以上へ上げ、上限に近い空間を詰め直す / 拒む / 空なら `empty` の
+    /// とおりに扱う (module doc)。
+    pub(crate) fn ensure_id_headroom(&mut self, empty: EmptySpace) -> Result<(), IdSpaceExhausted> {
+        // ARA のアーカイブはクリップの中身・音声素材・音声の event の id を中に持つ (見られない)。
+        let ara = self.all_plugins().any(|p| p.ara_archive.is_some());
+        self.ensure_song_id_headroom(empty, ara)?;
         self.ensure_section_ids();
         for track in &mut self.tracks {
-            track.ensure_id_headroom()?;
+            track.ensure_id_headroom(empty)?;
         }
         for lane in &mut self.song_lanes {
-            lane.ensure_clip_id_headroom("曲")?;
+            lane.ensure_clip_id_headroom("曲", empty)?;
         }
         for content in self.clip_contents.values_mut() {
-            content.ensure_id_headroom()?;
+            content.ensure_id_headroom(empty, ara)?;
         }
         Ok(())
     }
@@ -104,7 +139,7 @@ impl Song {
     /// 変調 / MIDI 割り当ての宛先 / `ViewState`、クリップの中身と音声素材 = ARA のアーカイブの persistent id、
     /// 動画 / 画像素材 = event と口パク、レーン = `ViewState`、モジュレーターと変調 = 宛先、シーン = セル / 発火の記録 /
     /// follow action / MIDI 割り当て。
-    fn ensure_song_id_headroom(&mut self) -> Result<(), IdSpaceExhausted> {
+    fn ensure_song_id_headroom(&mut self, empty: EmptySpace, ara: bool) -> Result<(), IdSpaceExhausted> {
         let max_track = self.tracks.iter().map(|t| t.id).max();
         let mut max_device: Option<u64> = None;
         let mut see = |id: u64| max_device = max_device.max(Some(id));
@@ -130,16 +165,17 @@ impl Song {
         let max_scene = self.scenes.iter().map(|s| s.id).max();
 
         let ids = &mut self.ids;
-        refuse_if(raise(&mut ids.next_track_id, max_track), || "トラック".into())?;
-        refuse_if(raise(&mut ids.next_device_id, max_device), || "デバイス".into())?;
-        refuse_if(raise(&mut ids.next_content_id, max_content), || "クリップの中身".into())?;
-        refuse_if(raise(&mut ids.next_audio_source_id, max_audio), || "音声素材".into())?;
-        refuse_if(raise(&mut ids.next_video_source_id, max_video), || "動画素材".into())?;
-        refuse_if(raise(&mut ids.next_image_source_id, max_image), || "画像素材".into())?;
-        refuse_if(raise(&mut ids.next_song_lane_id, max_song_lane), || "曲のオートメーションレーン".into())?;
-        refuse_if(raise(&mut ids.next_mod_source_id, max_mod_source), || "モジュレーター".into())?;
-        refuse_if(raise(&mut ids.next_mod_routing_id, max_mod_routing), || "変調の割り当て".into())?;
-        refuse_if(raise(&mut ids.next_scene_id, max_scene), || "シーン".into())?;
+        let e = empty;
+        refuse_if(settle(&mut ids.next_track_id, max_track, e, false), || "トラック".into())?;
+        refuse_if(settle(&mut ids.next_device_id, max_device, e, false), || "デバイス".into())?;
+        refuse_if(settle(&mut ids.next_content_id, max_content, e, ara), || "クリップの中身".into())?;
+        refuse_if(settle(&mut ids.next_audio_source_id, max_audio, e, ara), || "音声素材".into())?;
+        refuse_if(settle(&mut ids.next_video_source_id, max_video, e, false), || "動画素材".into())?;
+        refuse_if(settle(&mut ids.next_image_source_id, max_image, e, false), || "画像素材".into())?;
+        refuse_if(settle(&mut ids.next_song_lane_id, max_song_lane, e, false), || "曲のオートメーションレーン".into())?;
+        refuse_if(settle(&mut ids.next_mod_source_id, max_mod_source, e, false), || "モジュレーター".into())?;
+        refuse_if(settle(&mut ids.next_mod_routing_id, max_mod_routing, e, false), || "変調の割り当て".into())?;
+        refuse_if(settle(&mut ids.next_scene_id, max_scene, e, false), || "シーン".into())?;
         Ok(())
     }
 
@@ -164,18 +200,22 @@ impl Song {
 impl Track {
     /// トラック内の空間。どれも外から指される: クリップ = `ViewState` の clip ごとの表示 / 行の主導権、
     /// レーン = `ViewState` の隠し / 行の高さ、センド = センド量のオートメーション / 変調の宛先。
-    fn ensure_id_headroom(&mut self) -> Result<(), IdSpaceExhausted> {
+    fn ensure_id_headroom(&mut self, empty: EmptySpace) -> Result<(), IdSpaceExhausted> {
         let max_clip = self.all_clips().map(|c| c.id).max();
-        refuse_if(raise(&mut self.next_clip_id, max_clip), || format!("トラック「{}」のクリップ", self.name))?;
+        refuse_if(settle(&mut self.next_clip_id, max_clip, empty, false), || {
+            format!("トラック「{}」のクリップ", self.name)
+        })?;
         let max_lane = self.automation_lanes.iter().map(|l| l.id).max();
-        refuse_if(raise(&mut self.next_lane_id, max_lane), || {
+        refuse_if(settle(&mut self.next_lane_id, max_lane, empty, false), || {
             format!("トラック「{}」のオートメーションレーン", self.name)
         })?;
         let max_send = self.sends.iter().map(|s| s.id).max();
-        refuse_if(raise(&mut self.next_send_id, max_send), || format!("トラック「{}」のセンド", self.name))?;
+        refuse_if(settle(&mut self.next_send_id, max_send, empty, false), || {
+            format!("トラック「{}」のセンド", self.name)
+        })?;
         let owner = format!("トラック「{}」", self.name);
         for lane in &mut self.automation_lanes {
-            lane.ensure_clip_id_headroom(&owner)?;
+            lane.ensure_clip_id_headroom(&owner, empty)?;
         }
         Ok(())
     }
@@ -183,9 +223,11 @@ impl Track {
 
 impl AutomationLane {
     /// レーン内のクリップ (`ViewState` のオートメーション編集の表示 / 行の主導権が指す)。
-    fn ensure_clip_id_headroom(&mut self, owner: &str) -> Result<(), IdSpaceExhausted> {
+    fn ensure_clip_id_headroom(&mut self, owner: &str, empty: EmptySpace) -> Result<(), IdSpaceExhausted> {
         let max_clip = self.all_clips().map(|c| c.id).max();
-        refuse_if(raise(&mut self.next_clip_id, max_clip), || format!("{owner}のオートメーションレーンのクリップ"))
+        refuse_if(settle(&mut self.next_clip_id, max_clip, empty, false), || {
+            format!("{owner}のオートメーションレーンのクリップ")
+        })
     }
 }
 
@@ -193,7 +235,7 @@ impl ClipContent {
     /// content 内の要素。ノートとオートメーションの点は選択などの session 状態だけが指すので詰め直す。音声の event は
     /// take ([`AudioEvent::take_id`] = 分割の片が継いだ元の event の id、元が消えても使用中) と ARA の audio modification
     /// の persistent id (プラグインのアーカイブの中) から指されるので拒む。
-    fn ensure_id_headroom(&mut self) -> Result<(), IdSpaceExhausted> {
+    fn ensure_id_headroom(&mut self, empty: EmptySpace, ara: bool) -> Result<(), IdSpaceExhausted> {
         match self {
             ClipContent::Midi(m) => {
                 if raise(&mut m.next_note_id, m.notes.iter().map(|n| n.id).max()) {
@@ -207,7 +249,7 @@ impl ClipContent {
             }
             ClipContent::Audio(a) => {
                 let max_used = a.events.iter().flat_map(|e| [e.id, e.take_id]).max();
-                refuse_if(raise(&mut a.next_event_id, max_used), || "音声クリップのイベント".into())?;
+                refuse_if(settle(&mut a.next_event_id, max_used, empty, ara), || "音声クリップのイベント".into())?;
             }
             // event に安定 id の allocator を持たない種類。
             ClipContent::Video(_) | ClipContent::Image(_) | ClipContent::Text(_) => {}
@@ -315,11 +357,53 @@ mod tests {
         assert_eq!(song.normalize_after_load(), Err(IdSpaceExhausted { space: "デバイス".into() }));
 
         let mut song = song_with_track();
+        let dest = song.tracks[0].id;
+        song.tracks[0].sends.push(Send { id: 1, dest_track_id: dest, gain: 1.0, mode: SendMode::default(), enabled: true });
         song.tracks[0].next_send_id = u32::MAX;
         assert_eq!(
             song.normalize_after_load(),
             Err(IdSpaceExhausted { space: "トラック「Bass」のセンド".into() }),
             "使用中の id が小さくても、counter が上限に近ければ同じ"
+        );
+    }
+
+    /// 要素が 1 つも無い空間は、counter が上限に近くても拒まず `1` へ戻す (指すものが無いので詰め直す物も無い)。
+    /// 消えたトラックを指していた dangling な参照 (MIDI 割り当て) は掃除されてから戻す。ARA のアーカイブを持つ曲では、
+    /// アーカイブが中で指しうる空間 (クリップの中身) は空でも拒む。
+    #[test]
+    fn load_resets_saturated_counters_of_empty_spaces() {
+        let mut song = song_with_track();
+        song.tracks[0].next_send_id = u32::MAX;
+        song.tracks[0].next_clip_id = u32::MAX;
+        song.ids.next_scene_id = u32::MAX;
+        song.ids.next_mod_routing_id = u32::MAX;
+        assert_eq!(song.normalize_after_load(), Ok(false));
+        let t = &song.tracks[0];
+        assert_eq!((t.next_send_id, t.next_clip_id, song.ids.next_scene_id, song.ids.next_mod_routing_id), (1, 1, 1, 1));
+        let once = song.clone();
+        assert_eq!(song.normalize_after_load(), Ok(false));
+        assert_eq!(song, once, "冪等");
+
+        let mut song = Song::default();
+        song.tracks.clear();
+        song.ids.next_track_id = u32::MAX;
+        let target = BindingTarget::TrackVolume(u32::MAX - 1);
+        song.midi_bindings.push(MidiBinding { channel: 0, input: MidiBindInput::ControlChange(1), legacy_controller: None, target });
+        assert_eq!(song.normalize_after_load(), Ok(false), "トラックが 1 本も無ければトラックの番号も戻す");
+        assert_eq!(song.ids.next_track_id, 1);
+        assert!(song.midi_bindings.is_empty(), "消えたトラックを指す割り当ては、番号を戻す前に掃除される");
+
+        let mut song = song_with_track();
+        song.master_fx_chain.push(Device::Plugin(PluginInstance {
+            id: 1,
+            ara_archive: Some(std::sync::Arc::from(&b"ara"[..])),
+            ..PluginInstance::new("x".into(), crate::plugin_format::PluginFormat::Clap)
+        }));
+        song.ids.next_content_id = u32::MAX;
+        assert_eq!(
+            song.normalize_after_load(),
+            Err(IdSpaceExhausted { space: "クリップの中身".into() }),
+            "ARA のアーカイブが中で指しうる空間は空でも戻さない"
         );
     }
 }

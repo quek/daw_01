@@ -117,8 +117,9 @@ impl Song {
         self.ensure_project_id();
         self.sanitize_ranges();
         // 採番の counter を使用中の最大 + 1 以上へ上げ、上限に近い id 空間を詰め直す / 拒む。後段の採番
-        // (未採番 / 重複の採り直し) は counter が上限から遠い前提で数えるので、それより先。
-        self.ensure_id_headroom()?;
+        // (未採番 / 重複の採り直し) は counter が上限から遠い前提で数えるので、それより先。要素の無い空間は
+        // ここでは拒まず、dangling な参照を掃除した後の 2 回目で `1` へ戻す (`id_headroom` の module doc)。
+        self.ensure_id_headroom(super::id_headroom::EmptySpace::Defer)?;
         self.ensure_clip_contents();
         self.ensure_audio_source_ids();
         self.ensure_video_source_ids();
@@ -129,9 +130,10 @@ impl Song {
         // 正規化の後 (track id の remap / routing id / device id が確定してから解決する) でなければならない。
         self.prune_dangling_refs();
         self.normalize_session();
+        self.ensure_id_headroom(super::id_headroom::EmptySpace::Reset)?;
         self.ensure_scale_changes_sorted();
-        self.normalize_chords();
         self.compact_chord_ids_if_saturated();
+        self.normalize_chords();
         self.normalize_chord_basis();
         self.ensure_automation_points_sorted();
         // 重なり解消は id 採番の後 (分割断片に id を振るため)、 overlay の

@@ -31,9 +31,11 @@ impl AppData {
 
     /// 宛先の言葉。パラメーターはレーン名と同じ名前 (`automation_target_label` — プラグイン / 内蔵 device は
     /// `"Synth: Cutoff"` の完全修飾名、Tempo / Transpose)、トラックの Volume / Pan はトラック名を前に付ける。
-    /// ランチャー操作は `launcher_label`。
+    /// ランチャー操作は `launcher_label` の言葉の前に、撃つ行 (トラック名) / 列 (列の名前) を付ける。
     #[must_use]
     pub fn midi_binding_target_label(&self, target: BindingTarget) -> String {
+        let song = self.cur.song_doc.song();
+        let phrase = || target.launcher_label().unwrap_or_default();
         let (track, param) = match target {
             BindingTarget::TrackVolume(id) => (Some(id), AutomationTarget::TrackBuiltin(TrackBuiltinParam::Volume)),
             BindingTarget::TrackPan(id) => (Some(id), AutomationTarget::TrackBuiltin(TrackBuiltinParam::Pan)),
@@ -44,13 +46,29 @@ impl AppData {
             }
             BindingTarget::NativeParam { device_id, param } => (None, AutomationTarget::NativeParam { device_id, param }),
             BindingTarget::MasterLimiter(p) => (None, AutomationTarget::MasterLimiter(p)),
-            launcher => return launcher.launcher_label().unwrap_or_default().into(),
+            BindingTarget::LaunchCell { track_id, scene_id } => {
+                return format!("{} / {}: {}", song.track_display_name(track_id), self.scene_label(scene_id), phrase());
+            }
+            BindingTarget::LaunchScene { scene_id } => return format!("{}: {}", self.scene_label(scene_id), phrase()),
+            BindingTarget::StopLauncherRow { track_id } | BindingTarget::SwitchRowToArranger { track_id } => {
+                return format!("{}: {}", song.track_display_name(track_id), phrase());
+            }
+            BindingTarget::StopAllLauncherRows | BindingTarget::SwitchAllToArranger => return phrase().into(),
         };
         let name = self.automation_target_label(&param);
         match track {
-            Some(id) => format!("{}: {name}", self.cur.song_doc.song().track_display_name(id)),
+            Some(id) => format!("{}: {name}", song.track_display_name(id)),
             None => name,
         }
+    }
+
+    /// 列の言葉 (`列「A」`、無名は並び順の番号)。無い列 (削除済みを指したまま) は `列 (削除済み)`。
+    fn scene_label(&self, scene_id: u32) -> String {
+        let scenes = &self.cur.song_doc.song().scenes;
+        scenes.iter().position(|s| s.id == scene_id).map_or_else(
+            || "列 (削除済み)".to_string(),
+            |i| crate::view::track_inspector::vocab::scene_title(&scenes[i].display_name(i)),
+        )
     }
 }
 
@@ -95,5 +113,25 @@ mod tests {
         assert_eq!(row, format!("CC 7  any  {name}: Volume"));
         let note = MidiBinding { input: MidiBindInput::Note(36), ..cc(9, 0, BindingTarget::SongTempo) };
         assert_eq!(app.midi_binding_row_label(&note), "ノート 36  ch 10  Tempo");
+    }
+
+    /// ランチャー操作の行は、どの行 (トラック) / 列を撃つかを名前で出す。
+    #[test]
+    fn ランチャー操作の行はトラックと列の名前を出す() {
+        let mut app = crate::test_support::headless_app();
+        let track = app.cur.song_doc.song().tracks.first().map(|t| t.id).expect("既定のトラック");
+        let name = app.cur.song_doc.song().track_display_name(track).into_owned();
+        let scene_id = app.edit_song(|song| {
+            let id = song.ensure_scene_at(0);
+            song.scenes[0].name = "Intro".into();
+            id
+        });
+        let scene_id = scene_id.expect("シーン");
+        let label = |t| app.midi_binding_target_label(t);
+        assert_eq!(label(BindingTarget::LaunchCell { track_id: track, scene_id }), format!("{name} / 列「Intro」: セルを撃つ"));
+        assert_eq!(label(BindingTarget::LaunchScene { scene_id }), "列「Intro」: シーンを撃つ");
+        assert_eq!(label(BindingTarget::StopLauncherRow { track_id: track }), format!("{name}: 行を止める"));
+        assert_eq!(label(BindingTarget::LaunchScene { scene_id: scene_id + 1 }), "列 (削除済み): シーンを撃つ");
+        assert_eq!(label(BindingTarget::SwitchAllToArranger), "全行をアレンジへ戻す");
     }
 }

@@ -102,23 +102,26 @@ impl Song {
         });
     }
 
-    /// 読み込みだけで通す: 箱の採番 (`ids.next_chord_id` — 箱の id と系統の最大 + 1 以上) が飽和に近ければ
+    /// 読み込みだけで通す: 箱の番号の空間 (`ids.next_chord_id`・箱の id・系統のどれか) が飽和に近ければ
     /// (壊れた / 手で直したファイル。普通の編集では 1 ずつしか進まない)、箱の id を並び順に `1..=n` へ、系統を
     /// その系統を持つ最初の箱の新しい id へ詰め直し、全クリップ (アレンジとセル) の記録を同じ表で付け替える。
+    /// 未採番の系統 (`0`) は表を通さずその箱の新しい id にする (未採番の箱どうしを同じ系統にしない)。
     /// 飽和したままだと採番が毎回同じ値を返し、新しく置く箱が直前の箱を消す / 同じ id の箱が並ぶ / 無関係な箱が
     /// 壊れた箱の系統を継ぐ (不変条件 1)。上限より下なら何もしない (冪等 — 開いただけで `*` を立てない)。
-    /// [`Self::normalize_chords`] の後、[`Self::normalize_chord_basis`] の前に呼ぶ (後者はどの箱も持たない系統の
-    /// 記録を捨てるので、付け替えより先に走ると記録が消える)。編集ごとの `normalize_chords` には入れない
-    /// (GUI の選択などが箱の id を持っている)。
+    /// [`Self::normalize_chords`] の **前** に呼ぶ: 後だと、未採番 / 重複の id を飽和した採番から振り直すので
+    /// 同じ id (= 同じ系統) の箱が並び、詰め直しでもう区別できない。[`Self::normalize_chord_basis`] よりも前
+    /// (後者はどの箱も持たない系統の記録を捨てるので、付け替えより先に走ると記録が消える)。編集ごとの
+    /// `normalize_chords` には入れない (GUI の選択などが箱の id を持っている)。
     pub(crate) fn compact_chord_ids_if_saturated(&mut self) {
-        if self.ids.next_chord_id <= CHORD_ID_COMPACT_ABOVE {
+        let max_used = self.chords.iter().map(|c| c.id.max(c.lineage)).max().unwrap_or(0);
+        if self.ids.next_chord_id <= CHORD_ID_COMPACT_ABOVE && max_used <= CHORD_ID_COMPACT_ABOVE {
             return;
         }
         let mut table: HashMap<u32, u32> = HashMap::new();
         let mut next = 1u32;
         for c in &mut self.chords {
             c.id = next;
-            c.lineage = *table.entry(c.lineage).or_insert(next);
+            c.lineage = if c.lineage == 0 { next } else { *table.entry(c.lineage).or_insert(next) };
             next = next.saturating_add(1);
         }
         self.ids.next_chord_id = next;

@@ -1079,5 +1079,12 @@ mod tests {
         app.edit_song(|song| song.midi_bindings.clear());
         assert!(right_click(&mut host, &mut app, (learn.x + 5.0, learn.y + 5.0)).open, "空でも開く");
         assert!(!click(&mut host, &mut app, (900.0, 600.0)).open, "外クリックで閉じる");
+
+        // 開いている間に Learn をもう 1 度右クリックすると閉じたまま (press で閉じて release で開き直さない)。
+        let on_learn = (learn.x + 5.0, learn.y + 5.0);
+        assert!(right_click(&mut host, &mut app, on_learn).open, "前提: 開く");
+        assert!(!right_click(&mut host, &mut app, on_learn).open, "2 度目の右クリックで閉じる");
+        assert!(!frame(&mut host, &mut app, FrameInput::default()).open, "閉じたまま");
+        assert!(right_click(&mut host, &mut app, on_learn).open, "3 度目でまた開く");
     }
 }

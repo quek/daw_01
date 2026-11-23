@@ -10,7 +10,7 @@ use crate::state::*;
 use crate::app_types::*;
 
 use common::model::ClipContent;
-use common::snap::quantize_content_beat;
+use common::snap::{quantize_content_beat, quantize_content_beat_in_window};
 
 /// 窓の端の許容 (浮動小数の誤差で窓の中の点を「外」と判定しない)。
 const WINDOW_EPS: f64 = 1e-9;
@@ -31,14 +31,19 @@ impl AppData {
 
     /// `Ctrl+U` の宛先: 編集面 ([`Self::edit_surface`] — 最後に選んだ面) がノートならノート、
     /// オートメーションの点なら点を寄せる event。それ以外の面 / 分割が決まらないときは `None`。
-    /// 点の `Adaptive` の段はアレンジのズームで決める (Automation Editor の上で押しても同じ)。
+    /// `point_zoom_x` = 点の `Adaptive` の段を決める、ポインタが乗っている面の px/拍 (Automation Editor の上なら
+    /// エディタの、それ以外はアレンジの — 右クリックの「格子に揃える」と同じ格子)。
     #[must_use]
-    pub fn quantize_selection_event(&self, surface: Option<EditSurface>) -> Option<crate::event::AppEvent> {
+    pub fn quantize_selection_event(
+        &self,
+        surface: Option<EditSurface>,
+        point_zoom_x: f32,
+    ) -> Option<crate::event::AppEvent> {
         use crate::event::AppEvent;
         match surface? {
             EditSurface::Notes => Some(AppEvent::QuantizeSelectedNotes { grid_beats: self.note_quantize_grid()? }),
             EditSurface::AutomationPoints => Some(AppEvent::QuantizeSelectedAutomationPoints {
-                grid_beats: self.automation_point_quantize_grid(self.cur.view.arrange_zoom_x)?,
+                grid_beats: self.automation_point_quantize_grid(point_zoom_x)?,
             }),
             _ => None,
         }
@@ -47,22 +52,53 @@ impl AppData {
     /// 選択ノートの始まりを `grid_beats` 拍の格子へ寄せる (長さは変えない)。重なりは
     /// `edit_clip_notes` が寄せた側を勝者として解消し、選択 (packed id) も追従させる。
     /// クリップごとに `edit_song` を呼ぶが、1 event = 1 undo step (`SongDoc::event_scope`)。
+    ///
+    /// 格子の原点と窓は **ノートを選んだクリップ** のもの (点と同じ規則 — content を共有する別のクリップから
+    /// 選んだノートはそのクリップの原点で寄せる)。窓の中にあったノートは窓の外へ出さない。どのノートも既に
+    /// 格子の上なら何も編集しない (undo step も `*` も積まない)。
     pub(crate) fn quantize_selected_notes(&mut self, grid_beats: f64) {
         if !(grid_beats.is_finite() && grid_beats > 0.0) {
             return;
         }
-        let selected = self.selected_note_ids();
-        if selected.is_empty() {
-            return;
-        }
-        self.for_each_note_clip_group(selected.into_iter().map(|id| (id, ())), |app, slot, r, items| {
-            let origin = app.clip_start_beat_of(r);
-            let locals: Vec<usize> = items.iter().map(|&(local, ())| local).collect();
+        // packed id ごとの寄せた先 (選んだ slot のクリップで計算する。content ごとに畳むのは
+        // `for_each_note_clip_group` — 同じノートを 2 つのクリップから選んでいたら先の slot)。
+        let targets: Vec<(u32, f64)> = {
+            let shown = self.shown_pianoroll_clips();
+            let song = self.cur.song_doc.song();
+            self.selected_note_ids()
+                .into_iter()
+                .filter_map(|id| {
+                    let (key, local) = Self::decode_note_id_in(&shown, id)?;
+                    let clip = song.clip_by_key(key)?;
+                    let note = song.clip_notes(clip).get(local)?;
+                    let start = quantize_content_beat_in_window(
+                        note.start_beat,
+                        clip.content_origin_beat(),
+                        grid_beats,
+                        clip.content_window(),
+                    );
+                    Some((id, start))
+                })
+                .collect()
+        };
+        self.for_each_note_clip_group(targets, |app, slot, r, items| {
+            let moves: Vec<(usize, f64)> = {
+                let song = app.cur.song_doc.song();
+                let notes = song.clip_by_key(r).map_or(&[][..], |c| song.clip_notes(c));
+                items
+                    .iter()
+                    .copied()
+                    .filter(|&(local, start)| notes.get(local).is_some_and(|n| n.start_beat != start))
+                    .collect()
+            };
+            if moves.is_empty() {
+                return;
+            }
             app.edit_clip_notes(slot, r, move |notes| {
-                let mut winners = Vec::with_capacity(locals.len());
-                for local in locals {
+                let mut winners = Vec::with_capacity(moves.len());
+                for (local, start) in moves {
                     if let Some(n) = notes.get_mut(local) {
-                        n.start_beat = quantize_content_beat(n.start_beat, origin, grid_beats);
+                        n.start_beat = start;
                         winners.push(u32::try_from(local).unwrap_or(u32::MAX));
                     }
                 }
@@ -84,6 +120,7 @@ impl AppData {
         // content ごとの (点の位置, 寄せた時刻)。同じ点を 2 つのクリップから選んでいたら先の 1 つ。
         let mut moves: std::collections::BTreeMap<common::model::ContentId, Vec<(usize, f64)>> =
             std::collections::BTreeMap::new();
+        let mut moved = false;
         for k in &selected {
             let song = self.cur.song_doc.song();
             let Some(clip) = song.automation_lane_by_key(k.track_id, k.lane_id).and_then(|l| l.clip_by_id(k.clip_id))
@@ -104,9 +141,11 @@ impl AppData {
             if p.time_beat >= w0 - WINDOW_EPS && p.time_beat <= w1 + WINDOW_EPS {
                 t = t.clamp(w0.max(0.0), w1.max(0.0));
             }
+            moved |= t != p.time_beat;
             list.push((idx, t));
         }
-        if moves.is_empty() {
+        // どの点も既に格子の上なら何も編集しない (undo step も `*` も積まない)。
+        if !moved {
             return;
         }
         // content ごとの「元の位置 → 並べ直した後の位置」。
@@ -235,6 +274,69 @@ mod tests {
 
         app.handle_event(AppEvent::Undo);
         assert_eq!(app.cur.song_doc.song().clip_contents, before.clip_contents, "1 回の undo で両方のクリップが戻る");
+    }
+
+    /// 1 つの content を、窓の始まりが格子から外れたクリップ a (start 1.15 / offset 0.25 = 原点 0.9、窓は曲の
+    /// [1.15, 5.15)) と、原点の違うクリップ b (start 8.5) で見せる。ノートは local 0.3 と 0.6。
+    fn app_with_linked_clips() -> (AppData, ClipKey, ClipKey) {
+        let mut app = crate::test_support::headless_app();
+        let (a, b) = (ClipKey { track_id: 1, clip_id: 1 }, ClipKey { track_id: 1, clip_id: 2 });
+        app.edit_song(|song| {
+            song.tracks.clear();
+            let notes = vec![note(1, 0.3, 60), note(2, 0.6, 62)];
+            song.clip_contents.insert(101, ClipContent::Midi(MidiContent { notes, next_note_id: 3 }));
+            let clip = |id, start_beat, content_offset_beats| Clip {
+                id,
+                start_beat,
+                length_beats: 4.0,
+                content_offset_beats,
+                content_id: 101,
+                ..Clip::default()
+            };
+            song.tracks.push(Track { id: 1, clips: vec![clip(1, 1.15, 0.25), clip(2, 8.5, 0.0)], next_clip_id: 3, ..Track::default() });
+        });
+        app.handle_event(AppEvent::SelectClip { target: a, additive: false });
+        app.handle_event(AppEvent::SelectClip { target: b, additive: true });
+        (app, a, b)
+    }
+
+    /// 格子の原点はノートを選んだクリップのもの (content を共有していても、見せている最初のクリップではない)。
+    /// 窓の始まりが格子から外れたクリップでは、寄せた先が窓の前になるノートを窓の中で最初の線へ留める。
+    #[test]
+    fn ノートは選んだクリップの格子へ寄せ窓の外へ出さない() {
+        let (mut app, a, b) = app_with_linked_clips();
+        // b から選ぶ: 曲 8.8 → 9 = local 0.5 (a の原点で寄せると local 0.3 → 曲 1.2 → 1 で別の位置)。
+        app.set_note_selection(&app.pack_note_ids_for(b, &[0]));
+        app.handle_event(AppEvent::QuantizeSelectedNotes { grid_beats: GRID });
+        let starts = |app: &AppData| song_starts(app, b);
+        assert_eq!(starts(&app), vec![9.0, 9.1], "b の格子 (曲 8.8 → 9)");
+
+        // a から選ぶ: local 0.6 = 曲 1.5 → 2 (窓の中)。local 0.5 = 曲 1.4 → 1 は窓 [1.15, 5.15) の前なので 2 へ。
+        app.handle_event(AppEvent::SelectClip { target: a, additive: false });
+        app.set_note_selection(&app.pack_note_ids_for(a, &[0, 1]));
+        assert_eq!(app.selected_note_ids().len(), 2, "前提: 2 音とも a の窓で選ばれている");
+        app.handle_event(AppEvent::QuantizeSelectedNotes { grid_beats: GRID });
+        assert_eq!(song_starts(&app, a), vec![2.0, 2.0], "窓の前へ出さず、窓の中で最初の線 (曲 2) へ");
+    }
+
+    /// どのノートも既に格子の上なら、何も編集しない (undo step も `*` も積まない)。点も同じ。
+    #[test]
+    fn 既に格子の上なら_undo_step_も_dirty_も積まない() {
+        let (mut app, _, _) = app_with_two_midi_clips();
+        app.handle_event(AppEvent::QuantizeSelectedNotes { grid_beats: GRID });
+        let depth = app.cur.song_doc.history_labels().len();
+        app.cur.song_doc.mark_saved();
+        app.handle_event(AppEvent::QuantizeSelectedNotes { grid_beats: GRID });
+        assert_eq!(app.cur.song_doc.history_labels().len(), depth, "ノート: undo step を積まない");
+        assert!(!app.cur.song_doc.is_dirty(), "ノート: * を立てない");
+
+        let mut app = app_with_automation(vec![pt(1, 0.75)], Vec::new());
+        app.handle_event(AppEvent::SelectAutomationPoints { prev: Vec::new(), next: vec![key(1, 0)] });
+        let depth = app.cur.song_doc.history_labels().len();
+        app.cur.song_doc.mark_saved();
+        app.handle_event(AppEvent::QuantizeSelectedAutomationPoints { grid_beats: GRID });
+        assert_eq!(app.cur.song_doc.history_labels().len(), depth, "点: undo step を積まない");
+        assert!(!app.cur.song_doc.is_dirty(), "点: * を立てない");
     }
 
     const LANE_CONTENT: ContentId = 201;

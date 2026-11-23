@@ -1752,7 +1752,7 @@ impl AppEvent {
             E::SetNoteVelocities(..) => "ベロシティ変更",
             E::SetNotesMuted { .. } => "ノートミュート",
             E::SetNoteLyrics { .. } => "歌詞編集",
-            E::QuantizeSelectedNotes { .. } =>"ノートをクオンタイズ",
+            E::QuantizeSelectedNotes { .. } => "ノートをクオンタイズ",
             E::QuantizePitchesToScale(..) => "ピッチをスケールに補正",
 
             // ---- クリップ ----

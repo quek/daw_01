@@ -59,6 +59,7 @@ impl AppData {
             return;
         }
         self.cur.peph.automation_editor_hover_beat = None;
+        self.cur.peph.automation_editor_px_per_beat = None;
         self.drop_undisplayed_automation_points();
     }
 

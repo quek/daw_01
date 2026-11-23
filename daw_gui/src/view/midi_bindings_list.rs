@@ -2,10 +2,10 @@
 //! `Song::midi_bindings` を 1 行ずつ出す (入力 / チャンネル / 宛先の言葉と、その 1 件を消す ×)。
 //!
 //! `open_overlay` (`chord_popup` / `resource_monitor` と同じ) なので、開いている間も再生と shortcut は
-//! 背景に通り、背景への click は通さない。外クリック / Esc / もう 1 度の右クリックで閉じる。開閉は daw-ui の
-//! popup 状態だけが持つ (Song にも session にも載せない — 見方の都合)。
+//! 背景に通り、背景への click は通さない。外クリック / Esc / Learn の上のもう 1 度の右クリックで閉じる
+//! ([`ListState`])。開閉は daw-ui の popup 状態だけが持つ (Song にも session にも載せない — 見方の都合)。
 
-use daw_ui_core::{Edit, Ui};
+use daw_ui_core::{Edit, Ui, WidgetId};
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
@@ -20,14 +20,46 @@ const FONT: f32 = 11.0;
 const REMOVE_W: f32 = 20.0;
 const MIN_W: f32 = 200.0;
 
+/// 開閉の記憶 (daw-ui の widget state)。
+#[derive(Default)]
+struct ListState {
+    /// 開いていた一覧を、いま押されているボタンの press が外クリックとして閉じた。右クリックは press で
+    /// 閉じて release で確定する (`take_secondary_click_in_rect`) ので、Learn の上の 2 度目の右クリックは
+    /// これが無いと release で開き直す (閉じてすぐ開く)。ボタンを離したフレームで消す。
+    closed_by_press: bool,
+}
+
+fn state_wid() -> WidgetId {
+    WidgetId::ROOT.child(b"midi_bindings_list_state")
+}
+
 /// `learn` = 「Learn」ボタンの rect。ボタンを描いた直後に呼ぶ。
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, learn: Rect) {
-    if ui.take_secondary_click_in_rect(learn).is_some() && !ui.is_overlay_open(OVERLAY_ID) {
+    let pointer = ui.pointer();
+    let clicked = ui.take_secondary_click_in_rect(learn).is_some();
+    let state = ui.widget_state::<ListState>(state_wid());
+    let closed_by_press = state.closed_by_press;
+    if pointer.secondary_just_released || pointer.primary_just_pressed || pointer.primary_just_released {
+        state.closed_by_press = false;
+    }
+    if clicked && !closed_by_press && !ui.is_overlay_open(OVERLAY_ID) {
         ui.open_overlay(OVERLAY_ID);
     }
     if !ui.is_overlay_open(OVERLAY_ID) {
         return;
     }
+    draw_open(app, ui, learn);
+    if !ui.is_overlay_open(OVERLAY_ID) {
+        ui.widget_state::<ListState>(state_wid()).closed_by_press = true;
+        return;
+    }
+    if ui.take_shortcut("escape") {
+        ui.close_overlay(OVERLAY_ID);
+    }
+}
+
+/// 開いている一覧を描く (外クリックならここで閉じる — `popup_layer`)。
+fn draw_open(app: &AppData, ui: &mut Ui<'_, AppData>, learn: Rect) {
     let rows: Vec<(String, common::model::MidiBinding)> = app
         .cur
         .song_doc
@@ -68,7 +100,4 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, learn: Rect) {
             }
         });
     });
-    if ui.take_shortcut("escape") {
-        ui.close_overlay(OVERLAY_ID);
-    }
 }

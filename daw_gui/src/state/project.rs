@@ -607,6 +607,9 @@ pub struct ProjectEphemeral {
     /// Automation Editor の本体上のポインタ位置 (窓ローカル拍、スナップ済み)。貼り付けの基準。
     /// 本体の外では `None`。
     pub automation_editor_hover_beat: Option<f64>,
+    /// Automation Editor の本体の px/拍 (前のフレームに描いた値)。`Ctrl+U` の点の格子の `Adaptive` の段に使う
+    /// (エディタの右クリックの「格子に揃える」と同じ段)。閉じたら `None`。
+    pub automation_editor_px_per_beat: Option<f32>,
     /// ピアノロールの**対象 (target) クリップ**の focus ヒント。
     ///
     /// 選択そのものではない (選択の SSoT は `SelectionState::time` 1 本) —
@@ -1044,6 +1047,7 @@ impl ProjectState {
                 audio_editor_clip: None,
                 automation_editor_clip: None,
                 automation_editor_hover_beat: None,
+                automation_editor_px_per_beat: None,
                 pianoroll_focus_clip: None,
                 audio_editor_hover_beat_in_clip: None,
                 audio_editor_zoom_x: 0.0,

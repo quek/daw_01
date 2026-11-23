@@ -1585,6 +1585,26 @@ mod tests {
         }
     }
 
+    /// 採番が飽和に近いファイルで、箱の id が未採番 (`0`) / 上限 (`u32::MAX`) で重なっていても、読み込み後は
+    /// id も系統も箱ごとに別になる (飽和した採番から振り直すと同じ id = 同じ系統の箱が並び、無関係な箱どうしが
+    /// 系統を共有する)。
+    #[test]
+    fn saturated_duplicate_chord_ids_get_distinct_ids_and_lineages() {
+        use crate::model::{Chord, ChordEvent, ChordKind};
+        for (case, id) in [("zero", 0), ("max", u32::MAX)] {
+            let mut song = Song::default();
+            for start in [0.0, 4.0, 8.0] {
+                song.chords.push(ChordEvent { id, lineage: 0, ..ChordEvent::new(start, 4.0, Chord::new(0, ChordKind::Major)) });
+            }
+            song.ids.next_chord_id = u32::MAX;
+            song.normalize_after_load().expect("箱の id は詰め直すので拒まない");
+            let ids: std::collections::HashSet<u32> = song.chords.iter().map(|c| c.id).collect();
+            let lineages: std::collections::HashSet<u32> = song.chords.iter().map(|c| c.lineage).collect();
+            assert_eq!((ids.len(), lineages.len()), (3, 3), "{case}: id も系統も箱ごとに別: {:?}", song.chords);
+            assert!(song.ids.next_chord_id < 100, "{case}: 採番が詰め直される");
+        }
+    }
+
     /// Text clip 1 つを持つ非 vocal トラック 1 本だけの song (字幕デバイス無し)。
     fn song_with_one_text_clip() -> Song {
         let mut song = Song::default();

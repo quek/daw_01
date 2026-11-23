@@ -612,15 +612,19 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
             })
         }));
     }
-    // Phase 7 B5 (`docs/plan_scale.html` §5.3): Shift+P で選択 clip の
-    // note pitch を最寄り in-scale に一括補正。 selected_notes が空なら
-    // clip 全 note、 そうでなければ選択 note のみ。
     // Ctrl+U: 最後に選んだ面 (ノート / オートメーションの点) を格子へ寄せる (last-selection-wins)。
+    // 点の `Adaptive` の段は、ポインタが Automation Editor の上ならエディタの px/拍 (右クリックの「格子に揃える」と同じ)。
+    let point_zoom_x = automation_editor_active
+        .and(app.cur.peph.automation_editor_px_per_beat)
+        .unwrap_or(app.cur.view.arrange_zoom_x);
     if ui.take_shortcut("daw.quantize")
-        && let Some(ev) = app.quantize_selection_event(surface)
+        && let Some(ev) = app.quantize_selection_event(surface, point_zoom_x)
     {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| app.handle_event(ev)));
     }
+    // Phase 7 B5 (`docs/plan_scale.html` §5.3): Shift+P で選択 clip の
+    // note pitch を最寄り in-scale に一括補正。 selected_notes が空なら
+    // clip 全 note、 そうでなければ選択 note のみ。
     if ui.take_shortcut("daw.quantize_pitches_to_scale") {
         let target = if app.selected_note_ids().is_empty() {
             crate::app::QuantizePitchTarget::SelectedClipAllNotes
