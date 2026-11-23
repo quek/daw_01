@@ -10,13 +10,22 @@
 //! - 右端のドラッグで幅が 360〜640 に畳まれ、離したときに app_config へ書かれる。
 //! - 3 トラックの選択で、タイトル「3 トラック」、入力は「選択中の 3 トラック」、Rack 以下は「… のみ」。
 //!
+//! 段 2 (仕様 3・7・9): クリップの設定はクリップの帯の 1 か所だけ。
+//! - 歌声の声はクリップの帯に出て、VOICEVOX の Par には口パク先だけが残る。
+//! - テキストクリップの本文の欄は 1 本、字幕デバイスは Par を持たない。帯を畳むと入力中のセリフは確定する。
+//! - 名前の欄で改名しても、アレンジのクリップの上の改名欄は出ない。
+//! - 欄名は全部ラベル列に収まる。
+//!
 //! daw_gui 本体は起動しない (AppData を直に組む)。
 
 use std::cell::Cell;
 use std::sync::Arc;
 
 use common::app_dirs::AppDirs;
-use common::model::{AudioContent, Clip, ClipContent, ClipKey, ImageContent, NativeKind, RackPanelKey};
+use common::model::{
+    AudioContent, Clip, ClipContent, ClipKey, ImageContent, MidiContent, NativeKind, RackPanelKey, TextContent, TextEvent,
+};
+use common::plugin_db::{BUILTIN_ID_VOICEVOX, PluginDatabase, SUBTITLE_ID, builtin_descriptors};
 use common::protocol::{AudioCommand, PluginCommand};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
@@ -26,9 +35,11 @@ use daw_gui::event_device::DeviceEvent;
 use daw_gui::event_inspector::InspectorEvent;
 use daw_gui::handler::inspector_view::{INSPECTOR_MAX_W, INSPECTOR_MIN_W};
 use daw_gui::state::inspector_view::{ClipBandKind, InspectorBand, InspectorDetail, InspectorFolds};
+use daw_gui::view::track_inspector::layout::{FORM_GAP, FORM_LABEL_W, LABEL_FONT};
 use daw_gui::view::track_inspector::{panel_width, vocab};
+use daw_gui::voicevox_client::{VoiceVoxSinger, VoiceVoxStyle};
 use daw_gui::widgets::select_modifier::SelectModifier;
-use daw_ui_core::{FrameInput, PointerFrame, UiHost};
+use daw_ui_core::{FrameInput, ImeEvent, PointerFrame, UiHost};
 use daw_ui_platform::PhysicalSize;
 use daw_ui_renderer::{Primitive, Scene};
 
@@ -47,12 +58,24 @@ struct Harness {
 
 impl Harness {
     fn new(app_dirs: Option<AppDirs>) -> Self {
+        Self::build(app_dirs, None)
+    }
+
+    /// 内蔵 plugin (VOICEVOX / 字幕) を picker から足せる DB つき。VOICEVOX の engine は起こさない。
+    fn with_builtins() -> Self {
+        let db = Arc::new(PluginDatabase::new(builtin_descriptors(), None, 0));
+        let mut h = Self::build(None, Some(db));
+        h.app.voicevox.voicevox_launch_attempted = true;
+        h
+    }
+
+    fn build(app_dirs: Option<AppDirs>, db: Option<Arc<PluginDatabase>>) -> Self {
         let (audio_tx, audio_rx) = mpsc::unbounded_channel();
         let (plugin_tx, plugin_rx) = mpsc::unbounded_channel();
         let event_dispatcher: Arc<dyn BackgroundDispatcher> = RecordingDispatcher::new();
         let job_dispatcher: Arc<dyn JobDispatcher> = Arc::new(NoopJobDispatcher);
         let mut app =
-            AppData::new(audio_tx, plugin_tx, None, None, event_dispatcher, job_dispatcher, None, app_dirs, 48_000);
+            AppData::new(audio_tx, plugin_tx, None, db, event_dispatcher, job_dispatcher, None, app_dirs, 48_000);
         app.handle_event(AppEvent::SetTheme("dark".to_string()));
         let mut host: UiHost<AppData> = UiHost::no_redraw();
         if host.set_palette(app.theme.core.clone()) {
@@ -82,10 +105,32 @@ impl Harness {
         self.app.handle_event(AppEvent::Inspector(ev));
     }
 
+    /// picker から内蔵 plugin を `track` に足す (本番の「+ Plugin」と同じ経路)。返り値 = 足した device。
+    fn add_builtin(&mut self, track: u32, id: &str) -> u64 {
+        self.select(track);
+        self.app.handle_event(AppEvent::OpenPluginPicker { chain: None });
+        self.app.handle_event(AppEvent::SelectPluginFromDb { id: id.to_string(), keep_open: false, open_gui: false });
+        let song = self.app.cur.song_doc.song();
+        song.track_by_id(track).and_then(|t| t.plugins().filter(|p| p.plugin_id == id).last()).expect("足した device").id
+    }
+
+    /// フォーカス中の入力欄へ文字を確定入力する (IME の確定と同じ経路)。ポインタはどこにも hover しない。
+    fn type_text(&mut self, text: &str) -> Scene {
+        let input = FrameInput {
+            pointer: PointerFrame { pos: Some((W as f32 - 5.0, H as f32 - 5.0)), ..PointerFrame::default() },
+            ime: vec![ImeEvent::Commit(text.to_string())],
+            ..FrameInput::default()
+        };
+        self.frame_input(input, false)
+    }
+
     /// 1 フレーム描く。`scroll_to_end` ならインスペクタの本文を末尾までスクロールしてから描く。
     fn frame_with(&mut self, pointer: PointerFrame, scroll_to_end: bool) -> Scene {
+        self.frame_input(FrameInput { pointer, ..FrameInput::default() }, scroll_to_end)
+    }
+
+    fn frame_input(&mut self, input: FrameInput, scroll_to_end: bool) -> Scene {
         let mut scene = Scene::new();
-        let input = FrameInput { pointer, ..FrameInput::default() };
         let popups = &self.popups_open;
         self.host.frame(&mut self.app, &mut scene, SCREEN, input, |app, ui| {
             if scroll_to_end {
@@ -328,7 +373,9 @@ fn hidden_or_collapsed_bands_leave_no_hover_scopes_or_popups() {
     h.inspector(InspectorEvent::ToggleBand(InspectorBand::Rack));
     let scene = h.settle();
     let snap_before = find(&scene, W as f32, "Snap").expect("アレンジのツールバー").left;
-    h.click(center(&one(&h, &scene, "MIDI")));
+    // 入力元の dropdown (効果だけのトラックなので「MIDI (録れない)」と出ている)。
+    let input = glyphs_left_of(&scene, 360.0).into_iter().find(|g| g.text.starts_with("MIDI")).expect("入力元の dropdown");
+    h.click(center(&input));
     h.hover_at((W as f32 - 5.0, H as f32 - 5.0));
     assert!(h.popups_open.get(), "入力の dropdown が開いた");
     h.inspector(InspectorEvent::ToggleVisible);
@@ -400,4 +447,155 @@ fn multi_track_selection_shows_who_each_band_applies_to() {
     for text in [vocab::n_tracks(3), input_target, cursor_only] {
         assert!(find(&scene, 360.0, &text).is_some(), "`{text}` が描かれている");
     }
+}
+
+fn singer(name: &str, styles: &[(u32, &str)]) -> VoiceVoxSinger {
+    VoiceVoxSinger {
+        name: name.to_string(),
+        styles: styles.iter().map(|&(id, n)| VoiceVoxStyle { id, name: n.to_string() }).collect(),
+    }
+}
+
+/// `label` の欄の値 (同じ行で、ラベル列より右にある `text`)。
+fn field_value(h: &Harness, scene: &Scene, label: &str, text: &str) -> Glyph {
+    let label = one(h, scene, label);
+    glyphs_left_of(scene, panel_width(&h.app))
+        .into_iter()
+        .find(|g| g.text == text && g.left > label.left + 50.0 && (g.top - label.top).abs() < 8.0)
+        .unwrap_or_else(|| panic!("`{}` の欄に `{text}`", label.text))
+}
+
+fn count(h: &Harness, scene: &Scene, text: &str) -> usize {
+    glyphs_left_of(scene, panel_width(&h.app)).iter().filter(|g| g.text == text).count()
+}
+
+/// 歌声の声はクリップの帯 (Rack より上) の 1 か所だけ。VOICEVOX の Par に残るのは口パク先。
+#[test]
+fn singing_voice_lives_in_the_clip_band_and_par_keeps_only_the_lipsync_target() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    let vv = h.add_builtin(t0, BUILTIN_ID_VOICEVOX);
+    h.app.handle_event(AppEvent::SingersLoaded(vec![singer("ずんだもん", &[(3, "ノーマル"), (1, "あまあま")])]));
+    let clip = place(&mut h.app, t0, 0.0, ClipContent::Midi(MidiContent::default()), "Verse");
+    h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
+    h.app.handle_event(AppEvent::Device(DeviceEvent::ToggleRackPanel(RackPanelKey::Device(vv))));
+    let scene = h.settle();
+    let rack = one(&h, &scene, vocab::BAND_RACK).top;
+    assert!(one(&h, &scene, vocab::SUB_VOICE).top < rack, "歌声はクリップの帯 (Rack より上)");
+    assert_eq!(count(&h, &scene, vocab::FIELD_CHARACTER), 1, "声の欄は 1 か所だけ (Par に無い)");
+    assert!(one(&h, &scene, vocab::FIELD_LIPSYNC_TARGET).top > rack, "VOICEVOX の Par には口パク先");
+}
+
+/// テキストクリップの本文の欄は 1 本 (読み上げと字幕で共有)、字幕デバイスは Par を持たない。
+/// 本文に打っている途中で帯を畳むと、見出しを押した press で入力欄が確定する。
+#[test]
+fn text_clip_has_one_body_field_and_collapsing_commits_it() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    let vv = h.add_builtin(t0, BUILTIN_ID_VOICEVOX);
+    let sub = h.add_builtin(t0, SUBTITLE_ID);
+    let line = TextEvent { text: "こんにちは".to_string(), event_length_beats: 4.0, ..TextEvent::default() };
+    let clip = place(&mut h.app, t0, 0.0, ClipContent::Text(TextContent { events: vec![line] }), "");
+    h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
+    h.app.handle_event(AppEvent::Device(DeviceEvent::ToggleRackPanel(RackPanelKey::Device(vv))));
+
+    // 字幕デバイス: Par のボタンが無く、GUI / Par の操作をしても何も開かない。
+    let plugin = h.app.cur.song_doc.song().plugin_by_id(sub).expect("字幕デバイス").clone();
+    let entry = h.app.chain_entry_for(&plugin);
+    assert!(!entry.shows_param_panel() && !entry.shows_button(), "字幕デバイスは Par を持たない");
+    h.app.handle_event(AppEvent::Device(DeviceEvent::ToggleSlotGui { device_id: sub }));
+    assert!(!h.app.rack_panel_open(RackPanelKey::Device(sub)));
+
+    let scene = h.settle();
+    let rack = one(&h, &scene, vocab::BAND_RACK).top;
+    assert_eq!(count(&h, &scene, vocab::FIELD_LINE), 1, "本文の欄は 1 本");
+    assert_eq!(count(&h, &scene, vocab::FIELD_TEXT), 0);
+    assert!(one(&h, &scene, vocab::SUB_TALK).top < rack, "読み上げはクリップの帯");
+    assert!(one(&h, &scene, vocab::SUB_SUBTITLE).top < rack, "字幕はクリップの帯");
+    assert!(find(&scene, 360.0, vocab::SUB_FILL).is_none(), "字幕の細かい設定は最初は畳まれている");
+
+    // 本文に打ち、確定せずに帯の見出しを押す → 確定してから畳まれる。
+    let body = field_value(&h, &scene, vocab::FIELD_LINE, "こんにちは");
+    h.click(center(&body));
+    h.type_text("さようなら");
+    let band = one(&h, &scene, vocab::clip_band_title(ClipBandKind::Text));
+    h.click(center(&band));
+    assert!(!h.app.inspector_band_open(InspectorBand::Clip(ClipBandKind::Text)), "帯が畳まれた");
+    assert_eq!(h.app.text_first_event(clip, |e| e.text.clone()).as_deref(), Some("さようなら"), "入力中のセリフが確定した");
+}
+
+/// 名前の欄で改名する: 確定 (欄の外のクリック) で名前が変わり (1 undo step)、その間アレンジのクリップの上の
+/// 改名欄は出ない (同じ値の入力欄を 2 つ並べない)。
+#[test]
+fn name_field_renames_without_the_arrangement_rename_box() {
+    let mut h = Harness::new(None);
+    let t0 = h.track(0);
+    let clip = place(&mut h.app, t0, 0.0, ClipContent::Midi(MidiContent::default()), "Lead");
+    h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
+    let scene = h.settle();
+    let undo = h.app.cur.song_doc.undo_depth();
+    let name = field_value(&h, &scene, vocab::FIELD_NAME, "Lead");
+    h.click(center(&name));
+    h.type_text("Hook");
+    assert_eq!(h.app.cur.peph.clip_rename, None, "打っている間もアレンジの改名欄は出ない");
+    h.click(center(&one(&h, &scene, vocab::FIELD_NAME)));
+    let song = h.app.cur.song_doc.song();
+    let content_id = song.clip_by_key(clip).expect("clip").content_id;
+    assert_eq!(song.content_name(content_id), "Hook", "欄の外のクリックで確定した");
+    assert_eq!(h.app.cur.peph.clip_rename, None);
+    assert_eq!(h.app.cur.song_doc.undo_depth(), undo + 1, "改名は 1 undo step");
+}
+
+/// 欄名 (`vocab::FORM_LABELS`) は全部ラベル列に収まる (「…」で切れない)。
+#[test]
+fn form_labels_fit_the_label_column() {
+    let mut h = Harness::new(None);
+    let too_wide = Cell::new(Vec::new());
+    let widest = Cell::new(0.0_f32);
+    let mut scene = Scene::new();
+    h.host.frame(&mut h.app, &mut scene, SCREEN, FrameInput::default(), |_, ui| {
+        let measured: Vec<(String, f32)> =
+            vocab::FORM_LABELS.iter().map(|l| (l.to_string(), ui.measure_text(l, LABEL_FONT))).collect();
+        widest.set(measured.iter().map(|(_, w)| *w).fold(0.0, f32::max));
+        too_wide.set(measured.into_iter().filter(|(_, w)| *w > FORM_LABEL_W - FORM_GAP).collect());
+    });
+    // 測れていること (0 を返す測り方ならこの検査は素通りしてしまう)。
+    assert!(widest.get() > FORM_LABEL_W * 0.6, "一番長い欄名の幅 {} px", widest.get());
+    assert_eq!(too_wide.take(), Vec::<(String, f32)>::new(), "ラベル列 ({} px) に収まらない欄名", FORM_LABEL_W - FORM_GAP);
+}
+
+/// 字幕の数値欄は欄の種類ごとに別の undo の束ね (§6-13: `InspectorScrubField::Text` から device を外しても、
+/// 同時に描かれる X と Y の鍵は重ならない)。X を数フレームドラッグしても 1 undo step で、Y は動かない。
+#[test]
+fn subtitle_field_drag_is_one_undo_step() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    h.add_builtin(t0, SUBTITLE_ID);
+    let line = TextEvent { text: "字幕".to_string(), event_length_beats: 4.0, x: 0.1, y: 0.4, ..TextEvent::default() };
+    let clip = place(&mut h.app, t0, 0.0, ClipContent::Text(TextContent { events: vec![line] }), "");
+    h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
+    let scene = h.settle();
+    let x = field_value(&h, &scene, "X", "0.100");
+    let at = center(&x);
+    let undo = h.app.cur.song_doc.undo_depth();
+    let frame = |h: &mut Harness, pos: (f32, f32), jp: bool, pressed: bool, jr: bool| {
+        let p = PointerFrame {
+            pos: Some(pos),
+            primary_pressed: pressed,
+            primary_just_pressed: jp,
+            primary_just_released: jr,
+            ..PointerFrame::default()
+        };
+        h.frame_with(p, false);
+    };
+    frame(&mut h, at, true, true, false);
+    for i in 1..=5 {
+        frame(&mut h, (at.0 + 10.0 * i as f32, at.1), false, true, false);
+    }
+    frame(&mut h, (at.0 + 50.0, at.1), false, false, true);
+    h.settle();
+    let (x, y) = h.app.text_first_event(clip, |e| (e.x, e.y)).expect("字幕");
+    assert!(x > 0.15, "右へ引いたので X が増える: {x}");
+    assert!((y - 0.4).abs() < 1e-6, "Y は動かない: {y}");
+    assert_eq!(h.app.cur.song_doc.undo_depth(), undo + 1, "1 ドラッグ = 1 undo step");
 }

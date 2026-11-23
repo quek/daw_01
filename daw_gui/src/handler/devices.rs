@@ -506,16 +506,16 @@ impl AppData {
             return;
         }
         let device = song.plugin_by_id(device_id);
-        // 映像 FX (色補正 / Transform 等) は専用の video_fx パネル。 ただし字幕
-        // (`builtin.video.subtitle`) は video device だが video_fx def を持たず、
-        // 専用パラメータは Text Event セクション (= Par パネルで描画) なので、 ここで
-        // 弾いて下の汎用 param パネル経路へ流す。 Par は device ごとに独立して開く (Q18)。
+        // 映像 FX (色補正 / Transform 等) は専用の video_fx パネル。 Par は device ごとに独立して
+        // 開く (Q18)。 映像 device は plugin window を持たない。 字幕 (`builtin.video.subtitle`) は
+        // Par も持たない (文字と書式はクリップの帯で編集する、r.md #158) ので何もしない。
         if let Some(d) = device
             && d.ports.is_video()
-            && d.plugin_id != common::plugin_db::SUBTITLE_ID
         {
-            self.toggle_rack_panel(common::model::RackPanelKey::Device(device_id));
-            return; // 映像 device は plugin window を持たない。
+            if d.plugin_id != common::plugin_db::SUBTITLE_ID {
+                self.toggle_rack_panel(common::model::RackPanelKey::Device(device_id));
+            }
+            return;
         }
         // 埋め込み GUI を持たない plugin (VOICEVOX builtin / GUI 無し CLAP・VST3) は
         // editor window を開けない。 代わりにインスペクタ内の汎用 param パネル (Par) を

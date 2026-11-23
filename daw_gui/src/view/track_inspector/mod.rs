@@ -4,21 +4,19 @@
 //!   入力 → Rack → 口パク → モジュレーション。見出しのクリックで開閉 (種類ごとに共通、ViewState に保存)
 //! - 右端の 5px で幅を変える (360〜640)。`I` / View メニューで丸ごと隠す (app_config に保存)
 
-/// 選択クリップの「音声クリップ」の帯の中身 (Audio Event)。
-mod audio_event_section;
 /// r.md #158: 帯 (見出し / 詳細 / 小見出し)。
 mod band;
 mod chain_list;
 /// chain list の chain 行 / 操作行と、 Parallel ヘッダ行と共有する disclosure / 改名欄。
 mod chain_row;
 mod chain_sections;
+/// r.md #158: 選択の帯 (クリップ / セル) と列の帯の中身 (音声 / 画像 / 歌声 / 読み上げ / 字幕 / ローンチ)。
+mod clip_band;
 mod device_panel;
-/// 選択クリップの「画像クリップ」の帯の中身 (Image Event)。
-mod image_event_section;
+/// r.md #158: 欄 (ラベル左・値右)。
+mod form;
 /// r.md #156: トラックの「入力」と「モニター」。
 mod input_section;
-/// r.md #87: 選択中のランチャーセルのローンチ設定 (Q7 / 計画書 §3.4)。
-mod launch_section;
 /// r.md #158: インスペクタの寸法 (テストも読む)。
 pub mod layout;
 /// r.md #151: Rack の行の Mix ノブ (Alt+クリックで Δ)。
@@ -43,16 +41,13 @@ pub mod vocab;
 use daw_ui_core::{Edit, Orientation, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui};
 use daw_ui_renderer::Rect;
 
-use crate::app::{
-    text_num_to_builtin, AppData, AppEvent, ClipKey, DiscreteClipEdit,
-    FadeEdgeKind, InspectorScrubField, ScrubGesture, TalkParamKind, TextNumField,
-};
+use crate::app::{AppData, AppEvent, ClipKey, InspectorScrubField, ScrubGesture};
 use crate::event_inspector::InspectorEvent;
 use crate::handler::bypass_target::BypassTarget;
 use crate::state::ModRackHover;
 use crate::state::inspector_view::{InspectorBand, InspectorScrollFloor};
 use crate::view::modulation::{self as mod_widget, build_mod, scrub_field_mod, ModBuild};
-use common::model::{AutomationTarget, FadeCurve, TextAlign};
+use common::model::AutomationTarget;
 
 use band::BandHead;
 use layout::{BAND_GAP, PAD, RESIZE_HANDLE_W, TITLE_H};
@@ -202,24 +197,6 @@ fn scrub_field(
     }
 }
 
-const FADE_CURVE_LABELS: &[&str] = &["Linear", "Exp", "SCurve"];
-
-fn fade_curve_to_index(c: FadeCurve) -> usize {
-    match c {
-        FadeCurve::Linear => 0,
-        FadeCurve::Exponential => 1,
-        FadeCurve::SCurve => 2,
-    }
-}
-
-fn fade_curve_from_index(i: usize) -> FadeCurve {
-    match i {
-        1 => FadeCurve::Exponential,
-        2 => FadeCurve::SCurve,
-        _ => FadeCurve::Linear,
-    }
-}
-
 /// インスペクタが占める幅 (隠しているときは 0)。`root.rs` のレイアウト計算が使う
 /// (`master_panel::panel_width` と同じ形)。
 #[must_use]
@@ -319,21 +296,18 @@ fn draw_bands(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, mut y: f32, h
     // ---- 選んでいるクリップ / セル ----
     if let Some((kind, target)) = app.inspector_clip_band() {
         let head = BandHead { key: InspectorBand::Clip(kind), title: vocab::clip_band_title(kind), target: &target, actions_w: 0.0 };
-        y = band::band(app, ui, area, y, &head, |ui, y| {
-            // r.md #87: セルのローンチ設定 (セルを選んでいなければ何も描かない)。
-            let y = launch_section::draw_cell_launch(app, ui, area, PAD, y);
-            let y = audio_event_section::draw_audio_event_section(app, ui, area, PAD, y);
-            image_event_section::draw_image_event_section(app, ui, area, PAD, y)
-        }) + BAND_GAP;
+        y = band::band(app, ui, area, y, &head, |ui, y| clip_band::draw_clip_band_body(app, ui, area, PAD, y))
+            + BAND_GAP;
     }
     // ---- 選んでいる列 (シーン) ----
     if let Some(target) = app.inspector_scene_band_target() {
         let head = BandHead { key: InspectorBand::Scene, title: vocab::BAND_SCENE, target: &target, actions_w: 0.0 };
-        y = band::band(app, ui, area, y, &head, |ui, y| launch_section::draw_scene_launch(app, ui, area, PAD, y))
+        y = band::band(app, ui, area, y, &head, |ui, y| clip_band::draw_scene_launch(app, ui, area, PAD, y))
             + BAND_GAP;
     }
-    // ---- 入力 (選択中の全トラックに効く。master と、トラックが無いときは出ない) ----
-    if !app.input_target_track_ids().is_empty() {
+    // ---- 入力 (選択中の全トラックに効く。録れる入力が 1 つも無いトラック (master / グループのバス /
+    // 画像・映像のトラック) だけなら出さない — 仕様 14) ----
+    if input_section::input_band_shown(app) {
         let target = app.inspector_track_band_target(true);
         let head = BandHead { key: InspectorBand::Input, title: vocab::BAND_INPUT, target: &target, actions_w: 0.0 };
         y = band::band(app, ui, area, y, &head, |ui, y| input_section::draw_input_section(app, ui, area, PAD, y))

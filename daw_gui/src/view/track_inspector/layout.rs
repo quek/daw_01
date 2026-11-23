@@ -39,3 +39,20 @@ pub const SUB_HEAD_H: f32 = 16.0;
 
 /// 右端の幅のドラッグ帯 (scroll viewport の外の列)。
 pub const RESIZE_HANDLE_W: f32 = 5.0;
+
+/// 欄 (ラベル左・値右、`form.rs`) のラベル列の幅。欄の幅はこの 1 つだけ。一番長い欄名
+/// (「フォルマント st」、11px で 85px 前後) が切れずに入る幅 (計画の 88 では「…」で切れた)。
+pub const FORM_LABEL_W: f32 = 96.0;
+/// ラベル列 / 値 / A 列の間。
+pub const FORM_GAP: f32 = 4.0;
+/// 自動化の「A」の列 (A が無い欄でもこの幅を空けて、値の右端を揃える)。
+pub const FORM_AUTO_W: f32 = 22.0;
+/// 欄の部品 (数値欄 / dropdown / トグル / 入力欄) の高さ。
+pub const FORM_ROW_H: f32 = 22.0;
+/// 行の送り。
+pub const FORM_ROW_PITCH: f32 = 26.0;
+/// 欄のラベル (text_dim)。
+pub const LABEL_FONT: f32 = 11.0;
+/// 値の下に添える補足 (text_dim) の文字と行の送り。
+pub const HINT_FONT: f32 = 10.0;
+pub const HINT_PITCH: f32 = 16.0;

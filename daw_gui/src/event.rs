@@ -2104,7 +2104,6 @@ pub enum DiscreteClipEdit {
     /// r.md #98: 画像の左右 / 上下反転 (`ImageEvent.flip_h` / `flip_v`)。
     ImageFlipH(bool),
     ImageFlipV(bool),
-    TextMuted(bool),
     TextAlign(common::model::TextAlign),
     TextFadeCurve(FadeEdgeKind, common::model::FadeCurve),
 }

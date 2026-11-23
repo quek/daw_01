@@ -1,6 +1,6 @@
 //! インスペクタの「口パク」の帯の中身 (口形状 → 画像)。
 //!
-//! contract は `chain_sections.rs` / `launch_section.rs` と同じ
+//! contract は `chain_sections.rs` / `clip_band` と同じ
 //! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。 `track_inspector/mod.rs::draw` から
 //! 切り出したもの (サイズ budget、 不変条件 9)。
 

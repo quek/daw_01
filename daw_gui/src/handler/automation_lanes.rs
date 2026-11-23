@@ -626,9 +626,8 @@ impl AppData {
     /// 汎用 plugin の「Par」インライン param パネルの read snapshot。
     /// Par を開いた `device_id` が cursor track に居て、 host から param 一覧が
     /// 届いているときに、 lane default_value を実レンジ化した編集可能な param 行を返す。
-    /// VOICEVOX / 字幕 builtin は host param を持たず、 専用セクション (Clip Voice /
-    /// Talk / Text Event) が自分の gate (Par を開いた device の種類) で Par パネルとして描画される
-    /// ので、 ここでは `None` (= 汎用パネルは出さない)。
+    /// VOICEVOX / 字幕 builtin は host param を持たない (VOICEVOX の Par は口パク先だけ、声 / 読み上げ /
+    /// 字幕の欄はクリップの帯、r.md #158) ので、 ここでは `None` (= 汎用パネルは出さない)。
     ///
     /// 行は param 表の全 param ぶんあるので、device ごとに [`PluginParamsPanelCache`] (Song + param 表 +
     /// plugin DB の世代) に載せ、毎フレーム組み直さない。カーソルトラックの gate だけは毎回見る。

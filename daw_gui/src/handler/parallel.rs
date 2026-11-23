@@ -557,6 +557,7 @@ impl AppData {
             has_embedded_gui,
             is_video: p.ports.is_video(),
             is_voicevox,
+            is_subtitle: p.format == PluginFormat::Builtin && p.plugin_id == common::plugin_db::SUBTITLE_ID,
             has_params,
             send_all_keys: p.send_all_keys_to_plugin,
             load_error: self.cur.pipc.failed_plugin_loads.get(&p.id).cloned(),

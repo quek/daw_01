@@ -1,5 +1,8 @@
 //! インスペクタのチェーン行を **展開したとき** に出る param パネル本体 (plugin / 映像 FX /
-//! VOICEVOX / 字幕 / Transform。内蔵 device の Par は `native_panel`)。
+//! VOICEVOX の口パク先 / Transform。内蔵 device の Par は `native_panel`)。
+//!
+//! r.md #158: クリップの設定 (歌声の声 / 読み上げ / 字幕の文字と書式) はクリップの帯 (`clip_band`) へ
+//! 移した。Par に残すのはデバイスそのものの設定だけ (字幕デバイスは Par を持たない)。
 //!
 //! plugin 行の展開 (`plugin_row.rs`) がここ 1 本 ([`draw_device_panel`]) を呼ぶ。
 //!
@@ -18,12 +21,9 @@
 //! widget id と undo bracket の鍵には必ず `device_id` を入れる — 同じ種類の Par を 2 枚開いたとき、
 //! 片方のドラッグがもう片方の入力状態や bracket を奪わないため (§18-AA)。
 
-mod clip_voice;
 mod group_transform;
 mod lipsync;
 mod plugin_params;
-mod talk;
-mod text_event;
 mod video_fx;
 
 use super::*;
@@ -49,13 +49,10 @@ pub(super) fn draw_device_panel(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: Pa
     ctx.y = group_transform::draw_group_transform(app, ui, ctx);
     ctx.y = video_fx::draw_video_fx_params(app, ui, ctx);
     ctx.y = plugin_params::draw_plugin_params(app, ui, ctx);
-    ctx.y = text_event::draw_text_event(app, ui, ctx);
-    ctx.y = clip_voice::draw_clip_voice(app, ui, ctx);
-    ctx.y = talk::draw_talk(app, ui, ctx);
     lipsync::draw_lipsync_target(app, ui, ctx)
 }
 
-/// Par を開いた device が `plugin_id` の plugin か (VOICEVOX / 字幕の専用セクションの gate)。
+/// Par を開いた device が `plugin_id` の plugin か (VOICEVOX の専用欄の gate)。
 fn opened_plugin_is(app: &AppData, device_id: u64, plugin_id: &str) -> bool {
     app.cur.song_doc.plugin_by_id(device_id).is_some_and(|p| p.plugin_id == plugin_id)
 }

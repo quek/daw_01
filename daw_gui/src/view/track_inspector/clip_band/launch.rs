@@ -4,7 +4,8 @@
 //! 選択中の **ランチャーのセル** の量子化 / ローンチモード / ループ / レガート /
 //! フォローアクション一式を出す。複数選択は一括変更で、値が割れている欄は
 //! dropdown なら空表示 (選択 index を範囲外にする)、トグルなら OFF 表示にして
-//! 「押したら全部 ON に揃う」 側へ倒す (トグルは 3 状態を持てない)。
+//! 「押したら全部 ON に揃う」 側へ倒す (トグルは 3 状態を持てない)。量子化 / モード / 長さ / 動作は
+//! 「ラベル左・値右」の欄 (`form.rs`)、フォローアクションは複合の操作なので 3 列の格子のまま。
 //!
 //! ## 高さが変わるのは「ジャンプ」の行だけ
 //!
@@ -15,7 +16,7 @@
 //! ## 既存 idiom の流用
 //!
 //! `ui.dropdown` / `ui.toggle_button_at` / `ui.scrubable_number_at` と
-//! `super::{scrub_style, toggle_audio_style}` をそのまま使う。bespoke な
+//! `track_inspector::{scrub_style, toggle_audio_style}` をそのまま使う。bespoke な
 //! edit-buffer widget は作らない (`feedback_reuse_inspector_idiom`)。
 
 use std::sync::LazyLock;
@@ -25,6 +26,8 @@ use daw_ui_renderer::Rect;
 
 use common::model::{FollowAction, FollowActionKind, LaunchMode, LAUNCH_QUANTIZE_CHOICES};
 
+use super::super::form;
+use super::super::layout::FORM_ROW_PITCH;
 use crate::app::{AppData, AppEvent, ClipKey, InspectorScrubField};
 use crate::event_launcher::{LaunchEdit, LauncherCellKey, LauncherEvent};
 use crate::state::inspector_view::InspectorDetail;
@@ -95,14 +98,14 @@ pub(super) fn draw_cell_launch(app: &AppData, ui: &mut Ui<'_, AppData>, area: Re
     // セル側の行は **セルを選んでいるときだけ**出す。列見出しだけを選んだときに
     // セルの量子化 / 長さ / ループを出すと、触れる対象が無いのに操作できてしまう。
     let scene_ids = scenes_of(app, &cells);
-    let y = super::band::sub_heading(
+    let y = super::super::band::sub_heading(
         app,
         ui,
         "inspector_launch_head",
         area.x + pad,
         area.w - pad * 2.0,
         y,
-        super::vocab::SUB_LAUNCH,
+        super::super::vocab::SUB_LAUNCH,
         None,
     );
     let y = draw_cell_rows(app, ui, area, pad, y, &cells);
@@ -113,7 +116,7 @@ pub(super) fn draw_cell_launch(app: &AppData, ui: &mut Ui<'_, AppData>, area: Re
 /// (Live 12 の規則)。列見出しを選んだときだけ出る (r.md #153: セルを選んだだけで「セルが乗っている列」の
 /// 設定まで並ぶと、セルのフォローアクションと紛れる)。セルを選んでいなければ MIDI 割り当てもここに出す
 /// (セルがあればクリップの帯に出す — 1 つの選択に 1 か所)。どの列かは帯の対象 (列名) が示す。
-pub(super) fn draw_scene_launch(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, pad: f32, y: f32) -> f32 {
+pub(in crate::view::track_inspector) fn draw_scene_launch(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, pad: f32, y: f32) -> f32 {
     let cells = app.live_launcher_cells();
     // `scenes_of` は明示的な列選択があればそれを返すので、表示と書き込み先は食い違わない。
     let scene_ids = scenes_of(app, &cells);
@@ -135,62 +138,52 @@ fn draw_cell_rows(
     mut y: f32,
     cells: &[LauncherCellKey],
 ) -> f32 {
-    let row_w = area.w - pad * 2.0;
-    let half = (row_w - ROW_GAP) * 0.5;
+    // 量子化 / モード / 長さ / 再生は「ラベル左・値右」の欄 (r.md #158 仕様 9)。
+    let c = form::cols(area.x + pad, area.w - pad * 2.0);
 
-    // ---- 量子化 / モード ----
+    // ---- 量子化 ----
     let quantize = app.launch_fold(cells, |s| s.quantize);
     let q_idx = quantize
         .and_then(|q| LAUNCH_QUANTIZE_CHOICES.iter().position(|(c, _)| *c == q))
         // 値が割れているときは選択なし (dropdown は範囲外 index で空表示になる)。
         .unwrap_or(usize::MAX);
-    if let Some(i) = ui.dropdown(
-        "inspector_launch_quantize",
-        Rect { x: area.x + pad, y, w: half, h: ROW_H },
-        QUANTIZE_LABELS.as_slice(),
-        q_idx,
-    ) && let Some((q, _)) = LAUNCH_QUANTIZE_CHOICES.get(i)
+    form::label(ui, app, "inspector_launch_quantize_label", super::super::vocab::FIELD_LAUNCH_QUANTIZE, &c, y);
+    if let Some(i) = ui.dropdown("inspector_launch_quantize", c.value(y), QUANTIZE_LABELS.as_slice(), q_idx)
+        && let Some((q, _)) = LAUNCH_QUANTIZE_CHOICES.get(i)
     {
         push_cell_edit(ui, cells, LaunchEdit::Quantize(*q));
     }
+    y += FORM_ROW_PITCH;
+
+    // ---- モード ----
     let mode = app.launch_fold(cells, |s| s.mode);
     let m_idx = mode
         .and_then(|m| MODE_CHOICES.iter().position(|(c, _)| *c == m))
         .unwrap_or(usize::MAX);
-    if let Some(i) = ui.dropdown(
-        "inspector_launch_mode",
-        Rect { x: area.x + pad + half + ROW_GAP, y, w: half, h: ROW_H },
-        MODE_LABELS.as_slice(),
-        m_idx,
-    ) && let Some((m, _)) = MODE_CHOICES.get(i)
+    form::label(ui, app, "inspector_launch_mode_label", super::super::vocab::FIELD_LAUNCH_MODE, &c, y);
+    if let Some(i) = ui.dropdown("inspector_launch_mode", c.value(y), MODE_LABELS.as_slice(), m_idx)
+        && let Some((m, _)) = MODE_CHOICES.get(i)
     {
         push_cell_edit(ui, cells, LaunchEdit::Mode(*m));
     }
-    y += ROW_H + ROW_GAP;
+    y += FORM_ROW_PITCH;
 
     // ---- 長さ (ループ長) ----
     // セルは格子の中の固定サイズなので、アレンジのクリップのように端を掴めない。
     // ここが**セルの長さを変える唯一の口**。値が割れているときは 0 を出す
     // (触ると全部その値に揃う)。
-    ui.label_at(
-        "inspector_launch_len_label",
-        "長さ (拍)",
-        area.x + pad,
-        y + 4.0,
-        11.0,
-        app.theme.core.text_dim,
-    );
+    form::label(ui, app, "inspector_launch_len_label", super::super::vocab::FIELD_LAUNCH_LENGTH, &c, y);
     let len = app.launch_cell_length_fold(cells).unwrap_or(0.0);
     {
         let style = ScrubableNumberStyle {
             sensitivity: 0.05,
             range: Some((f64::from(common::model::MIN_CLIP_LEN_BEATS as f32), 4096.0)),
-            ..super::scrub_style(&app.theme)
+            ..super::super::scrub_style(&app.theme)
         };
         let cells_for_len = cells.to_vec();
         let resp = ui.scrubable_number_at(
             ("inspector_launch_len", "cells"),
-            Rect { x: area.x + pad + half + ROW_GAP, y, w: half, h: ROW_H },
+            c.value(y),
             len,
             4.0,
             ScrubableNumberFormat::Decimal(2),
@@ -208,42 +201,25 @@ fn draw_cell_rows(
             None,
         );
         // 4 → 64 の 1 ドラッグで undo が数十 step 積まれないよう bracket する
-        // (`super::push_scrub_bracket` が inspector 共通の 1 本)。
-        super::push_scrub_bracket(
+        // (`super::super::push_scrub_bracket` が inspector 共通の 1 本)。
+        super::super::push_scrub_bracket(
             ui,
             app,
             InspectorScrubField::Launch(("inspector_launch_len", "cells")),
             resp.dragging || resp.editing_text,
         );
     }
-    y += ROW_H + ROW_GAP;
+    y += FORM_ROW_PITCH;
 
-    // ---- ループ / レガート ----
+    // ---- 動作: ループ / レガート ----
     // 値が割れているときは OFF 表示にして、押すと「全部 ON」 に揃える
     // (トグルは 3 状態を持てないので、揃える方向を 1 つに決める)。
+    form::label(ui, app, "inspector_launch_play_label", super::super::vocab::FIELD_LAUNCH_BEHAVIOR, &c, y);
     let looping = app.launch_fold(cells, |s| s.looping).unwrap_or(false);
-    toggle(
-        ui,
-        app,
-        "inspector_launch_loop",
-        "ループ",
-        Rect { x: area.x + pad, y, w: half, h: ROW_H },
-        looping,
-        cells,
-        LaunchEdit::Looping(!looping),
-    );
+    toggle(ui, app, "inspector_launch_loop", "ループ", c.value_part(y, 2, 0), looping, cells, LaunchEdit::Looping(!looping));
     let legato = app.launch_fold(cells, |s| s.legato).unwrap_or(false);
-    toggle(
-        ui,
-        app,
-        "inspector_launch_legato",
-        "レガート",
-        Rect { x: area.x + pad + half + ROW_GAP, y, w: half, h: ROW_H },
-        legato,
-        cells,
-        LaunchEdit::Legato(!legato),
-    );
-    y += ROW_H + ROW_GAP;
+    toggle(ui, app, "inspector_launch_legato", "レガート", c.value_part(y, 2, 1), legato, cells, LaunchEdit::Legato(!legato));
+    y += FORM_ROW_PITCH;
 
     // ---- フォローアクション (セル) ----
     let cell_follow = app.launch_fold(cells, |s| s.follow.clone()).unwrap_or_default();
@@ -253,7 +229,7 @@ fn draw_cell_rows(
 
 /// 小見出し「フォローアクション」(セルと列で同じ形)。
 fn follow_heading(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, pad: f32, y: f32, id: &'static str) -> f32 {
-    super::band::sub_heading(app, ui, id, area.x + pad, area.w - pad * 2.0, y + 2.0, "フォローアクション", None)
+    super::super::band::sub_heading(app, ui, id, area.x + pad, area.w - pad * 2.0, y + 2.0, "フォローアクション", None)
 }
 
 /// フォローアクションの 2 行 (有効・発火条件 / 動作 A・確率・動作 B) と、ジャンプの
@@ -287,7 +263,7 @@ fn draw_follow_rows(
         "有効",
         Rect { x: x0, y, w: third, h: ROW_H },
         enabled,
-        &super::toggle_audio_style(&app.theme),
+        &super::super::toggle_audio_style(&app.theme),
         follow_edit_cb(target, cells, app, ed),
     );
     let link_idx = usize::from(!follow.linked);
@@ -483,7 +459,7 @@ fn draw_midi_rows(
     let n = app.launcher_bindings().len();
     // めったに使わないので「詳細」で最初は畳む (r.md #158 仕様 7、セルと列で同じ鍵)。
     let label = format!("MIDI 割り当て ({n} 件)");
-    super::band::details(app, ui, area.x + pad, row_w, y, InspectorDetail::LaunchMidi, &label, |ui, y| {
+    super::super::band::details(app, ui, area.x + pad, row_w, y, InspectorDetail::LaunchMidi, &label, |ui, y| {
         draw_midi_buttons(app, ui, area, pad, y, anchor, scene_id, learning)
     })
 }
@@ -547,7 +523,7 @@ fn draw_midi_buttons(
             label,
             rect,
             active,
-            &super::toggle_audio_style(&app.theme),
+            &super::super::toggle_audio_style(&app.theme),
             move |_| {
                 Edit::mutate(move |app: &mut AppData| {
                     let ev = match (active, target) {
@@ -651,7 +627,7 @@ fn toggle(
     edit: LaunchEdit,
 ) {
     let cells = cells.to_vec();
-    let style = super::toggle_audio_style(&app.theme);
+    let style = super::super::toggle_audio_style(&app.theme);
     ui.toggle_button_at(id, label, rect, on, &style, move |_| {
         launch_edit_for(FollowTarget::Cells, &cells, &[], edit)
     });
@@ -681,7 +657,7 @@ fn num_field(
     let style = ScrubableNumberStyle {
         sensitivity,
         range: Some(range),
-        ..super::scrub_style(&app.theme)
+        ..super::super::scrub_style(&app.theme)
     };
     let cells = cells.to_vec();
     let scene_ids = scenes_of(app, &cells);
@@ -697,7 +673,7 @@ fn num_field(
         None,
     );
     // key は欄の widget id そのもの (`tag` に宛先が入っているので列側と衝突しない)。
-    super::push_scrub_bracket(
+    super::super::push_scrub_bracket(
         ui,
         app,
         InspectorScrubField::Launch(id),
@@ -711,7 +687,7 @@ fn num_field(
 /// 選べるようになる前 (r.md #87 初版) は後者しか無く、セルを 1 つも持たない列の
 /// フォローアクションを設定する手段が存在しなかった。
 ///
-/// 表示 (`draw_launch_section`) と書き込み (`push_follow_edit`) が **同じこの 1 本**を
+/// 表示 (`draw_cell_launch` / `draw_scene_launch`) と書き込み (`push_follow_edit`) が **同じこの 1 本**を
 /// 通るので、「見えている値」と「書き込み先」が食い違わない。
 fn scenes_of(app: &AppData, cells: &[LauncherCellKey]) -> Vec<u32> {
     if !app.cur.selection.selected_scene_ids.is_empty() {

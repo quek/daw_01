@@ -96,7 +96,8 @@ impl AppData {
             .collect();
         plugin_editor_windows.sort_unstable_by_key(|(id, _)| *id);
         // r.md #129 (Q18): 開いている Par。現存する device の分だけ (Limiter は常に居る)、キー順
-        // (`BTreeSet` の順) で save 差分を安定させる。
+        // (`BTreeSet` の順) で save 差分を安定させる。Par を持たない字幕デバイスの鍵 (r.md #158 より前の
+        // ファイルから来たもの) は書かない。
         let open_rack_panels: Vec<common::model::RackPanelKey> = self
             .cur
             .view
@@ -104,7 +105,9 @@ impl AppData {
             .iter()
             .filter(|k| match k {
                 common::model::RackPanelKey::Device(id) => {
-                    self.cur.song_doc.song().device_by_id(*id).is_some()
+                    let song = self.cur.song_doc.song();
+                    song.device_by_id(*id).is_some()
+                        && song.plugin_by_id(*id).is_none_or(|p| p.plugin_id != common::plugin_db::SUBTITLE_ID)
                 }
                 common::model::RackPanelKey::MasterLimiter => true,
             })

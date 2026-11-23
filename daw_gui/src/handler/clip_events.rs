@@ -57,7 +57,7 @@ impl AppData {
 
     /// clip-level mute (`Clip.muted`) を設定する。MIDI / audio / video / image /
     /// 字幕 / 歌唱すべての content type 共通の単一 SSoT。`q` ショートカット (`SetClipsMuted`)、
-    /// 各 inspector の "Mute" トグル (`DiscreteClipEdit::Muted` / `TextMuted`)、単発の
+    /// インスペクタのクリップの帯の「ミュート」(`DiscreteClipEdit::Muted`、全種類で 1 本)、単発の
     /// `SetClipMuted` / `SetClipTextMuted` event がすべてここを経由する。変更があれば
     /// `flush_song_sync` で daw_audio へ LoadSong flush し、再生・書き出しに反映する
     /// (is_dirty もそこで立つ)。

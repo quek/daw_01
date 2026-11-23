@@ -19,8 +19,11 @@ pub struct ChainEntry {
     /// この device が内蔵映像 FX (= `ports.is_video()`) か。 映像 FX は専用の
     /// インライン param パネル (`open_video_fx_params`) を持つ。
     pub is_video: bool,
-    /// この device が VOICEVOX builtin か (= 声選択パネルを出す対象)。
+    /// この device が VOICEVOX builtin か (= Par に口パク先を出す対象)。
     pub is_voicevox: bool,
+    /// この device が字幕 (`builtin.video.subtitle`) か。映像 device だが Par を持たない (字幕の文字と書式は
+    /// クリップの帯で編集する、r.md #158)。
+    pub is_subtitle: bool,
     /// host から param 一覧が届いていて 1 つ以上 param があるか (= 汎用 param
     /// パネルに出す中身がある)。
     pub has_params: bool,
@@ -193,10 +196,10 @@ pub struct SidechainPort {
 
 impl ChainEntry {
     /// チェーン行ボタンが「埋め込み GUI window を開く」 のではなく
-    /// 「インライン param パネルをトグルする」 種類か。 映像 FX / VOICEVOX /
+    /// 「インライン param パネルをトグルする」 種類か。 映像 FX (字幕を除く) / VOICEVOX /
     /// 埋め込み GUI を持たないが param がある plugin が該当。
     pub fn shows_param_panel(&self) -> bool {
-        self.is_video || self.is_voicevox || (!self.has_embedded_gui && self.has_params)
+        (self.is_video && !self.is_subtitle) || self.is_voicevox || (!self.has_embedded_gui && self.has_params)
     }
 
     /// チェーン行にボタンを出すか。 GUI も param パネルも無い device

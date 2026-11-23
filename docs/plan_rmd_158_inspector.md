@@ -76,7 +76,7 @@ pub const BAND_BODY_TOP: f32 = 6.0;   // 見出しから中身まで
 pub const BAND_BODY_BOTTOM: f32 = 8.0;
 pub const HEAD_FONT: f32 = 12.0;      // 帯の名前
 pub const TARGET_FONT: f32 = 11.0;    // 帯の対象 (text_dim)
-pub const FORM_LABEL_W: f32 = 88.0;   // ラベル列 (欄の幅はこの 1 つだけ)
+pub const FORM_LABEL_W: f32 = 96.0;   // ラベル列 (欄の幅はこの 1 つだけ。段 2 で 88 → 96: 「フォルマント st」が 88 では切れた)
 pub const FORM_GAP: f32 = 4.0;
 pub const FORM_AUTO_W: f32 = 22.0;    // A 列 (A が無い欄でも空ける)
 pub const FORM_ROW_H: f32 = 22.0;     // 部品の高さ (今の 18/20/22/24 を 1 つに)
@@ -372,7 +372,7 @@ pub struct InspectorTitle {
 | Par の中の `lipsync` | 見出し + 全幅 dropdown を「口パク先」の 1 行に |
 | ローンチ | (下の注) |
 
-- ローンチ: 量子化・モード・長さ・再生 [ループ][レガート] は form の行にする。フォローアクションの 2〜3 行は複合の操作なので 3 列の格子のまま、小見出し「フォローアクション」の下に置き、左端をラベル列の左端に揃える (§8-6)。
+- ローンチ: 量子化・モード・長さ・動作 [ループ][レガート] は form の行にする (段 2 で実施。欄名は、同じ帯の先頭の「再生 [ミュート]」と並ばないよう「動作」にした)。フォローアクションの 2〜3 行は複合の操作なので 3 列の格子のまま、小見出し「フォローアクション」の下に置き、左端をラベル列の左端に揃える (§8-6)。
 - A 列: A を持つ欄 (画像・字幕・Group Transform) も持たない欄も、値の右端を `auto_x - FORM_GAP` に揃える。
 - 同じトグル部品の形の不揃いを直す (map §4-8)。
   - ミュートの幅 (音声は半幅、画像 / 字幕は全幅) → 共通の「再生」行 1 本。
@@ -475,7 +475,9 @@ pub struct InspectorTitle {
 
 - **MIDI を録れる**:
   - chain (Parallel の中も) に `PortConfig::has_note_input` の device がある (`common/src/port_config.rs:28-29`)。
-  - または、組み込み以外の device もクリップもまだ無い空のトラックである。
+  - または、MIDI クリップを持つ (段 2 で追加: 楽器を挿していない MIDI トラックで MIDI が消えないように)。
+  - または、組み込み以外の device もクリップも子トラックもまだ無い空のトラックである (段 2 で「子トラック」を追加:
+    組み込みだけのグループのバスを空のトラックと数えない)。
 - **音声を録れる**:
   - 子トラックを持たない (他のトラックの `parent_group_id` がこのトラックを指していない、`track.rs:136-142`)。
   - かつ、映像系の中身 (Image / Video / Text のクリップ、`PortConfig::is_video` の device) を持たない。
@@ -484,7 +486,9 @@ pub struct InspectorTitle {
 **表示**
 
 - 入力の帯は、対象のどれかが録れるときだけ出す。
-- 入力の選択肢 (`audio_input_choices`、`audio_rec.rs:117-138`) には録れるものだけを並べる。
+- 入力の選択肢 (`audio_input_choices`、`audio_rec.rs:117-138`) には録れるものだけを並べる。いま選ばれている入力が
+  録れない種類なら「(録れない)」を添えて残す (デバイスに無い ch の「(無い入力)」と同じく、黙って付け替えない)。
+- 欄名は「入力元」(帯の名前「入力」と同じ語を並べない)。
 - モニターの行は、音声入力を選んでいるときだけ出す。出さないときは何も空けない (`input_section.rs:44-53` の 6:4 の固定幅をやめ、仕様 9 の 2 行にする)。
 - 複数選択で書き込むときは、録れるトラックにだけ書く。
 
@@ -720,6 +724,10 @@ pub struct InspectorTitle {
       - script の `dispatchRenameClip` (`script.rs:1135`)
       - インスペクタの名前の欄
     - 入力欄を描くのは、札が自分の面のときだけ。Esc の取消 (`root.rs:1237`) は札に関係なく効く。
+    - **段 2 の実装 (札は作らなかった)**: インスペクタの名前の欄は打っている間の文字を入力欄自身に持たせ、
+      確定 (Enter / 欄の外のクリック) のフレームで `BeginRenameClip` → `RenameClipChanged` → `CommitRenameClip` を
+      1 つの Edit で通す。`peph.clip_rename` はフレームをまたいで立たないので、アレンジの改名欄は出ない
+      (`clip_band/mod.rs::name_row`、テスト `inspector_bands::name_field_renames_without_the_arrangement_rename_box`)。
 
 12. **undo に積まない**
     - 開閉と幅の変更は `edit_song` を通さない (§2.5)。段 1 のテストで undo の段数が変わらないことを確かめる。

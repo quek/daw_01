@@ -420,9 +420,9 @@ fn インスペクタの数値欄をドラッグしても_undo_は_1_step() {
     app.handle_event(AppEvent::SetClipSelection(vec![ClipKey { track_id: track, clip_id: 1 }]));
 
     let scene = settle(&mut host, &mut app);
-    let label = inspector_glyph(&scene, "Gain dB");
+    let label = inspector_glyph(&scene, daw_gui::view::track_inspector::vocab::FIELD_GAIN);
     let field = find_glyph(&scene, |t, x, y| t == "0.0" && x > label.0 + 40.0 && x < INSPECTOR_DEFAULT_W && (y - label.1).abs() < 8.0)
-        .expect("Gain dB の数値欄 (0.0)");
+        .expect("ゲインの数値欄 (0.0)");
     let at = (field.0 + 4.0, field.1 + 6.0);
     let gain = |app: &AppData| match app.cur.song_doc.song().clip_contents.values().next() {
         Some(ClipContent::Audio(a)) => a.events[0].gain_db,

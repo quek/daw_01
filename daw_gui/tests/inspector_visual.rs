@@ -1,10 +1,12 @@
 //! r.md #158: トラックインスペクタ (左カラム、`view::track_inspector`) の見た目を撮る (目視用)。
 //!
-//! 1 つの曲 (MIDI / VOICEVOX 歌声 / オーディオ / 画像 + 映像 FX / グループ + Parallel / 読み上げ + 字幕) を組み、
-//! 状態ごとに選択・帯の開閉・Par の開閉・幅・テーマを変えてルート view を GPU でオフスクリーン描画し、
+//! 1 つの曲 (MIDI / VOICEVOX 歌声 / オーディオ / 画像 + 映像 FX / グループ + Parallel / 読み上げ + 字幕 / 映像) を
+//! 組み、状態ごとに選択・帯の開閉・Par の開閉・幅・テーマを変えてルート view を GPU でオフスクリーン描画し、
 //! `target/inspector_shots/<名前>.png` に保存する。今の見た目は、スクロールしない 2 行のタイトル
 //! (選んでいるもの + 色見本) の下に、見出しの帯 (選択 → 列 → 入力 → Rack → 口パク → モジュレーション) を
-//! 積んだ 1 本の縦スクロール。見た目の良し悪しは人が判断するので、ここで確かめるのは
+//! 積んだ 1 本の縦スクロール。クリップの設定 (音声 / 画像 / 歌声 / 読み上げ / 字幕 / ローンチ) は全部一番上の
+//! 選択の帯に「ラベル左・値右」の欄で並び、Par にはデバイスそのものの設定だけが残る。
+//! 見た目の良し悪しは人が判断するので、ここで確かめるのは
 //! 「PNG が書けた」ことだけ (インスペクタの文言に依存する assert を置くと、作り直すたびにこのカメラが壊れる)。
 //! 各状態で期待した見出しが描かれたかは `--nocapture` の出力に出す (文言は `track_inspector::vocab`)。
 //!
@@ -16,7 +18,7 @@ use std::sync::Arc;
 use common::model::{
     AudioContent, AudioEvent, AudioSource, AudioSourcePath, ChainRef, Clip, ClipContent, ClipKey, Device,
     ImageContent, ImageEvent, ImageSource, ImageSourcePath, MASTER_TRACK_ID, MidiContent, NativeKind, Note,
-    RackPanelKey, Split, StretchMode, TextContent, TextEvent,
+    RackPanelKey, Split, StretchMode, TextContent, TextEvent, VideoContent,
 };
 use common::plugin_db::{BUILTIN_ID_VOICEVOX, PluginDatabase, SUBTITLE_ID, builtin_descriptors};
 use common::protocol::{AudioCommand, PluginCommand};
@@ -55,10 +57,11 @@ struct Project {
     audio_clip: ClipKey,
     image_clip: ClipKey,
     color_grade: u64,
+    image: u32,
     group: u32,
     talk_clip: ClipKey,
     talk_voicevox: u64,
-    talk_subtitle: u64,
+    video_clip: ClipKey,
 }
 
 struct Harness {
@@ -360,9 +363,17 @@ fn populate(app: &mut AppData) -> Project {
             token: common::protocol::InstanceToken(2),
         },
     );
-    let talk_subtitle = add_plugin(app, talk, SUBTITLE_ID);
+    add_plugin(app, talk, SUBTITLE_ID);
     let line = TextEvent { text: "こんにちは".to_string(), event_length_beats: 4.0, ..TextEvent::default() };
     let talk_clip = place(app, talk, 0.0, 4.0, ClipContent::Text(TextContent { events: vec![line] }), "");
+    app.handle_event(AppEvent::SpeakersLoaded(vec![
+        singer("四国めたん", &[(2, "ノーマル"), (0, "あまあま")]),
+        singer("ずんだもん", &[(3, "ノーマル"), (1, "あまあま")]),
+    ]));
+
+    // 7. 映像トラック: 映像クリップ (ファイルは無い = 中身の event も無い)。
+    let video = add_track(app, "Video");
+    let video_clip = place(app, video, 0.0, 8.0, ClipContent::Video(VideoContent::default()), "Intro");
 
     Project {
         synth,
@@ -376,10 +387,11 @@ fn populate(app: &mut AppData) -> Project {
         audio_clip,
         image_clip,
         color_grade,
+        image,
         group,
         talk_clip,
         talk_voicevox,
-        talk_subtitle,
+        video_clip,
     }
 }
 
@@ -454,8 +466,6 @@ fn capture_track_inspector_states() {
     shot(r, "s1_1_midi_track", &["Synth", input, rack, modulation, "Reverb", "Delay", "Comp", "EQ"], |h| {
         h.select_track(h.project.synth);
     });
-    // 2. オーディオクリップ: タイトル 2 行 (クリップ名 + 種類 · トラック) と、一番上の音声クリップの帯。
-    shot(r, "s1_2_audio_clip", &["Drums", audio_band, input, rack], |h| h.select_clip(h.project.audio_clip));
     // 3. 3 トラックの選択: タイトル「3 トラック」、入力は「選択中の 3 トラック」、Rack 以下は「… のみ」。
     shot(r, "s1_3_multi_tracks", &["3 トラック", "選択中の 3 トラック", "Audio のみ"], |h| {
         h.select_track(h.project.synth);
@@ -485,34 +495,13 @@ fn capture_track_inspector_states() {
         h.set_theme("light");
         h.select_clip(h.project.audio_clip);
     });
-    // 8. MIDI クリップ (Synth の Lead): 段 1 ではクリップの帯は見出しだけ (共通の欄は段 2)。
-    shot(r, "s1_8_midi_clip", &["Lead", vocab::clip_band_title(ClipBandKind::Midi)], |h| {
-        h.select_clip(h.project.synth_clip);
-    });
     // 9. 同じ MIDI トラックで、組み込み EQ と Reverb の Par を開いた状態。
     shot(r, "s1_9_midi_track_par_open", &["HP", "LMF"], |h| {
         h.select_track(h.project.synth);
         h.open_panel(h.project.synth_eq);
         h.open_panel(h.project.synth_reverb);
     });
-    // 10. VOICEVOX 歌声: 歌詞付きクリップを選び、VOICEVOX の Par (段 1 では声はまだ Par の中) を開く。
-    shot(r, "s1_10_vocal_clip_par", &["Verse", "Clip Voice"], |h| {
-        h.select_clip(h.project.vocal_clip);
-        h.open_panel(h.project.voicevox);
-        assert_eq!(h.app.cursor_track_id(), Some(h.project.vocal));
-    });
-    // 11. 画像クリップ + Color Grade の Par (映像 FX の param)。
-    shot(r, "s1_11_image_video_fx", &[vocab::clip_band_title(ClipBandKind::Image), "Color Grade", "Exposure"], |h| {
-        h.select_clip(h.project.image_clip);
-        h.open_panel(h.project.color_grade);
-    });
-    // 12. 読み上げ + 字幕: Text クリップを選び、VOICEVOX (読み上げ) と字幕デバイス (Text Event) の Par を開く。
-    shot(r, "s1_12_talk_clip", &[vocab::clip_band_title(ClipBandKind::Text), "Text Event"], |h| {
-        h.select_clip(h.project.talk_clip);
-        h.open_panel(h.project.talk_voicevox);
-        h.open_panel(h.project.talk_subtitle);
-    });
-    // 13. グループ (バス) トラック: 3 帯域分割の Parallel。
+    // 13. グループ (バス) トラック: 3 帯域分割の Parallel。入力の帯は出ない (段 2、録れる入力が無い)。
     shot(r, "s1_13_group_parallel", &["Bus", "Parallel", "Low", "Mid", "High"], |h| {
         h.select_track(h.project.group);
     });
@@ -520,22 +509,77 @@ fn capture_track_inspector_states() {
     shot(r, "s1_14_master", &["Bus Comp", "Tone EQ", "Post-Fader", "Limiter"], |h| {
         h.select_track(MASTER_TRACK_ID);
     });
-    // 15. ランチャーのセル: クリップの帯の中の小見出し「ローンチ」、MIDI 割り当ては詳細で畳まれている。
-    shot(r, "s1_15_launcher_cell", &[vocab::SUB_LAUNCH, "フォローアクション"], |h| {
-        let row = LauncherRow::Track(h.project.synth);
-        h.app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell { row, scene_index: 0 }));
-    });
-    // 16. 同じセルで MIDI 割り当ての詳細を開いた。
+    // 16. ランチャーのセルで MIDI 割り当ての詳細を開いた。
     shot(r, "s1_16_launcher_cell_midi_open", &["セル", "割り当てを消す"], |h| {
         let row = LauncherRow::Track(h.project.synth);
         h.app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell { row, scene_index: 0 }));
         h.inspector(InspectorEvent::ToggleDetail(InspectorDetail::LaunchMidi));
     });
-    // 17. 列 (シーン) の見出しを選んだ: 列の帯 (対象 = 列名) にフォローアクション。
-    shot(r, "s1_17_scene_column", &[vocab::BAND_SCENE, "フォローアクション"], |h| {
+
+    // 段 2 (r.md #158 クリップの帯への集約): クリップの設定は全部クリップの帯、Par からは消えた。
+    // 1. オーディオクリップ: 名前 / 再生 (ミュート・逆再生) / 伸縮 / ゲイン… / フェード。
+    shot(
+        r,
+        "s2_1_audio_clip",
+        &["Drums", audio_band, vocab::FIELD_NAME, vocab::TOGGLE_REVERSE, vocab::FIELD_GAIN, vocab::FIELD_FADE_OUT, input],
+        |h| h.select_clip(h.project.audio_clip),
+    );
+    // 2. 歌声のクリップ: 小見出し「歌声」の下にキャラ / スタイル。
+    shot(r, "s2_2_vocal_clip", &["Verse", vocab::SUB_VOICE, vocab::FIELD_CHARACTER, vocab::FIELD_STYLE], |h| {
+        h.select_clip(h.project.vocal_clip);
+    });
+    // 3. 同じクリップで VOICEVOX の Par を開く: Par には口パク先だけ (声はクリップの帯)。
+    shot(r, "s2_3_vocal_par_open", &[vocab::SUB_VOICE, vocab::FIELD_LIPSYNC_TARGET], |h| {
+        h.select_clip(h.project.vocal_clip);
+        h.open_panel(h.project.voicevox);
+    });
+    // 4. 読み上げ + 字幕の Text クリップ: セリフ 1 本、読み上げ (話者 / スケール)、字幕 (詳細は畳む)。
+    shot(
+        r,
+        "s2_4_talk_clip",
+        &[vocab::FIELD_LINE, vocab::SUB_TALK, vocab::SUB_SUBTITLE, "話速", vocab::DETAIL_SUBTITLE_STYLE],
+        |h| {
+            h.select_clip(h.project.talk_clip);
+            h.open_panel(h.project.talk_voicevox);
+        },
+    );
+    // 5. 字幕の細かい設定を開いた (塗り / 縁 / 影)。
+    shot(r, "s2_5_subtitle_details_open", &[vocab::SUB_FILL, vocab::SUB_OUTLINE, vocab::SUB_SHADOW], |h| {
+        h.select_clip(h.project.talk_clip);
+        h.inspector(InspectorEvent::ToggleDetail(InspectorDetail::SubtitleStyle));
+        h.inspector(InspectorEvent::ToggleBand(InspectorBand::Rack));
+        h.inspector(InspectorEvent::ToggleBand(InspectorBand::Input));
+    });
+    // 6. 画像クリップ (A つきの欄、反転) + Color Grade の Par。
+    shot(
+        r,
+        "s2_6_image_clip",
+        &[vocab::clip_band_title(ClipBandKind::Image), vocab::FIELD_OPACITY, vocab::FIELD_FLIP, "Color Grade", "Exposure"],
+        |h| {
+            h.select_clip(h.project.image_clip);
+            h.open_panel(h.project.color_grade);
+        },
+    );
+    // 7. MIDI クリップ (Synth の Lead): 共通の欄 (名前 / 再生) だけ。
+    shot(r, "s2_7_midi_clip", &["Lead", vocab::clip_band_title(ClipBandKind::Midi), vocab::FIELD_NAME, vocab::TOGGLE_MUTE], |h| {
+        h.select_clip(h.project.synth_clip);
+    });
+    // 8. 映像クリップ: 共通の欄だけ。
+    shot(r, "s2_8_video_clip", &["Intro", vocab::clip_band_title(ClipBandKind::Video), vocab::FIELD_PLAYBACK], |h| {
+        h.select_clip(h.project.video_clip);
+    });
+    // 9. ランチャーのセル: クリップの帯に共通の欄と小見出し「ローンチ」、MIDI 割り当ては詳細で畳まれている。
+    shot(r, "s2_9_launcher_cell", &[vocab::FIELD_PLAYBACK, vocab::SUB_LAUNCH, "フォローアクション"], |h| {
+        let row = LauncherRow::Track(h.project.synth);
+        h.app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell { row, scene_index: 0 }));
+    });
+    // 10. 列 (シーン) の見出しを選んだ: 列の帯 (対象 = 列名) にフォローアクション。
+    shot(r, "s2_10_scene_column", &[vocab::BAND_SCENE, "フォローアクション"], |h| {
         // 既定の曲は列を持たないので 1 本足す。
         h.app.handle_event(AppEvent::Launcher(LauncherEvent::AddScene));
         let scene_id = h.app.cur.song_doc.song().scenes.first().expect("足した列").id;
         h.app.handle_event(AppEvent::Launcher(LauncherEvent::SelectScene { scene_id, modifier: SelectModifier::Single }));
     });
+    // 11. 画像トラック (映像 FX): 入力の帯は出ない (録れる入力が無い。グループのバスは s1_13)。
+    shot(r, "s2_11_image_track", &[rack, "Color Grade"], |h| h.select_track(h.project.image));
 }
