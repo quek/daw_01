@@ -1637,10 +1637,6 @@ impl AppData {
             AppEvent::ResetAutomationLaneClipColors { lane } => {
                 self.reset_automation_lane_clip_colors(lane);
             }
-            AppEvent::SetClipMuted { target, muted } => {
-                // clip-level mute の SSoT (`Clip.muted`)。 content type を問わない。
-                self.set_clip_muted(target, muted);
-            }
             AppEvent::SetClipsMuted { targets, muted } => {
                 // `q` で選択 clip / カーソル直下 clip を一括 toggle した結果。
                 let _ = self.edit_song(|song| {
@@ -1660,9 +1656,6 @@ impl AppData {
             AppEvent::SetNotesMuted { notes, muted } => {
                 // `q` で選択 note / カーソル直下 note (packed id) を一括 toggle。
                 self.set_notes_muted(&notes, muted);
-            }
-            AppEvent::SetClipStretchMode { target, mode } => {
-                self.set_clip_audio_event_stretch_mode(target, mode);
             }
             AppEvent::ResyncClipEditBuffers(target) => {
                 // 数値 buffer は撤去済み。 text section と共有する
@@ -1693,20 +1686,6 @@ impl AppData {
                     self.set_clip_image_event_fade_out_beats(target, beats);
                 } else {
                     self.set_clip_audio_event_fade_out_beats(target, beats);
-                }
-            }
-            AppEvent::SetClipFadeInCurve { target, curve } => {
-                if self.is_image_clip(target) {
-                    self.set_clip_image_event_fade_in_curve(target, curve);
-                } else {
-                    self.set_clip_audio_event_fade_in_curve(target, curve);
-                }
-            }
-            AppEvent::SetClipFadeOutCurve { target, curve } => {
-                if self.is_image_clip(target) {
-                    self.set_clip_image_event_fade_out_curve(target, curve);
-                } else {
-                    self.set_clip_audio_event_fade_out_curve(target, curve);
                 }
             }
             AppEvent::SetClipImageX { target, value } => {
@@ -1755,32 +1734,8 @@ impl AppData {
             AppEvent::SetClipTextContent { target, value } => {
                 self.set_clip_text_event_content(target, value);
             }
-            AppEvent::SetClipTextFontFamily { target, value } => {
-                self.set_clip_text_event_font_family(target, value);
-            }
-            AppEvent::SetClipTextAlign { target, value } => {
-                self.set_clip_text_event_align(target, value);
-            }
-            AppEvent::SetClipTextFadeInCurve { target, curve } => {
-                self.set_clip_text_event_fade_in_curve(target, curve);
-            }
-            AppEvent::SetClipTextFadeOutCurve { target, curve } => {
-                self.set_clip_text_event_fade_out_curve(target, curve);
-            }
             AppEvent::SetClipTextNumField { target, field, value } => {
                 self.set_clip_text_num_field(target, field, value);
-            }
-            AppEvent::ClipTextContentEditChanged(s) => {
-                self.cur.peph.clip_text_content_edit_text = s;
-            }
-            AppEvent::ClipTextFontFamilyEditChanged(s) => {
-                self.cur.peph.clip_text_font_family_edit_text = s;
-            }
-            AppEvent::CommitClipTextContentEdit => {
-                self.commit_clip_text_content_edit();
-            }
-            AppEvent::CommitClipTextFontFamilyEdit => {
-                self.commit_clip_text_font_family_edit();
             }
             AppEvent::ResyncClipTextEditBuffers(target) => {
                 self.resync_clip_text_event_edit_buffers(target);

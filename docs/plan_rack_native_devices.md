@@ -37,7 +37,7 @@
 | Q9 | Par を閉じた行は「名前 + 小表示 + [Par]」。EQ / Tone EQ の小表示は幅 80px ほどのミニ EQ カーブ、Comp / Bus Comp は横向きの GR バー。OFF の行は名前と小表示が薄くなる |
 | Q10 | 組み込み行に鍵マークは付けない（× の有無だけで見分ける）。名前は種類名 + 番号で、組み込みは「Comp」、足した分は「Comp 2」「Comp 3」。そのトラックに同じ種類がまだ無ければ番号は付かない。番号は足したときに決まり、並べ替えても変わらない。オートメーションレーン名にも出る |
 | Q11 | Par は行ごとに独立していて、何枚でも同時に開ける。plugin / 映像 FX / VOICEVOX の Par も同じ（今は Rack 全体で 1 枚） |
-| Q12 | Par の中身は幅 336px、6 列 × 約 56px の格子で、左詰め。<br>・**EQ**: 上に全幅 × 72px のカーブ。下の列は HP/LF/LMF/HMF/HF/LP、行は Freq / Gain / Q。HP・LP は Freq + [ON]、LF・HF は Freq / Gain / [Bell]、LMF・HMF は Freq / Gain / Q<br>・**Comp**: [LEV\|CMP\|LIM] と GR バー（dB 数値）、列 Thr/Rat/Atk/Rel/SC/Gain、SC 列の下に [Listen]<br>・**Bus Comp**: Thr / Ratio [2\|4\|10] / Atk / Rel / Makeup + GR バー<br>・**Tone EQ**: Low / LoMid / High + カーブ<br>・**master Limiter**: Ceiling + GR バー<br>数値はつまみの下に常に出る。ドラッグで変更、クリックで数値入力、ダブルクリックで既定値 |
+| Q12 | Par の中身は幅 336px、6 列 × 約 56px の格子で、左詰め。**r.md #158 で置き換わった**: Par の幅はインスペクタの幅に従う (行幅 − 8px。6 等分は変わらず、幅 360・深さ 0 で 1 列約 54px。`docs/plan_rmd_158_inspector.md` §6-10 / 仕様 12)。<br>・**EQ**: 上に全幅 × 72px のカーブ。下の列は HP/LF/LMF/HMF/HF/LP、行は Freq / Gain / Q。HP・LP は Freq + [ON]、LF・HF は Freq / Gain / [Bell]、LMF・HMF は Freq / Gain / Q<br>・**Comp**: [LEV\|CMP\|LIM] と GR バー（dB 数値）、列 Thr/Rat/Atk/Rel/SC/Gain、SC 列の下に [Listen]<br>・**Bus Comp**: Thr / Ratio [2\|4\|10] / Atk / Rel / Makeup + GR バー<br>・**Tone EQ**: Low / LoMid / High + カーブ<br>・**master Limiter**: Ceiling + GR バー<br>数値はつまみの下に常に出る。ドラッグで変更、クリックで数値入力、ダブルクリックで既定値 |
 | Q13 | EQ カーブ上に各バンドの点が出て、ドラッグで調整できる。左右 = Freq、上下 = Gain、ホイール = Q（Q を持つバンドのみ）。HP/LP の点は 0dB 線上を左右にだけ動く。Tone EQ の点は上下にだけ動く。OFF のバンドやデバイスの点を触ると自動で ON になる。点を動かすと、下のつまみと数値も同時に動く |
 | Q14 | Par の EQ カーブの背後に「その EQ を通った後の音」のスペクトラムが薄く出る。計算するのは Par が開いている間だけ |
 | Q15 | 行に ON ボタンは置かない。ON/OFF は Q キー（行に hover）/ 右クリック / 行の小表示ダブルクリックで切り替える。4 種とも、組み込み・追加分とも、つまみやカーブ点に触ると自動で ON になる（Q で OFF にした直後でも）。plugin は今のまま（触っても ON にならない） |
@@ -60,7 +60,7 @@
 | 縦置きのデバイスリスト（原文「Live/Bitwig/Renoise の縦置きイメージ」） | **Bitwig 5.3** Mix View「The devices section provides a list of all the top-level devices on each track.」 https://www.bitwig.com/userguide/latest/the_mix_view/ 、Inspector にも同じ一覧 https://www.bitwig.com/userguide/latest/other_mixing_interfaces/ / **Renoise** Mixer「Track Effects devices are shown in the Mixer rack above the track levels.」 https://tutorials.renoise.com/wiki/Mixer / **Live 12** の Device View は横並び（公式の縦表示は無い） https://www.ableton.com/en/manual/working-with-instruments-and-effects/ | Rack（インスペクタ）の縦リストに組み込み行を入れる |
 | 行の小表示（Q9） | **Bitwig**「This includes EQ curves (for EQ+, EQ-5 …) or gain reduction amounts (for Compressor+ …)」（the_mix_view、公式画像 3201/3203 で行の右端に出ることを目視） / **Cakewalk** ProChannel 折り畳み時「QuadCurve Equalizer graph. Shows the equalization curve.」 | EQ はカーブ、Comp は GR バー |
 | デバイスごとの展開（Q11） | **Fender Studio Pro** Micro View（Insert をダブルクリックで下へ展開、取得テキスト `fsp2_Built-In_Effects_Topics_Effect_Micro.txt:9-11`）/ **Cakewalk** モジュールごとの Minimize/Restore / **Renoise** デバイスごとの最小化 | Par を行ごとに独立させる |
-| 展開すると幅いっぱいを使う（Q12） | **Cakewalk**「When expanding ProChannel in the Inspector, ProChannel fills the entire width of the Inspector.」 | Par は中身の幅 336px 全体を使う |
+| 展開すると幅いっぱいを使う（Q12） | **Cakewalk**「When expanding ProChannel in the Inspector, ProChannel fills the entire width of the Inspector.」 | Par は中身の幅全体を使う (幅はインスペクタの幅に従う、r.md #158) |
 | インスペクタは固定幅（Q1/Q2） | **Bitwig**「This panel is not resizable.」（the_window_body、`bw_the_window_body.txt:25`） | 固定 360px (r.md #158 で 360〜640 の可変に置き換わった) |
 | Ctrl+ドロップでコピー（Q5） | **Renoise** Mixer「Holding "Left Control" while dropping the effect will create a copy of the device.」 / **Bitwig** ALT ドラッグでコピー | daw_01 既存の Ctrl コピーのまま |
 | GR 表示 | **Reason**「The right LED meter shows the gain reduction applied by the compressor.」/ **Studio Pro** Channel Strip の GR LED | 行と Par に GR バーを出す |
@@ -1593,7 +1593,7 @@ pub fn gr_text(gr_db: f32) -> String;                                           
 
 ### 10.5 Rack（`view/track_inspector/`、R）
 
-**幅**: `INSPECTOR_W: f32 = 360.0`（view/root.rs:30。参照 :115, :125, :129, :131 は式のまま）。
+**幅**: `INSPECTOR_W: f32 = 360.0`（view/root.rs:30。参照 :115, :125, :129, :131 は式のまま）。(実装当時の記録。r.md #158 で `INSPECTOR_DEFAULT_W` に改名し、幅は 360〜640 の可変。正本は `handler/inspector_view.rs`)
 
 **画面**
 ```
@@ -1639,7 +1639,7 @@ impl ChainRow {
   - `draw_master_limiter_row`: `ROW_H`、背景は `draw_row_bg`、「Limiter」+ GR セグメント 80×8（`draw_gr_segments`、12 段）+ `[Par]` → `ToggleRackPanel(MasterLimiter)`。× 列は空け、SC は出さない。右クリックは「有効化 / 無効化」だけ。小表示のダブルクリックで `MasterLimiterEdit::On(!on)`。Par が開いていれば直下に `native_panel::limiter`。
   - drag_list の外に描くので、掴めず、落とし先にもならないことが構造で決まる。
 
-**`native_row.rs`（新設）`draw_native_row`**（右から左、深さ 0 の行幅 336）
+**`native_row.rs`（新設）`draw_native_row`**（右から左、深さ 0 の行幅 336。r.md #158 で幅は可変）
 
 | 要素 | 幅 | 内容 |
 |---|---|---|

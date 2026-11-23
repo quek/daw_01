@@ -2529,11 +2529,12 @@ mod multi_project_tests {
 
     /// r.md #156: デバイスの入力は、モニターが効いているトラック (オン、または自動で録音待機中) のチェーンを通って
     /// マスターへ出る (止まっていても)。オフ・自動で待機していない・背景のタブでは出ない。
+    /// r.md #158: 音声を録れないトラック (画像を置いた) では、音声入力を保存したままでも出ない (入力メーターも)。
     #[test]
     fn モニターが効いているトラックだけ入力がマスターへ出る() {
         use crate::device::input::{DeviceIo, InputBlock};
         use common::audio_device::ChannelRange;
-        use common::model::{MonitorMode, TrackInput};
+        use common::model::{Clip, ClipContent, ImageContent, MonitorMode, TrackInput};
         const N: usize = 256;
         let key = ProjectKey(1);
         // デバイスの入力 ch 2 だけに音がある (ch 番号で引けていること)。
@@ -2541,15 +2542,16 @@ mod multi_project_tests {
         for (i, s) in data[2 * N..].iter_mut().enumerate() {
             *s = 0.25 + i as f32 / 1024.0;
         }
-        // (モニター, 録音待機, アクティブなタブか, 聞こえるか)
+        // (モニター, 録音待機, アクティブなタブか, 画像を置いたトラックか, 聞こえるか)
         let cases = [
-            (MonitorMode::Off, true, true, false),
-            (MonitorMode::Auto, false, true, false),
-            (MonitorMode::Auto, true, true, true),
-            (MonitorMode::On, false, true, true),
-            (MonitorMode::On, true, false, false),
+            (MonitorMode::Off, true, true, false, false),
+            (MonitorMode::Auto, false, true, false, false),
+            (MonitorMode::Auto, true, true, false, true),
+            (MonitorMode::On, false, true, false, true),
+            (MonitorMode::On, true, false, false, false),
+            (MonitorMode::On, true, true, true, false),
         ];
-        for (i, (monitor, armed, active, heard)) in cases.into_iter().enumerate() {
+        for (i, (monitor, armed, active, image, heard)) in cases.into_iter().enumerate() {
             let mut r = rig(&format!("monitor{i}"));
             let (_shared, mut bundle_tx) = open(&mut r, key);
             r.engine.scope_project.store(if active { key.0 } else { 99 }, Ordering::Release);
@@ -2557,7 +2559,13 @@ mod multi_project_tests {
             t.input = TrackInput::AudioMono { channel: 2 };
             t.monitor = monitor;
             t.armed = armed;
-            let song = Arc::new(Song { tracks: vec![t], ..Song::default() });
+            let mut song = Song::default();
+            if image {
+                let content_id = song.alloc_content(ClipContent::Image(ImageContent::default()), String::new());
+                t.place_clip(Clip { start_beat: 64.0, length_beats: 4.0, content_id, ..Clip::default() });
+            }
+            song.tracks = vec![t];
+            let song = Arc::new(song);
             let mut b = bundle(&song);
             b.input_stage = Some(crate::graph::input_stage::InputStage::new(
                 &crate::graph::input_stage::input_plan(&song),
@@ -2573,7 +2581,7 @@ mod multi_project_tests {
                 };
                 r.dev.process_buffer(&r.bridge, &r.scope, &r.device_scope, 48_000, N, io);
             }
-            let case = format!("{monitor:?} armed={armed} active={active}");
+            let case = format!("{monitor:?} armed={armed} active={active} image={image}");
             if heard {
                 // フェーダー 1.0・pan 中央なので、モノの入力がそのまま L / R に出る。
                 for ch in [&r.dev.master_l, &r.dev.master_r] {
@@ -2586,7 +2594,7 @@ mod multi_project_tests {
             }
             assert_eq!(r.dev.any_input_monitoring(), heard, "{case}");
             // 録音待機でモニターしていなければ、入力メーターのために入力を読み続ける (アクティブなタブだけ)。
-            assert_eq!(r.dev.any_input_live(), heard || (armed && active), "{case}");
+            assert_eq!(r.dev.any_input_live(), heard || (armed && active && !image), "{case}");
         }
     }
 

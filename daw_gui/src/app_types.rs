@@ -240,41 +240,9 @@ impl PluginPickEntry {
     }
 }
 
-/// Audio event 単位 field の inspector 表示用 read snapshot (Phase 2 PR1)。
-/// `selected_clip` が `ClipContent::Audio` の clip を指していて、 中に
-/// 少なくとも 1 event があれば `inspector_audio_event_summary()` が
-/// `Some` を返す。 view (`track_inspector::clip_band`) はこれを使って
-/// 音声クリップの帯の欄を出し、 toggle / dropdown 操作を `target`
-/// に向けて発火する。 Phase 1 で 1 clip = 1 event 前提なので first event
-/// を代表値として表示する。
-#[derive(Debug, Clone, Copy)]
-pub struct InspectorAudioEventSummary {
-    /// 編集 AppEvent (`SetClipReversed` 等) の宛先 clip。
-    pub target: ClipKey,
-    pub reversed: bool,
-    pub muted: bool,
-    pub stretch_mode: common::model::StretchMode,
-    pub fade_in_curve: common::model::FadeCurve,
-    pub fade_out_curve: common::model::FadeCurve,
-    // scrubable_number に表示する現値 (= first event 代表値)。
-    pub gain_db: f32,
-    pub pan: f32,
-    pub pitch_semitones: f32,
-    pub fade_in_beats: f64,
-    pub fade_out_beats: f64,
-    /// r.md #38: fade scrub の range 上限 = **この event の長さ** (拍)。
-    /// fade は clip 長ではなく event 長に対して掛かる (音 / 映像 / 画像 / 字幕の
-    /// 適用側が全部 event 長基準)。 handler 側の clamp (`e.event_length_beats`) と
-    /// ここが食い違うと、 入力した値が clamp で切られて表示が巻き戻る。
-    pub fade_max_beats: f64,
-}
-
-/// Image event 単位 field の inspector 表示用 read snapshot
-/// (`docs/plan_image_overlay.md` §4 P4)。 `selected_clip` が
-/// `ClipContent::Image` の clip を指していて、 中に少なくとも 1 event
-/// があれば `inspector_image_event_summary()` が `Some` を返す。
-/// view (`track_inspector::clip_band`) は画像クリップの帯の欄を出し、 数値入力 (x/y/w/h/opacity) と
-/// fade / 反転 toggle を first event 代表値として表示する。
+/// 画像クリップの帯の欄のうち、**代表クリップから読むもの** (`docs/plan_image_overlay.md` §4 P4、
+/// `AppData::inspector_image_event_summary`)。値の欄 (位置 / 大きさ / 不透明度 / 回転 / フェード / 反転) は
+/// 選んでいるクリップ全部を畳む (`handler::inspector_selection`) ので、ここには持たない。
 ///
 /// `{x,y,w,h,opacity}_automated` は対応する `ImageBuiltin` lane が
 /// 存在する (`Track.automation_lanes` 上の visible 不問) か。 lane が
@@ -283,29 +251,15 @@ pub struct InspectorAudioEventSummary {
 /// (`docs/plan_image_automation.md` §4.3 / §5)。
 #[derive(Debug, Clone, Copy)]
 pub struct InspectorImageEventSummary {
-    pub target: ClipKey,
-    pub muted: bool,
-    pub fade_in_curve: common::model::FadeCurve,
-    pub fade_out_curve: common::model::FadeCurve,
     pub x_automated: bool,
     pub y_automated: bool,
     pub w_automated: bool,
     pub h_automated: bool,
     pub opacity_automated: bool,
     pub rotation_automated: bool,
-    // scrubable_number に表示する現値 (= first event 代表値)。
-    // rotation は radians 保持 (view が degree 表示に変換)。
-    pub x: f32,
-    pub y: f32,
+    /// dblclick で大きさを戻す先 (今の値。0 に潰さない、縦横比を保つ)。
     pub w: f32,
     pub h: f32,
-    pub opacity: f32,
-    pub rotation_radians: f32,
-    pub fade_in_beats: f64,
-    pub fade_out_beats: f64,
-    /// r.md #98: 左右 / 上下反転 toggle の表示状態 (first event 代表値)。
-    pub flip_h: bool,
-    pub flip_v: bool,
     /// r.md #38: fade scrub の range 上限 = **この event の長さ** (拍)。
     /// fade は clip 長ではなく event 長に対して掛かる (音 / 映像 / 画像 / 字幕の
     /// 適用側が全部 event 長基準)。 handler 側の clamp (`e.event_length_beats`) と
@@ -645,24 +599,13 @@ pub struct InspectorModData {
     pub base_norm: f64,
 }
 
-/// docs/plan_text_overlay.md §4 P5: text inspector の read snapshot
-/// (= image idiom)。 `selected_clip` が `ClipContent::Text` を指していて
-/// 中に 1 event 以上あれば `inspector_text_event_summary()` が `Some` を
-/// 返す。 `automated` は lane を持つ全 `TextBuiltinParam` の集合 (=
-/// inspector 各 「A」 toggle が ON / OFF 判定に使う)。 align / fade curve
-/// は dropdown 直値、 `muted` は toggle 直値。
+/// docs/plan_text_overlay.md §4 P5: 字幕の欄のうち **代表クリップから読むもの** (= image idiom、
+/// `AppData::inspector_text_event_summary`)。 `automated` は lane を持つ全 `TextBuiltinParam` の集合 (=
+/// inspector 各 「A」 toggle が ON / OFF 判定に使う)。 値の欄 (数値 / 揃え / フェードのカーブ) は選んでいる
+/// クリップ全部を畳む (`handler::inspector_selection`) ので、ここには持たない。
 #[derive(Debug, Clone)]
 pub struct InspectorTextEventSummary {
-    pub target: ClipKey,
-    pub muted: bool,
-    pub align: common::model::TextAlign,
-    pub fade_in_curve: common::model::FadeCurve,
-    pub fade_out_curve: common::model::FadeCurve,
     pub automated: std::collections::HashSet<common::model::TextBuiltinParam>,
-    /// scrubable_number に表示する現値の供給源 (= first event
-    /// snapshot)。 `text_num_field_value` で field 毎の f64 を取り出す
-    /// (Rotation は degree に変換)。
-    pub event: common::model::TextEvent,
     /// r.md #38: fade scrub の range 上限 = **この event の長さ** (拍)。
     /// fade は clip 長ではなく event 長に対して掛かる (音 / 映像 / 画像 / 字幕の
     /// 適用側が全部 event 長基準)。 handler 側の clamp (`e.event_length_beats`) と
@@ -670,20 +613,10 @@ pub struct InspectorTextEventSummary {
     pub fade_max_beats: f64,
 }
 
-impl InspectorTextEventSummary {
-    /// scrubable_number の `value` 引数に渡す現値を field 毎に
-    /// 取り出す。 Rotation は内部 radians を degree に変換して返す
-    /// (= 旧 text_input が degree 表示だったのと整合、 on_change で
-    /// radians に戻す)。
-    pub fn text_num_field_value(&self, field: TextNumField) -> f64 {
-        text_event_num_value(&self.event, field)
-    }
-}
-
 /// `TextEvent` 1 つから `TextNumField` の現値 (f64) を取り出す。
-/// `InspectorTextEventSummary::text_num_field_value` (= アンカー代表値) と
-/// inspector の mixed 畳み込み (`inspector_text_num_folded`、 = 他クリップの event)
-/// の両方から使う single source。 Rotation は内部 radians を degree に変換。
+/// inspector の mixed 畳み込み (`AppData::text_num_value_of`) と、dblclick で戻す既定値 (`TextEvent::default()`
+/// から読む。automation lane の既定値 `param_value::fallback_plain` と同じ出どころ) が使う single source。
+/// Rotation は内部 radians を degree に変換。
 pub fn text_event_num_value(ev: &common::model::TextEvent, field: TextNumField) -> f64 {
     use TextNumField as F;
     match field {
@@ -732,7 +665,6 @@ pub struct SidechainSourceChoice {
 /// `PluginInstance::aux_outputs[port]` の宛先トラック id (`None` = 未配線 = 無音、業界標準の既定)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParallelOutputEntry {
-    pub track_id: u32,
     pub device_id: u64,
     pub aux_output_count: u8,
     pub routes: Vec<Option<u32>>,

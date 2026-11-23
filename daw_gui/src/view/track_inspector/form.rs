@@ -82,7 +82,8 @@ pub(super) fn value_text(ui: &mut Ui<'_, AppData>, app: &AppData, id: impl std::
     ui.label_at_clipped(id, text, rect, LABEL_FONT, app.theme.core.text);
 }
 
-/// 数値欄 1 行 (ラベル + scrub_field)。返り値 = 次の行の y。
+/// 数値欄 1 行 (ラベル + scrub_field)。`mod_owner` = 変調の持ち主のトラック (代表クリップの居るトラック、
+/// `clip_band::ClipFields::mod_owner`)。返り値 = 次の行の y。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scrub_row(
     ui: &mut Ui<'_, AppData>,
@@ -96,10 +97,12 @@ pub(super) fn scrub_row(
     fmt: ScrubableNumberFormat,
     style: &ScrubableNumberStyle,
     key: InspectorScrubField,
+    mod_owner: u32,
     make_event: impl Fn(ClipKey, f64) -> AppEvent + Clone + Send + Sync + 'static,
 ) -> f32 {
     label(ui, app, (id, "label"), text, c, y);
-    super::scrub_field(ui, app, (id, "input"), c.value(y), value, default, fmt, style, key, make_event);
+    let field = super::ScrubFieldSpec { value, default, fmt, style, key, mod_owner };
+    super::scrub_field(ui, app, (id, "input"), c.value(y), &field, make_event);
     y + FORM_ROW_PITCH
 }
 
@@ -151,8 +154,11 @@ pub(super) struct FadeRowSpec {
     pub beats: Option<f64>,
     /// 長さの上限 (ひと続きの長さ)。
     pub max_beats: f64,
-    pub curve: FadeCurve,
+    /// カーブ (割れていれば `None` = 空の dropdown)。
+    pub curve: Option<FadeCurve>,
     pub key: InspectorScrubField,
+    /// 長さの欄の変調の持ち主 ([`scrub_row`] と同じ)。
+    pub owner: u32,
     /// 長さの編集。
     pub set_beats: fn(ClipKey, f64) -> AppEvent,
     /// カーブの編集。
@@ -171,22 +177,18 @@ pub(super) fn fade_row(ui: &mut Ui<'_, AppData>, app: &AppData, c: &FormCols, y:
         range: Some((0.0, spec.max_beats.max(0.0))),
         ..super::scrub_style(&app.theme)
     };
-    super::scrub_field(
-        ui,
-        app,
-        (spec.id, "input"),
-        Rect { w: len_w, ..c.value(y) },
-        spec.beats,
-        0.0,
-        ScrubableNumberFormat::Decimal(3),
-        &style,
-        spec.key,
-        spec.set_beats,
-    );
+    let field = super::ScrubFieldSpec {
+        value: spec.beats,
+        default: 0.0,
+        fmt: ScrubableNumberFormat::Decimal(3),
+        style: &style,
+        key: spec.key,
+        mod_owner: spec.owner,
+    };
+    super::scrub_field(ui, app, (spec.id, "input"), Rect { w: len_w, ..c.value(y) }, &field, spec.set_beats);
     let curve_rect = Rect { x: c.value_x + len_w + FORM_GAP, w: c.value_w - len_w - FORM_GAP, ..c.value(y) };
-    if let Some(picked) =
-        ui.dropdown((spec.id, "curve"), curve_rect, FADE_CURVE_LABELS, fade_curve_to_index(spec.curve))
-    {
+    let selected = spec.curve.map_or(usize::MAX, fade_curve_to_index);
+    if let Some(picked) = ui.dropdown((spec.id, "curve"), curve_rect, FADE_CURVE_LABELS, selected) {
         ui.push_edit(broadcast((spec.set_curve)(fade_curve_from_index(picked))));
     }
     y + FORM_ROW_PITCH

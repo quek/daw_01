@@ -522,6 +522,10 @@ pub struct ProjectEphemeral {
     /// r.md #129 (§11.2): 直近 `AudioCommand::SetDeviceScopes` で engine に送った device id
     /// (差分送信用)。respawn で clear し、次のフレームで再送する。session-only。
     pub device_scopes_sent: Vec<u64>,
+    /// r.md #158: 前フレームにインスペクタが **見える所に** カーブを描いた EQ / Tone EQ の Par (上から、
+    /// `MAX_DEVICE_SCOPES` まで)。書くのは `track_inspector::draw` だけ (変わったフレームだけ、lag-by-one)、
+    /// 読むのは `AppData::wanted_device_scopes`。
+    pub inspector_visible_eq_scopes: Vec<u64>,
     /// r.md #129 (§7.6): パラメーターのジェスチャーの**在席印**。所有者の面がこのフレームも
     /// 同じ param を描いたら入る。フレーム末の `view::param_gesture::sweep_param_gestures` が
     /// 見て、入っていない (= 描かれなくなった) gesture を閉じる (`scrub_gesture_seen` と同じ作り)。
@@ -1032,6 +1036,7 @@ impl ProjectState {
                 sc_listen_device: None,
                 delta_devices: Vec::new(),
                 device_scopes_sent: Vec::new(),
+                inspector_visible_eq_scopes: Vec::new(),
                 param_gesture_seen: std::collections::HashSet::new(),
                 pianoroll_hover_beat: None,
                 pianoroll_hover_beat_song_raw: None,

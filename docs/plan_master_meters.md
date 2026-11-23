@@ -176,6 +176,7 @@ transport (44)
 │            │ arrangement              │  MASTER     │  ← 新パネル
 │ inspector  ├──────────────────────────┤  spectrum   │     (幅可変、
 │ (360 固定) │ bottom (mixer/pianoroll) │  scope      │      境界ドラッグ)
+                                                         (inspector の幅は r.md #158 で 360〜640 の可変に置き換わった)
 │            │                          │  gonio      │
 └────────────┴──────────────────────────┴─────────────┘
 status (24)

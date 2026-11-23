@@ -58,13 +58,14 @@ pub(crate) fn render(app: &AppData, ui: &mut Ui<'_, AppData>) {
             .iter()
             .find(|s| s.id == id)
             .map(|s| Color { r: s.color[0], g: s.color[1], b: s.color[2], a: 1.0 }),
-        // r.md #87: ランチャーの列。`Scene::color` は `None` = パレット既定なので、
-        // 未設定のときは並び順から導いた既定色を初期値に見せる (トラック色と同流儀)。
-        ColorPickerTarget::Scene(id) => app.cur.song_doc.song().scenes.iter().position(|s| s.id == id).map(|i| {
-            let s = &app.cur.song_doc.song().scenes[i];
-            let rgb = s.color.unwrap_or(track_color::PALETTE[i % track_color::PALETTE.len()]);
-            Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 }
-        }),
+        // r.md #87: ランチャーの列。未設定のときは列見出しと同じ既定色を初期値に見せる
+        // (`track_color::effective_scene_color`、トラック色と同流儀で id から導く)。
+        ColorPickerTarget::Scene(id) => {
+            app.cur.song_doc.song().scenes.iter().find(|s| s.id == id).map(|s| {
+                let rgb = track_color::effective_scene_color(s);
+                Color { r: rgb[0], g: rgb[1], b: rgb[2], a: 1.0 }
+            })
+        }
         // r.md #110: Parallel chain。 未設定は中立色 (text_dim) を初期値に見せる。
         ColorPickerTarget::ParallelChain(id) => app.cur.song_doc.chain_by_id(id).map(|(_, c)| {
             c.color

@@ -8,6 +8,23 @@ use crate::event_device::DeviceEvent;
 use crate::event_launcher::LauncherEvent;
 use common::model::Note;
 
+/// 生きているクリップ 1 本: 住所と、その持ち主のトラック / クリップ本体 (歩いたときに引いたもの。引き直さない)。
+#[derive(Debug, Clone, Copy)]
+pub struct LiveClip<'s> {
+    pub key: ClipKey,
+    pub track: &'s common::model::Track,
+    pub clip: &'s common::model::Clip,
+}
+
+/// 選ばれているクリップ ([`AppData::selected_clips`])。
+#[derive(Debug, Default)]
+pub struct SelectedClips<'s> {
+    /// 開始拍順 (先頭が代表 = [`AppData::selected_clip_ref`])。
+    pub items: Vec<LiveClip<'s>>,
+    /// ランチャーのセル選択から来たか (アレンジのクリップとは排他)。
+    pub from_cells: bool,
+}
+
 impl AppData {
     /// copy / cut / delete / duplicate / zoom が共有する **単一 arbiter**:
     /// 「いまキーボード操作の対象になっている編集面」 を 1 つに解決する
@@ -237,20 +254,20 @@ impl AppData {
         self.cur.song_doc.song().clip_by_key(key).map(|_| key)
     }
 
-    /// 対象 (代表) クリップ = **範囲の先頭に最も近い**交差クリップ。
+    /// 対象 (代表) クリップ = **範囲の先頭に最も近い**交差クリップ ([`Self::selected_clips`] の先頭と同じ 1 本)。
     ///
     /// 旧「最後にクリックした anchor」 の後継。 選択の SSoT が範囲 1 本になったので
     /// 代表も範囲から導出する — クリップヘッダをクリックすれば範囲はそのクリップの
     /// 占有区間になるので、結果は「クリックしたクリップ」で一致する。
+    /// 開始拍が同じなら選択を歩いた順で先のもの (stable sort の先頭と同じ)。確保せずに 1 回だけ歩く。
     pub fn selected_clip_ref(&self) -> Option<ClipKey> {
-        let song = self.cur.song_doc.song();
-        self.selected_clip_refs()
-            .into_iter()
-            .min_by(|a, b| {
-                let sa = song.clip_by_key(*a).map_or(f64::INFINITY, |c| c.start_beat);
-                let sb = song.clip_by_key(*b).map_or(f64::INFINITY, |c| c.start_beat);
-                sa.total_cmp(&sb)
-            })
+        let mut best: Option<LiveClip<'_>> = None;
+        self.visit_selected_clips(|c| {
+            if best.is_none_or(|b| c.clip.start_beat.total_cmp(&b.clip.start_beat).is_lt()) {
+                best = Some(c);
+            }
+        });
+        best.map(|c| c.key)
     }
 
     /// 選択範囲から**消えた行**を落とす (トラック削除 / undo / グループ解除の後始末)。
@@ -495,17 +512,53 @@ impl AppData {
     /// 「クリップ未選択」 になっていた (r.md #97)。 `Track::clip_by_id` はセルも引けるので、
     /// 呼び出し側は key の出所を区別しなくてよい。
     pub fn selected_clip_refs(&self) -> Vec<ClipKey> {
-        if self.has_live_launcher_cells() {
-            return self
-                .live_launcher_cells()
-                .into_iter()
-                .filter_map(|cell| match cell {
-                    crate::event_launcher::LauncherCellKey::Track(k) => Some(k),
-                    crate::event_launcher::LauncherCellKey::Lane(_) => None,
-                })
-                .collect();
+        self.selected_clips().items.into_iter().map(|c| c.key).collect()
+    }
+
+    /// [`Self::selected_clip_refs`] の中身を、トラックとクリップ本体ごと 1 回だけ引いたもの (開始拍順の
+    /// stable sort)。毎フレーム全部を見る側 (インスペクタ) は key から引き直さずにこれを使う。
+    pub fn selected_clips(&self) -> SelectedClips<'_> {
+        let mut items = Vec::new();
+        let from_cells = self.visit_selected_clips(|c| items.push(c));
+        items.sort_by(|a, b| a.clip.start_beat.total_cmp(&b.clip.start_beat));
+        SelectedClips { items, from_cells }
+    }
+
+    /// 選ばれているクリップを選択の並び (セルは選んだ順、アレンジは行 → 行の中のクリップの順) で 1 回だけ歩く。
+    /// 返り値 = セル選択から来たか (択一の判定は [`Self::selected_clip_refs`] の doc)。
+    fn visit_selected_clips<'s>(&'s self, mut f: impl FnMut(LiveClip<'s>)) -> bool {
+        if !self.has_live_launcher_cells() {
+            self.visit_arrangement_selected_clips(f);
+            return false;
         }
-        self.arrangement_selected_clip_refs()
+        let song = self.cur.song_doc.song();
+        for cell in &self.cur.selection.selected_launcher_cells {
+            let crate::event_launcher::LauncherCellKey::Track(key) = *cell else { continue };
+            let Some(track) = song.track_by_id(key.track_id) else { continue };
+            if let Some(sc) = track.session_clip_by_id(key.clip_id) {
+                f(LiveClip { key, track, clip: &sc.clip });
+            }
+        }
+        true
+    }
+
+    /// 選択範囲と交差するアレンジのクリップを、範囲の行の順 → 行の中のクリップの順で歩く。
+    fn visit_arrangement_selected_clips<'s>(&'s self, mut f: impl FnMut(LiveClip<'s>)) {
+        let Some(sel) = self.cur.selection.time.as_ref() else {
+            return;
+        };
+        let song = self.cur.song_doc.song();
+        for lane in &sel.lanes {
+            let common::model::LaneRef::Track(track_id) = lane else {
+                continue;
+            };
+            let Some(track) = song.track_by_id(*track_id) else {
+                continue;
+            };
+            for clip in track.clips.iter().filter(|c| sel.intersects(c.start_beat, c.length_beats)) {
+                f(LiveClip { key: ClipKey { track_id: *track_id, clip_id: clip.id }, track, clip });
+            }
+        }
     }
 
     /// 選択範囲と**交差**する**アレンジの**クリップ群 (開始拍順)。 セルは含まない。
@@ -519,27 +572,8 @@ impl AppData {
     /// (`ArrangementFrame::selected_clips` は帯のセルを混ぜない契約 —
     /// `LauncherView::selected` の doc) だけ。 それ以外は [`Self::selected_clip_refs`]。
     pub fn arrangement_selected_clip_refs(&self) -> Vec<ClipKey> {
-        let Some(sel) = self.cur.selection.time.as_ref() else {
-            return Vec::new();
-        };
-        let song = self.cur.song_doc.song();
         let mut out: Vec<(f64, ClipKey)> = Vec::new();
-        for lane in &sel.lanes {
-            let common::model::LaneRef::Track(track_id) = lane else {
-                continue;
-            };
-            let Some(track) = song.track_by_id(*track_id) else {
-                continue;
-            };
-            for clip in &track.clips {
-                if sel.intersects(clip.start_beat, clip.length_beats) {
-                    out.push((
-                        clip.start_beat,
-                        ClipKey { track_id: *track_id, clip_id: clip.id },
-                    ));
-                }
-            }
-        }
+        self.visit_arrangement_selected_clips(|c| out.push((c.clip.start_beat, c.key)));
         out.sort_by(|a, b| a.0.total_cmp(&b.0));
         out.into_iter().map(|(_, k)| k).collect()
     }
@@ -925,112 +959,6 @@ impl AppData {
         if !self.cur.view.locked_pr_tracks.remove(&track_id) {
             self.cur.view.locked_pr_tracks.insert(track_id);
         }
-    }
-
-    /// inspector の編集対象クリップ群 = [`Self::selected_clip_refs`] そのもの
-    /// (セルを選んでいればそのセル群、 アレンジなら**範囲と交差するクリップ全体** —
-    /// `docs/plan_range_selection.md` 質問 27b)。 範囲をかすめただけのクリップも
-    /// 対象に入る — 属性操作 (改名 / 色 / ゲイン / 声 / 画像の位置) はクリップという
-    /// オブジェクトに効くので、範囲操作 (Delete / `J` / ミュート) とは対象の決め方が違う。
-    pub(crate) fn for_each_inspector_target(&self, mut f: impl FnMut(ClipKey)) {
-        for r in self.selected_clip_refs() {
-            f(r);
-        }
-    }
-
-    pub fn inspector_target_refs(&self) -> Vec<ClipKey> {
-        let mut refs = Vec::new();
-        self.for_each_inspector_target(|r| refs.push(r));
-        refs
-    }
-
-    /// 編集対象クリップ各々に `extract` を適用し、 値が全て一致すれば
-    /// `Some(値)`、 割れていれば `None` (= mixed) を返す。 `extract` が `None` を返す
-    /// クリップ (= その field を持たない種別) は無視する。 表示中の section のアンカーは
-    /// 必ずその種別なので、 表示中 field では `None` == mixed と解釈できる。 毎フレーム
-    /// 全 field で呼ばれるので alloc しない (`for_each_inspector_target` を使う)。
-    pub fn inspector_fold(&self, extract: impl Fn(&AppData, ClipKey) -> Option<f64>) -> Option<f64> {
-        let mut acc: Option<f64> = None;
-        let mut mixed = false;
-        self.for_each_inspector_target(|t| {
-            if mixed {
-                return;
-            }
-            if let Some(v) = extract(self, t) {
-                match acc {
-                    None => acc = Some(v),
-                    Some(a) if (a - v).abs() > 1e-6 => mixed = true,
-                    _ => {}
-                }
-            }
-        });
-        if mixed { None } else { acc }
-    }
-
-    /// `target` clip の編集が効く最初の `ImageEvent` に `f` を適用 (image clip でない / 窓に見えている
-    /// event が無ければ `None`、`handler::clip_window`)。 mixed 畳み込み (`inspector_fold`) 用 accessor。
-    /// fade は片ではなくひと続きの値なので [`Self::image_first_fade`] で読む。
-    pub fn image_first_event<R>(
-        &self,
-        target: ClipKey,
-        f: impl FnOnce(&common::model::ImageEvent) -> R,
-    ) -> Option<R> {
-        let events_of = common::model::ClipContent::image_events;
-        self.clip_edit_anchor(self.clip_shown_targets(target, events_of)?, events_of, None).map(|(e, _)| f(e))
-    }
-
-    /// `target` clip の編集が効く最初のひと続きの fade (位置・長さ・両端)。
-    pub fn image_first_fade(&self, target: ClipKey) -> Option<common::model::EventFade> {
-        let events_of = common::model::ClipContent::image_events;
-        self.clip_edit_anchor(self.clip_shown_targets(target, events_of)?, events_of, None).map(|(_, fade)| fade)
-    }
-
-    /// `target` clip の編集が効く最初の `TextEvent` に `f` を適用 (text clip でなければ `None`)。
-    pub fn text_first_event<R>(
-        &self,
-        target: ClipKey,
-        f: impl FnOnce(&common::model::TextEvent) -> R,
-    ) -> Option<R> {
-        self.text_first_run(target).map(|(e, _)| f(e))
-    }
-
-    /// `target` clip の窓に見えている最初の `TextEvent` と、そのひと続きの fade。
-    fn text_first_run(&self, target: ClipKey) -> Option<(&common::model::TextEvent, common::model::EventFade)> {
-        let events_of = common::model::ClipContent::text_events;
-        self.clip_edit_anchor(self.clip_shown_targets(target, events_of)?, events_of, None)
-    }
-
-    /// `target` clip の編集が効く最初の `AudioEvent` に `f` を適用 (audio clip でなければ `None`)。
-    /// Audio Editor がこの clip を開いて event を選んでいれば、その代表 (Inspector の summary と同じ)。
-    pub fn audio_first_event<R>(
-        &self,
-        target: ClipKey,
-        f: impl FnOnce(&common::model::AudioEvent) -> R,
-    ) -> Option<R> {
-        self.audio_first_run(target).map(|(e, _)| f(e))
-    }
-
-    /// `target` clip の編集が効く最初のひと続きの fade (位置・長さ・両端)。
-    pub fn audio_first_fade(&self, target: ClipKey) -> Option<common::model::EventFade> {
-        self.audio_first_run(target).map(|(_, fade)| fade)
-    }
-
-    fn audio_first_run(&self, target: ClipKey) -> Option<(&common::model::AudioEvent, common::model::EventFade)> {
-        let anchor = (self.cur.peph.audio_editor_clip == Some(target)).then(|| self.audio_editor_anchor_event()).flatten();
-        self.clip_edit_anchor(self.audio_edit_targets(target)?, common::model::ClipContent::audio_events, anchor)
-    }
-
-    /// text num field を `inspector_target_refs` 全体で畳む (mixed 検出)。 fade の長さは片ではなく
-    /// ひと続きの窓に見えているランプの長さ (編集が効くのと同じ単位)。
-    pub fn inspector_text_num_folded(&self, field: TextNumField) -> Option<f64> {
-        self.inspector_fold(|a, t| {
-            let (e, fade) = a.text_first_run(t)?;
-            Some(match field {
-                TextNumField::FadeInBeats => fade.visible_fade_in_beats(),
-                TextNumField::FadeOutBeats => fade.visible_fade_out_beats(),
-                _ => text_event_num_value(e, field),
-            })
-        })
     }
 
     /// stable `ClipKey` → `&Clip` (track_by_id + clip_by_id)。

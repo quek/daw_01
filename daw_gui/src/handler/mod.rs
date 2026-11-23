@@ -56,6 +56,8 @@ pub mod history;
 pub mod inspector_view;
 /// r.md #158: トラックインスペクタのタイトル (選んでいるもの) と帯の対象の表示。
 pub mod inspector_title;
+/// r.md #158: インスペクタが 1 フレームに 1 回だけ作る選択のスナップショットと、欄の値の取り出し。
+pub mod inspector_selection;
 pub mod ipc;
 /// r.md #87: クリップランチャーの発火 / 行の主導権 / 列 (シーン) の CRUD。
 pub mod launcher;

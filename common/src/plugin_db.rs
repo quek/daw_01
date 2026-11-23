@@ -359,8 +359,8 @@ pub const NATIVE_DELAY_PICKER_ID: &str = "builtin://daw_01.native.delay";
 pub const SUBTITLE_ID: &str = "builtin.video.subtitle";
 
 /// 字幕デバイス ([`SUBTITLE_ID`] の builtin) か。映像 device だが Par を持たない (字幕の文字と書式は
-/// daw_gui のインスペクタのクリップの帯で編集する、r.md #158)。「Par を開けるか / 開いた Par を覚えるか /
-/// param パネルを組むか」の判定はこの 1 本を通す。
+/// daw_gui のインスペクタのクリップの帯で編集する、r.md #158)。「Par を開けるか / 開いた Par を覚えるか」の判定は
+/// この 1 本を通す (汎用の param パネルを組まないのは、映像 device を先に弾く `PortConfig::is_video` が持つ)。
 #[must_use]
 pub fn is_subtitle(format: PluginFormat, plugin_id: &str) -> bool {
     format == PluginFormat::Builtin && plugin_id == SUBTITLE_ID

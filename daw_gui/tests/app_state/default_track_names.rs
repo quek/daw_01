@@ -86,7 +86,7 @@ fn グループ化と送り先追加も未命名で作りグループも送り�
         "上からの通し番号 (グループの子も続きの番号)"
     );
     select_track_single(&mut app, 2);
-    assert_eq!(app.inspector_title().main, "3", "インスペクタの見出しも同じ番号");
+    assert_eq!(app.inspector_title(&app.inspector_selection()).main, "3", "インスペクタの見出しも同じ番号");
 }
 
 #[test]

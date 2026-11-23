@@ -42,9 +42,23 @@ pub const PALETTE: [[f32; 3]; 16] = [
 /// id ベースなので色が動かない。
 #[must_use]
 pub fn derived_track_color(track_id: u32) -> [f32; 3] {
+    derived_palette_color(track_id)
+}
+
+/// 色を持たないもの (トラック / 列) の既定色: 安定 id (1 始まり) からパレットを巡回する。並び順ではなく id
+/// から導くので、並べ替えても色が動かない。
+#[must_use]
+pub fn derived_palette_color(id: u32) -> [f32; 3] {
     let n = PALETTE.len() as u32;
-    let idx = track_id.saturating_sub(1) % n;
+    let idx = id.saturating_sub(1) % n;
     PALETTE[idx as usize]
+}
+
+/// 列 (シーン) の実効色: 明示上書き (`Some`) か、無ければ id 由来のパレット色 (`Scene::color` の doc
+/// 「`None` = パレット既定色」)。ランチャーの列見出し・色の選択窓の初期値・インスペクタのタイトルが同じ 1 本を使う。
+#[must_use]
+pub fn effective_scene_color(scene: &common::model::Scene) -> [f32; 3] {
+    scene.color.unwrap_or_else(|| derived_palette_color(scene.id))
 }
 
 /// トラックの実効色: 明示上書き (`Some`) か、無ければ id 由来の導出色。

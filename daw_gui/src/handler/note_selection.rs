@@ -597,9 +597,10 @@ mod launcher_cell_editing_tests {
             Vec::<ClipKey>::new(),
             "アレンジ widget のハイライト集合にセルは混ざらない"
         );
-        let summary = app.inspector_image_event_summary().expect("Image Event 節が出る");
-        assert_eq!(summary.target, cell);
-        assert_eq!(summary.x, 0.25);
+        let rep = app.inspector_selection().rep().expect("代表はセル");
+        assert_eq!(rep.key, cell);
+        assert!(app.inspector_image_event_summary(rep).is_some(), "画像の欄が出る");
+        assert_eq!(app.image_first_event(cell, |e| e.x), Some(0.25));
 
         app.handle_event(AppEvent::SetClipImageX { target: cell, value: 0.75 });
         assert_eq!(app.image_first_event(cell, |e| e.x), Some(0.75), "編集がセルの event に届く");

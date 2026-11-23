@@ -626,8 +626,9 @@ impl AppData {
     /// 汎用 plugin の「Par」インライン param パネルの read snapshot。
     /// Par を開いた `device_id` が cursor track に居て、 host から param 一覧が
     /// 届いているときに、 lane default_value を実レンジ化した編集可能な param 行を返す。
-    /// VOICEVOX / 字幕 builtin は host param を持たない (VOICEVOX の Par は口パク先だけ、声 / 読み上げ /
-    /// 字幕の欄はクリップの帯、r.md #158) ので、 ここでは `None` (= 汎用パネルは出さない)。
+    /// 映像 device (映像 FX は専用セクション、字幕デバイスは Par を持たない) は先に弾く。VOICEVOX は host param を
+    /// 持たない (VOICEVOX の Par は口パク先の欄だけ、声 / 読み上げのクリップの設定はクリップの帯、r.md #158) ので、
+    /// ここでは `None` (= 汎用パネルは出さない)。
     ///
     /// 行は param 表の全 param ぶんあるので、device ごとに [`PluginParamsPanelCache`] (Song + param 表 +
     /// plugin DB の世代) に載せ、毎フレーム組み直さない。カーソルトラックの gate だけは毎回見る。
@@ -651,8 +652,8 @@ impl AppData {
     fn build_plugin_params_inspector(&self, device_id: u64) -> Option<PluginParamsInspector> {
         use common::model::AutomationTarget;
         let (device, track_id) = self.plugin_node(device_id)?;
-        if device.ports.is_video() && !common::plugin_db::is_subtitle(device.format, &device.plugin_id) {
-            return None; // 映像 FX は専用セクション。
+        if device.ports.is_video() {
+            return None; // 映像 device: 映像 FX は専用セクション (video_fx)、字幕は Par を持たない (r.md #158)。
         }
         // param 行: lane default_value (無ければ info.default_value を正規化) を
         // 実レンジへ。 HIDDEN は出さない。レーンは param id で 1 回だけ引ける形にする
@@ -672,8 +673,8 @@ impl AppData {
             .filter(|p| p.flags & common::protocol::plugin_param_flags::HIDDEN == 0)
             .map(|p| plugin_param_row(p, lane_defaults.get(&p.id).copied()))
             .collect();
-        // param が 1 つも無い device (VOICEVOX / 字幕 / Silence) は汎用パネルを出さない
-        // (= 専用セクションが Par パネルを担う)。
+        // param が 1 つも無い device (VOICEVOX / Silence) は汎用パネルを出さない (VOICEVOX の Par は口パク先の欄
+        // `device_panel::lipsync` だけ。Silence は Par を持たない)。
         if params.is_empty() {
             return None;
         }
