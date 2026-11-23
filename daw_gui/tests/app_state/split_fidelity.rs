@@ -535,8 +535,8 @@ fn ひと続きの片への_inspector_編集は分割前に掛けてから割っ
 
     // Inspector の表示もひと続きから読む (fade の長さはひと続きの端のランプ、上限はひと続きの長さ)。
     after.handle_event(AppEvent::SelectClip { target: CLIP, additive: false });
-    let summary = after.inspector_audio_event_summary().expect("audio clip");
-    assert_eq!((summary.fade_in_beats, summary.fade_out_beats, summary.fade_max_beats), (3.0, 1.5, 8.0));
+    let fade = after.audio_first_fade(CLIP).expect("audio clip");
+    assert_eq!((fade.visible_fade_in_beats(), fade.visible_fade_out_beats(), fade.len_beats), (3.0, 1.5, 8.0));
 }
 
 /// クリップごと割った片 (content を共有して別の窓を見る) へのクリップ単位の編集は、そのクリップの窓の片にだけ

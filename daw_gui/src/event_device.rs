@@ -95,6 +95,10 @@ pub enum DeviceEvent {
         port: u8,
         tap_point: TapPoint,
     },
+    /// plugin DB の `id` (内蔵 device / Parallel の picker id も可) を `chain` の既定位置 (組み込みの手前) に挿す。
+    /// picker と違って宛先を自分で持つ — picker の開閉にもカーソルのトラックにも依存しない (インスペクタの
+    /// 「+ 字幕デバイス」が、クリップの居るトラックへ足す)。
+    AddPlugin { chain: ChainRef, id: String, open_gui: bool },
     // -------- r.md #110 Parallel (`docs/plan_parallel.md` §6.3) ------------------
     /// 空の Parallel (chain 1 本) を `chain` の `at` に挿す。
     AddParallel { chain: ChainRef, at: InsertAt },
@@ -149,6 +153,7 @@ impl DeviceEvent {
                     "デバイス移動"
                 }
             }
+            E::AddPlugin { .. } => "プラグイン追加",
             E::AddParallel { .. } => "Parallel 追加",
             E::GroupDevices { .. } => "Parallel にまとめる",
             E::UngroupParallel { .. } => "Parallel を解除",

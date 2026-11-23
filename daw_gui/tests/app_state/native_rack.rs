@@ -491,6 +491,18 @@ fn scope_msgs(rx: &mut UnboundedReceiver<AudioCommand>) -> Vec<Vec<u64>> {
         .collect()
 }
 
+/// root view を headless で 1 フレーム描き、runner のフレーム末と同じく `sync_device_scopes` を呼ぶ (スペクトラムの
+/// 要求は、インスペクタが見える所に描いた EQ の Par から決まる)。
+fn draw_and_sync(app: &mut AppData) {
+    let size = daw_ui_platform::PhysicalSize { width: 1400, height: 900 };
+    let mut host: daw_ui_core::UiHost<AppData> = daw_ui_core::UiHost::no_redraw();
+    let mut scene = daw_ui_renderer::Scene::new();
+    host.frame(app, &mut scene, size, daw_ui_core::FrameInput::default(), |app, ui| {
+        daw_gui::view::root::build_root(app, ui, size);
+    });
+    app.sync_device_scopes();
+}
+
 /// R-9 (Q14 / §11.2): EQ の Par を開くと差分があったときだけ `SetDeviceScopes` を 1 通送る。Parallel を折り畳むと
 /// 外れる。タブを切り替えて戻っても再送しない (送った集合はタブごとに覚えている)。
 #[test]
@@ -505,22 +517,22 @@ fn device_scopes_are_sent_only_when_the_open_eq_panels_change() {
     let eq = *app.cur.selection.selected_device_ids.last().unwrap();
     let _ = drain(&mut audio);
 
-    app.sync_device_scopes();
+    draw_and_sync(&mut app);
     assert_eq!(scope_msgs(&mut audio), vec![vec![eq]]);
-    app.sync_device_scopes();
+    draw_and_sync(&mut app);
     assert!(scope_msgs(&mut audio).is_empty(), "変化が無ければ送らない");
     dev(&mut app, DeviceEvent::ToggleParallelNodeCollapsed { id: parallel });
-    app.sync_device_scopes();
+    draw_and_sync(&mut app);
     assert_eq!(scope_msgs(&mut audio), vec![Vec::<u64>::new()], "折り畳んだ Parallel の中は外れる");
     dev(&mut app, DeviceEvent::ToggleParallelNodeCollapsed { id: parallel });
-    app.sync_device_scopes();
+    draw_and_sync(&mut app);
     assert_eq!(scope_msgs(&mut audio), vec![vec![eq]]);
 
     let a = app.pk();
     app.handle_event(AppEvent::Tab(TabEvent::New));
-    app.sync_device_scopes();
+    draw_and_sync(&mut app);
     app.handle_event(AppEvent::Tab(TabEvent::Switch(a)));
     let _ = scope_msgs(&mut audio);
-    app.sync_device_scopes();
+    draw_and_sync(&mut app);
     assert!(scope_msgs(&mut audio).is_empty(), "戻ったタブは覚えている集合と同じなので再送しない");
 }

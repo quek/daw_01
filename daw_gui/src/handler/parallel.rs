@@ -583,7 +583,7 @@ impl AppData {
             aux_input_count: p.aux_input_count,
             sc_wired: p.aux_inputs.iter().any(Option::is_some),
             aux_output_count: p.aux_output_count,
-            aux_out_wired: p.aux_outputs.iter().any(Option::is_some),
+            aux_out_wired: crate::handler::view_model::wired_aux_outputs(p),
         }
     }
 

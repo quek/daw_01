@@ -119,7 +119,7 @@ impl AppData {
     /// engine の `pending_preview`) をそのまま使う。 engine は次の dispatch の
     /// frame 0 に注入するので、再生中でも停止中でも鳴る。
     fn monitor_note_on(&mut self, pitch: u8, velocity: u8) {
-        for track_id in self.armed_track_ids() {
+        for track_id in self.midi_armed_track_ids() {
             self.monitor_note_on_track(track_id, pitch, velocity);
         }
     }
@@ -160,13 +160,26 @@ impl AppData {
         }
     }
 
-    /// 録音待機 (`Track::armed`) のトラック id。 録音・モニターの宛先。
+    /// 録音待機 (`Track::armed`) で、入力がそのトラックで効く (`common::model::InputRules::effective_input`) トラック
+    /// id。録音を始めてよいか (録音先があるか) の判定。音声の書き先は `request_audio_takes` が同じ規則で決める。
     /// r.md #131: 実効的に無効なトラックは宛先にしない (待機のまま無効な group へ移した場合も)。
     pub(crate) fn armed_track_ids(&self) -> Vec<u32> {
+        self.armed_tracks_where(|_| true)
+    }
+
+    /// MIDI 入力の録音・モニターの宛先: 録音待機で、効く入力が MIDI のトラック。入力の帯が「未選択」と出す
+    /// トラック (MIDI を録れない) や、音声入力を選んだトラックには MIDI を録らない / 鳴らさない。
+    pub(crate) fn midi_armed_track_ids(&self) -> Vec<u32> {
+        self.armed_tracks_where(common::model::TrackInput::is_midi)
+    }
+
+    fn armed_tracks_where(&self, input: impl Fn(&common::model::TrackInput) -> bool) -> Vec<u32> {
         let song = self.cur.song_doc.song();
+        let rules = common::model::InputRules::new(song);
         song.tracks
             .iter()
             .filter(|t| t.armed && song.track_effectively_enabled(t.id))
+            .filter(|t| rules.effective_input(t).is_some_and(|i| input(&i)))
             .map(|t| t.id)
             .collect()
     }
@@ -435,7 +448,7 @@ impl AppData {
     /// 録音書き込みでも同じ動作、 不都合なら別 phase で「録音前に
     /// make_unique」 を検討)。
     pub(crate) fn record_midi_note_on(&mut self, pitch: u8, velocity: u8) {
-        let tracks = self.armed_track_ids();
+        let tracks = self.midi_armed_track_ids();
         self.record_midi_note_on_tracks(&tracks, pitch, velocity);
     }
 

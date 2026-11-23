@@ -49,6 +49,7 @@ impl AppData {
             DeviceEvent::SetAuxInputTapPoint { device_id, port, tap_point } => {
                 self.set_aux_input_tap_point(device_id, port, tap_point);
             }
+            DeviceEvent::AddPlugin { chain, id, open_gui } => self.add_plugin_from_db(&id, chain, open_gui),
             // ---- r.md #110 Parallel ----
             DeviceEvent::AddParallel { chain, at } => self.add_parallel(chain, at),
             DeviceEvent::GroupDevices { device_ids } => self.group_devices(device_ids),

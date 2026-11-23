@@ -478,30 +478,19 @@ pub enum AppEvent {
     EndTextPiPDrag,
 
     /// docs/plan_text_overlay.md §4 P5: text inspector の編集パス。
-    /// Text content / Font family は string-shaped で個別 event (ミュートは全種類共通の
-    /// `SetClipMuted` / `DiscreteClipEdit::Muted`)、
-    /// 23 numeric field + 2 fade beats は `SetClipTextNumField` 1 event で
-    /// `TextNumField` discriminator dispatch する。 数値入力は
-    /// scrubable_number 化され、 on_change が直接 `SetClipTextNumField` を
-    /// 発火 (= 旧 buffer 経路 `ClipTextNumEditChanged` / `CommitClipTextNumEdit`
-    /// は撤去)。 lane override 経由でも同様、 lane が effective なら
+    /// 本文 (セリフ / 文字) は確定した文字列を宛先のクリップへ書く (入力欄の id と確定先をクリップに束ねる、
+    /// `track_inspector::clip_band`)。揃え / フェードのカーブ / ミュートは全種類共通の離散編集
+    /// (`BroadcastDiscreteClipEdit` の `DiscreteClipEdit::TextAlign` / `TextFadeCurve` / `Muted`)、フォントは
+    /// font picker が直接書く。23 numeric field + 2 fade beats は `SetClipTextNumField` 1 event で
+    /// `TextNumField` discriminator dispatch する。 lane override 経由でも同様、 lane が effective なら
     /// TextEvent.field の直接書き込みは preview に反映されない。
     SetClipTextContent { target: ClipKey, value: String },
-    SetClipTextFontFamily { target: ClipKey, value: String },
-    SetClipTextAlign { target: ClipKey, value: common::model::TextAlign },
-    SetClipTextFadeInCurve { target: ClipKey, curve: common::model::FadeCurve },
-    SetClipTextFadeOutCurve { target: ClipKey, curve: common::model::FadeCurve },
 
     /// text inspector の scrubable_number on_change から発火
     /// (drag 中 per-frame / text commit)。 `set_clip_text_num_field` で
     /// `value` (= Rotation は radians) を clamp + 全 TextEvent に書く。
     /// 非 undoable (= drag stroke を `Begin/EndInspectorScrub` で bracket)。
     SetClipTextNumField { target: ClipKey, field: TextNumField, value: f32 },
-
-    ClipTextContentEditChanged(String),
-    ClipTextFontFamilyEditChanged(String),
-    CommitClipTextContentEdit,
-    CommitClipTextFontFamilyEdit,
 
     /// 選択中 text clip の `TextEvent` 現値から文字列 edit buffer
     /// (content / font_family) を再生成。 inspector が clip 切替 / Undo /
@@ -1477,11 +1466,6 @@ pub enum AppEvent {
     /// 走査する flag。
     SetClipReversed { target: ClipKey, reversed: bool },
 
-    /// clip 全体の mute を設定 (`Clip.muted` = clip-level mute の SSoT)。
-    /// 旧 (v26 以前) は per-event `AudioEvent.muted` を立てていたが、v27 で `Clip.muted` に
-    /// 一本化したので audio inspector の "Mute" トグルもここを設定する。track-mute とは独立。
-    SetClipMuted { target: ClipKey, muted: bool },
-
     /// 複数 clip の mute を一括設定 (= `q` ショートカットで選択 clip / カーソル
     /// 直下 clip を toggle した結果)。各 target の `Clip.muted` に `muted` を設定する。
     SetClipsMuted { targets: Vec<ClipKey>, muted: bool },
@@ -1508,12 +1492,6 @@ pub enum AppEvent {
     /// (`ResetTrackClipColors` のレーン版、lane-scoped)。
     ResetAutomationLaneClipColors { lane: common::model::AutomationLaneKey },
 
-    /// Set `AudioEvent.stretch_mode` for every event in the selected
-    /// audio clip. Phase 1 で再生に効くのは `Raw` / `Repitch` のみ;
-    /// `Stretch` / `Slice` は §3.7 に従って Raw 同等で再生される
-    /// (Phase 3+ で本実装)。
-    SetClipStretchMode { target: ClipKey, mode: common::model::StretchMode },
-
     // ---- Audio event 数値 field 編集 (Phase 2 PR2) ----------------------
     /// audio / image inspector が `clip_edit_buffer_target` を
     /// `target` に同期するために発火する純 sync marker。 数値 field は
@@ -1534,17 +1512,15 @@ pub enum AppEvent {
     SetClipFormantSemitones { target: ClipKey, semitones: f32 },
 
     // ---- Audio event fade 編集 (Phase 2 PR3) ----------------------------
-    /// Fade length / curve の programmatic 設定。 `SetClipGainDb` 等と
+    /// Fade length の programmatic 設定。 `SetClipGainDb` 等と
     /// 同じ semantics で全 event に broadcast、 値は clip.length_beats
-    /// で clamp (= fade が clip より長くならない)。 curve は spec §3.5
-    /// の Linear / Exponential / SCurve から選択 (Inspector dropdown 経由)。
+    /// で clamp (= fade が clip より長くならない)。 curve (spec §3.5 の Linear / Exponential / SCurve) は
+    /// 離散編集 `DiscreteClipEdit::FadeCurve` (Inspector dropdown 経由)。
     /// `target` の `ClipContent` が `Audio` / `Image` のいずれであっても
     /// fade フィールドが存在するので kind-aware に書き分ける (handler
     /// 側で resolve)。
     SetClipFadeInBeats { target: ClipKey, beats: f64 },
     SetClipFadeOutBeats { target: ClipKey, beats: f64 },
-    SetClipFadeInCurve { target: ClipKey, curve: common::model::FadeCurve },
-    SetClipFadeOutCurve { target: ClipKey, curve: common::model::FadeCurve },
 
     // ---- Image event 編集 (`docs/plan_image_overlay.md` §4 P4) -----------
     /// PiP rect / opacity / rotation の programmatic 設定 (Inspector の
@@ -1840,17 +1816,14 @@ impl AppEvent {
             E::SetAutomationClipColor { .. } => "オートメーションクリップ色変更",
             E::SetAutomationLaneColor { .. } => "レーン色変更",
             E::ResetAutomationLaneClipColors { .. } => "クリップ色リセット",
-            E::SetClipMuted { .. } | E::SetClipsMuted { .. } => "クリップミュート",
+            E::SetClipsMuted { .. } => "クリップミュート",
             E::SetClipReversed { .. } | E::ToggleClipReversed(..) => "クリップ逆再生",
-            E::SetClipStretchMode { .. } => "ストレッチモード変更",
             E::SetClipGainDb { .. } => "クリップゲイン変更",
             E::SetClipPan { .. } => "クリップパン変更",
             E::SetClipPitchSemitones { .. } => "クリップピッチ変更",
             E::SetClipFormantSemitones { .. } => "クリップフォルマント変更",
             E::SetClipFadeInBeats { .. }
             | E::SetClipFadeOutBeats { .. }
-            | E::SetClipFadeInCurve { .. }
-            | E::SetClipFadeOutCurve { .. }
             | E::SetClipFadeBeatsBatch(..)
             | E::SetClipFadeCurveBatch(..) => "フェード変更",
             E::AutoFadeSelectedClips => "オートフェード",
@@ -1860,13 +1833,7 @@ impl AppEvent {
 
             // ---- テキスト / 画像 クリップ ----
             E::SetClipTextContent { .. }
-            | E::SetClipTextFontFamily { .. }
-            | E::SetClipTextAlign { .. }
-            | E::SetClipTextFadeInCurve { .. }
-            | E::SetClipTextFadeOutCurve { .. }
             | E::SetClipTextNumField { .. }
-            | E::CommitClipTextContentEdit
-            | E::CommitClipTextFontFamilyEdit
             | E::SetClipTextX { .. }
             | E::SetClipTextY { .. }
             | E::SetClipTextW { .. }

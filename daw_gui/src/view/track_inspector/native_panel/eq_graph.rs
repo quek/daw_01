@@ -45,6 +45,7 @@ pub(super) fn draw_eq_graph(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Panel
     let active = !ctx.dev.bypassed;
     ui.panel(wid(ParamSurface::Rack, key, "curve_well", ()), rect, p.inset_bg, 2.0);
     draw_eq_curve(app, ui, rect, &src, &CurveLook { active, spectrum_db: app.device_spectrum_db(id) });
+    ctx.eq_scopes.note_drawn(ui, id, rect);
     let axes = CurveAxes::for_source(&src);
     for h in curve_handles(&src, &axes, rect) {
         let lock = match h.axes {

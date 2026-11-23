@@ -40,7 +40,9 @@ pub(super) fn draw_title(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, ti
     let line2_y = line1_y + TITLE_FONT * 1.2 + TITLE_LINE_GAP;
     let x = area.x + PAD;
     let reserve = if title.sub_swatch.is_some() { TITLE_SUB_SWATCH + TITLE_SUB_SWATCH_GAP } else { 0.0 };
-    let text_w = ui.measure_text(&title.sub, TITLE_SUB_FONT).min((right - x - reserve).max(0.0));
+    let avail = (right - x - reserve).max(0.0);
+    // 文字の幅が要るのは色見本を文字のすぐ右に置くときだけ (見本が無ければ幅いっぱいに切って描けば同じ見た目)。
+    let text_w = if title.sub_swatch.is_some() { ui.measure_text(&title.sub, TITLE_SUB_FONT).min(avail) } else { avail };
     ui.label_at_clipped(
         "inspector_title_sub",
         &title.sub,

@@ -8,28 +8,26 @@
 
 use daw_ui_core::{Edit, ScrubableNumberFormat, ScrubableNumberStyle, Ui};
 
-use common::model::{TextAlign, TextBuiltinParam};
+use common::model::{EventFade, FadeCurve, TextAlign, TextBuiltinParam, TextEvent};
 
-use super::super::form::{self, FadeRowSpec, FormCols};
+use super::super::form::{self, FadeRowSpec};
 use super::super::layout::FORM_ROW_PITCH;
 use super::super::{band, scrub_style, vocab};
+use super::ClipFields;
 use crate::app::{
     AppData, AppEvent, DiscreteClipEdit, FadeEdgeKind, InspectorScrubField, InspectorTextEventSummary, TextNumField,
-    text_num_to_builtin,
+    text_event_num_value, text_num_to_builtin,
 };
 use crate::state::inspector_view::InspectorDetail;
 
 const ALIGN_LABELS: &[&str] = &["左", "中央", "右"];
 
 /// 小見出し「字幕」以下。字幕デバイスを持つトラックの Text クリップでなければ何も描かない。
-pub(super) fn draw_subtitle(app: &AppData, ui: &mut Ui<'_, AppData>, c: &FormCols, w: f32, y: f32) -> f32 {
-    let has_subtitle = app
-        .selected_clip_ref()
-        .and_then(|r| app.cur.song_doc.song().track_by_id(r.track_id))
-        .is_some_and(common::model::Track::has_subtitle_device);
-    let Some(summary) = app.inspector_text_event_summary().filter(|_| has_subtitle) else {
+pub(super) fn draw_subtitle(app: &AppData, ui: &mut Ui<'_, AppData>, f: &ClipFields<'_, '_>, y: f32) -> f32 {
+    let Some(summary) = app.inspector_text_event_summary(f.rep).filter(|_| f.rep.track.has_subtitle_device()) else {
         return y;
     };
+    let (c, w) = (&f.c, f.w);
     let mut y = band::sub_heading(app, ui, "inspector_subtitle_head", c.label_x, w, y + 2.0, vocab::SUB_SUBTITLE, None);
 
     // フォント: ボタンで font picker を開く (検索付き、↑↓ / ホバーでキャンバスにライブプレビュー)。
@@ -41,13 +39,15 @@ pub(super) fn draw_subtitle(app: &AppData, ui: &mut Ui<'_, AppData>, c: &FormCol
     }
     y += FORM_ROW_PITCH;
 
-    // 揃え。
+    // 揃え (選んでいる全部を畳む。割れていれば空)。
     form::label(ui, app, "inspector_text_align_label", vocab::FIELD_ALIGN, c, y);
-    let align_idx = match summary.align {
-        TextAlign::Left => 0,
-        TextAlign::Center => 1,
-        TextAlign::Right => 2,
-    };
+    let align_idx = f.sel.fold_eq(|cl| app.text_first_run_of(cl.clip).map(|(e, _)| e.align)).map_or(usize::MAX, |a| {
+        match a {
+            TextAlign::Left => 0,
+            TextAlign::Center => 1,
+            TextAlign::Right => 2,
+        }
+    });
     if let Some(picked) = ui.dropdown("inspector_text_align_dropdown", c.value(y), ALIGN_LABELS, align_idx) {
         let align = match picked {
             0 => TextAlign::Left,
@@ -66,47 +66,55 @@ pub(super) fn draw_subtitle(app: &AppData, ui: &mut Ui<'_, AppData>, c: &FormCol
         (vocab::FIELD_FONT_SIZE, TextNumField::FontSize),
         (vocab::FIELD_OPACITY, TextNumField::Opacity),
     ] {
-        y = num_row(app, ui, c, &summary, y, label, field);
+        y = num_row(app, ui, f, &summary, y, label, field);
     }
 
     let max_beats = summary.fade_max_beats;
+    let curve = |get: fn(&EventFade) -> FadeCurve| f.sel.fold_eq(|cl| app.text_first_run_of(cl.clip).map(|(_, x)| get(&x)));
     y = form::fade_row(ui, app, c, y, &FadeRowSpec {
         id: "inspector_text_fade_in",
         label: vocab::FIELD_FADE_IN,
-        beats: app.inspector_text_num_folded(TextNumField::FadeInBeats),
+        beats: fold_num(app, f, TextNumField::FadeInBeats),
         max_beats,
-        curve: summary.fade_in_curve,
+        curve: curve(|x| x.fade_in_curve),
         key: InspectorScrubField::Text { field: TextNumField::FadeInBeats },
+        owner: f.mod_owner(),
         set_beats: |t, v| AppEvent::SetClipTextNumField { target: t, field: TextNumField::FadeInBeats, value: v as f32 },
         set_curve: |c| DiscreteClipEdit::TextFadeCurve(FadeEdgeKind::In, c),
     });
     y = form::fade_row(ui, app, c, y, &FadeRowSpec {
         id: "inspector_text_fade_out",
         label: vocab::FIELD_FADE_OUT,
-        beats: app.inspector_text_num_folded(TextNumField::FadeOutBeats),
+        beats: fold_num(app, f, TextNumField::FadeOutBeats),
         max_beats,
-        curve: summary.fade_out_curve,
+        curve: curve(|x| x.fade_out_curve),
         key: InspectorScrubField::Text { field: TextNumField::FadeOutBeats },
+        owner: f.mod_owner(),
         set_beats: |t, v| AppEvent::SetClipTextNumField { target: t, field: TextNumField::FadeOutBeats, value: v as f32 },
         set_curve: |c| DiscreteClipEdit::TextFadeCurve(FadeEdgeKind::Out, c),
     });
 
     // めったに触らない見た目 (r.md #158 仕様 7): 最初は畳む。
     band::details(app, ui, c.label_x, w, y, InspectorDetail::SubtitleStyle, vocab::DETAIL_SUBTITLE_STYLE, |ui, y| {
-        draw_style_details(app, ui, c, w, &summary, y)
+        draw_style_details(app, ui, f, &summary, y)
     })
+}
+
+/// text num field を選んでいる字幕全部で畳む (割れていれば `None` = 「—」)。
+fn fold_num(app: &AppData, f: &ClipFields<'_, '_>, field: TextNumField) -> Option<f64> {
+    f.sel.fold_num(|cl| app.text_num_value_of(cl.clip, field))
 }
 
 /// 詳細の中身: 回転と、塗り / 縁 / 影。
 fn draw_style_details(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
-    c: &FormCols,
-    w: f32,
+    f: &ClipFields<'_, '_>,
     summary: &InspectorTextEventSummary,
     y: f32,
 ) -> f32 {
-    let mut y = num_row(app, ui, c, summary, y, vocab::FIELD_ROTATION, TextNumField::Rotation);
+    let (c, w) = (&f.c, f.w);
+    let mut y = num_row(app, ui, f, summary, y, vocab::FIELD_ROTATION, TextNumField::Rotation);
     // アルファの欄名は「不透明度」(「A」だと右の自動化の「A」と並んで紛れる)。
     let (r, g, b, a) = (vocab::FIELD_R, vocab::FIELD_G, vocab::FIELD_B, vocab::FIELD_OPACITY);
     let groups: [(&str, &[(&str, TextNumField)]); 3] = [
@@ -140,7 +148,7 @@ fn draw_style_details(
     for (heading, fields) in groups {
         y = band::sub_heading(app, ui, ("inspector_text_group", heading), c.label_x, w, y + 2.0, heading, None);
         for &(label, field) in fields {
-            y = num_row(app, ui, c, summary, y, label, field);
+            y = num_row(app, ui, f, summary, y, label, field);
         }
     }
     y
@@ -150,13 +158,14 @@ fn draw_style_details(
 fn num_row(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
-    c: &FormCols,
+    f: &ClipFields<'_, '_>,
     summary: &InspectorTextEventSummary,
     y: f32,
     label: &str,
     field: TextNumField,
 ) -> f32 {
     use TextNumField as F;
+    let c = &f.c;
     let (fmt, range, sensitivity): (ScrubableNumberFormat, Option<(f64, f64)>, f32) = match field {
         // 位置と大きさ (0..1)。
         F::X | F::Y | F::W | F::H => (ScrubableNumberFormat::Decimal(3), Some((0.0, 1.0)), 0.004),
@@ -185,12 +194,9 @@ fn num_row(
         // フェード (拍) は `fade_row` が描く。
         F::FadeInBeats | F::FadeOutBeats => (ScrubableNumberFormat::Decimal(3), Some((0.0, summary.fade_max_beats)), 0.01),
     };
-    // dblclick で戻す値。
-    let default = match field {
-        F::Opacity | F::FillA | F::W | F::H => summary.text_num_field_value(field),
-        F::FontSize => 48.0,
-        _ => 0.0,
-    };
+    // dblclick で戻す値 = 新しい字幕と同じ既定値 (model の `TextEvent::default()` が SSoT。手で表を写さない —
+    // automation lane の既定値 `param_value::fallback_plain` と同じ出どころ)。
+    let default = text_event_num_value(&TextEvent::default(), field);
     let style = ScrubableNumberStyle { sensitivity, range, ..scrub_style(&app.theme) };
     let next = form::scrub_row(
         ui,
@@ -199,11 +205,12 @@ fn num_row(
         y,
         text_field_id(field),
         label,
-        app.inspector_text_num_folded(field),
+        fold_num(app, f, field),
         default,
         fmt,
         &style,
         InspectorScrubField::Text { field },
+        f.mod_owner(),
         move |t, v| {
             // 回転だけ度 → radians (handler が wrap)。
             let value = if matches!(field, F::Rotation) { (v as f32).to_radians() } else { v as f32 };

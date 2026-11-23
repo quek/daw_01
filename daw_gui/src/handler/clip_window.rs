@@ -25,16 +25,32 @@ impl AppData {
         target: ClipKey,
         events_of: EventsOf<E>,
     ) -> Option<(ContentId, Vec<usize>)> {
-        let song = self.cur.song_doc.song();
-        let clip = song.clip_by_key(target)?;
-        let events = events_of(song.clip_contents.get(&clip.content_id)?)?;
+        self.clip_shown_targets_of(self.cur.song_doc.song().clip_by_key(target)?, events_of)
+    }
+
+    /// [`Self::clip_shown_targets`] の、クリップ本体を手に持っている版 (key から引き直さない)。
+    pub(crate) fn clip_shown_targets_of<E: TimedEvent>(
+        &self,
+        clip: &common::model::Clip,
+        events_of: EventsOf<E>,
+    ) -> Option<(ContentId, Vec<usize>)> {
+        let events = events_of(self.cur.song_doc.song().clip_contents.get(&clip.content_id)?)?;
         Some((clip.content_id, shown_indices(events, clip.content_window())))
     }
 
     /// audio 版 [`Self::clip_shown_targets`]: Audio Editor が `target` を開いて event を選んでいれば選んだ
     /// event (範囲外の index は捨てる)、そうでなければ窓に見えている片。
     pub(crate) fn audio_edit_targets(&self, target: ClipKey) -> Option<(ContentId, Vec<usize>)> {
-        let (content_id, shown) = self.clip_shown_targets(target, ClipContent::audio_events)?;
+        self.audio_edit_targets_of(target, self.cur.song_doc.song().clip_by_key(target)?)
+    }
+
+    /// [`Self::audio_edit_targets`] の、クリップ本体を手に持っている版。
+    pub(crate) fn audio_edit_targets_of(
+        &self,
+        target: ClipKey,
+        clip: &common::model::Clip,
+    ) -> Option<(ContentId, Vec<usize>)> {
+        let (content_id, shown) = self.clip_shown_targets_of(clip, ClipContent::audio_events)?;
         if self.cur.peph.audio_editor_clip != Some(target) {
             return Some((content_id, shown));
         }

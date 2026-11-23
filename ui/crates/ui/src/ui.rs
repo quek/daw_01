@@ -1000,6 +1000,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
         scene.popup_primitives.extend(popup_primitives);
         // M4 Phase 11: 今フレームに登場しなかった widget を scenegraph から eviction。
         self.scenegraph.retain(&seen_widgets);
+        // 測った文字幅の cache も、しばらく測られなかったものを捨てる (`TextMetrics::end_frame`)。
+        self.text_metrics.end_frame();
         // M8 Phase 30: 次フレーム用に focusable 一覧を保存。
         self.last_focusable = focus_order_snapshot;
         // M9 Phase 43: frame stats を確定 (debug overlay は次フレームでこれを read)。

@@ -2,6 +2,8 @@
 //!
 //! 見出しと欄名は日本語。Par / SC / Mix / dB / A のような短い記号・単位と、呼び名「Rack」は残す。
 //! テストは描かれた glyph をこの定数で探す (文言を変えてもテストが壊れない)。
+//! dropdown の選択肢の値・空のときの表示・ヒントはここに置かず、値の持ち主 (型の `label` / 選択肢を作る handler /
+//! 部品のファイル) が持つ (入力元の「未選択」「無い入力」「録れない」は `handler::audio_rec`)。
 
 use crate::state::inspector_view::ClipBandKind;
 
@@ -302,6 +304,46 @@ pub fn clip_band_title(kind: ClipBandKind) -> &'static str {
         ClipBandKind::Text => "テキストクリップ",
         ClipBandKind::Automation => "オートメーションクリップ",
     }
+}
+
+/// タイトルの 2 行目と選択の帯の見出し: 種類の違うクリップを一緒に選んでいる (代表の種類を名乗らない)。
+pub const KIND_MIXED: &str = "種類の違うクリップ";
+
+/// タイトルの 2 行目 / 選択の帯の見出しの種類の語 (`mixed` = 種類が混ざっている)。
+#[must_use]
+pub fn clip_kind_label(kind: ClipBandKind, mixed: bool) -> &'static str {
+    if mixed { KIND_MIXED } else { clip_band_title(kind) }
+}
+
+/// 種類の内訳の短い語 (「音声 2 · MIDI 1」)。
+#[must_use]
+fn clip_kind_short(kind: ClipBandKind) -> &'static str {
+    match kind {
+        ClipBandKind::Audio => "音声",
+        ClipBandKind::Midi => "MIDI",
+        ClipBandKind::Image => "画像",
+        ClipBandKind::Video => "映像",
+        ClipBandKind::Text => "テキスト",
+        ClipBandKind::Automation => "オートメーション",
+    }
+}
+
+/// 選択の帯の対象: 種類ごとの数 (`counts` は `ClipBandKind::ALL` の並び。0 の種類は出さない)。
+#[must_use]
+pub fn clip_kind_counts(counts: &[usize; ClipBandKind::ALL.len()]) -> String {
+    let parts: Vec<String> = ClipBandKind::ALL
+        .iter()
+        .zip(counts)
+        .filter(|(_, n)| **n > 0)
+        .map(|(k, n)| format!("{} {n}", clip_kind_short(*k)))
+        .collect();
+    parts.join(SEP)
+}
+
+/// 種類の違うクリップを選んでいるとき、種類ごとの欄の上に出す小見出し (この下の欄が効く相手)。
+#[must_use]
+pub fn only_kind(kind: ClipBandKind, n: usize, total: usize) -> String {
+    format!("{} だけに効く ({total} のうち {n})", clip_band_title(kind))
 }
 
 /// 帯の対象: 複数のトラックに効く帯 (入力)。
