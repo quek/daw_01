@@ -94,11 +94,15 @@ pub struct ChordPopup {
     /// MIDI 鍵盤で弾いた和音 (`ChordToolsState::played`) の通し番号のうち、もう拾ったもの。開いた時点の
     /// 番号を入れておくので、開く前に弾いた和音は拾わない (Instrument Input)。
     pub played_seen: u64,
+    /// r.md #159: このポップアップで **作った** 箱 (空きのダブルクリック / Tab)。閉じるまで、←→ で戻って直しても
+    /// これらの箱のコードを決めるのは「置く」(メロディーは動かない、`ChordTrackEvent::Recast`)。ほかの箱のコードを
+    /// 変えるのは「書き換え」(`ChordTrackEvent::SetChord`)。
+    pub placing: Vec<u32>,
 }
 
 impl ChordPopup {
     #[must_use]
     pub fn new(chord_id: u32, text: String) -> Self {
-        Self { chord_id, rev: 0, text, typed: false, candidate: None, played_seen: 0 }
+        Self { chord_id, rev: 0, text, typed: false, candidate: None, played_seen: 0, placing: Vec::new() }
     }
 }

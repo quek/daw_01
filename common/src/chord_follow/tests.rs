@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::chord_detect::DetectOptions;
-use crate::model::{ChordEvent, Clip, ClipContent, MidiContent, Note, Track};
+use crate::model::{ChordEvent, Clip, ClipChordBasis, ClipContent, MidiContent, Note, Track};
 use crate::transpose::TrackTranspose;
 
 fn note(id: u32, start: f64, len: f64, pitch: u8) -> Note {
@@ -61,7 +61,9 @@ fn piano_and_melody(piano: ChordFollow, melody: ChordFollow) -> Song {
 #[test]
 fn placing_a_chord_moves_only_the_chord_part_and_rewriting_it_moves_the_melody() {
     let melody = [76u8, 77, 79, 81];
-    let cases: [(ChordFollow, [u8; 3], [u8; 3], [u8; 4]); 4] = [
+    /// (モード, Am を置いた後のピアノ, Dm に書き換えた後のピアノ, 書き換えた後のメロディー)。
+    type Case = (ChordFollow, [u8; 3], [u8; 3], [u8; 4]);
+    let cases: [Case; 4] = [
         (ChordFollow::Parallel, [57, 61, 64], [62, 66, 69], [81, 82, 84, 86]),
         (ChordFollow::Narrow, [60, 64, 69], [62, 65, 69], [77, 77, 79, 81]),
         (ChordFollow::Bass, [57, 61, 64], [62, 66, 69], [81, 82, 84, 86]),
@@ -185,6 +187,94 @@ fn moving_or_splitting_a_rewritten_box_keeps_the_melody_on_the_current_chord() {
     assert_eq!(sounding(&song, MELODY), keys(&[64, 66, 66, 66, 64, 64, 64, 64]), "拍 4 の新しく覆った音は動かない");
     song.place_chord(boxed(2.0, 1.0, "E"));
     assert_eq!(sounding(&song, MELODY), keys(&[64, 66, 68, 66, 64, 64, 64, 64]), "内側の E の箱は C → E");
+}
+
+/// 書き換えで動いたノートを跨いでクリップを割っても (共有している content は fork される)、後ろの片は元のノートと
+/// 同じく動いたまま鳴る。共有していた別の位置のクリップは変わらない。
+#[test]
+fn splitting_a_clip_keeps_the_rewritten_sound_of_both_pieces() {
+    let mut song = song_with(&[(MELODY, ChordFollow::Parallel, vec![note(1, 0.0, 4.0, 64), note(2, 0.0, 4.0, 76)])]);
+    let linked = Clip { id: 200, start_beat: 8.0, ..song.tracks[0].clips[0].clone() };
+    song.tracks[0].clips[0].length_beats = 4.0;
+    song.tracks[0].clips.push(Clip { length_beats: 4.0, ..linked });
+    song.place_chord(boxed(0.0, 4.0, "C"));
+    let id = song.chords[0].id;
+    assert!(song.set_chord(&[id], chord("D")));
+    song.split_clips_at(2.0);
+    let follow = TrackTranspose::of(&song, MELODY);
+    let track = song.track_by_id(MELODY).expect("track");
+    let heard = |clip: &Clip| -> Vec<Option<u8>> {
+        song.clip_notes(clip)
+            .iter()
+            .filter(|n| clip.window_has_onset(n.start_beat))
+            .map(|n| follow.key(clip, n, Some(clip.content_to_song_beat(n.start_beat))))
+            .collect()
+    };
+    let back = track.clips.iter().find(|c| c.start_beat == 2.0).expect("後ろの片");
+    assert_ne!(back.content_id, track.clips.iter().find(|c| c.id == 200).expect("linked").content_id, "fork される");
+    assert_eq!(heard(back), keys(&[66, 78]), "後ろの片も C → D");
+    assert_eq!(heard(&track.clips[0]), keys(&[66, 78]));
+}
+
+/// オーディオ: 和音を弾いていない音源にコードを置いただけでは動かず、書き換えるとその差だけ動く (記録は take の
+/// 音源フレーム)。後から同じ音源の event を置いたクリップは、記録が無いので動かない。和音を弾いている区間
+/// (`chordal`) があれば、それが基準になる。
+#[test]
+fn audio_follows_only_rewrites_unless_it_plays_a_chord() {
+    use crate::audio_render::TempoMap;
+    use crate::model::{AudioChordSpan, AudioContent, AudioEvent, AudioSource, AudioSourcePath};
+    // 120 BPM: 1 拍 = 24 000 frame。8 拍の音源を Raw で鳴らす。
+    let mut song = Song::default();
+    song.media.audio_sources.insert(1, AudioSource {
+        path: AudioSourcePath::Absolute("x.wav".into()),
+        sample_rate: 48_000,
+        channels: 1,
+        frames: 192_000,
+        original_bpm: None,
+        root_key: None,
+    });
+    let event = AudioEvent {
+        id: 1,
+        source_id: 1,
+        event_length_beats: 8.0,
+        source_end_frames: 192_000,
+        stretch_mode: crate::model::StretchMode::Raw,
+        ..AudioEvent::default()
+    };
+    let content_id = song.alloc_content_id();
+    song.clip_contents.insert(content_id, ClipContent::Audio(AudioContent { events: vec![event], next_event_id: 2 }));
+    let clip = Clip { id: 1, start_beat: 0.0, length_beats: 8.0, content_id, ..Clip::default() };
+    song.tracks.push(Track { id: 1, follow_chords: ChordFollow::Parallel, clips: vec![clip], ..Track::default() });
+    song.place_chord(boxed(0.0, 4.0, "C"));
+    song.place_chord(boxed(4.0, 4.0, "F"));
+    let shifts = |song: &Song, clip_idx: usize| -> Vec<i32> {
+        let clip = &song.tracks[0].clips[clip_idx];
+        let Some(ClipContent::Audio(a)) = song.clip_contents.get(&clip.content_id) else { panic!("audio") };
+        let bases = song.audio_event_bases(&TempoMap::from_song(song), clip, &a.events[0]);
+        let f = TrackChordFollow::of(song, 1);
+        [1.0, 5.0]
+            .map(|beat: f64| {
+                let at = beat + clip.start_beat;
+                let basis = bases.iter().find(|b| b.start_beat <= at && at < b.end_beat).map_or(Basis::NONE, |b| b.basis());
+                f.shift(at, basis)
+            })
+            .to_vec()
+    };
+    assert_eq!(shifts(&song, 0), vec![0, 0], "置いただけ");
+    assert!(song.transpose_chords(&[], 2));
+    assert_eq!(shifts(&song, 0), vec![2, 2], "書き換えの差");
+    // 書き換えの後に同じ音源で置いたクリップ (別の take の扱いではなく、新しいクリップの記録が無い)。
+    let mut later = song.tracks[0].clips[0].clone();
+    later.id = 2;
+    later.start_beat = 8.0;
+    later.chord_basis = ClipChordBasis::default();
+    song.tracks[0].clips.push(later);
+    song.place_chord(boxed(8.0, 8.0, "E"));
+    assert_eq!(shifts(&song, 1), vec![0, 0], "後から置いたクリップは動かない");
+    // 素材が Am を弾いている (前半 4 拍): 自分の和音が基準 (Am → D = +5)。後半は記録 (F → G = +2)。
+    let span = AudioChordSpan { start_frame: 0, end_frame: 96_000, chord: chord("Am"), chordal: true };
+    song.audio_chords.insert(1, vec![span]);
+    assert_eq!(shifts(&song, 0), vec![5, 2]);
 }
 
 /// 呼び名だけを変えた書き換え (C6 → Am7、構成音が同じ) ではメロディーは動かない。どのコードでも、書かれたときの

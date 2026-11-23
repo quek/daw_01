@@ -29,8 +29,11 @@ pub enum ChordTrackEvent {
     /// 選んだ箱を `delta` 拍ずらした位置に複製する。
     Duplicate { ids: Vec<u32>, delta: f64 },
     Delete { ids: Vec<u32> },
-    /// 選んだ箱のコードを差し替える。
+    /// 選んだ箱のコードを **書き換える** (r.md #159: 箱の下のメロディーは書き換える前のコードとの差だけ動く)。
     SetChord { ids: Vec<u32>, chord: Chord },
+    /// 置いている最中の箱 (このポップアップで作った箱) のコードを **決める** (r.md #159: 置き直すのと同じで、
+    /// メロディーは動かない。`Song::recast_chords`)。
+    Recast { ids: Vec<u32>, chord: Chord },
     /// 選んだ箱 (空なら全部) のコードを移調する。
     Transpose { ids: Vec<u32>, semitones: i32 },
     /// 選んだ箱の色 (`None` = テーマの既定色)。
@@ -50,7 +53,7 @@ impl ChordTrackEvent {
             Self::Resize { .. } | Self::SetSpans { .. } => "コード長さ変更",
             Self::Duplicate { .. } => "コード複製",
             Self::Delete { .. } => "コード削除",
-            Self::SetChord { .. } => "コード変更",
+            Self::SetChord { .. } | Self::Recast { .. } => "コード変更",
             Self::Transpose { .. } => "コード移調",
             Self::SetColor { .. } => "コード色変更",
             Self::Clear => "コードを全部削除",

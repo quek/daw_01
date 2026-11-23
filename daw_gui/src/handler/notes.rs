@@ -39,22 +39,23 @@ fn dup_dest_in_clip(
 /// `dest` は content-local な行き先区間、`pitches` は対象の鍵盤行。 クリップと同じで、
 /// 複製が乗る区間に元から居たノートは (同じ鍵盤行なら) 消える。 これが無いと、
 /// 行き先に居たノートが次の `D` で一緒に複製されて雪だるまになる (実機で報告)。
+///
+/// 返り値は `(元のノートの id, 複製の id)` (r.md #159: 書かれたときのコードの記録を複製へ写す)。
 fn duplicate_notes_over(
     content: &mut common::model::MidiContent,
     locals: &[u32],
     offset: f64,
     dest: (f64, f64),
     pitches: &[u8],
-) {
+) -> Vec<(u32, u32)> {
+    let sources = note_ids_at(content, locals);
     let new_ids = duplicate_notes_into(content, locals, offset);
     if new_ids.is_empty() {
-        return;
+        return Vec::new();
     }
     // 複製は index で受け取るが、この後の削除でずれるので id で追う。
-    let fresh: Vec<u32> = new_ids
-        .iter()
-        .filter_map(|&i| content.notes.get(i as usize).map(|n| n.id))
-        .collect();
+    let fresh = note_ids_at(content, &new_ids);
+    let pairs: Vec<(u32, u32)> = sources.into_iter().zip(fresh.iter().copied()).collect();
     content.notes.retain(|n| {
         fresh.contains(&n.id)
             || !(pitches.contains(&n.pitch)
@@ -70,6 +71,20 @@ fn duplicate_notes_over(
         .map(|(i, _)| u32::try_from(i).unwrap_or(u32::MAX))
         .collect();
     resolve_note_overlaps(&mut content.notes, &moved);
+    pairs
+}
+
+/// r.md #159: クリップ `r` の content で複製したノート (`pairs` = `(元の id, 複製の id)`) に、元のノートの書かれたときの
+/// コードの記録を写す (同じ content を見る全クリップ)。複製は元と同じ素材なので、同じ基準で鳴る。
+fn copy_basis_in_clip(song: &mut common::model::Song, r: ClipKey, pairs: &[(u32, u32)]) {
+    if let Some(content_id) = song.clip_by_key(r).map(|c| c.content_id) {
+        song.copy_note_basis(content_id, pairs);
+    }
+}
+
+/// content の index `indices` のノートの id (無い index は飛ばす。複製の関数が飛ばすのと同じ)。
+fn note_ids_at(content: &common::model::MidiContent, indices: &[u32]) -> Vec<u32> {
+    indices.iter().filter_map(|&i| content.notes.get(i as usize).map(|n| n.id)).collect()
 }
 
 impl AppData {
@@ -525,9 +540,10 @@ impl AppData {
                     return;
                 };
                 app.edit_song(move |song| {
-                    if let Some(content) = midi_content_in_clip_mut(song, r) {
-                        duplicate_notes_over(content, &locals, offset, dest, &pitches);
-                    }
+                    let pairs = midi_content_in_clip_mut(song, r)
+                        .map(|content| duplicate_notes_over(content, &locals, offset, dest, &pitches))
+                        .unwrap_or_default();
+                    copy_basis_in_clip(song, r, &pairs);
                 });
             },
         );
@@ -611,16 +627,21 @@ impl AppData {
                     else {
                         return Vec::new();
                     };
+                    let sources: Vec<u32> = local_entries.iter().map(|(i, _, _)| *i).collect();
+                    let sources = note_ids_at(content, &sources);
                     let new_ids = copy_notes_into(content, &local_entries);
                     if new_ids.is_empty() {
                         return Vec::new();
                     }
+                    let pairs: Vec<(u32, u32)> = sources.into_iter().zip(note_ids_at(content, &new_ids)).collect();
                     // コピーを勝者として重なり解消。複製の local id を packed 化。
                     let remap = resolve_note_overlaps(&mut content.notes, &new_ids);
-                    remap_indices(&remap, &new_ids)
+                    let packed = remap_indices(&remap, &new_ids)
                         .into_iter()
                         .map(|nid| Self::pack_note_id(slot, nid as usize))
-                        .collect::<Vec<u32>>()
+                        .collect::<Vec<u32>>();
+                    copy_basis_in_clip(song, r, &pairs);
+                    packed
                 });
                 if let Some(packed) = packed {
                     new_selection.extend(packed);

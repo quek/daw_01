@@ -72,7 +72,10 @@ fn crop_event<E: TimedEvent>(ev: &E, win_start: f64, win_end: f64, shift: f64) -
 /// 非 audio kind の結合素材 (窓で切り出して combined-local 拍へ寄せ終えたもの)。
 #[derive(Default)]
 struct Fragments {
+    /// id は集めた順の仮の通し番号 (元のクリップの id は content ごとなので重なりうる。[`merged_content`] が振り直す)。
     midi_notes: Vec<Note>,
+    /// r.md #159: 仮の id → 元のクリップの、そのノートの書かれたときのコードの記録。
+    midi_basis: Vec<common::model::NoteChordBasis>,
     video_events: Vec<common::model::VideoEvent>,
     image_events: Vec<common::model::ImageEvent>,
     text_events: Vec<common::model::TextEvent>,
@@ -129,10 +132,14 @@ fn collect_fragments(song: &Song, refs: &[ClipKey], combined_start: f64) -> Frag
             ClipContent::Midi(midi) => {
                 // sequencer と同じ gate: 発音開始が窓内の note だけ、長さは窓末尾で clamp
                 // (= 実際に鳴っている姿、`Clip::sounding_note_len`)。
-                frags.midi_notes.extend(midi.notes.iter().filter_map(|note| {
-                    let dur = clip.sounding_note_len(note)?;
-                    Some(Note { start_beat: note.start_beat + shift, duration_beats: dur, ..note.clone() })
-                }));
+                for note in &midi.notes {
+                    let Some(dur) = clip.sounding_note_len(note) else { continue };
+                    let id = u32::try_from(frags.midi_notes.len()).unwrap_or(u32::MAX).saturating_add(1);
+                    if let Some(chord) = common::chord_follow::note_basis_at(&clip.chord_basis.notes, note.id) {
+                        frags.midi_basis.push(common::model::NoteChordBasis { note_id: id, chord: *chord });
+                    }
+                    frags.midi_notes.push(Note { id, start_beat: note.start_beat + shift, duration_beats: dur, ..note.clone() });
+                }
             }
             ClipContent::Video(video) => frags
                 .video_events
@@ -150,16 +157,18 @@ fn collect_fragments(song: &Song, refs: &[ClipKey], combined_start: f64) -> Frag
     frags
 }
 
-/// 非 audio kind の結合 content を組む。
+/// 非 audio kind の結合 content と、結合したクリップの記録 (r.md #159: 元のクリップの書かれたときのコードを、
+/// 振り直した note id へ写したもの)。
 ///
 /// 時間軸を持つ event は、分割で切り出したまま隣り合っている片を元の 1 つへつなぐ
 /// ([`join_pieces`]、分割の逆)。 分割した片同士を Glue すると分割前の 1 つに戻る。
-fn merged_content(kind: GlueKind, frags: Fragments) -> ClipContent {
+fn merged_content(kind: GlueKind, frags: Fragments) -> (ClipContent, common::model::ClipChordBasis) {
     fn joined<E: TimedEvent>(mut events: Vec<E>) -> Vec<E> {
         join_pieces(&mut events);
         events
     }
-    match kind {
+    let mut basis = common::model::ClipChordBasis::default();
+    let content = match kind {
         GlueKind::Video => ClipContent::Video(common::model::VideoContent {
             events: joined(frags.video_events),
         }),
@@ -176,16 +185,23 @@ fn merged_content(kind: GlueKind, frags: Fragments) -> ClipContent {
             // 全 note を勝者として重なりを解消する。
             let all: Vec<u32> = (0..notes.len() as u32).collect();
             resolve_note_overlaps(&mut notes, &all);
-            // v29: merged content では note id を振り直す (per-content unique が不変条件)。
+            // v29: merged content では note id を振り直す (per-content unique が不変条件)。記録も新しい id へ。
+            let mut by_tmp = frags.midi_basis;
+            by_tmp.sort_by_key(|b| b.note_id);
             for (i, n) in notes.iter_mut().enumerate() {
-                n.id = i as u32 + 1;
+                let id = i as u32 + 1;
+                if let Some(chord) = common::chord_follow::note_basis_at(&by_tmp, n.id) {
+                    basis.notes.push(common::model::NoteChordBasis { note_id: id, chord: *chord });
+                }
+                n.id = id;
             }
             ClipContent::Midi(MidiContent {
                 next_note_id: notes.len() as u32 + 1,
                 notes,
             })
         }
-    }
+    };
+    (content, basis)
 }
 
 impl AppData {
@@ -587,7 +603,7 @@ impl AppData {
             .and_then(|r| song.clip_by_key(*r))
             .map(|c| song.content_name(c.content_id).to_string())
             .unwrap_or_default();
-        let new_content = merged_content(kind, collect_fragments(song, refs, start));
+        let (new_content, chord_basis) = merged_content(kind, collect_fragments(song, refs, start));
         // merged clip は最初 (= 最も早い) の source clip の声 / mute を採用
         // (複数声混在時のポリシー)。 source 削除前に capture する。
         let meta = refs.first().and_then(|r| song.clip_by_key(*r)).map(|c| {
@@ -611,6 +627,7 @@ impl AppData {
                 singer_name,
                 style_name,
                 talk,
+                chord_basis,
                 ..Clip::default()
             });
             Some(ClipKey { track_id, clip_id })

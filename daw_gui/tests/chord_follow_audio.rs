@@ -2,7 +2,7 @@
 //! 書き出しまで通して** 確かめる end-to-end (daw_audio を spawn して audio device を開く = `make test` の起動あり target)。
 //!
 //! `tests/scripts/chord_follow_audio.js` が 440 Hz のサイン波のクリップにコード C / F / A (2 秒ずつ) を当て、
-//! 素材のコード 未検出 / Am / 曲全体のスイッチ Off の 3 通りで書き出す。ここ (harness) は WAV の区間ごとの
+//! 置いただけ / 素材が Am を弾いている / コード列を書き換えた / 曲全体のスイッチ Off の 4 通りで書き出す。ここ (harness) は WAV の区間ごとの
 //! 音程 (零交差の数) を測り、平行移動の半音と突き合わせる。
 
 use std::io::Write;
@@ -94,10 +94,12 @@ fn chord_follow_moves_audio_clips_in_the_export() {
         let ok = got.iter().zip(expected).all(|(g, e)| (g - e).abs() < 0.2);
         assert!(ok, "{name}: 区間ごとの半音 {got:?} が {expected:?} にならない");
     };
-    // 素材のコード未検出 (キーも無い) → C 基準: C 0 / F +5 / A -3 (最短の向き)。
-    check("follow_none.wav", [0.0, 5.0, -3.0]);
-    // 素材のコード Am → C +3 / F -4 / A 0。
+    // r.md #159: 和音を弾いていない素材にコードを置いただけでは動かない。
+    check("follow_none.wav", [0.0, 0.0, 0.0]);
+    // 素材が Am を弾いている → C +3 / F -4 / A 0 (最短の向き)。
     check("follow_am.wav", [3.0, -4.0, 0.0]);
+    // 和音を弾いていない素材は、書き換えたときだけ書き換えの差 (+2) だけ動く。
+    check("follow_rewritten.wav", [2.0, 2.0, 2.0]);
     // 曲全体のスイッチを切ると書いた音。
     check("follow_off.wav", [0.0, 0.0, 0.0]);
 }

@@ -96,7 +96,8 @@ impl AppData {
     }
 
     /// 空きのダブルクリック: `[start, start + len)` に箱を作り、選んでポップアップを開く。
-    /// 中身はその位置のキーのトニックの 3 和音 (キーが無ければ C) — 開いたポップアップで書き換える前提。
+    /// 中身はその位置のキーのトニックの 3 和音 (キーが無ければ C) — 開いたポップアップでコードを決める前提で、
+    /// 決めるのは「置く」(r.md #159、メロディーは動かない。`ChordPopup::placing`)。
     pub(crate) fn create_chord_box(&mut self, start: f64, len: f64) {
         let chord = self.default_chord_at(start);
         self.handle_event(AppEvent::Chord(ChordTrackEvent::Place { start, len, chord }));
@@ -105,7 +106,10 @@ impl AppData {
         };
         self.set_chord_selection(vec![id]);
         self.cur.selection.chord_anchor = Some(id);
+        // ダブルクリックで作るたびに、作った箱だけを「置いている最中」とするポップアップとして開き直す。
+        self.close_chord_popup();
         self.open_chord_popup(id);
+        self.mark_chord_popup_placing(id);
     }
 
     /// `beat` の位置のキーのトニックの 3 和音 (短 3 度を持つスケールなら minor)。

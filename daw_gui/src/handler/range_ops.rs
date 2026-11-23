@@ -78,10 +78,7 @@ fn cut_content_at_range(
     if b <= a {
         return None;
     }
-    let cid = song.split_content_at_points(clip.content_id, &[a, b]);
-    if let Some(clip) = song.clip_by_key_mut(key) {
-        clip.content_id = cid;
-    }
+    let cid = song.split_clip_content_at(key, &[a, b])?;
     Some((cid, a, b))
 }
 

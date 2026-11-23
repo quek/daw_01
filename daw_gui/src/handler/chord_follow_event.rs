@@ -301,6 +301,138 @@ mod tests {
         (track_id, [901, 902])
     }
 
+    /// ピアノ (トラック 1、C の 3 和音 60 64 67) とメロディー (トラック 2、76 77 79 81 の 4 分音符) を拍 0-4 に置き、
+    /// 両方を `mode` で追従させる。`(piano, melody)` の `(track id, clip id)`。
+    fn piano_and_melody(app: &mut AppData, mode: ChordFollow) -> ((u32, u32), (u32, u32)) {
+        app.edit_song(|song| {
+            song.tracks.clear();
+            for (track_id, notes) in [(1u32, vec![(0.0, 4.0, 60u8), (0.0, 4.0, 64), (0.0, 4.0, 67)]), (2, vec![
+                (0.0, 1.0, 76),
+                (1.0, 1.0, 77),
+                (2.0, 1.0, 79),
+                (3.0, 1.0, 81),
+            ])] {
+                let content_id = song.alloc_content_id();
+                let notes: Vec<Note> = notes
+                    .into_iter()
+                    .zip(1u32..)
+                    .map(|((start, len, pitch), id)| Note { id, start_beat: start, duration_beats: len, pitch, velocity: 100, lyric: None, muted: false })
+                    .collect();
+                let next_note_id = u32::try_from(notes.len()).unwrap_or(0) + 1;
+                song.clip_contents.insert(content_id, ClipContent::Midi(MidiContent { notes, next_note_id }));
+                song.tracks.push(crate::app::track_with(|t| {
+                    t.id = track_id;
+                    t.follow_chords = mode;
+                    t.clips.push(Clip { id: 10 + track_id, start_beat: 0.0, length_beats: 4.0, content_id, ..Clip::default() });
+                }));
+            }
+        });
+        ((1, 11), (2, 12))
+    }
+
+    /// クリップの鳴る音 (書いた順)。
+    fn sounding(app: &AppData, (track_id, clip_id): (u32, u32)) -> Vec<u8> {
+        let song = app.cur.song_doc.song();
+        let clip = song.track_by_id(track_id).and_then(|t| t.clip_by_id(clip_id)).expect("clip");
+        let keys = app.clip_sounding_keys(track_id, clip_id).expect("keys");
+        song.clip_notes(clip).iter().filter_map(|n| keys.key(n)).collect()
+    }
+
+    /// r.md #159 のユーザーの例を帯の操作で: 空きのダブルクリックで箱を作り、ポップアップで Am を入れて閉じる
+    /// (置いた = メロディーは動かない、ピアノは Am へ)。開き直して Dm に書き換えると、メロディーは Am → Dm の差だけ
+    /// 動き、ピアノは Dm へ。書き換えは 1 undo step で戻る。
+    #[test]
+    fn placing_in_the_popup_keeps_the_melody_and_rewriting_moves_it() {
+        let mut app = crate::test_support::headless_app();
+        let (piano, melody) = piano_and_melody(&mut app, ChordFollow::Parallel);
+        app.create_chord_box(0.0, 4.0);
+        app.chord_popup_typed("Am".into());
+        app.chord_popup_enter();
+        assert_eq!(app.chord_popup_id(), None, "Enter で閉じる");
+        assert_eq!(sounding(&app, piano), vec![57, 61, 64]);
+        assert_eq!(sounding(&app, melody), vec![76, 77, 79, 81], "置いただけではメロディーは動かない");
+        let id = app.cur.song_doc.song().chords[0].id;
+        app.open_chord_popup(id);
+        let depth = app.cur.song_doc.undo_depth();
+        app.chord_popup_typed("Dm".into());
+        app.chord_popup_enter();
+        assert_eq!(sounding(&app, piano), vec![62, 66, 69]);
+        assert_eq!(sounding(&app, melody), vec![81, 82, 84, 86], "書き換えると Am → Dm (+5)");
+        assert_eq!(app.cur.song_doc.undo_depth(), depth + 1);
+        app.handle_event(AppEvent::Undo);
+        assert_eq!(sounding(&app, melody), vec![76, 77, 79, 81]);
+        assert!(app.cur.song_doc.song().tracks[1].clips[0].chord_basis.is_empty(), "undo で記録も戻る");
+    }
+
+    /// 同じポップアップで Tab で作った箱へ ← で戻ってコードを直しても、作った箱なので置き直し (メロディーは動かない)。
+    #[test]
+    fn going_back_to_a_box_made_in_the_same_popup_still_places_it() {
+        let mut app = crate::test_support::headless_app();
+        let (_, melody) = piano_and_melody(&mut app, ChordFollow::Parallel);
+        app.create_chord_box(0.0, 2.0);
+        app.chord_popup_typed("C".into());
+        app.chord_popup_tab();
+        app.chord_popup_typed("Am".into());
+        app.chord_popup_commit_text();
+        app.chord_popup_step(-1);
+        app.chord_popup_typed("Em".into());
+        app.chord_popup_enter();
+        let names: Vec<u8> = app.cur.song_doc.song().chords.iter().map(|c| c.chord.root).collect();
+        assert_eq!(names, vec![4, 9]);
+        assert_eq!(sounding(&app, melody), vec![76, 77, 79, 81]);
+    }
+
+    /// 書き換えで動いたメロディーを鳴る音で確定すると、確定した音のまま鳴り (二重に動かない)、記録が消えるので次の
+    /// 書き換えでは書き換えの差だけ 1 回動く。和音のパートも確定した後に動き直さない。
+    #[test]
+    fn freezing_after_a_rewrite_does_not_move_twice() {
+        for mode in [ChordFollow::Parallel, ChordFollow::Narrow, ChordFollow::Bass, ChordFollow::Scale] {
+            let mut app = crate::test_support::headless_app();
+            let (piano, melody) = piano_and_melody(&mut app, mode);
+            app.edit_song(|song| {
+                song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: Chord::new(0, ChordKind::Major), color: None });
+            });
+            let id = app.cur.song_doc.song().chords[0].id;
+            app.handle_event(AppEvent::Chord(crate::event_chord::ChordTrackEvent::SetChord { ids: vec![id], chord: Chord::new(2, ChordKind::Minor) }));
+            let before = [sounding(&app, piano), sounding(&app, melody)];
+            let targets = [piano, melody].map(|(track_id, clip_id)| FreezeTarget { track_id, clip_id, note_ids: Vec::new() });
+            app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezePitch { targets: targets.to_vec() }));
+            for (k, sound) in [piano, melody].into_iter().zip(&before) {
+                assert_eq!(&written_and_sounding(&app, k.0, k.1).0, &{
+                    let mut s = sound.clone();
+                    s.sort_unstable();
+                    s
+                }, "{mode:?}: 書いた音 = 確定前の鳴る音");
+            }
+            assert_eq!([sounding(&app, piano), sounding(&app, melody)], before, "{mode:?}: 確定の前後で同じ音");
+            assert!(app.cur.song_doc.song().tracks[1].clips[0].chord_basis.is_empty(), "{mode:?}: 記録は消える");
+            // 次の書き換え (Dm → Em) では 1 回だけ動く: メロディーは書き換えの差、記録の無い旋律として。
+            app.handle_event(AppEvent::Chord(crate::event_chord::ChordTrackEvent::SetChord { ids: vec![id], chord: Chord::new(4, ChordKind::Minor) }));
+            let moved = sounding(&app, melody);
+            if matches!(mode, ChordFollow::Parallel | ChordFollow::Bass) {
+                assert_eq!(moved, before[1].iter().map(|p| p + 2).collect::<Vec<_>>(), "{mode:?}: Dm → Em の +2 だけ");
+            }
+        }
+    }
+
+    /// 和音の一部の音だけを確定すると残りの音の鳴り方が変わる (平行移動で C の 3 和音の C だけを確定すると、残りの
+    /// E G の和音の読みが変わる) ので確定しない。
+    #[test]
+    fn freezing_part_of_a_chord_that_would_change_the_rest_is_refused() {
+        let mut app = crate::test_support::headless_app();
+        let (piano, _) = piano_and_melody(&mut app, ChordFollow::Parallel);
+        app.edit_song(|song| {
+            song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: Chord::new(9, ChordKind::Minor), color: None });
+        });
+        let depth = app.cur.song_doc.undo_depth();
+        app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezePitch {
+            targets: vec![FreezeTarget { track_id: piano.0, clip_id: piano.1, note_ids: vec![1] }],
+        }));
+        assert_eq!(app.cur.song_doc.undo_depth(), depth, "確定しない");
+        assert!(app.ui_ephemeral.status_message.contains("確定しませんでした"));
+        assert_eq!(sounding(&app, piano), vec![57, 61, 64]);
+    }
+
     /// クリップの、書いた音と鳴る音 (どちらも昇順)。
     fn written_and_sounding(app: &AppData, track_id: u32, clip_id: u32) -> (Vec<u8>, Vec<u8>) {
         let song = app.cur.song_doc.song();

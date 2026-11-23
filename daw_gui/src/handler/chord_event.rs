@@ -59,6 +59,7 @@ impl AppData {
             ChordTrackEvent::Duplicate { ids, delta } => !song.duplicate_chords(&ids, delta).is_empty(),
             ChordTrackEvent::Delete { ids } => song.delete_chords(&ids),
             ChordTrackEvent::SetChord { ids, chord } => song.set_chord(&ids, chord),
+            ChordTrackEvent::Recast { ids, chord } => song.recast_chords(&ids, chord),
             ChordTrackEvent::Transpose { ids, semitones } => song.transpose_chords(&ids, semitones),
             ChordTrackEvent::SetColor { ids, color } => song.set_chord_color(&ids, color),
             ChordTrackEvent::Clear => {

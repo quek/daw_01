@@ -14,6 +14,7 @@
 | Q5 | 追従中のピアノロール | **書いた音を表示し、鳴る音を薄い枠で重ねる**。編集するのは書いた音。「鳴る音で確定」(Studio One の Freeze Pitch) コマンドを持つ |
 | Q6 | 追従モードの設定 | **トラックヘッダの右クリックメニュー** (「移調に追従」の隣)。`コードに追従 ▸ Off / 平行移動 / 最寄りのコード音 / ベース / スケール`。右クリックしたトラックが選択に含まれれば選択全体。追従中はヘッダの名前の横にモードの印 |
 | Q7 | 試聴音 | **既存の音源トラックを 1 本選んで鳴らす** (Cubase 型)。見出し側のドロップダウン。未選択なら無音。鳴る場面: コードのクリック / 編集、ポップアップの候補選択、「再生中も鳴らす」ON の再生中 |
+| Q8 | 何を基準に動かすか (r.md #159、2026-11-23 ユーザー確定) | 帯に (抽出でも手でも) コードを **置いた時点のコードがメロディーの基準**。メロディーが動くのは **後からそのコードを書き換えたときだけ** (置いただけでは動かない)。ピアノなど **和音のパートは今どおり**、自分の和音から帯のコードへ合わせて動く |
 
 ### main が決めた細部
 
@@ -22,20 +23,36 @@
   今と次のコード表示 / コードの色 / 同じコードの一括選択 / コード列の移調 / コード進行プリセット。
   外す = daw_01 に土台が無い譜面連携・Chord Pads・Show Page・Chorder / HALion 連携。
 - **オーディオの追従は全体の平行移動だけ** (和音の中の 1 音だけは動かせない)。オーディオでは「最寄りのコード音」
-  「スケール」も「平行移動」と同じ量になる (ユーザーに報告済み)。
+  「スケール」も「平行移動」と同じ量になる (ユーザーに報告済み)。ただし書かれたときのコードから動かすとき (下の
+  基準) は、寄せ先 (構成音 / スケール) が変わらない書き換えでは動かさない (MIDI の旋律が動かないのと揃える)。
 - **コードはノートの開始位置で決まる**。伸びているノートは途中のコード変更で鳴り直さない (Studio One と同じ)。
   オーディオの移動量は buffer ごとの今の位置で決まる。
 - **評価の順序は 追従 → 移調**。コードも Key も書いた音の空間にあり、r.md #130 の移調は最後に足す。
-- **平行移動 / ベースの基準 (素材のコード)**: MIDI はノートから毎回検出する (保存しない)。オーディオは検出結果を
-  音源ごとに `Song.audio_chords` へ保存する。素材のコードが分からない位置 (単音のメロディ / ベースライン /
-  未検出のオーディオ) は、その位置のキーのトニック (キーも無ければ C) を基準にする。
+- **基準 (r.md #159、Q8)**: 何から今のコードへ合わせるかは素材の音から決める (トラックに役割を持たせない)。
+  式の SSoT は `common/src/chord_follow.rs` (`Basis`)、記録の規則の正本は `common/src/model/chord_basis.rs` の module doc。
+  - **自分の和音** (素材が一緒に弾いている和音): MIDI はノートから毎回検出する (`chord_detect::own_chords`、保存しない)。
+    「コードを抽出」と同じ鳴り始めの区切りで、始まりか終わりが揃った 3 音以上 (2 pitch class なら 3 音以上) の組が
+    ある区間だけ — 2 拍の窓に集めた旋律の音は和音にしない。ノートの頭で鳴っていなければ、その箱の範囲でいちばん長く
+    鳴っている和音 (ブンチャッのベース音も一緒に動く)。食って入る和音 (箱の頭の半拍前から) は次の箱に従う。
+    和音が今のコードに収まっていれば動かさない (抽出しただけ・合うコードを置いただけでは動かない)。
+  - **書かれたときのコード** (`Clip::chord_basis`): 和音を持たない素材の基準。コードを **書き換えた** とき
+    (`Song::set_chord` / `transpose_chords`) にだけ、その箱の下の記録の無い素材へ書き換える前のコードを記録する。
+    記録は素材の事実で箱には縛らない (動かしても写しても「記録 → 今のコード」)。記録が無ければ動かない。
+    追従 Off のトラックには記録しない (ON にした時点が基準)。
+  - モードごとの式 (Q1 = 1): 平行移動 / ベースは差だけ移調 (呼び名だけの書き換え = 構成音が同じなら動かない)、
+    最寄りのコード音 / スケールは元のコードの構成音 / スケールの音だけを寄せ、経過音は動かさない。
+  - オーディオ: 自分の和音は `Song.audio_chords` のうち和音を弾いている区間 (`AudioChordSpan::chordal`)、記録は
+    take の音源フレームの範囲。engine は箱ごとに基準を 1 つに決めて compile 時に焼く (`Song::audio_event_bases`)。
+  - トニックを基準にする規則は廃止 (r.md #159 の不具合の原因)。
 - **重なりの規則**: クリップと同じ「後から置いた方が勝つ」。時間操作 (セクション移動 / Delete Time / Insert / Paste
   Time) では、箱もクリップの窓と同じく境界で割って同伴する。
 - **聴き方の状態は Song に載せない** (不変条件 6): 試聴トラック・「再生中も鳴らす」・帯の表示 / 非表示・表記は
   session / ViewState。書き出しに試聴音は入らない。追従の全体スイッチとトラックのモードは鳴る音を変えるので Song。
-- **ランチャーのセル**: 追従は再生時の曲の playhead の位置のコードで決める (#130 のセルの MIDI と同じ)。
+- **ランチャーのセル**: 追従は再生時の曲の playhead の位置のコードで決める (#130 のセルの MIDI と同じ)。和音の
+  セルはそのコードへ合わせて動き、旋律のセルは (記録が無いので) 書いた音のまま。
 - **バウンス**: #130 と同じ「外に出すもの = 鳴る音 / プロジェクトの中に作るもの = 書いた音」。焼く Song は追従を
-  切り、できたトラック / クリップの追従モードは元と同じ。
+  切り、できたトラック / クリップの追従モードは元と同じ。焼いた音源は書かれたときのコードの記録を持たない
+  (r.md #159 の残件: 焼いた音源への記録の写しは未実装)。
 - **ARA (Melodyne)**: 追従できない (プラグインがソースを読む)。#130 と同じ扱い。
 
 ## 2. 土台 (base branch `rmd-157-chord` に実装済み)
@@ -45,18 +62,19 @@
 
 | 何 | どこ |
 |---|---|
-| 型: `Chord` / `ChordKind` / `Tensions` / `Spelling` / `ChordEvent` / `ChordFollow` / `SourceChord` / `AudioChordSpan` | `common/src/model/chords.rs` (wire、`WIRE_SOURCES` 登録済み) |
-| `Song.chords` / `Song.chord_follow_enabled` / `Song.audio_chords`、`Track.follow_chords`、`ids.next_chord_id`、保存 v47 | `common/src/model.rs` / `track.rs` / `ids.rs` |
+| 型: `Chord` / `ChordKind` / `Tensions` / `Spelling` / `ChordEvent` / `ChordFollow` / `SourceChord` / `AudioChordSpan` / `ClipChordBasis` (r.md #159) | `common/src/model/chords.rs` (wire、`WIRE_SOURCES` 登録済み) |
+| `Song.chords` / `Song.chord_follow_enabled` / `Song.audio_chords`、`Track.follow_chords`、`Clip.chord_basis`、`ids.next_chord_id`、保存 v48 | `common/src/model.rs` / `track.rs` / `content.rs` / `ids.rs` |
+| 書かれたときのコードの記録 (書き換え `set_chord` / `transpose_chords` と置き直し `recast_chords`、引き継ぎ `copy_note_basis` / `forget_note_basis`、正規化、オーディオの箱ごとの基準 `audio_event_bases`) | `common/src/model/chord_basis.rs` |
 | 箱の編集 (`place_chord` 上書き規則 / `move_chords` / `resize_chord` / `duplicate_chords` / `delete_chords` / `set_chord` / `transpose_chords` / `set_chord_color` / `split_chords_at` / `normalize_chords`) と参照 (`chord_at` / `next_chord_after` / `chord_by_id` / `track_chord_follow` / `chord_follow_can_apply`) | `common/src/model/chord_ops.rs` |
 | 時間操作への同伴 (ripple / `move_section` / copy・delete・insert・paste time、`TimeRangeCopy.chords`) | `common/src/model/section_ops.rs` / `time_ops.rs` |
 | **追従の評価の SSoT**: `follow_pitch` (ノート) / `follow_shift` (オーディオ) / `TrackChordFollow` (読み口) / `chord_scale_mask` / `snap_to_mask` | `common/src/chord_follow.rs` |
 | コード名: `format_chord` (音名 / 数字 / ローマ数字) / `parse_chord` / `note_name` / `kind_suffix` | `common/src/chord_name.rs` |
-| 検出: `detect_chords` (ノート列 → 区間) / `match_chord` (pitch class の強さ → コード。オーディオの chroma もここへ渡す) / `source_chord_at` | `common/src/chord_detect.rs` |
+| 検出: `detect_chords` / `extract_chords` (ノート列 → 区間) / `match_chord` (pitch class の強さ → コード。オーディオの chroma もここへ渡す) / 追従の基準の `own_chords` / `own_chord_at` / `longest_own_in` / `audio_own_chord_at` | `common/src/chord_detect.rs` |
 | voicing と変換: `chord_pitches` / `Voicing` / `Song::chords_to_clip` / `Song::chords_from_clips` | `common/src/chord_voicing.rs` |
 | イベント 3 族: `AppEvent::Chord(ChordTrackEvent)` / `ChordFollow(ChordFollowEvent)` / `ChordTool(ChordToolEvent)` | `daw_gui/src/event_chord.rs` |
 | handler | `daw_gui/src/handler/chord_event.rs` / `chord_follow_event.rs` / `chord_tool_event.rs` |
 | 表示名の口: `AppData::chord_label(chord, beat)` / `chord_notation()` (**コード名を出す表示面は必ずこれを呼ぶ**) | `daw_gui/src/handler/chord_event.rs` |
-| headless script: `daw.chordEvent(json)` (3 族を保存形のまま) / `daw.chordsJson()` / `daw.parseChord(text)` / `daw.followedKey(trackId, pitch, beat)` | `daw_gui/src/script/chords.rs` |
+| headless script: `daw.chordEvent(json)` (3 族を保存形のまま) / `daw.chordsJson()` / `daw.parseChord(text)` / `daw.soundingKey(trackId, clipId, noteId)` | `daw_gui/src/script/chords.rs` |
 
 ## 3. 分担 (4 本、base から分岐)
 
@@ -77,6 +95,8 @@
   Alt ドラッグで複数選択を比例伸縮) / Ctrl+ドラッグで複製 / Cut・Copy・Paste (OS クリップボード、`ChordTrackEvent::PlaceMany`) /
   Delete / 矩形・Shift・Ctrl の選択 (`state/selection.rs`、Delete 等は last-selection-wins) / snap は既存の `view.snap`。
 - **ポップアップ** (Q4): `open_overlay` 系 (再生継続)。文字入力は `common::chord_name::parse_chord`、読めない間は確定しない。
+  r.md #159: そのポップアップで作った箱 (空きのダブルクリック / Tab) のコードを決めるのは「置く」(`ChordTrackEvent::Recast`、
+  閉じるまで ←→ で戻っても同じ)、ほかの箱のコードを変えるのは「書き換え」(`SetChord`)。
   五度圏の輪 (クリックでルート、同じ位置の再クリックで異名同音 `Spelling`) / 種類 (`ChordKind::ALL`) / テンション
   (`Tensions::ALL`) / ベース。**次のコードの候補**: 直前のコードとキーから (ダイアトニック / 五度圏の近さ / 終止形) を並べ、
   上下キーで巡回。←→ で隣の箱、Tab で次の箱を追加。変更のたびに試聴の口 (`c157-tools` が用意、§4) を呼ぶ。
@@ -95,23 +115,29 @@
 (`rg "transpose|sounding_key|transposable"` の全件を表にしてから着手)。
 
 - **engine (`daw_audio`)**: `sequencer.rs` の note-on の鍵盤 (`sounding_key(note.pitch, transpose)`) を
-  「追従 → 移調」に。追従の実効モードは `SongIndex` に焼く (RT で Song を線形走査しない、確保しない)。平行移動 / ベースの
-  素材のコード (MIDI の content ごとの検出結果) も compile 時に off-RT で索引に焼く。発音台帳 (`note_ledger`) は送った鍵盤を
+  「追従 → 移調」に。追従の実効モードは `SongIndex` に焼く (RT で Song を線形走査しない、確保しない)。追従する全モードの
+  自分の和音 (MIDI の content ごとの検出結果) も compile 時に off-RT で索引に焼き、クリップの記録 (r.md #159) は
+  sequencer が持っている clip から二分探索で引く (`PitchMap::note_key`)。発音台帳 (`note_ledger`) は送った鍵盤を
   持つ既存の形のまま。ランチャーのセルは playhead の位置のコード。
-- **オーディオ**: `audio_clip_renderer.rs` の `transposable` / buffer ごとの移調量に、`follow_shift` を足す。素材のコードは
-  `Song.audio_chords[source_id]` (音源フレーム) を event の再生位置から引く。移調 0 かつ追従なしの event は今までどおり
+- **オーディオ**: `audio_clip_renderer.rs` の `transposable` / buffer ごとの移調量に、`follow_shift` を足す。基準は
+  アレンジの event なら compile 時に箱ごとに決めた値 (`RenderedEvent::chord_bases` = `Song::audio_event_bases`)、
+  セルなら音源フレームを覆う、和音を弾いている区間 (`audio_own_chord_at`)。移調 0 かつ追従なしの event は今までどおり
   エンジンを通さない。
 - **オフライン**: VOICEVOX (`handler/voicevox.rs` の `sung_pitch` / 口パクの fingerprint — 開いただけで `*` にならない冪等性)、
   SMF 書き出し (`midi_export.rs`)、バウンス (`bounce_ops.rs` の `isolated_track` で追従を切る)。`TrackTranspose::key` に
   相乗りできるならそこへ (読み口を 1 本に保つ)。
 - **GUI**: 演奏プレビュー (`handler/transpose.rs` の `preview_key`: MIDI 入力モニター / 仮想鍵盤 / 鍵盤レーン /
-  MIDI Capture の試聴) = **演奏入力のリアルタイム変換** (Cubase の Live Input)。追従するトラックで弾いた音は playhead の
-  位置のコードへ寄る (録音されるのは弾いた音 — #130 Q2 と同じ移調楽器の扱い)。**既にあるノートの試聴** (ナッジ) は
+  MIDI Capture の試聴) = **演奏入力のリアルタイム変換** (Cubase の Live Input)。最寄りのコード音 / スケールで追従する
+  トラックで弾いた音は playhead の位置のコードへ寄り (`live_input_key`)、r.md #159 Q2 で **寄せた音を録る**
+  (`record_midi_note_on_tracks`。録った音は記録を持たないので再生でもそのまま = 聴いた音 = 録れた音 = 再生の音)。
+  平行移動 / ベースは弾いた音のまま (移調だけ)。録音の台帳は弾いた鍵盤で引く。**既にあるノートの試聴** (ナッジ) は
   playhead ではなくノートの位置のコードで鳴らす (`note_preview_key` = ピアノロールの薄い枠と同じ鍵盤 + 移調)。
 - **ヘッダ** (Q6): `view/track_header_menu.rs` に「コードに追従」(メニューは平坦な文字列リストなので、選ぶとモードの
   メニューを開く 2 段、または `コードに追従: <モード>` を 5 行並べる — 既存の `context_menu` の形で実現できる方)。
   印は `widgets/arrangement/header.rs` の `♮` の隣 (`ChordFollow::mark()`)。
 - **鳴る音で確定** (Q5): 選択したクリップ / ノートの書いた音を、今の追従結果で書き換えるコマンド (`ChordFollowEvent` に足す)。
+  r.md #159: 確定したノートの記録は消す (二重に動かない)。選んだ音だけの確定で残りの音の鳴り方が変わるクリップは
+  確定しない (ステータスに出す)。
 - **ピアノロール用の読み口**: 「このクリップのノート 1 つが鳴る鍵盤」を返す関数を GUI 側に 1 つ用意する
   (`c157-roll` が薄い枠の描画に使う。§4)。
 
@@ -123,8 +149,7 @@
   トラック色を潰さない形 (輪郭・明度) で、明暗両方のクリップ色でコントラストを保証する。背景の行にも今のコードの構成音の
   ガイドを出す (既存のスケールのハイライト `draw_grid_background` と同じ流儀、ON/OFF のトグル)。
 - **鳴る音の薄い枠** (Q5): 追従するトラックのクリップで、書いた音と鳴る音が違うノートに、鳴る音の位置へ薄い枠を重ねる。
-  鳴る音は `c157-follow` の読み口 (§4) を呼ぶ。届くまでは `common::chord_follow::TrackChordFollow::key` を
-  素材のコードなし (`None`) で直接呼んで進める。
+  鳴る音は `c157-follow` の読み口 (§4、`ClipSoundingKeys`) を呼ぶ。
 - **今と次のコード** (Studio One の Chord Display): トランスポートの Key の近くに、playhead の位置のコードと次のコードを
   出す (`Song::chord_at` / `next_chord_after`)。トランスポートの幅が足りなければ配置を main に相談。
 - ARA: `kARAContentTypeSheetChords` をホストが答えると Melodyne がコードを読める (`daw_plugin_host/src/ara/host_controllers.rs`)。
@@ -141,7 +166,9 @@
   試聴とノート化 (`chords_to_clip`) が同じ `chord_pitches` を通る形を保つ。選択は見出し側 (ViewState)。
 - **オーディオからの検出**: 音源 → chroma (`realfft`、`master_meter/spectrum.rs` と `handler/clip_events.rs` の onset 検出の流れ) →
   `common::chord_detect::match_chord` → `ChordToolEvent::SetAudioChords` で保存。重いので off-thread、進捗表示は既存の
-  activity の仕組み。追従を ON にしたオーディオトラックで未検出の音源があれば自動で検出を走らせる。
+  activity の仕組み。追従を ON にしたオーディオトラックで未検出の音源があれば自動で検出を走らせる。r.md #159: 窓ごとに
+  「和音を弾いているか」(`chordal` — FFT フレームの半分以上が単音の倍音列に乗らず 3 pitch class 以上) を持ち、追従の
+  基準にするのはその窓だけ (抽出は全窓)。v48 未満のファイルの検出結果は捨てて測り直す。
   オーディオクリップ → 帯のドロップ / クリップの右クリック「コードを抽出」で、検出結果を帯にも置く。
 - **検出の設定** (Cubase の Create Chord Events): 窓の長さ / ベース音を含める / テンションを含める / 短いノートを無視。
   クリップの右クリック「コードを抽出…」から。

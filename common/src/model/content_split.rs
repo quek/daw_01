@@ -18,7 +18,7 @@
 //! 変わらないので fork しない、[`Song::split_content_at_points`])。
 
 use crate::model::{
-    AudioContent, AudioEvent, ClipContent, ContentId, MidiContent, Note, Song, TimedEvent, split_pieces,
+    AudioContent, AudioEvent, ClipContent, ClipKey, ContentId, MidiContent, Note, Song, TimedEvent, split_pieces,
 };
 
 /// 拍の同一視許容量。
@@ -62,10 +62,11 @@ impl MidiContent {
     /// - pitch / velocity / muted は全片が継ぐ。 片同士は隣接するだけなので同じ音程の
     ///   重なりは作らない (重なり解消は要らない)。
     ///
-    /// 返り値は実際に割ったノートの数。
-    pub fn split_notes(&mut self, mut cuts: impl FnMut(&Note) -> Vec<f64>, min_piece: f64) -> usize {
+    /// 返り値は後ろの片ごとの `(元のノートの id, 片の id)` (r.md #159: 書かれたときのコードの記録を片へ写す
+    /// `Song::copy_note_basis` に渡す)。割ったノートの数は元の id の数。
+    pub fn split_notes(&mut self, mut cuts: impl FnMut(&Note) -> Vec<f64>, min_piece: f64) -> Vec<(u32, u32)> {
         let mut pieces: Vec<Note> = Vec::new();
-        let mut split = 0;
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
         for i in 0..self.notes.len() {
             let note = self.notes[i].clone();
             let end = note.start_beat + note.duration_beats;
@@ -73,7 +74,6 @@ impl MidiContent {
             let Some(&first) = kept.first() else {
                 continue;
             };
-            split += 1;
             self.notes[i].duration_beats = first - note.start_beat;
             let tail_lyric = note
                 .lyric
@@ -81,20 +81,16 @@ impl MidiContent {
                 .map(|_| crate::voicevox::PROLONGED_SOUND_MARK.to_string());
             for (j, &at) in kept.iter().enumerate() {
                 let to = kept.get(j + 1).copied().unwrap_or(end);
-                pieces.push(Note {
-                    id: self.alloc_note_id(),
-                    start_beat: at,
-                    duration_beats: to - at,
-                    lyric: tail_lyric.clone(),
-                    ..note.clone()
-                });
+                let id = self.alloc_note_id();
+                pairs.push((note.id, id));
+                pieces.push(Note { id, start_beat: at, duration_beats: to - at, lyric: tail_lyric.clone(), ..note.clone() });
             }
         }
-        if split > 0 {
+        if !pairs.is_empty() {
             self.notes.extend(pieces);
             self.notes.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
         }
-        split
+        pairs
     }
 }
 
@@ -179,11 +175,16 @@ impl Song {
     /// ARA の編集 = content と take ごとの audio modification も共有したまま続く)。 返り値は「切り終えた
     /// content の id」= 分割後の全片が使う id。 跨ぐ要素が無ければ `content_id` をそのまま返す。
     pub fn split_content_at_points(&mut self, content_id: ContentId, ats: &[f64]) -> ContentId {
+        self.cut_content_at_points(content_id, ats).0
+    }
+
+    /// [`Self::split_content_at_points`] の本体。2 つ目はノートを割った片の `(元の id, 片の id)`。
+    fn cut_content_at_points(&mut self, content_id: ContentId, ats: &[f64]) -> (ContentId, Vec<(u32, u32)>) {
         let Some(content) = self.clip_contents.get(&content_id) else {
-            return content_id;
+            return (content_id, Vec::new());
         };
         if !ats.iter().any(|&at| Self::content_crosses(content, at)) {
-            return content_id;
+            return (content_id, Vec::new());
         }
         let cut_changes_meaning = matches!(content, ClipContent::Midi(_));
         let target = if cut_changes_meaning && self.clip_content_refcount(content_id) > 1 {
@@ -191,10 +192,22 @@ impl Song {
         } else {
             content_id
         };
-        if let Some(content) = self.clip_contents.get_mut(&target) {
-            Self::cut_content_at(content, ats);
+        let pairs = self.clip_contents.get_mut(&target).map(|content| Self::cut_content_at(content, ats)).unwrap_or_default();
+        (target, pairs)
+    }
+
+    /// クリップ `key` の content を content-local 拍 `ats` で切り ([`Self::split_content_at_points`])、クリップを
+    /// 切り終えた content へ張り替え、割ったノートの後ろの片へ書かれたときのコードの記録を写す (r.md #159。
+    /// 共有している MIDI を fork したときは、張り替えた後でないと写す先のクリップが無い)。切り終えた content の id
+    /// を返す (クリップが無ければ `None`)。
+    pub fn split_clip_content_at(&mut self, key: ClipKey, ats: &[f64]) -> Option<ContentId> {
+        let content_id = self.clip_by_key(key)?.content_id;
+        let (target, pairs) = self.cut_content_at_points(content_id, ats);
+        if let Some(clip) = self.clip_by_key_mut(key) {
+            clip.content_id = target;
         }
-        target
+        self.copy_note_basis(target, &pairs);
+        Some(target)
     }
 
     /// `at` を厳密に跨ぐ要素があるか (`split_content_at_points` の早期 return 判定)。
@@ -217,12 +230,10 @@ impl Song {
         }
     }
 
-    /// `ats` を跨ぐ要素を割る (位置は動かさない)。
-    fn cut_content_at(content: &mut ClipContent, ats: &[f64]) {
+    /// `ats` を跨ぐ要素を割る (位置は動かさない)。返り値はノートを割った片の `(元の id, 片の id)`。
+    fn cut_content_at(content: &mut ClipContent, ats: &[f64]) -> Vec<(u32, u32)> {
         match content {
-            ClipContent::Midi(m) => {
-                m.split_notes(|_| ats.to_vec(), 0.0);
-            }
+            ClipContent::Midi(m) => return m.split_notes(|_| ats.to_vec(), 0.0),
             ClipContent::Audio(a) => {
                 a.split_events(|_| ats.to_vec(), 0.0);
             }
@@ -231,5 +242,6 @@ impl Song {
             ClipContent::Text(t) => split_timed(&mut t.events, ats),
             ClipContent::Automation(_) => {}
         }
+        Vec::new()
     }
 }

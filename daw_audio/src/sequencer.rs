@@ -1131,7 +1131,7 @@ mod tests {
                 Some(ClipContent::Midi(m)) => m,
                 _ => panic!("Midi"),
             };
-            assert_eq!(m.split_notes(|_| vec![at], 0.0), 1);
+            assert_eq!(m.split_notes(|_| vec![at], 0.0).len(), 1);
         }
         /// アレンジの E: clip を拍 `at` で割る (`daw_gui::handler::split::split_clip_window` と同じ形 —
         /// content を切り、前の片は元の id のまま短く、後ろの片は新しい id で同じ content の続きを見る)。

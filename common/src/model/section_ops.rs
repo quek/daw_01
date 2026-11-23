@@ -453,9 +453,10 @@ impl Song {
                 };
                 if start < beat && beat < start + len {
                     let cut = beat - start;
-                    // 跨ぐ note / event は content 側で切る (共有されている MIDI は CoW)。
+                    // 跨ぐ note / event は content 側で切る (共有されている MIDI は CoW、割った片へ記録を写す)。
                     // その上で窓を 2 つに割る — 両断片は同じ content を別の窓で見る。
-                    let cid = self.split_content_at(cid, off + cut);
+                    let key = ClipKey { track_id: self.tracks[ti].id, clip_id: self.tracks[ti].clips[i].id };
+                    let cid = self.split_clip_content_at(key, &[off + cut]).unwrap_or(cid);
                     let right_id = self.tracks[ti].alloc_clip_id();
                     let mut right = self.tracks[ti].clips[i].clone();
                     right.id = right_id;

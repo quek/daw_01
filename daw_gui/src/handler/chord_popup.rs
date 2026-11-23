@@ -41,10 +41,14 @@ impl AppData {
         }
     }
 
-    /// ポップアップの箱のコードを差し替えて試聴し、入力欄を今の名前で出し直す。
+    /// ポップアップの箱のコードを差し替えて試聴し、入力欄を今の名前で出し直す。このポップアップで作った箱なら
+    /// 置いている最中 (`ChordTrackEvent::Recast`、メロディーは動かない)、それ以外は書き換え (r.md #159)。
     pub(crate) fn chord_popup_set(&mut self, chord: Chord) {
-        let Some(id) = self.chord_popup_id() else { return };
-        self.handle_event(AppEvent::Chord(ChordTrackEvent::SetChord { ids: vec![id], chord }));
+        let Some(p) = self.cur.peph.chord_band.popup.as_ref() else { return };
+        let (id, placing) = (p.chord_id, p.placing.contains(&p.chord_id));
+        let ids = vec![id];
+        let ev = if placing { ChordTrackEvent::Recast { ids, chord } } else { ChordTrackEvent::SetChord { ids, chord } };
+        self.handle_event(AppEvent::Chord(ev));
         self.audition_chord_box(id);
         self.refresh_chord_popup_text();
     }
@@ -105,6 +109,16 @@ impl AppData {
             return;
         };
         self.focus_chord_box(new_id);
+        self.mark_chord_popup_placing(new_id);
+    }
+
+    /// 箱 `id` をこのポップアップで作った箱にする ([`ChordPopup::placing`])。
+    pub(crate) fn mark_chord_popup_placing(&mut self, id: u32) {
+        if let Some(p) = self.cur.peph.chord_band.popup.as_mut()
+            && !p.placing.contains(&id)
+        {
+            p.placing.push(id);
+        }
     }
 
     /// ↑↓: 候補を巡回し、選んだ候補をそのまま箱に入れる (`delta` = -1 / +1)。
@@ -146,13 +160,16 @@ impl AppData {
         }
     }
 
-    /// 箱のポップアップを開く (開いていれば箱を差し替え、入力欄を作り直す)。
+    /// 箱のポップアップを開く (開いていれば箱を差し替え、入力欄を作り直す。このポップアップで作った箱の集合は
+    /// 閉じるまで持ち越す)。
     pub(crate) fn open_chord_popup(&mut self, id: u32) {
         let Some(c) = self.cur.song_doc.song().chord_by_id(id).cloned() else { return };
         let text = self.chord_entry_text(&c.chord, c.start_beat);
-        let rev =self.cur.peph.chord_band.popup.as_ref().map_or(0, |p| p.rev.wrapping_add(1));
+        let prev = self.cur.peph.chord_band.popup.take();
+        let rev = prev.as_ref().map_or(0, |p| p.rev.wrapping_add(1));
+        let placing = prev.map(|p| p.placing).unwrap_or_default();
         let played_seen = self.cur.chord_tools.played.map_or(0, |(_, seq)| seq);
-        self.cur.peph.chord_band.popup = Some(ChordPopup { rev, played_seen, ..ChordPopup::new(id, text) });
+        self.cur.peph.chord_band.popup = Some(ChordPopup { rev, played_seen, placing, ..ChordPopup::new(id, text) });
     }
 
     /// Instrument Input: ポップアップを開いている間に MIDI 鍵盤で弾き終えた和音を、編集中の箱に入れる
