@@ -163,3 +163,43 @@ fn the_extract_dialog_draws_its_open_list_above_the_rows_below() {
         }
     }
 }
+
+/// 箱を選んで ↑ / ↓ を押すと、選んだ箱だけ半音ずつ移調する (本番の shortcut map とルートの view を通す)。
+/// 3 箱 (Am7 / Fmaj7 / G7) のうち 2 つを Shift+クリックで選び、↑↑ → ↓ で +1。選んでいない G7 は動かない。
+#[test]
+fn up_and_down_keys_transpose_the_selected_boxes() {
+    use daw_ui_platform::{ElementState, KeyEvent, Modifiers, PhysicalKey};
+    let (mut app, _rx) = build_app();
+    populate(&mut app);
+    app.cur.view.launcher_layout = common::model::LauncherLayout::ArrangerOnly;
+    app.cur.view.arrange_zoom_x = 24.0;
+    app.cur.view.arrange_scroll_beat = 0.0;
+    let mut host: UiHost<AppData> = UiHost::no_redraw();
+    *host.shortcut_map_mut() = daw_gui::view::shortcuts::daw_shortcut_map();
+    let screen = PhysicalSize { width: W, height: H };
+    let mut frame = |app: &mut AppData, pointer: PointerFrame, keyboard: Vec<KeyEvent>| {
+        let mut scene = Scene::new();
+        let input = FrameInput { pointer, keyboard, ..FrameInput::default() };
+        host.frame(app, &mut scene, screen, input, |app, ui| daw_gui::view::root::build_root(app, ui, screen));
+    };
+    let away = PointerFrame { pos: Some((W as f32 - 5.0, H as f32 - 5.0)), ..PointerFrame::default() };
+    frame(&mut app, away, Vec::new());
+    let lane = app.cur.peph.chord_band.lane;
+    let y = lane.rect.y + lane.rect.h * 0.5;
+    let mut click = |app: &mut AppData, beat: f64, shift: bool| {
+        let modifiers = Modifiers { shift, ..Modifiers::empty() };
+        let at = Some((lane.x_of(beat), y));
+        frame(app, PointerFrame { pos: at, primary_just_pressed: true, primary_pressed: true, modifiers, ..PointerFrame::default() }, Vec::new());
+        frame(app, PointerFrame { pos: at, primary_just_released: true, modifiers, ..PointerFrame::default() }, Vec::new());
+    };
+    click(&mut app, 2.0, false);
+    click(&mut app, 6.0, true);
+    assert_eq!(app.cur.selection.selected_chord_ids.len(), 2, "前提: Am7 と Fmaj7 を選んでいる");
+    let key = |k: PhysicalKey| KeyEvent { state: ElementState::Pressed, text: None, physical_key: k, repeat: false };
+    let roots = |app: &AppData| -> Vec<u8> { app.cur.song_doc.song().chords.iter().map(|c| c.chord.root).collect() };
+    assert_eq!(roots(&app), vec![9, 5, 7]);
+    frame(&mut app, away, vec![key(PhysicalKey::ArrowUp), key(PhysicalKey::ArrowUp)]);
+    assert_eq!(roots(&app), vec![11, 7, 7], "↑ 2 回で選んだ 2 箱が全音上");
+    frame(&mut app, away, vec![key(PhysicalKey::ArrowDown)]);
+    assert_eq!(roots(&app), vec![10, 6, 7], "↓ で半音下 (選んでいない G7 はそのまま)");
+}
