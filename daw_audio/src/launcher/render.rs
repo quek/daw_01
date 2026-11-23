@@ -610,8 +610,7 @@ mod tests {
     /// r.md #157: 3 連符の量子化で撃ったセル (発火拍が 2/3 拍の端数を持つ) でも、コードの箱の境界ちょうどに始まる
     /// ノートは 1 回だけ鳴る。コードを引く拍を buffer ごとの「曲の拍 − 実効拍」から作っていたときは、引き算の丸めで
     /// 箱の境界の前後を行き来し、伸びている間に鳴り直していた (20 回のはずが 21 / 43 / 113 回)。
-    /// (境界ちょうどのノートが引く箱は、今も浮動小数の丸めで境界の手前の箱になることがある — `Song::chord_at` に
-    /// 許容幅が無いため。毎 buffer 同じ箱を引くので鳴り直しはしない。)
+    /// 境界ちょうどのノートは、拍の丸めで境界の手前に出ても、その境界から始まる箱を引く (`Song::chord_at_onset`)。
     #[test]
     fn 端数の拍で撃ったセルの境界ちょうどのノートは鳴り直さない() {
         use common::model::{Chord, ChordEvent, ChordFollow, ChordKind};
@@ -644,8 +643,12 @@ mod tests {
                 }));
                 beat += bpf;
             }
-            // 20 個のノートが 1 回ずつ。鍵盤は箱のコード (C = 60 / D = 62) のどちらか。
-            report.push((launch, ons.len() == 20 && ons.iter().all(|k| matches!(k, 60 | 62)), ons));
+            // 20 個のノートが 1 回ずつ。ノート i は拍 `launch + 1/3 + i` (整数) の箱ちょうどに始まり、その箱のコード
+            // (偶数拍 = C で 60 / 奇数拍 = D で 62) で鳴る。
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let first_box = (launch + 1.0 / 3.0).round() as u32;
+            let want: Vec<u8> = (0..20).map(|i| if (first_box + i).is_multiple_of(2) { 60 } else { 62 }).collect();
+            report.push((launch, ons == want, ons));
         }
         assert!(report.iter().all(|r| r.1), "撃った拍ごとの鍵盤 (各ノート 1 回): {report:?}");
     }

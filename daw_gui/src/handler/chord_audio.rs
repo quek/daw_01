@@ -89,10 +89,14 @@ impl AppData {
     }
 
     /// 検出を積む (走らせるのは [`Self::start_queued_detections`])。同じ音源を検出中 / 順番待ちなら重ねない
-    /// (置き先だけ足す)。新しく積んだら `true`。
+    /// (置き先だけ足す)。順番待ちなら後から来た発注の設定で測る (設定を変えてから「抽出」した結果が、先に積まれた
+    /// 自動検出の設定にならない。走り出した検出は差し替えられない)。新しく積んだら `true`。
     fn order_detection(&mut self, r: DetectRequest, place_on: Option<(u32, u32)>, opts: DetectOptions) -> bool {
         let jobs = &mut self.cur.chord_tools.detect_jobs;
         if let Some(job) = jobs.iter_mut().find(|j| j.source_id == r.source_id) {
+            if let DetectRun::Queued { buf, grid, opts: queued } = &mut job.run {
+                (*buf, *grid, *queued) = (r.buf, r.grid, opts);
+            }
             job.place_on.extend(place_on);
             return false;
         }

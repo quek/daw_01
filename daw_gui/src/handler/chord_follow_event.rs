@@ -23,8 +23,9 @@ impl AppData {
                 changed
             }
             ChordFollowEvent::SetTracks { track_ids, mode } => {
-                let track_ids = follow_targets(song, &track_ids);
-                set_modes(song, &track_ids, mode)
+                let targets = follow_targets(song, &track_ids);
+                let cleared = clear_group_modes(song, &track_ids);
+                set_modes(song, &targets, mode) | cleared
             }
             ChordFollowEvent::FreezePitch { targets } => freeze_clips(song, &targets),
             ChordFollowEvent::FreezeTracks { track_ids } => {
@@ -87,9 +88,24 @@ impl AppData {
     pub(crate) fn can_freeze_shown_pitch(&self) -> bool {
         let song = self.cur.song_doc.song();
         self.shown_pianoroll_clips().iter().any(|k| {
-            song.track_by_id(k.track_id).is_some_and(|t| t.clip_by_id(k.clip_id).is_some())
+            // セルは確定できない (`ClipSoundingKeys::of`)。`Track::clip_by_id` はセルも返すので、アレンジの列を見る。
+            song.track_by_id(k.track_id).is_some_and(|t| t.clip_index_by_id(k.clip_id).is_some())
                 && !song.track_chord_follow(k.track_id).is_off()
         })
+    }
+
+    /// トラックの右クリックメニューでチェックを付ける追従モード: 設定が入るトラック ([`follow_targets`]: グループは
+    /// 子孫) が全部同じモードならそのモード、混ざっている / 入るトラックが無いなら `None` (どれにも付けない)。
+    #[must_use]
+    pub(crate) fn track_menu_chord_follow(&self, track_id: u32) -> Option<ChordFollow> {
+        let song = self.cur.song_doc.song();
+        if !song.track_has_children(track_id) {
+            return song.track_by_id(track_id).map(|t| t.follow_chords);
+        }
+        let targets = follow_targets(song, &[track_id]);
+        let mut modes = song.tracks.iter().filter(|t| targets.contains(&t.id)).map(|t| t.follow_chords);
+        let first = modes.next()?;
+        modes.all(|m| m == first).then_some(first)
     }
 }
 
@@ -112,6 +128,13 @@ fn follow_targets(song: &Song, track_ids: &[u32]) -> Vec<u32> {
         }
     }
     song.tracks.iter().map(|t| t.id).filter(|id| picked.contains(id)).collect()
+}
+
+/// `track_ids` のうちグループ自身に残っているモード (グループになる前に入れた設定) を Off にする。グループの値は
+/// 音に効かず、印だけが出て、メニューの設定は子孫へ行くので、ここで消さないと消す手段が無い。
+fn clear_group_modes(song: &mut Song, track_ids: &[u32]) -> bool {
+    let groups: Vec<u32> = track_ids.iter().copied().filter(|id| song.track_is_pure_group(*id)).collect();
+    set_modes(song, &groups, ChordFollow::Off)
 }
 
 fn set_modes(song: &mut Song, track_ids: &[u32], mode: ChordFollow) -> bool {
@@ -340,5 +363,37 @@ mod tests {
         assert_eq!(modes(&app), vec![off, n, off, n, off]);
         app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezeTracks { track_ids: vec![3] }));
         assert_eq!(modes(&app), vec![off, n, off, off, off], "確定もグループ 3 の子 (4) へ");
+        // メニューのチェック: グループは子孫が揃っていればそのモード、混ざっていれば付けない。
+        assert_eq!(app.track_menu_chord_follow(3), Some(off));
+        assert_eq!(app.track_menu_chord_follow(1), None, "2 = Narrow / 4 = Off");
+        assert_eq!(app.track_menu_chord_follow(2), Some(n));
+        // グループ自身に残っていた値 (グループになる前の設定) は、グループへ設定し直すと消える。
+        app.edit_song(|song| song.track_by_id_mut(1).expect("group").follow_chords = ChordFollow::Bass);
+        app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::SetTracks { track_ids: vec![1], mode: off }));
+        assert_eq!(modes(&app), vec![off; 5]);
+        assert_eq!(app.track_menu_chord_follow(1), Some(off));
+    }
+
+    /// ランチャーのセルは曲の位置を持たない (撃った位置のコードで鳴る) ので、鳴る音の枠も確定も出さない。
+    /// セルとアレンジのクリップは 1 つの id 空間なので、id だけではアレンジのクリップと区別できない。
+    #[test]
+    fn a_launcher_cell_shows_written_notes_and_cannot_be_frozen() {
+        let mut app = crate::test_support::headless_app();
+        let (track_id, clips) = linked_triads(&mut app, ChordFollow::Narrow);
+        let cell_id = 950;
+        app.edit_song(|song| {
+            let scene_id = song.scenes.first().map_or(1, |s| s.id);
+            let track = song.track_by_id_mut(track_id).expect("track");
+            let mut clip = track.clips[0].clone();
+            clip.id = cell_id;
+            track.session_clips.push(common::model::SessionClip { scene_id, clip, launch: Default::default() });
+        });
+        assert!(app.clip_sounding_keys(track_id, clips[0]).expect("clip").is_active());
+        assert!(!app.clip_sounding_keys(track_id, cell_id).expect("cell").is_active());
+        let before = app.cur.song_doc.undo_depth();
+        app.handle_event(AppEvent::ChordFollow(ChordFollowEvent::FreezePitch {
+            targets: vec![FreezeTarget { track_id, clip_id: cell_id, note_ids: Vec::new() }],
+        }));
+        assert_eq!(app.cur.song_doc.undo_depth(), before, "セルは確定しない");
     }
 }

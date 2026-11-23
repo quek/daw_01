@@ -100,8 +100,9 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, _screen: PhysicalSize) {
         let x = panel.x + PAD;
         let full_w = panel.w - PAD * 2.0;
         let field = |y: f32| Rect { x: x + LABEL_W, y, w: full_w - LABEL_W, h: ROW_H };
-        // 開いた dropdown の一覧は下の行より手前に描かれ (daw-ui: popup の中の popup)、checkbox / button は
-        // 一覧の下ではヒットしない (`pointer_blocked_by_modal_popup`)。
+        // 開いた dropdown の一覧は下の行より手前に描かれる (daw-ui: popup の中の popup)。一覧の上の click は一覧の
+        // popup が出口で消費するので、**dropdown より後に呼ぶ** widget (下の行) には届かない。dropdown を、一覧が
+        // 重なる widget より先に呼ぶこと (一覧が上へ開く配置にすると、先に呼んだ widget が click を取る)。
         let mut y = panel.y + PAD + 30.0;
         ui.label_at("cex_win_l", "1 コードの長さ", x, y + 6.0, 13.0, p.text);
         if let Some(i) = ui.dropdown("cex_win", field(y), &window_labels, window_sel) {

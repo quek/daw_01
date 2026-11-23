@@ -25,7 +25,8 @@ impl<'a> ClipSoundingKeys<'a> {
     /// (撃った瞬間の playhead のコードで鳴る) ので、鳴る音を先に決められない → 書いた音のまま (追従しない読み口)。
     #[must_use]
     pub fn of(song: &'a Song, track_id: u32, clip: &'a Clip) -> Self {
-        let in_song = song.track_by_id(track_id).is_some_and(|t| t.clip_by_id(clip.id).is_some());
+        // `Track::clip_by_id` はセルも返す (アレンジと 1 つの id 空間) ので、アレンジの列だけを見る。
+        let in_song = song.track_by_id(track_id).is_some_and(|t| t.clip_index_by_id(clip.id).is_some());
         let follow =
             if in_song { TrackChordFollow::of(song, track_id) } else { TrackChordFollow::written(song) };
         let sources = match song.clip_contents.get(&clip.content_id).and_then(|c| c.notes()) {
@@ -59,7 +60,6 @@ impl AppData {
     pub fn clip_sounding_keys(&self, track_id: u32, clip_id: u32) -> Option<ClipSoundingKeys<'_>> {
         let song = self.cur.song_doc.song();
         let track = song.track_by_id(track_id)?;
-        let clip = track.clip_by_id(clip_id).or_else(|| track.session_clip_by_id(clip_id).map(|c| &c.clip))?;
-        Some(ClipSoundingKeys::of(song, track_id, clip))
+        Some(ClipSoundingKeys::of(song, track_id, track.clip_by_id(clip_id)?))
     }
 }
