@@ -6,7 +6,13 @@
 //! - L / R を別々に解析し、**パワーの平均**で 1 本にまとめる。位相に依存しない
 //!   ので逆相成分が消えない (L+R を先に足す方式の弱点)。
 //! - ビン → 表示バンドの集約は**パワーの最大**。正弦のピークを取りこぼさない。
-//! - 平均・集約はすべてパワー領域で行い、dB 化は最終段だけ。
+//! - 低域ではバンドがビン間隔より細く、最近傍ビンを読むと何本ものバンドが同じ値を共有して
+//!   階段になる (傾き補正が乗ると「右上がり + 垂直落ち」の鋸歯)。そこで**ビン 2 本分より細い
+//!   バンドは、バンド中心でビンの間を補間した値も見る** (dB 領域の単調 3 次 Hermite = PCHIP。
+//!   行き過ぎないので、ビンに無い山や谷を作らない)。バンド内のビンの最大とも突き合わせるので、
+//!   ビンちょうどの値 (校正) は変わらない。DC ビンは補間の節点にしない (DC オフセットを最低域の
+//!   バンドへ混ぜない)。最初のビンより下は最初のビンの値で平らに伸ばす。
+//! - L/R の平均とバンド内のビンの集約はパワー領域で行い、補間と傾き補正は dB 領域。
 //!
 //! バンド数は固定 ([`SPECTRUM_BANDS`])。widget 側は「バンド → ピクセル列」を
 //! さらに max で畳むだけでよい (max は結合的なので二段に分けても結果は同じ)。
@@ -39,11 +45,40 @@ pub fn band_center_hz(b: usize) -> f32 {
     F_MIN * (F_MAX / F_MIN).powf(t)
 }
 
-/// 1 バンドが参照するビン範囲 (`lo..hi`、空なら最近傍 1 本)。
+/// 補間の節点に使うパワーの下限。パワー 0 のビンを `-inf` dB にすると補間が成り立たない。
+/// その隣の区間の補間値はこの床 (-300 dB) へ引っ張られるが、f32 の FFT で厳密な 0 が出るのは
+/// 入力全体が無音のときだけで、そのときは表示の下限に張り付く。
+const BIN_POWER_FLOOR: f32 = 1e-30;
+
+/// 等間隔の PCHIP の端点の傾き (Moler の 3 点式 + 形を保つ補正。scipy `PchipInterpolator` と同じ)。
+/// `d_edge` は端の区間の差分、`d_inner` はその内側の区間の差分。
+fn pchip_end_slope(d_edge: f32, d_inner: f32) -> f32 {
+    let m = (3.0 * d_edge - d_inner) / 2.0;
+    if m * d_edge <= 0.0 {
+        0.0
+    } else if d_edge * d_inner <= 0.0 && m.abs() > 3.0 * d_edge.abs() {
+        3.0 * d_edge
+    } else {
+        m
+    }
+}
+
+/// 等間隔の PCHIP の内側の点の傾き。両側の差分の符号が違えば (山・谷) 0、同じなら調和平均
+/// (Fritsch–Butland)。
+fn pchip_inner_slope(d_left: f32, d_right: f32) -> f32 {
+    if d_left * d_right <= 0.0 { 0.0 } else { 2.0 * d_left * d_right / (d_left + d_right) }
+}
+
+/// 1 バンドが参照するビン。
 #[derive(Debug, Clone, Copy)]
 struct BandBins {
+    /// 周波数がバンド内にあるビン (`lo..=hi`)。`lo > hi` なら 1 本も無い。
     lo: usize,
     hi: usize,
+    /// バンドがビン 2 本分より細いときだけ、バンド中心の小数ビン位置。ここで補間した値も見る。
+    /// 2 本分以上あると中心の両隣のビンがどちらもバンド内にあり、行き過ぎない補間は
+    /// その最大を越えないので要らない。
+    interp_at: Option<f32>,
 }
 
 pub struct SpectrumAnalyzer {
@@ -67,6 +102,12 @@ pub struct SpectrumAnalyzer {
     bin_power: Vec<f32>,
     /// バンド → ビン範囲の写像 (fft_len / sample_rate が変わったら再構築)。
     band_bins: Vec<BandBins>,
+    /// 補間の節点 (ビン 1..=`node_hi`) の dB と PCHIP の傾き。FFT ごとに 1 回だけ埋める
+    /// (補間する数百本のバンドが同じ数本のビンを読むので、バンドごとに log10 しない)。
+    /// 添字はビン番号のまま (0 = DC は使わない)。`node_hi == 0` なら補間するバンドが無い。
+    node_db: Vec<f32>,
+    node_slope: Vec<f32>,
+    node_hi: usize,
     /// 傾き補正量 [dB] (バンドごとに定数)。
     band_slope_db: Vec<f32>,
     slope_db_oct: f32,
@@ -96,6 +137,9 @@ impl SpectrumAnalyzer {
             fft_out: Vec::new(),
             bin_power: Vec::new(),
             band_bins: Vec::new(),
+            node_db: Vec::new(),
+            node_slope: Vec::new(),
+            node_hi: 0,
             band_slope_db: vec![0.0; SPECTRUM_BANDS],
             slope_db_oct: f32::NAN,
             display_db: vec![f32::NEG_INFINITY; SPECTRUM_BANDS],
@@ -154,19 +198,24 @@ impl SpectrumAnalyzer {
                 let c = band_center_hz(b);
                 let f_lo = c / half;
                 let f_hi = c * half;
-                let lo = (f_lo * n / fs).ceil().max(0.0) as usize;
-                let hi = (f_hi * n / fs).floor().max(0.0) as usize;
-                let lo = lo.min(bins);
-                let hi = hi.min(bins);
-                if lo > hi {
-                    // バンドがビン間隔より細い: 最近傍ビン 1 本を見る。
-                    let k = ((c * n / fs).round().max(0.0) as usize).min(bins);
-                    BandBins { lo: k, hi: k }
-                } else {
-                    BandBins { lo, hi }
-                }
+                let lo = ((f_lo * n / fs).ceil().max(0.0) as usize).min(bins);
+                let hi = ((f_hi * n / fs).floor().max(0.0) as usize).min(bins);
+                let width_bins = (f_hi - f_lo) * n / fs;
+                let interp_at = (width_bins < 2.0).then(|| (c * n / fs).clamp(0.0, bins as f32));
+                BandBins { lo, hi, interp_at }
             })
             .collect();
+        // 補間で読む区間 k..=k+1 の右端の最大。節点は最低 2 本 (ビン 1, 2) 要る。
+        self.node_hi = self
+            .band_bins
+            .iter()
+            .filter_map(|b| b.interp_at)
+            .map(|pos| (pos.floor() as usize + 1).max(2).min(bins))
+            .max()
+            .unwrap_or(0);
+        // 傾きは両隣の dB を読むので、dB は 1 本先まで要る。
+        self.node_db = vec![0.0; (self.node_hi + 2).min(bins + 1)];
+        self.node_slope = vec![0.0; self.node_hi + 1];
     }
 
     fn rebuild_slope(&mut self, slope_db_oct: f32) {
@@ -194,6 +243,7 @@ impl SpectrumAnalyzer {
             if self.since_hop >= self.hop {
                 self.since_hop = 0;
                 self.run_fft();
+                self.fill_nodes();
                 latest.fill(f32::NEG_INFINITY);
                 self.fold_bands(&mut latest);
                 let dt = since_advance as f32 / self.sample_rate as f32;
@@ -235,7 +285,8 @@ impl SpectrumAnalyzer {
         }
     }
 
-    /// ビンのパワーをバンドへ max で畳み、傾き補正込みの dB にする。
+    /// ビンのパワーをバンドへ max で畳み (細いバンドはビン間の補間値とも max)、
+    /// 傾き補正込みの dB にする。
     fn fold_bands(&self, out: &mut [f32]) {
         for (b, bins) in self.band_bins.iter().enumerate() {
             let mut p = 0.0_f32;
@@ -245,15 +296,57 @@ impl SpectrumAnalyzer {
                     p = v;
                 }
             }
-            let db = if p > 0.0 {
-                10.0 * p.log10() + self.band_slope_db[b]
-            } else {
-                f32::NEG_INFINITY
-            };
+            let mut db = if p > 0.0 { 10.0 * p.log10() } else { f32::NEG_INFINITY };
+            // `f32::max` は NaN の側を捨てるので、壊れたビンが表示へ NaN を持ち込まない。
+            if let Some(pos) = bins.interp_at {
+                db = db.max(self.interp_db(pos));
+            }
+            let db = db + self.band_slope_db[b];
             if db > out[b] {
                 out[b] = db;
             }
         }
+    }
+
+    /// 補間の節点 (ビン 1..=`node_hi`) の dB と PCHIP の傾きを、今の `bin_power` から埋める。
+    fn fill_nodes(&mut self) {
+        let hi = self.node_hi;
+        if hi == 0 {
+            return;
+        }
+        let last_bin = self.bin_power.len() - 1;
+        for (j, v) in self.node_db.iter_mut().enumerate().skip(1) {
+            *v = 10.0 * self.bin_power[j].max(BIN_POWER_FLOOR).log10();
+        }
+        let db = &self.node_db;
+        for j in 1..=hi {
+            self.node_slope[j] = if j == 1 {
+                pchip_end_slope(db[2] - db[1], db[3] - db[2])
+            } else if j == last_bin {
+                pchip_end_slope(db[j] - db[j - 1], db[j - 1] - db[j - 2])
+            } else {
+                pchip_inner_slope(db[j] - db[j - 1], db[j + 1] - db[j])
+            };
+        }
+    }
+
+    /// 小数ビン位置 `pos` の dB を、両隣の節点の間の 3 次 Hermite で補間する。最初の節点
+    /// (ビン 1) より下は、その値で平らに伸ばす。`fill_nodes` の後に呼ぶ。
+    fn interp_db(&self, pos: f32) -> f32 {
+        if pos <= 1.0 {
+            return self.node_db[1];
+        }
+        let k = (pos.floor() as usize).min(self.node_hi - 1);
+        let t = (pos - k as f32).clamp(0.0, 1.0);
+        let (t2, t3) = (t * t, t * t * t);
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        let h10 = t3 - 2.0 * t2 + t;
+        let h01 = -2.0 * t3 + 3.0 * t2;
+        let h11 = t3 - t2;
+        h00 * self.node_db[k]
+            + h10 * self.node_slope[k]
+            + h01 * self.node_db[k + 1]
+            + h11 * self.node_slope[k + 1]
     }
 
     /// アタック瞬時 / リリースのみ時定数、という FabFilter・Voxengo と同じ弾道。
@@ -411,6 +504,69 @@ mod tests {
             feed_whole_hops(&mut a, fs, f, 1.0, fft.size());
             let db = a.display_db()[nearest_band(f)];
             assert!((db - 0.0).abs() < 0.2, "{}: got {db}", fft.label());
+        }
+    }
+
+    /// 傾き補正で平らになるスペクトル (-4.5 dB/oct) は、低域まで平らに表示される。
+    /// 低域でバンドが最近傍ビンを共有すると、1 本のビンの値に補正だけが乗って
+    /// 「右上がり + 垂直落ち」の鋸歯になる (4096 点の 35 Hz のビンが受け持つ区間で約 2.2 dB)。
+    /// 最初のビン (DC の次) より下は情報が無く平らに伸ばすだけなので、そこから上を見る。
+    #[test]
+    fn tilt_flattened_spectrum_reads_flat_down_to_the_low_end() {
+        for fft in SpectrumFft::ALL {
+            let fs = 48_000;
+            let s = MeterSettings { spectrum_fft: fft, ..MeterSettings::default() };
+            assert!((s.spectrum_slope_db_oct - 4.5).abs() < 1e-6);
+            let mut a = SpectrumAnalyzer::new(fs, &s);
+            let bin_hz = fs as f32 / fft.size() as f32;
+            for k in 0..a.bin_power.len() {
+                let f = k.max(1) as f32 * bin_hz;
+                let db = -4.5 * (f / 1000.0).log2();
+                a.bin_power[k] = 10f32.powf(db / 10.0);
+            }
+            a.fill_nodes();
+            let mut out = vec![f32::NEG_INFINITY; SPECTRUM_BANDS];
+            a.fold_bands(&mut out);
+            for (b, db) in out.iter().enumerate() {
+                let f = band_center_hz(b);
+                if f < bin_hz {
+                    continue;
+                }
+                assert!(db.abs() < 0.25, "{}: band {b} ({f:.1} Hz) = {db:.2} dB", fft.label());
+            }
+        }
+    }
+
+    /// 補間はビンの間で行き過ぎない (隣り合う 2 本のビンの値の範囲に収まる)。行き過ぎると
+    /// 音に無い山や谷が低域に描かれる。
+    #[test]
+    fn interpolation_never_overshoots_the_neighboring_bins() {
+        for fft in SpectrumFft::ALL {
+            let mut a = SpectrumAnalyzer::new(48_000, &MeterSettings { spectrum_fft: fft, ..MeterSettings::default() });
+            // 決定的な擬似乱数で -90..0 dB のでこぼこなスペクトルを作る。
+            let mut x = 0x2545_f491_u32;
+            for p in &mut a.bin_power {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                let db = -90.0 * (x as f32 / u32::MAX as f32);
+                *p = 10f32.powf(db / 10.0);
+            }
+            a.fill_nodes();
+            for bins in &a.band_bins {
+                let Some(pos) = bins.interp_at else { continue };
+                if pos <= 1.0 {
+                    continue;
+                }
+                let k = pos.floor() as usize;
+                let (y0, y1) = (a.node_db[k], a.node_db[k + 1]);
+                let v = a.interp_db(pos);
+                assert!(
+                    v >= y0.min(y1) - 1e-3 && v <= y0.max(y1) + 1e-3,
+                    "{}: pos {pos} = {v} not within [{y0}, {y1}]",
+                    fft.label()
+                );
+            }
         }
     }
 
