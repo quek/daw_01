@@ -378,7 +378,7 @@ impl AppData {
 
     /// インスペクタの chain list (縦回転 Live 型、`docs/plan_parallel.md` §6.1)。 cursor track の
     /// device ツリーを行に flatten する: Parallel は 開始行 / chain 行 × N (展開中の chain はその直下に
-    /// device (再帰) + `+ Plugin`) / `+ chain` / 終了行。 折り畳んだ chain / Parallel は 1 行だけ。
+    /// device (再帰) + `+ プラグイン`) / `+ チェーン` / 終了行。 折り畳んだ chain / Parallel は 1 行だけ。
     pub fn chain_rows(&self) -> Vec<ChainRow> {
         let Some(track_id) = self.cursor_track_id() else {
             return Vec::new();
@@ -433,7 +433,7 @@ impl AppData {
     }
 
     /// Parallel 1 つぶんの行: 開始行 / chain 行 × N (展開中の chain はその行の直下に中身 (再帰) +
-    /// `+ Plugin`) / `+ chain` / 終了行。 折り畳んだ Parallel は開始行だけ。
+    /// `+ プラグイン`) / `+ チェーン` / 終了行。 折り畳んだ Parallel は開始行だけ。
     fn push_parallel_rows(
         &self,
         r: &Parallel,
@@ -452,6 +452,8 @@ impl AppData {
             parallel_band: Some(r.color),
         };
         let parallel_open = self.parallel_node_open(r.id);
+        let hidden_failures =
+            if parallel_open { 0 } else { r.chains.iter().map(|c| self.failed_loads_in(&c.devices)).sum() };
         rows.push(row(ChainRowKind::ParallelBegin {
             parallel_id: r.id,
             name: r.name.clone(),
@@ -461,6 +463,7 @@ impl AppData {
             out_gain: r.out_gain,
             gain_match: r.gain_match,
             split: r.split,
+            hidden_failures,
         }));
         // 折り畳んだ Parallel は開始行 1 本だけ (chain も終了行も出さない)。
         if !parallel_open {
@@ -486,6 +489,7 @@ impl AppData {
                 open,
                 n_devices: c.devices.len(),
                 inactive: active.is_some_and(|a| a != k),
+                hidden_failures: if open { 0 } else { self.failed_loads_in(&c.devices) },
             }));
             // 展開中 chain の中身は **その chain 行の直下** (他の chain 行はその後ろに続く)。
             if !open {
@@ -512,6 +516,20 @@ impl AppData {
             bars: bars.to_vec(),
             parallel_band: Some(r.color),
         });
+    }
+
+    /// `devices` 以下 (Parallel の中も) で読み込みに失敗した plugin の数 (`SlotPluginLoadFailed`)。
+    pub fn failed_loads_in(&self, devices: &[Device]) -> usize {
+        let failed = &self.cur.pipc.failed_plugin_loads;
+        if failed.is_empty() {
+            return 0;
+        }
+        common::model::plugins(devices).filter(|p| failed.contains_key(&p.id)).count()
+    }
+
+    /// トラック (master 含む) のチェーン全体で読み込みに失敗した plugin の数 (Rack の帯の見出しに出す)。
+    pub fn failed_loads_in_track(&self, track_id: u32) -> usize {
+        self.cur.song_doc.song().fx_chain_by_track_id(track_id).map_or(0, |d| self.failed_loads_in(d))
     }
 
     /// この plugin が埋め込みエディタ窓を持つか。**判定はここ 1 箇所**
@@ -557,12 +575,15 @@ impl AppData {
             has_embedded_gui,
             is_video: p.ports.is_video(),
             is_voicevox,
+            is_subtitle: common::plugin_db::is_subtitle(p.format, &p.plugin_id),
             has_params,
             send_all_keys: p.send_all_keys_to_plugin,
             load_error: self.cur.pipc.failed_plugin_loads.get(&p.id).cloned(),
             bypassed: p.bypassed,
             aux_input_count: p.aux_input_count,
             sc_wired: p.aux_inputs.iter().any(Option::is_some),
+            aux_output_count: p.aux_output_count,
+            aux_out_wired: p.aux_outputs.iter().any(Option::is_some),
         }
     }
 

@@ -137,6 +137,15 @@ pub struct ViewState {
     /// Limiter)。「見方の都合」なので dirty は立てないが保存する。save 時に sort、存在しない device は落とす。
     #[serde(default)]
     pub open_rack_panels: Vec<RackPanelKey>,
+    /// r.md #158: インスペクタで畳んでいる帯 (既定は開、畳んだものだけ持つ)。**id の文字列**で持つ
+    /// (`"clip.audio"` / `"track.rack"` 等、正本は daw_gui の `InspectorBand::id`) — 新しい版が足した種類を
+    /// 古い版が読んでも、知らない id を捨てるだけで読み込みを失敗させない。「見方の都合」なので dirty は
+    /// 立てないが保存する。
+    #[serde(default)]
+    pub inspector_collapsed: Vec<String>,
+    /// r.md #158: インスペクタで開いている「詳細」(既定は閉、開いたものだけ持つ)。id の文字列。
+    #[serde(default)]
+    pub inspector_open_details: Vec<String>,
     /// r.md #157: コードトラックの帯を隠しているか (既定は表示)。「見方の都合」。
     #[serde(default)]
     pub chord_lane_hidden: bool,

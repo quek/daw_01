@@ -27,7 +27,7 @@ use daw_gui::dispatcher::{BackgroundDispatcher, JobDispatcher, NoopJobDispatcher
 use daw_gui::event::StripSection;
 use daw_gui::event_device::DeviceEvent;
 use daw_gui::view::native_device::{CurveAxes, CurveBand, EqCurveSource, curve_handles};
-use daw_gui::view::root::INSPECTOR_W;
+use daw_gui::view::root::INSPECTOR_DEFAULT_W;
 use daw_gui::view::track_inspector::native_panel::layout;
 use daw_gui::widgets::select_modifier::SelectModifier;
 use daw_ui_core::{FrameInput, PointerFrame, UiHost};
@@ -40,10 +40,10 @@ const H: u32 = 1000;
 const STRIP_WIDTH: f32 = 80.0;
 /// 1 フレームあたりのドラッグ量 (px)。
 const STEP: f32 = 10.0;
-/// インスペクタの左右の余白 / chain list の行高 / 行の名前の上端からの距離 (`native_rack_visual.rs` と同じ)。
-const RACK_PAD: f32 = 12.0;
-const RACK_ROW_H: f32 = 26.0;
-const NAME_TOP: f32 = 8.0;
+/// インスペクタの左右の余白 / chain list の行高 / 行の名前の上端からの距離 (寸法の SSoT は `track_inspector::layout`)。
+const RACK_PAD: f32 = daw_gui::view::track_inspector::layout::PAD;
+const RACK_ROW_H: f32 = daw_gui::view::track_inspector::layout::RACK_ROW_H;
+const NAME_TOP: f32 = daw_gui::view::track_inspector::layout::ROW_NAME_TOP;
 
 /// 1 トラック目を選んだ app (インスペクタの Rack はこのトラックを出す)。
 fn build_app() -> AppData {
@@ -150,21 +150,23 @@ fn first_strip_x(scene: &Scene) -> f32 {
 fn inspector_glyph(scene: &Scene, text: &str) -> (f32, f32) {
     let v: Vec<(f32, f32)> = scene
         .iter_glyphs()
-        .filter(|g| g.left < INSPECTOR_W && g.text.as_ref() == text)
+        .filter(|g| g.left < INSPECTOR_DEFAULT_W && g.text.as_ref() == text)
         .map(|g| (g.left, g.top))
         .collect();
     assert_eq!(v.len(), 1, "インスペクタに `{text}` が 1 つ: {v:?}");
     v[0]
 }
 
-/// Rack の行の名前の glyph から、その行の Par の矩形 (行の直下、行の中身の幅)。
+/// Rack の行 (深さ 0) の名前の glyph から、その行の Par の矩形 (描画と同じ `layout::par_rect` を通す)。
 fn rack_panel_rect(name: (f32, f32), kind: NativeKind) -> Rect {
-    Rect {
+    let row = Rect {
         x: RACK_PAD,
-        y: name.1 - NAME_TOP + RACK_ROW_H,
-        w: INSPECTOR_W - RACK_PAD * 2.0,
-        h: layout::panel_height(kind),
-    }
+        y: name.1 - NAME_TOP,
+        // インスペクタの右端の幅のドラッグ帯は本文の外 (r.md #158)。
+        w: INSPECTOR_DEFAULT_W - daw_gui::view::track_inspector::layout::RESIZE_HANDLE_W - RACK_PAD * 2.0,
+        h: RACK_ROW_H,
+    };
+    daw_gui::view::track_inspector::layout::par_rect(row, layout::panel_height(kind))
 }
 
 fn native_param(app: &AppData, id: u64, param: NativeParamId) -> f32 {
@@ -200,7 +202,7 @@ fn mixer_帯と_rack_par_に同じ_thr_を描いても_mixer_のドラッグは�
     let knob = mixer_thr_knob(&mut host, &mut app);
     let scene = run(&mut host, &mut app, hover(knob));
     assert!(
-        find_glyph(&scene, |t, x, _| t == "Listen" && x < INSPECTOR_W).is_some(),
+        find_glyph(&scene, |t, x, _| t == "Listen" && x < INSPECTOR_DEFAULT_W).is_some(),
         "Rack に組み込み Comp の Par が開いている (同じ Thr を毎フレーム描く)"
     );
 
@@ -419,9 +421,9 @@ fn インスペクタの数値欄をドラッグしても_undo_は_1_step() {
     app.handle_event(AppEvent::SetClipSelection(vec![ClipKey { track_id: track, clip_id: 1 }]));
 
     let scene = settle(&mut host, &mut app);
-    let label = inspector_glyph(&scene, "Gain dB");
-    let field = find_glyph(&scene, |t, x, y| t == "0.0" && x > label.0 + 40.0 && x < INSPECTOR_W && (y - label.1).abs() < 8.0)
-        .expect("Gain dB の数値欄 (0.0)");
+    let label = inspector_glyph(&scene, daw_gui::view::track_inspector::vocab::FIELD_GAIN);
+    let field = find_glyph(&scene, |t, x, y| t == "0.0" && x > label.0 + 40.0 && x < INSPECTOR_DEFAULT_W && (y - label.1).abs() < 8.0)
+        .expect("ゲインの数値欄 (0.0)");
     let at = (field.0 + 4.0, field.1 + 6.0);
     let gain = |app: &AppData| match app.cur.song_doc.song().clip_contents.values().next() {
         Some(ClipContent::Audio(a)) => a.events[0].gain_db,

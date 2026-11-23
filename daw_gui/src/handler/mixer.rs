@@ -70,7 +70,7 @@ impl AppData {
         // daw_audio に運ぶ (= daw_audio が DB なしに役割を導出できる SSoT)。
         let ports = port_config_of(entry);
         let is_voicevox = entry_id.as_str() == common::plugin_db::BUILTIN_ID_VOICEVOX;
-        // r.md #110: 挿入先は picker を開いた chain (`+ Plugin` の行が指す chain)。無指定 / 消えていれば cursor
+        // r.md #110: 挿入先は picker を開いた chain (`+ プラグイン` の行が指す chain)。無指定 / 消えていれば cursor
         // track (master なら `Song.master_fx_chain`)。音源トラック化 / Transform の既定値 / 有効かどうかは、cursor では
         // なく **挿す chain の持ち主** のトラックで決める (picker を別トラックの chain で開いていても取り違えない)。
         let Some(dest) = self.plugin_insert_chain(picker_target) else { return };

@@ -626,9 +626,8 @@ impl AppData {
     /// 汎用 plugin の「Par」インライン param パネルの read snapshot。
     /// Par を開いた `device_id` が cursor track に居て、 host から param 一覧が
     /// 届いているときに、 lane default_value を実レンジ化した編集可能な param 行を返す。
-    /// VOICEVOX / 字幕 builtin は host param を持たず、 専用セクション (Clip Voice /
-    /// Talk / Text Event) が自分の gate (Par を開いた device の種類) で Par パネルとして描画される
-    /// ので、 ここでは `None` (= 汎用パネルは出さない)。
+    /// VOICEVOX / 字幕 builtin は host param を持たない (VOICEVOX の Par は口パク先だけ、声 / 読み上げ /
+    /// 字幕の欄はクリップの帯、r.md #158) ので、 ここでは `None` (= 汎用パネルは出さない)。
     ///
     /// 行は param 表の全 param ぶんあるので、device ごとに [`PluginParamsPanelCache`] (Song + param 表 +
     /// plugin DB の世代) に載せ、毎フレーム組み直さない。カーソルトラックの gate だけは毎回見る。
@@ -652,11 +651,9 @@ impl AppData {
     fn build_plugin_params_inspector(&self, device_id: u64) -> Option<PluginParamsInspector> {
         use common::model::AutomationTarget;
         let (device, track_id) = self.plugin_node(device_id)?;
-        if device.ports.is_video() && device.plugin_id != common::plugin_db::SUBTITLE_ID {
+        if device.ports.is_video() && !common::plugin_db::is_subtitle(device.format, &device.plugin_id) {
             return None; // 映像 FX は専用セクション。
         }
-        let plugin_name = resolve_plugin_name(&self.ipc.plugin_db, &device.plugin_id);
-
         // param 行: lane default_value (無ければ info.default_value を正規化) を
         // 実レンジへ。 HIDDEN は出さない。レーンは param id で 1 回だけ引ける形にする
         // (param ごとにレーン列を探さない。同じ target のレーンが複数あれば先頭)。
@@ -683,7 +680,6 @@ impl AppData {
         Some(PluginParamsInspector {
             track_id,
             device_id,
-            plugin_name,
             params,
         })
     }
@@ -1169,7 +1165,7 @@ mod plugin_params_panel_tests {
     /// plugin の Par の param 行は世代キャッシュから引くが、host の param 表の到着・値の編集 (レーン既定値)・
     /// plugin DB の差し替え・カーソルトラックの切り替えの後は必ず今の内容になる。
     #[test]
-    fn plugin_params_panel_follows_param_lists_edits_the_plugin_db_and_the_cursor() {
+    fn plugin_params_panel_follows_param_lists_edits_and_the_cursor() {
         let mut app = crate::test_support::headless_app();
         let (mut track_id, mut device_id) = (0, 0);
         app.edit_song(|song| {
@@ -1193,18 +1189,11 @@ mod plugin_params_panel_tests {
         };
         app.cur.pipc.plugin_params.insert(device_id, vec![cutoff]);
         let panel = app.inspector_plugin_params(device_id).expect("param 表が届いたら出る");
-        assert_eq!((panel.plugin_name.as_str(), panel.params[0].value_real), ("com.example.synth", 50.0));
+        assert_eq!(panel.params[0].value_real, 50.0);
 
         app.set_plugin_param(device_id, 7, 25.0);
         let panel = app.inspector_plugin_params(device_id).expect("panel");
         assert!((panel.params[0].value_real - 25.0).abs() < 1e-9, "値の編集が反映される: {}", panel.params[0].value_real);
-
-        let db: common::plugin_db::PluginDatabase = serde_json::from_str(
-            r#"{"entries":[{"id":"com.example.synth","name":"Synth","path":"synth.clap","descriptor_index":0}]}"#,
-        )
-        .expect("plugin DB");
-        app.ipc.plugin_db = Some(std::sync::Arc::new(db));
-        assert_eq!(app.inspector_plugin_params(device_id).expect("panel").plugin_name, "Synth", "plugin DB の名前");
 
         app.cur.selection.selected_track_ids.clear();
         assert!(app.inspector_plugin_params(device_id).is_none(), "カーソルトラックに居ない device は出さない");

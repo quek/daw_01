@@ -1,29 +1,34 @@
-//! トラック inspector (左サイドバー):
-//! - 選択トラック名
-//! - 「Chain」見出し
-//! - MIDI FX → Instrument → FX のリスト (各行に GUI / × ボタン、drag&drop で reorder)
-//! - + Instrument / + Effect / + MIDI FX ボタン
+//! トラックインスペクタ (画面左の縦長のカラム、r.md #158 `docs/plan_rmd_158_inspector.md`):
+//! - タイトル (スクロールしない 2 行): 選んでいるもの (クリップ → 列 → トラック) と色見本 (`title.rs`)
+//! - その下は 1 本の縦スクロールに **帯** を積む (`band.rs`)。上から 選択 (クリップ / セル) → 列 →
+//!   入力 → Rack → 口パク → モジュレーション。見出しのクリックで開閉 (種類ごとに共通、ViewState に保存)
+//! - 右端の 5px で幅を変える (360〜640)。`I` / View メニューで丸ごと隠す (app_config に保存)
+//! - 帯の中の欄は「ラベル左・値右」(`form.rs`、寸法は `layout.rs`)。Rack の行の直下に開く Par / SC / 出力の
+//!   欄も、値の列は帯の欄と同じ x (`form::cols_nested`)。見出し・欄名の文言は `vocab.rs`
 
-/// 選択クリップの「Audio Event」 セクション。
-mod audio_event_section;
+/// r.md #158: plugin 行の `Out▾` で直下に開く出力 (パラアウト) のパネル。
+mod aux_out_panel;
+/// r.md #158: 帯 (見出し / 詳細 / 小見出し)。
+mod band;
 mod chain_list;
 /// chain list の chain 行 / 操作行と、 Parallel ヘッダ行と共有する disclosure / 改名欄。
 mod chain_row;
-mod chain_sections;
+/// r.md #158: 選択の帯 (クリップ / セル) と列の帯の中身 (音声 / 画像 / 歌声 / 読み上げ / 字幕 / ローンチ)。
+mod clip_band;
 mod device_panel;
-/// 選択クリップの「Image Event」 セクション。
-mod image_event_section;
+/// r.md #158: 欄 (ラベル左・値右)。
+mod form;
 /// r.md #156: トラックの「入力」と「モニター」。
 mod input_section;
-/// r.md #87: 選択中のランチャーセルのローンチ設定 (Q7 / 計画書 §3.4)。
-mod launch_section;
+/// r.md #158: インスペクタの寸法 (テストも読む)。
+pub mod layout;
 /// r.md #151: Rack の行の Mix ノブ (Alt+クリックで Δ)。
 mod mix_knob;
 /// 口パク出力先トラックの「口形状 → 画像」 セクション。
 mod mouth_map_section;
 /// r.md #129: 内蔵 device の Par パネル (格子の寸法 `layout` はテストが座標を求めるのに使う)。
 pub mod native_panel;
-/// r.md #129: chain list の内蔵 device の行と展開、 master の末尾 (Post-Fader / Limiter)。
+/// r.md #129: chain list の内蔵 device の行と展開、 master の末尾 (フェーダー後 / Limiter)。
 mod native_row;
 mod parallel_header;
 /// chain list の plugin 行と、 その直下の展開 (SC パネル / param パネル)。
@@ -31,27 +36,33 @@ mod plugin_row;
 /// chain list の行の右クリックメニュー (項目は型で持つ)。
 mod row_menu;
 mod modulation_rack;
+/// r.md #158: タイトル (選んでいるもの + 色見本)。
+mod title;
+/// r.md #158: 見出し・欄名の文言 (テストも読む)。
+pub mod vocab;
 
-use daw_ui_core::{Edit, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui};
+use daw_ui_core::{Edit, Orientation, ScrubableNumberFormat, ScrubableNumberStyle, ToggleButtonStyle, Ui};
 use daw_ui_renderer::Rect;
 
-use crate::app::{
-    text_num_to_builtin, AppData, AppEvent, ClipKey, ColorPickerTarget, DiscreteClipEdit,
-    FadeEdgeKind, InspectorScrubField, ScrubGesture, TalkParamKind, TextNumField,
-};
+use crate::app::{AppData, AppEvent, ClipKey, InspectorScrubField, ScrubGesture};
+use crate::event_inspector::InspectorEvent;
+use crate::handler::bypass_target::BypassTarget;
+use crate::state::ModRackHover;
+use crate::state::inspector_view::{InspectorBand, InspectorScrollFloor};
 use crate::view::modulation::{self as mod_widget, build_mod, scrub_field_mod, ModBuild};
-use crate::view::track_color;
-use common::model::{AutomationTarget, FadeCurve, TextAlign};
+use common::model::AutomationTarget;
+
+use band::BandHead;
+use layout::{BAND_ADD_W, BAND_GAP, PAD, RESIZE_HANDLE_W, TITLE_H};
 
 // r.md #48: style は const にできない (const はランタイムのパレットを読めず、テーマを
 // 切り替えても古い色のまま残る)。 いずれも `Theme` を受け取る fn にして、 ui-core の
 // `from_palette` を base にした差分だけをここで宣言する。
 
-/// Audio event toggle (Reverse / Muted) 用 style。 mixer_strips の
-/// STYLE_MUTE / STYLE_SOLO とほぼ同じだが、 inspector 側に独立して定義
-/// (mixer の private style を import するより、 同 widget 並びの一覧性を
-/// 優先)。 hint band は無し (= 単純トグル) にして、 文字 + ON/OFF 色だけで
-/// 状態を伝える。
+/// インスペクタのトグル (クリップの帯の ミュート / 逆再生 / 反転 / ループ…、Rack の行の ⌨ / SC▾ / Out▾、
+/// chain の M / S、MIDI 割り当て) 共通の style。 mixer_strips の STYLE_MUTE / STYLE_SOLO とほぼ同じだが、
+/// inspector 側に独立して定義 (mixer の private style を import するより、 同 widget 並びの一覧性を
+/// 優先)。 hint band は無し (= 単純トグル) にして、 文字 + ON/OFF 色だけで 状態を伝える。
 pub(super) fn toggle_audio_style(theme: &crate::theme::Theme) -> ToggleButtonStyle {
     ToggleButtonStyle {
         radius: 4.0,
@@ -188,142 +199,174 @@ fn scrub_field(
     }
 }
 
-const FADE_CURVE_LABELS: &[&str] = &["Linear", "Exp", "SCurve"];
-
-fn fade_curve_to_index(c: FadeCurve) -> usize {
-    match c {
-        FadeCurve::Linear => 0,
-        FadeCurve::Exponential => 1,
-        FadeCurve::SCurve => 2,
+/// インスペクタが占める幅 (隠しているときは 0)。`root.rs` のレイアウト計算が使う
+/// (`master_panel::panel_width` と同じ形)。
+#[must_use]
+pub fn panel_width(app: &AppData) -> f32 {
+    if app.ui_prefs.inspector_open {
+        crate::handler::inspector_view::clamp_inspector_w(app.ui_prefs.inspector_w)
+    } else {
+        0.0
     }
 }
 
-fn fade_curve_from_index(i: usize) -> FadeCurve {
-    match i {
-        1 => FadeCurve::Exponential,
-        2 => FadeCurve::SCurve,
-        _ => FadeCurve::Linear,
-    }
-}
-
+/// インスペクタを描き、Q の宛先 (Rack の行 / モジュレーター) を **ここ 1 か所で** 公開する。
+///
+/// 宛先を描画の途中で書くと、帯を畳んだ / インスペクタを隠したフレームで誰も消さず、見えない行が
+/// `Q` で切り替わる (マスターパネルの §18-AB と同じ)。描画は宛先を返すだけにして、どの経路で抜けても
+/// 毎フレーム必ずここを通す。
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
+    let hover = draw_panel(app, ui, area);
+    if app.cur.peph.inspector_hovered_row != hover.row {
+        let row = hover.row;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| app.cur.peph.inspector_hovered_row = row));
+    }
+    if app.cur.peph.inspector_hovered_mod != hover.module {
+        let module = hover.module;
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| app.cur.peph.inspector_hovered_mod = module));
+    }
+}
+
+/// 帯の中身が返す Q の宛先。描かれなかった帯は `None` のまま。
+#[derive(Default)]
+struct InspectorHover {
+    row: Option<BypassTarget>,
+    module: Option<ModRackHover>,
+}
+
+fn draw_panel(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> InspectorHover {
+    if !app.ui_prefs.inspector_open || area.w < 1.0 {
+        // 隠したら、開いていた dropdown の一覧は持ち主が描かれないフレームの末尾で daw-ui が閉じる
+        // (`Ui::close_popups_without_owner`)。右クリックメニューも同じ。
+        return InspectorHover::default();
+    }
     let p = &app.theme.core;
     ui.panel("inspector_bg", area, p.panel, 0.0);
 
-    let pad = 12.0;
-    let mut y = area.y + pad;
-
-    // 選択トラック名
-    ui.label_at(
-        "inspector_title",
-        &app.selected_track_label(),
-        area.x + pad,
-        y,
-        16.0,
-        p.text,
-    );
-
-    // v18 (`docs/plan_track_clip_color.md`): タイトル行右端に track 色スウォッチ。
-    // 単一トラック選択時のみ表示し、クリックで color_picker を開く (anchor =
-    // スウォッチ rect)。effective 色 (上書き or id 由来の導出色) を塗る。
-    if app.cur.selection.selected_track_ids.len() <= 1
-        && let Some(idx) = app.cursor_track_index()
-        && let Some(track) = app.cur.song_doc.song().tracks.get(idx)
-    {
-        let track_id = track.id;
-        let swatch = Rect { x: area.x + area.w - pad - 20.0, y: y - 2.0, w: 20.0, h: 20.0 };
-        // hit-test (click 検出) を先に行い、 その上に色を塗る (button の既定
-        // 描画は隠れる)。
-        let clicked = ui.button_at_clicked("inspector_color_swatch", "", swatch);
-        let fill = track_color::to_renderer(track_color::effective_track_color(track));
-        ui.panel_with_border(
-            "inspector_color_swatch_fill",
-            swatch,
-            fill,
-            p.border,
-            1.0,
-            4.0,
-        );
-        if clicked {
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.open_color_picker(ColorPickerTarget::Track(track_id), swatch);
-            }));
-        }
+    // ---- 右端の幅のドラッグ帯 (scroll viewport の外の列。縦スクロールバーと掴み合わない) ----
+    let handle = Rect { x: area.x + area.w - RESIZE_HANDLE_W, y: area.y, w: RESIZE_HANDLE_W, h: area.h };
+    if let Some(drag) = ui.resize_handle("inspector_resize", handle, Orientation::Horizontal) {
+        // 左端固定なので、右へ動かすほど広い。縁 = 帯の右端 (帯の中の掴んだ位置を保つので跳ばない)。
+        let (w, commit) = (drag.handle_origin.0 + RESIZE_HANDLE_W - area.x, drag.released);
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::Inspector(InspectorEvent::SetWidth { w, commit }));
+        }));
     }
+    ui.panel("inspector_edge", Rect { x: area.x + area.w - 1.0, y: area.y, w: 1.0, h: area.h }, p.border, 0.0);
+    let content = Rect { w: (area.w - RESIZE_HANDLE_W).max(1.0), ..area };
 
-    y += 28.0;
+    let title = app.inspector_title();
+    title::draw_title(app, ui, Rect { h: TITLE_H, ..content }, &title);
 
-    // ---- param セクションを縦スクロール領域に収める --------------
-    // r.md #37: title 下〜area 下端の **全部** が scroll viewport。 inspector の縦位置は
-    // 「1 本の y カーソル」 だけが決める (= 縦位置の SSoT が 1 つ)。
-    //
-    // 旧実装は viewport の下に 「chain band」 (Parallel Out / Sidechain / 「+ Plugin」) を
-    // pinned で置き、 `btns_y = area.y + area.h - btns_h - pad` から **上へ逆算** して
-    // 積んでいた。 その帰結が 3 つとも実害だった:
-    //   (a) band 予約高の下限 `CHAIN_MIN_H = 160` が実コンテンツ (device 0 個なら
-    //       ボタン 26 + pad 12 = 38px) を上回るので、 viewport 下端とボタンの間に
-    //       誰も描かない空白が最大 122px 残る (= ユーザーの言う 「下寄せ」)。
-    //   (b) 逆算配置は描画前に各セクションの高さを知る必要があるので、 高さ式が
-    //       描画ループと二重管理になる。
-    //   (c) 予約高に収まらない行を無言で捨てる cap が要る。 パラアウト 5 行 /
-    //       sidechain 4 行を超えた分は **描画も操作もできなかった**。
-    // 逆算を全廃すると (a)(b)(c) が同時に消える。 3 セクションは
-    // `chain_sections::draw_*` として scroll フロー内へ移した。
-    //
-    // param の実高さは前フレーム測定値 (`inspector_body_h`、 immediate-mode の
-    // lag-by-one) を content_size に使う。 content <= viewport なら scrollbar は出ない。
-    // dropdown popup は deferred buffer 描画なので clip_rect の外に出て切れない
-    // (gui_01 popup.rs)。 各セクションは `(app, ui, area, pad, y) -> f32` 契約の関数で、
-    // この並び順がそのまま画面の上下順。
-    let body_top = y;
-    let param_h = (area.y + area.h - body_top).max(0.0);
-    let content_h = app.cur.peph.inspector_body_h.max(1.0);
-    let param_vp = Rect { x: area.x, y: body_top, w: area.w, h: param_h };
+    // ---- 帯を縦スクロール領域に積む ------------------------------------------
+    // r.md #37: title 下〜area 下端の **全部** が scroll viewport。 縦位置は「1 本の y カーソル」 だけが
+    // 決め、帯の並び順がそのまま画面の上下順 (daw_gui/CLAUDE.md「UI の配置・操作性」)。
+    // 本文の実高さは前フレーム測定値 (`inspector_body_h`、 lag-by-one)。帯 / Par を畳んで本文が縮んでも、
+    // 見えている下端は床 (`InspectorScrollFloor`) で保つ — 末尾までスクロールした状態で畳んでも、
+    // scroll_area が offset を詰めて押した見出しが下へずれることが無い。
+    let body_top = content.y + TITLE_H;
+    let vp = Rect { x: content.x, y: body_top, w: content.w, h: (area.y + area.h - body_top).max(0.0) };
+    let subject = app.inspector_subject();
+    let prev_floor = app.cur.peph.inspector_scroll_floor.as_ref();
+    let floor = InspectorScrollFloor::floor_for(prev_floor, &subject).unwrap_or(0.0);
+    let content_h = app.cur.peph.inspector_body_h.max(floor).max(1.0);
     let measured_body_h = std::cell::Cell::new(0.0_f32);
-    ui.scroll_area("inspector_body", param_vp, (param_vp.w, content_h), |ui, scroll_off| {
-        let mut y = body_top - scroll_off.1;
-
-        // ---- r.md #156: トラックの入力 / モニター (高さ固定。開閉で下を動かさない) ----
-        y = input_section::draw_input_section(app, ui, area, pad, y);
-
-        // ---- r.md #87: ランチャーのセルのローンチ設定 (Q7) -------------------
-        // 選択にセルが 1 つも無ければ何も描かない (= 通常のクリップ編集時は
-        // 従来と 1px も変わらない)。 先頭に置くのは「セルを選んだらまずここを見る」
-        // 導線のため (`chain_sections` と同じ `(app, ui, area, pad, y) -> f32` 契約)。
-        y = launch_section::draw_launch_section(app, ui, area, pad, y);
-
-        // ---- Audio Event section (Phase 2 PR1 + PR2 + PR3) ------------------
-        y = audio_event_section::draw_audio_event_section(app, ui, area, pad, y);
-
-        // ---- Image Event section (`docs/plan_image_overlay.md` §4 P4) ------
-        y = image_event_section::draw_image_event_section(app, ui, area, pad, y);
-
-        // ---- Plugin chain (r.md #110: Parallel 対応の縦回転 Live 型 chain list) ----
-        y = chain_list::draw_chain_list(app, ui, area, pad, y);
-
-        // r.md #37: チェーン直下に 「+ Plugin」 → Parallel Out → Sidechain を top-down で
-        // 並べる (旧: inspector 下端に pinned)。 「このチェーンの末尾に足す」 「このチェーンの
-        // デバイスの配線」 が読み順で自明になる。 各 fn は modulation_rack と同じ
-        // `(app, ui, area, pad, y) -> f32` contract。
-        // ロード失敗は他の配線セクションより上 (= チェーンに最も近い位置)。
-        y = chain_sections::draw_failed_load_section(app, ui, area, pad, y);
-        y = chain_sections::draw_parallel_out_section(app, ui, area, pad, y);
-
-        // ---- 口パク mapping (口形状 → 画像) -------------------------------
-        y = mouth_map_section::draw_mouth_map_section(app, ui, area, pad, y);
-
-        // Modulation rack を scroll viewport 末尾に置く (top-down フロー、
-        // 展開で 1 個を大きなグラフィカルエディタに、ソース数無制限・スクロール)。
-        y += 10.0;
-        y = modulation_rack::draw_modulation_rack(app, ui, area, pad, y);
-
-        measured_body_h.set(y - (body_top - scroll_off.1));
+    let mut hover = InspectorHover::default();
+    let offset = ui.scroll_area("inspector_body", vp, (vp.w, content_h), |ui, scroll_off| {
+        let top = body_top - scroll_off.1;
+        let y = draw_bands(app, ui, content, top + BAND_GAP, &title.main, &mut hover);
+        measured_body_h.set(y - top);
     });
-    // 測定した param 実高さを次フレーム用に保存 (変化時のみ edit を積む)。
+    // 測定した本文の実高さと床を次フレーム用に保存 (変化時のみ edit を積む)。
     let measured = measured_body_h.get();
     if (app.cur.peph.inspector_body_h - measured).abs() > 0.5 {
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.cur.peph.inspector_body_h = measured;
         }));
     }
+    let next_floor = InspectorScrollFloor::next(prev_floor, subject, measured, offset.1 + vp.h);
+    if prev_floor != Some(&next_floor) {
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.cur.peph.inspector_scroll_floor = Some(next_floor);
+        }));
+    }
+    hover
+}
+
+/// 帯を上から積む (r.md #158 仕様 2): 選択 (クリップ / セル) → 列 → 入力 → Rack → 口パク →
+/// モジュレーション。中身は各セクションの `(app, ui, area, pad, y) -> y` 契約の関数 (Rack とモジュレーションは
+/// Q の宛先も返す)。帯の対象がタイトルの 1 行目 (`title_main`) と同じ語なら省く — 1 本のトラックを選んだだけで
+/// トラック名が 4 回並ばない (複数選択の「選択中の N トラック」/「… のみ」は 1 行目と違うので残る)。
+fn draw_bands(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    mut y: f32,
+    title_main: &str,
+    hover: &mut InspectorHover,
+) -> f32 {
+    let shown = |target: &str| -> String { if target == title_main { String::new() } else { target.to_string() } };
+    // ---- 選んでいるクリップ / セル ----
+    if let Some((kind, target)) = app.inspector_clip_band() {
+        let target = shown(&target);
+        let head = BandHead::new(InspectorBand::Clip(kind), vocab::clip_band_title(kind), &target);
+        y = band::band(app, ui, area, y, &head, |ui, y| clip_band::draw_clip_band_body(app, ui, area, PAD, y))
+            + BAND_GAP;
+    }
+    // ---- 選んでいる列 (シーン) ----
+    if let Some(target) = app.inspector_scene_band_target() {
+        let head = BandHead::new(InspectorBand::Scene, vocab::BAND_SCENE, &target);
+        y = band::band(app, ui, area, y, &head, |ui, y| clip_band::draw_scene_launch(app, ui, area, PAD, y))
+            + BAND_GAP;
+    }
+    // ---- 入力 (選択中の全トラックに効く。録れる入力が 1 つも無いトラック (master / グループのバス /
+    // 画像・映像のトラック) だけなら出さない — 仕様 14) ----
+    if input_section::input_band_shown(app) {
+        let target = shown(&app.inspector_track_band_target(true));
+        let head = BandHead::new(InspectorBand::Input, vocab::BAND_INPUT, &target);
+        y = band::band(app, ui, area, y, &head, |ui, y| input_section::draw_input_section(app, ui, area, PAD, y))
+            + BAND_GAP;
+    }
+    let Some(cursor) = app.cursor_track_id() else {
+        return y;
+    };
+    // ---- Rack (カーソルのトラック 1 本) ----
+    let cursor_only = shown(&app.inspector_track_band_target(false));
+    let target = if app.cur.song_doc.song().track_effectively_enabled(cursor) {
+        cursor_only.clone()
+    } else {
+        let name = app.inspector_track_band_target(false);
+        format!("{name}{}{}", vocab::SEP, vocab::DISABLED)
+    };
+    // 読み込みに失敗した plugin の数は見出しに出す (畳んだ Rack / Parallel / 選んでいない chain の中でも
+    // 気付ける。理由と [再読込] は各 plugin 行の中、仕様 2: トリガの近く)。
+    let failed = app.failed_loads_in_track(cursor);
+    let warn = if failed > 0 { vocab::failed_loads(failed) } else { String::new() };
+    let head = BandHead { warn: &warn, ..BandHead::new(InspectorBand::Rack, vocab::BAND_RACK, &target) };
+    y = band::band(app, ui, area, y, &head, |ui, y| {
+        let (y, row) = chain_list::draw_chain_list(app, ui, area, PAD, y);
+        hover.row = row;
+        y
+    }) + BAND_GAP;
+    // ---- 口パク (このトラックを口パク出力先にしている歌声トラックがあるとき) ----
+    if mouth_map_section::mouth_map_shown(app) {
+        let head = BandHead::new(InspectorBand::MouthMap, vocab::BAND_MOUTH, &cursor_only);
+        y = band::band(app, ui, area, y, &head, |ui, y| mouth_map_section::draw_mouth_map_section(app, ui, area, PAD, y))
+            + BAND_GAP;
+    }
+    // ---- モジュレーション (見出しの右端に追加メニュー。畳んでいても見える) ----
+    let head = BandHead {
+        actions_w: BAND_ADD_W,
+        ..BandHead::new(InspectorBand::Modulation, vocab::BAND_MODULATION, &cursor_only)
+    };
+    let out = band::head(app, ui, area, y, &head);
+    modulation_rack::draw_add_source_menu(ui, out.actions);
+    let body_end = if out.open {
+        let (y, module) = modulation_rack::draw_modulation_rack(app, ui, area, PAD, out.body_y);
+        hover.module = module;
+        y
+    } else {
+        out.body_y
+    };
+    band::end(&out, body_end) + BAND_GAP
 }

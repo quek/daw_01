@@ -126,27 +126,14 @@ fn draw_panel<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) -> Opt
     ui.panel("master_panel_bg", rect, p.panel_raised, 0.0);
 
     // ----- 左端のリサイズ帯 -----
-    // popup が開いている間は掴まない。掴むと press を消費してしまい、
-    // 「メニュー外クリックで閉じる」が効かなくなる (= 見えない popup が残る)。
     let handle = Rect { x: rect.x, y: rect.y, w: RESIZE_HANDLE_W, h: rect.h };
-    if !ui.has_open_popups()
-        && let Some(drag) = ui.take_drag_in_rect("master_panel_resize", handle)
-    {
-        // 左へ動かすほど広くなる (右端固定パネル)。
-        let next = rect.x + rect.w - drag.current.0;
-        let commit = matches!(drag.kind, daw_ui_core::DragKind::Released);
-        // ドラッグ中は帯から離れても矢印のまま (掴んでいる間の形を保つ)。
-        ui.set_cursor(daw_ui_core::CursorIcon::EwResize);
+    if let Some(drag) = ui.resize_handle("master_panel_resize", handle, daw_ui_core::Orientation::Horizontal) {
+        // 左へ動かすほど広くなる (右端固定パネル)。縁 = 帯の左端 (掴んだ位置を保つ、跳ばない)。
+        let next = rect.x + rect.w - drag.handle_origin.0;
+        let commit = drag.released;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::SetMasterPanelWidth { w: next, commit });
         }));
-    }
-    if ui
-        .pointer()
-        .pos
-        .is_some_and(|(x, y)| handle.contains(x, y))
-    {
-        ui.set_cursor(daw_ui_core::CursorIcon::EwResize);
     }
     ui.push_rect(RectCommand {
         rect: Rect { x: rect.x, y: rect.y, w: 1.0, h: rect.h },
@@ -283,23 +270,17 @@ fn draw_section_handle<'a>(
         radius: [0.0; 4],
         clip_rect: None,
     });
-    if ui.pointer().pos.is_some_and(|(px, py)| handle.contains(px, py)) {
-        ui.set_cursor(daw_ui_core::CursorIcon::NsResize);
-    }
-    if ui.has_open_popups() {
-        return;
-    }
-    let Some(drag) = ui.take_drag_in_rect(("master_panel_section", i), handle) else {
+    // popup の間は掴まない / 掴んだ press を名乗る / カーソルの形は `resize_handle` が持つ。
+    let Some(drag) = ui.resize_handle(("master_panel_section", i), handle, daw_ui_core::Orientation::Vertical) else {
         return;
     };
-    // ドラッグ中は境界から離れても形を保つ。
-    ui.set_cursor(daw_ui_core::CursorIcon::NsResize);
-    let commit = matches!(drag.kind, daw_ui_core::DragKind::Released);
+    let commit = drag.released;
     // ドラッグ量ぶんを i と i+1 の間で移す。実高で計算してから
     // `section_ratios` (= `section_heights` の逆写像) で比率へ戻す。
     // 単純な正規化で戻すと最低高の下駄が二重に効いて、掴んだ境界がカーソルに
-    // 追従せず、触っていないセクションまで毎フレーム動く。
-    let dy = drag.current.1 - (y + SECTION_HANDLE_H * 0.5);
+    // 追従せず、触っていないセクションまで毎フレーム動く。帯の上端は掴んだ位置を保って動く
+    // (`handle_origin`) ので、帯のどこを掴んでも境界は跳ばない。
+    let dy = drag.handle_origin.1 - y;
     if dy.abs() < 0.5 && !commit {
         return;
     }

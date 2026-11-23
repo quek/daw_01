@@ -97,6 +97,14 @@ fn view_state_snapshot_restore_roundtrips() {
     // ループ (ON/OFF + 範囲) も表示状態と同じ扱いで往復する。
     app.handle_event(AppEvent::SetLoopRange { start: 3.0, end: 11.0 });
     app.handle_event(AppEvent::ToggleLoop);
+    // r.md #158: インスペクタの帯 / 詳細の開閉も同じ扱い。
+    {
+        use daw_gui::event_inspector::InspectorEvent;
+        use daw_gui::state::inspector_view::{InspectorBand, InspectorDetail};
+        app.handle_event(AppEvent::Inspector(InspectorEvent::ToggleBand(InspectorBand::Modulation)));
+        app.handle_event(AppEvent::Inspector(InspectorEvent::ToggleDetail(InspectorDetail::SubtitleStyle)));
+    }
+    let folds = app.cur.view.inspector_folds.clone();
 
     let snap = app.snapshot_view_state();
 
@@ -107,6 +115,7 @@ fn view_state_snapshot_restore_roundtrips() {
     app.cur.view.master_row_automation_expanded = false;
     app.cur.view.expanded_automation_tracks.clear();
     app.cur.view.piano_roll_views.clear();
+    app.cur.view.inspector_folds = daw_gui::state::inspector_view::InspectorFolds::default();
     app.handle_event(AppEvent::SetLoopRange { start: 0.0, end: 0.0 });
     app.handle_event(AppEvent::ToggleLoop);
 
@@ -128,6 +137,7 @@ fn view_state_snapshot_restore_roundtrips() {
         common::model::LoopRegion { enabled: true, start_beat: 3.0, end_beat: 11.0 },
         "ループ (ON/OFF + 範囲) も往復する"
     );
+    assert_eq!(app.cur.view.inspector_folds, folds, "インスペクタの帯 / 詳細の開閉も往復する");
 }
 
 /// r.md #65: プラグインエディタ窓のジオメトリはプロジェクト単位で往復し、

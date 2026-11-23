@@ -27,8 +27,9 @@ use crate::event_tabs::TabEvent;
 pub const MENU_H: f32 = 24.0;
 pub const TRANSPORT_H: f32 = 44.0;
 pub const STATUS_H: f32 = 24.0;
-/// インスペクタ (Rack) の固定幅 (r.md #129 Q1/Q2: ドラッグで変えない。 中身は `pad` 12 を除いた 336px)。
-pub const INSPECTOR_W: f32 = 360.0;
+/// インスペクタの既定幅 (r.md #158 で可変 360〜640 になり、隠せるようになった。r.md #129 Q1/Q2 の
+/// 「固定 360px」を置き換える)。実際の幅は `track_inspector::panel_width` (テストは窓幅の計算にこれを使う)。
+pub const INSPECTOR_DEFAULT_W: f32 = crate::handler::inspector_view::INSPECTOR_DEFAULT_W;
 
 /// arrangement (top) と bottom_panel (= piano_roll / mixer / audio_editor) の
 /// 初期分割比率。 上が `default_ratio`、 下が `1.0 - default_ratio`。 0.65 で
@@ -116,7 +117,9 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     // r.md #50: 右端にマスターパネルを切り出してから、残りを inspector +
     // split(arrangement / bottom) に配る。**アレンジと Mixer/MIDI エディタの
     // 両方の右**に常駐させるので、切り出すのは center_bottom 帯の全高。
-    let master_w = master_panel::panel_width(app).min((center_bottom_rect.w - INSPECTOR_W).max(0.0));
+    // r.md #158: インスペクタは右端ドラッグで幅を変え、`I` で隠せる (隠すと 0 = 右の領域が広がる)。
+    let inspector_w = track_inspector::panel_width(app).min(center_bottom_rect.w);
+    let master_w = master_panel::panel_width(app).min((center_bottom_rect.w - inspector_w).max(0.0));
     let master_rect = Rect {
         x: center_bottom_rect.x + center_bottom_rect.w - master_w,
         y: center_bottom_rect.y,
@@ -126,13 +129,13 @@ pub fn build_root<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, screen: Physic
     let inspector_rect = Rect {
         x: center_bottom_rect.x,
         y: center_bottom_rect.y,
-        w: INSPECTOR_W,
+        w: inspector_w,
         h: center_bottom_rect.h,
     };
     let right_rect = Rect {
-        x: center_bottom_rect.x + INSPECTOR_W,
+        x: center_bottom_rect.x + inspector_w,
         y: center_bottom_rect.y,
-        w: (center_bottom_rect.w - INSPECTOR_W - master_w).max(0.0),
+        w: (center_bottom_rect.w - inspector_w - master_w).max(0.0),
         h: center_bottom_rect.h,
     };
 
@@ -747,6 +750,12 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     if ui.take_shortcut("daw.toggle_master_panel") {
         ui.push_edit(Edit::mutate(|app: &mut AppData| {
             app.handle_event(AppEvent::ToggleMasterPanel)
+        }));
+    }
+    // r.md #158: I で画面左のインスペクタを開閉 (Logic Pro の I と同キー)。
+    if ui.take_shortcut("daw.toggle_inspector") {
+        ui.push_edit(Edit::mutate(|app: &mut AppData| {
+            app.handle_event(AppEvent::Inspector(crate::event_inspector::InspectorEvent::ToggleVisible))
         }));
     }
     // r.md #96: B で下部パネルの Mixer を開閉 (Bitwig の B と同キー)。

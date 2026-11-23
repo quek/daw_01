@@ -280,6 +280,13 @@ pub fn draw<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) {
             );
             // r.md #50: 画面右端のマスターパネル (フェーダー + 各種メーター)。
             event_item(m, "マスターパネル", "daw.toggle_master_panel", AppEvent::ToggleMasterPanel);
+            // r.md #158: 画面左のトラックインスペクタ (`I`)。
+            event_item(
+                m,
+                "インスペクタ",
+                "daw.toggle_inspector",
+                AppEvent::Inspector(crate::event_inspector::InspectorEvent::ToggleVisible),
+            );
             add_mixer_toggle_item(m);
             // r.md #55: 開いているプラグインエディタ窓を一括で閉じる
             // (Cubase の Window > Close All Plug-in Windows 相当)。

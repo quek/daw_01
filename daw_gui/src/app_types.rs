@@ -243,8 +243,8 @@ impl PluginPickEntry {
 /// Audio event 単位 field の inspector 表示用 read snapshot (Phase 2 PR1)。
 /// `selected_clip` が `ClipContent::Audio` の clip を指していて、 中に
 /// 少なくとも 1 event があれば `inspector_audio_event_summary()` が
-/// `Some` を返す。 view (`track_inspector::draw`) はこれを使って
-/// "Audio Event" section を出し、 toggle / dropdown 操作を `target`
+/// `Some` を返す。 view (`track_inspector::clip_band`) はこれを使って
+/// 音声クリップの帯の欄を出し、 toggle / dropdown 操作を `target`
 /// に向けて発火する。 Phase 1 で 1 clip = 1 event 前提なので first event
 /// を代表値として表示する。
 #[derive(Debug, Clone, Copy)]
@@ -273,8 +273,8 @@ pub struct InspectorAudioEventSummary {
 /// (`docs/plan_image_overlay.md` §4 P4)。 `selected_clip` が
 /// `ClipContent::Image` の clip を指していて、 中に少なくとも 1 event
 /// があれば `inspector_image_event_summary()` が `Some` を返す。
-/// view は "Image Event" section を出し、 数値入力 (x/y/w/h/opacity) と
-/// fade / mute toggle を first event 代表値として表示する。
+/// view (`track_inspector::clip_band`) は画像クリップの帯の欄を出し、 数値入力 (x/y/w/h/opacity) と
+/// fade / 反転 toggle を first event 代表値として表示する。
 ///
 /// `{x,y,w,h,opacity}_automated` は対応する `ImageBuiltin` lane が
 /// 存在する (`Track.automation_lanes` 上の visible 不問) か。 lane が
@@ -410,16 +410,16 @@ pub enum InspectorScrubField {
     ImageRotation,
     ImageFadeIn,
     ImageFadeOut,
-    /// 字幕 device の Par の Text Event 数値欄 (device_id 単位: 同じ種類の Par を 2 枚開いても
-    /// 片方のドラッグがもう片方の bracket を閉じない、r.md #129 §18-AA)。
-    Text { device_id: u64, field: TextNumField },
+    /// クリップの帯の字幕の数値欄 (r.md #158 で字幕デバイスの Par から移した。インスペクタに字幕の欄は
+    /// 1 組しかないので、欄の種類だけで同時に描かれる欄と重ならない)。
+    Text { field: TextNumField },
     /// 内蔵映像 FX param scrub（device_id, param_id 単位で
     /// drag stroke を undo 1 step に bracket する）。
     VideoFx { device_id: u64, param_id: u32 },
     /// 汎用 plugin param scrub (「⚙」パネル、device_id, param_id 単位)。
     PluginParam { device_id: u64, param_id: u32 },
-    /// talk 読み上げスケール (話速/音高/抑揚/音量) の scrub (VOICEVOX device の Par、device_id 単位)。
-    Talk { device_id: u64, kind: TalkParamKind },
+    /// 読み上げのスケール (話速/音高/抑揚/音量) の scrub (クリップの帯の「読み上げ」、欄は 1 組だけ)。
+    Talk { kind: TalkParamKind },
     /// r.md #112: Parallel の帯域分割クロスオーバー周波数の欄 (Parallel id + 境界)。
     ParallelSplit { parallel_id: u64, edge: common::model::SplitEdge },
     /// r.md #114: Selector のアクティブ chain 欄 (`Active`)。
@@ -726,17 +726,14 @@ pub struct SidechainSourceChoice {
     pub source: Option<common::model::TapSource>,
 }
 
-/// パラアウト (docs/plan_paraout.md): one inspector row group per chain device
-/// that declares `is_main=false` audio outputs (`aux_output_count > 0`). The
-/// inspector shows an "explode" button (auto-create child tracks) plus a
-/// per-port destination dropdown. `routes[port]` = the current
-/// `PluginInstance::aux_outputs[port]` destination track id (`None` = unrouted
-/// = silent, the industry-standard default).
+/// パラアウト (docs/plan_paraout.md): `is_main=false` の音声出力を持つ (`aux_output_count > 0`) chain の
+/// device 1 つの配線。Rack の plugin 行の `Out▾` で開く出力のパネル (r.md #158) が「展開」ボタン
+/// (子トラックを自動で作る) と port ごとの宛先 dropdown を出す。`routes[port]` = 今の
+/// `PluginInstance::aux_outputs[port]` の宛先トラック id (`None` = 未配線 = 無音、業界標準の既定)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParallelOutputEntry {
     pub track_id: u32,
     pub device_id: u64,
-    pub plugin_name: String,
     pub aux_output_count: u8,
     pub routes: Vec<Option<u32>>,
     /// True once at least one aux output is routed (so the inspector shows the
@@ -1003,14 +1000,12 @@ pub struct VideoFxParamsInspector {
     pub values: Vec<f32>,
 }
 
-/// 埋め込み GUI を持たない plugin の「⚙」インライン param パネルの
-/// read snapshot。 `open_plugin_params` が cursor track の device を指すとき
-/// `inspector_plugin_params()` が返す。 VOICEVOX builtin は `voice` に device
-/// 既定の声を、 汎用 plugin は `params` に編集可能な param 行を載せる。
+/// 埋め込み GUI を持たない plugin の Par (インライン param パネル) の read snapshot。Par を開いた device が
+/// cursor track に居るとき `inspector_plugin_params()` が返す。中身は編集可能な param 行だけ (plugin の名前は
+/// 行の見出しが出すので持たない、r.md #158)。VOICEVOX / 字幕は host param を持たないので返らない。
 pub struct PluginParamsInspector {
     pub track_id: u32,
     pub device_id: u64,
-    pub plugin_name: String,
     /// 汎用 plugin param 行 (lane default_value を実レンジ化した現値つき)。
     pub params: Vec<PluginParamRow>,
 }

@@ -14,7 +14,7 @@
 1. 組み込み Comp / EQ（master は Bus Comp / Tone EQ）を、チェーン上の正式なデバイス `Device::Native(NativeDevice)` にする。
    - plugin と同じく固有 id を持ち、次の対象になる: 行 / Par / D&D / オートメーション / 変調 / MIDI Learn / 外部サイドチェイン。
    - plugin との違いは 3 点だけ: 削除できない、Parallel に入れられない、普通のドラッグで他トラックへ移せない。
-2. Rack を固定幅 360px にし、デバイスの GUI（Par）を収める。Rack 行 / Par / Mixer 帯 / マスターパネル / オートメーションは、すべて `Song` 内の同じ `NativeDevice` の値を読む。
+2. Rack を固定幅 360px にし (r.md #158 で 360〜640 の可変に置き換わった)、デバイスの GUI（Par）を収める。Rack 行 / Par / Mixer 帯 / マスターパネル / オートメーションは、すべて `Song` 内の同じ `NativeDevice` の値を読む。
 3. strip 専用に複製されていた経路を、デバイス一般の経路 1 本にまとめる。
    - 対象: 値 IPC / GR テレメトリ / 自動 ON / hover と Q / 構造の正規化 / ジェスチャー / 束縛の運搬と掃除。
    - これで周辺にある既存の穴（§18）を塞ぐ。
@@ -27,7 +27,7 @@
 
 | # | 見える挙動 |
 |---|---|
-| Q1/Q2 | Rack の幅はドラッグで変えられない。固定 360px（現在 280px）、中身の幅 336px |
+| Q1/Q2 | Rack の幅はドラッグで変えられない。固定 360px（現在 280px）、中身の幅 336px。**r.md #158 で置き換わった**: インスペクタの幅は右端のドラッグで 360〜640 (下限が旧固定幅)、`I` で隠せる (`docs/plan_rmd_158_inspector.md` 仕様 12) |
 | Q3 | master の Rack にも組み込み行が出る。Limiter は Rack の末尾、フェーダーの後ろにあたる位置に固定行として出て、動かせず消せない |
 | Q4 | 組み込みの Comp と EQ は別々の行で、plugin と同じく D&D で自由に並べ替えられる。楽器より上に置いた Comp は楽器の音を処理しない（plugin と同じ規則） |
 | Q5 | 組み込み行はチェーンの最上位にしか置けない（Parallel の中へは落ちない）。× ボタンは無く、右クリックにも削除 / 切り取り / Parallel にまとめるは出ない。複数選択して Delete すると組み込みだけが残る。Ctrl+ドラッグ / コピー貼付 / 複製で増やしたものは「追加の Comp / EQ」になる（同じトラックでも他トラックでも）。普通のドラッグでは他トラックへ移らない |
@@ -61,7 +61,7 @@
 | 行の小表示（Q9） | **Bitwig**「This includes EQ curves (for EQ+, EQ-5 …) or gain reduction amounts (for Compressor+ …)」（the_mix_view、公式画像 3201/3203 で行の右端に出ることを目視） / **Cakewalk** ProChannel 折り畳み時「QuadCurve Equalizer graph. Shows the equalization curve.」 | EQ はカーブ、Comp は GR バー |
 | デバイスごとの展開（Q11） | **Fender Studio Pro** Micro View（Insert をダブルクリックで下へ展開、取得テキスト `fsp2_Built-In_Effects_Topics_Effect_Micro.txt:9-11`）/ **Cakewalk** モジュールごとの Minimize/Restore / **Renoise** デバイスごとの最小化 | Par を行ごとに独立させる |
 | 展開すると幅いっぱいを使う（Q12） | **Cakewalk**「When expanding ProChannel in the Inspector, ProChannel fills the entire width of the Inspector.」 | Par は中身の幅 336px 全体を使う |
-| インスペクタは固定幅（Q1/Q2） | **Bitwig**「This panel is not resizable.」（the_window_body、`bw_the_window_body.txt:25`） | 固定 360px |
+| インスペクタは固定幅（Q1/Q2） | **Bitwig**「This panel is not resizable.」（the_window_body、`bw_the_window_body.txt:25`） | 固定 360px (r.md #158 で 360〜640 の可変に置き換わった) |
 | Ctrl+ドロップでコピー（Q5） | **Renoise** Mixer「Holding "Left Control" while dropping the effect will create a copy of the device.」 / **Bitwig** ALT ドラッグでコピー | daw_01 既存の Ctrl コピーのまま |
 | GR 表示 | **Reason**「The right LED meter shows the gain reduction applied by the compressor.」/ **Studio Pro** Channel Strip の GR LED | 行と Par に GR バーを出す |
 | EQ のグラフ表示 | **Renoise** EQ 5/10 の Graph Only / Sliders Only / Full Display https://tutorials.renoise.com/wiki/Audio_Effects / **REAPER** User Guide v7.79 §6.12 p.118 の埋め込み UI | Par にカーブを置き、点を直接操作する |

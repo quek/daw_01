@@ -478,14 +478,14 @@ pub enum AppEvent {
     EndTextPiPDrag,
 
     /// docs/plan_text_overlay.md §4 P5: text inspector の編集パス。
-    /// Mute / Text content / Font family は string-shaped で個別 event、
+    /// Text content / Font family は string-shaped で個別 event (ミュートは全種類共通の
+    /// `SetClipMuted` / `DiscreteClipEdit::Muted`)、
     /// 23 numeric field + 2 fade beats は `SetClipTextNumField` 1 event で
     /// `TextNumField` discriminator dispatch する。 数値入力は
     /// scrubable_number 化され、 on_change が直接 `SetClipTextNumField` を
     /// 発火 (= 旧 buffer 経路 `ClipTextNumEditChanged` / `CommitClipTextNumEdit`
     /// は撤去)。 lane override 経由でも同様、 lane が effective なら
     /// TextEvent.field の直接書き込みは preview に反映されない。
-    SetClipTextMuted { target: ClipKey, muted: bool },
     SetClipTextContent { target: ClipKey, value: String },
     SetClipTextFontFamily { target: ClipKey, value: String },
     SetClipTextAlign { target: ClipKey, value: common::model::TextAlign },
@@ -679,6 +679,9 @@ pub enum AppEvent {
     /// r.md #113: PC キーボードによる仮想鍵盤 (`docs/plan_virtual_keyboard.md`)。同じく
     /// 「1 arm = 1 サブ enum」。
     VirtualKeyboard(crate::event_virtual_keyboard::VirtualKeyboardEvent),
+    /// r.md #158: トラックインスペクタの帯の開閉 / 表示 / 幅 (見方の都合、Song を書かない)。同じく
+    /// 「1 arm = 1 サブ enum」。
+    Inspector(crate::event_inspector::InspectorEvent),
     /// `docs/plan_project_tabs.md` §5.2: プロジェクトタブの操作 (新規 / 開く / 切替 /
     /// 閉じる / 並べ替え)。同じく「1 arm = 1 サブ enum」。
     Tab(crate::event_tabs::TabEvent),
@@ -788,7 +791,7 @@ pub enum AppEvent {
     NudgeSelectedNotePitch { octave: bool, steps: i32 },
 
     // -------- Plugin picker / chain ---------------------------------------
-    /// r.md #110: `chain` = 挿入先 (`+ Plugin` の行が指す chain)。 `None` = cursor track
+    /// r.md #110: `chain` = 挿入先 (`+ プラグイン` の行が指す chain)。 `None` = cursor track
     /// の top-level 末尾。
     OpenPluginPicker { chain: Option<common::model::ChainRef> },
     ClosePluginPicker,
@@ -1202,10 +1205,10 @@ pub enum AppEvent {
     /// (= それ以降変更なし) 全 bound vocal track を再生成する。Undo 対象外。
     LipsyncDebounceFired { project: common::protocol::ProjectKey, generation: u64 },
     /// Clip Inspector の 2 段 dropdown で選択された声を、 対象
-    /// clip (stable `ClipKey`) に焼き込む。 builtin へ再 flush して新しい声で
+    /// clip (stable `ClipKey`、複数選択なら全部 — 1 undo step) に焼き込む。 builtin へ再 flush して新しい声で
     /// 再合成する。
     SetClipVoice {
-        clip: common::model::ClipKey,
+        clips: Vec<common::model::ClipKey>,
         speaker_id: u32,
         singer_name: String,
         style_name: String,
@@ -1219,10 +1222,10 @@ pub enum AppEvent {
     /// (talk) Text clip Inspector の「再取得」ボタン。`/speakers` を再取得する。
     RefetchSpeakers,
     /// (talk) Text clip Inspector の talk スケール (話速/音高/抑揚/音量) を 1 つ
-    /// 編集する。対象 clip (stable `ClipKey`) の `Clip::talk` に焼き込んで builtin へ
+    /// 編集する。対象 clip (stable `ClipKey`、複数選択なら全部) の `Clip::talk` に焼き込んで builtin へ
     /// 再 flush (= 新しいスケールで再合成)。
     SetClipTalkParam {
-        clip: common::model::ClipKey,
+        clips: Vec<common::model::ClipKey>,
         param: TalkParamKind,
         value: f32,
     },
@@ -1856,8 +1859,7 @@ impl AppEvent {
             E::BounceClipInPlace(..) | E::BounceClipWithFx(..) => "バウンス",
 
             // ---- テキスト / 画像 クリップ ----
-            E::SetClipTextMuted { .. }
-            | E::SetClipTextContent { .. }
+            E::SetClipTextContent { .. }
             | E::SetClipTextFontFamily { .. }
             | E::SetClipTextAlign { .. }
             | E::SetClipTextFadeInCurve { .. }
@@ -2101,7 +2103,6 @@ pub enum DiscreteClipEdit {
     /// r.md #98: 画像の左右 / 上下反転 (`ImageEvent.flip_h` / `flip_v`)。
     ImageFlipH(bool),
     ImageFlipV(bool),
-    TextMuted(bool),
     TextAlign(common::model::TextAlign),
     TextFadeCurve(FadeEdgeKind, common::model::FadeCurve),
 }

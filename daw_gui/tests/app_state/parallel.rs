@@ -87,7 +87,7 @@ fn chain_rows_put_each_open_chains_devices_under_its_row() {
         let r = app.cur.song_doc.song().parallel_by_id(parallel_id).unwrap();
         (r.chains[0].id, r.chains[1].id)
     };
-    // 既定は全 chain 展開: 各 chain の中身はその chain 行の直下、`+ chain` は一番下。
+    // 既定は全 chain 展開: 各 chain の中身はその chain 行の直下、`+ チェーン` は一番下。
     let rows = app.chain_rows();
     let kinds: Vec<String> = rows
         .iter()

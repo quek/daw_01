@@ -188,9 +188,11 @@ fn draw_window(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
             w: RESIZE_MARGIN,
             h: (committed.h - TITLE_H - CORNER).max(0.0),
         };
-        if let Some(d) = ui.take_drag_in_rect("loudness_size_r", right_edge) {
-            rect.w = (committed.w + d.delta.0).max(MIN_W);
-            commit |= matches!(d.kind, DragKind::Released);
+        // 縁の帯は `resize_handle` (popup の間は掴まない / 掴んだ press を名乗る / リサイズのカーソル)。帯は
+        // committed の位置のまま動かないので、帯の動き (`handle_origin` − 帯の位置) がそのまま delta。
+        if let Some(d) = ui.resize_handle("loudness_size_r", right_edge, daw_ui_core::Orientation::Horizontal) {
+            rect.w = (committed.w + d.handle_origin.0 - right_edge.x).max(MIN_W);
+            commit |= d.released;
         }
         let bottom_edge = Rect {
             x: committed.x,
@@ -198,9 +200,9 @@ fn draw_window(app: &AppData, ui: &mut Ui<'_, AppData>, screen: Rect) {
             w: (committed.w - CORNER).max(0.0),
             h: RESIZE_MARGIN,
         };
-        if let Some(d) = ui.take_drag_in_rect("loudness_size_b", bottom_edge) {
-            rect.h = (committed.h + d.delta.1).max(MIN_H);
-            commit |= matches!(d.kind, DragKind::Released);
+        if let Some(d) = ui.resize_handle("loudness_size_b", bottom_edge, daw_ui_core::Orientation::Vertical) {
+            rect.h = (committed.h + d.handle_origin.1 - bottom_edge.y).max(MIN_H);
+            commit |= d.released;
         }
         rect = clamp_to_screen(rect, screen);
     }

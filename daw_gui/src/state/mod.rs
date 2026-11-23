@@ -39,6 +39,8 @@ pub mod audio_device;
 pub mod chord_band;
 /// r.md #157: コードの試聴 / voicing / 検出 / 録音の、タブごとの状態。
 pub mod chord_tools;
+/// r.md #158: トラックインスペクタの帯と「詳細」の開閉状態。
+pub mod inspector_view;
 
 pub use loudness::{LoudnessPhase, LoudnessState};
 pub use project::{ProjectEphemeral, ProjectIpc, ProjectState, ProjectView, ProjectVoicevox};

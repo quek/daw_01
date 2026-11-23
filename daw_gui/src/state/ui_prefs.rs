@@ -86,6 +86,12 @@ pub struct UiPrefs {
     /// マスターパネルのセクション高さ配分 (MASTER / スペクトラム / オシロ / ゴニオ)。
     /// 合計 1.0 に正規化されている。境界ドラッグで変わる。
     pub master_panel_sections: [f32; 4],
+    /// r.md #158: 画面左のトラックインスペクタを出すか (app_config で永続)。
+    /// View メニュー / `I` で toggle。
+    pub inspector_open: bool,
+    /// r.md #158: トラックインスペクタの幅 (px、app_config で永続)。右端ドラッグで変わる。
+    /// 読むときは `track_inspector::panel_width` (有効範囲へクランプ) を通す。
+    pub inspector_w: f32,
     /// 各メーターの設定 (右クリックメニューで変える、app_config で永続)。
     /// テレメトリスレッドの解析器へは `AppData::meter_control` 経由で渡る。
     pub meter_settings: crate::master_meter::settings::MeterSettings,

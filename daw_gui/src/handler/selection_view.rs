@@ -490,8 +490,8 @@ impl AppData {
     ///   倒れる (r.md #90)。
     /// - そうでなければ [`Self::arrangement_selected_clip_refs`]。
     ///
-    /// 以前はアレンジ側しか導出しておらず、 セルを選ぶとインスペクタの Image / Text /
-    /// Audio Event 節が出ない・preview に選択枠が出ない・F2 改名やノート貼り付けが
+    /// 以前はアレンジ側しか導出しておらず、 セルを選ぶとインスペクタの画像 / テキスト /
+    /// 音声クリップの欄が出ない・preview に選択枠が出ない・F2 改名やノート貼り付けが
     /// 「クリップ未選択」 になっていた (r.md #97)。 `Track::clip_by_id` はセルも引けるので、
     /// 呼び出し側は key の出所を区別しなくてよい。
     pub fn selected_clip_refs(&self) -> Vec<ClipKey> {

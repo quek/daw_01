@@ -95,21 +95,10 @@ impl AppData {
             .map(|(id, g)| (*id, *g))
             .collect();
         plugin_editor_windows.sort_unstable_by_key(|(id, _)| *id);
-        // r.md #129 (Q18): 開いている Par。現存する device の分だけ (Limiter は常に居る)、キー順
+        // r.md #129 (Q18): 開いている Par。現存して Par を持つ device の分だけ (`rack_panel_key_valid`)、キー順
         // (`BTreeSet` の順) で save 差分を安定させる。
-        let open_rack_panels: Vec<common::model::RackPanelKey> = self
-            .cur
-            .view
-            .open_rack_panels
-            .iter()
-            .filter(|k| match k {
-                common::model::RackPanelKey::Device(id) => {
-                    self.cur.song_doc.song().device_by_id(*id).is_some()
-                }
-                common::model::RackPanelKey::MasterLimiter => true,
-            })
-            .copied()
-            .collect();
+        let open_rack_panels: Vec<common::model::RackPanelKey> =
+            self.cur.view.open_rack_panels.iter().copied().filter(|k| self.rack_panel_key_valid(*k)).collect();
         common::model::ViewState {
             arrange_zoom_x: self.cur.view.arrange_zoom_x,
             arrangement_split_ratio: self.cur.view.arrangement_split_ratio,
@@ -147,6 +136,9 @@ impl AppData {
             launcher_scene_col_w: self.cur.view.launcher_scene_col_w,
             launcher_scroll_scene: self.cur.view.launcher_scroll_scene,
             open_rack_panels,
+            // r.md #158: インスペクタの帯 / 詳細の開閉 (id の文字列、`BTreeSet` の順で差分を安定させる)。
+            inspector_collapsed: self.cur.view.inspector_folds.collapsed_ids(),
+            inspector_open_details: self.cur.view.inspector_folds.open_detail_ids(),
             chord_lane_hidden: !self.cur.view.chord_band.visible,
             chord_notation: self.cur.view.chord_band.notation,
             chord_tools: self.cur.chord_tools.view,
@@ -181,6 +173,8 @@ impl AppData {
         self.cur.view.plugin_editor_windows.clear();
         // r.md #129 (Q18): 開いている Par も同じ (`view = None` の旧ファイルでも前プロジェクトを持ち越さない)。
         self.cur.view.open_rack_panels.clear();
+        // r.md #158: インスペクタの帯の開閉も同じ (旧ファイルは「帯は全部開・詳細は閉」で開く)。
+        self.cur.view.inspector_folds = crate::state::inspector_view::InspectorFolds::default();
         self.set_loop_region(loop_region);
         // 消えたレーンのキーは捨てる (`automation_lane_row_overrides` と同じ)。
         self.cur.view.hidden_automation_lanes = hidden_automation_lanes
@@ -216,15 +210,14 @@ impl AppData {
             .collect();
         self.cur.view.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
         self.cur.view.collapsed_parallel_nodes = v.collapsed_parallel_nodes.into_iter().collect();
-        // r.md #129 (Q18): 開いている Par。現存する device の分だけ入れる (Limiter は常に居る)。
-        self.cur.view.open_rack_panels = v
-            .open_rack_panels
-            .into_iter()
-            .filter(|k| match k {
-                common::model::RackPanelKey::Device(id) => self.cur.song_doc.song().device_by_id(*id).is_some(),
-                common::model::RackPanelKey::MasterLimiter => true,
-            })
-            .collect();
+        // r.md #129 (Q18): 開いている Par。現存して Par を持つ device の分だけ入れる (保存と同じ
+        // `rack_panel_key_valid`。r.md #158 より前のファイルの字幕デバイスの鍵はここで落ちる)。
+        let open_rack_panels: Vec<common::model::RackPanelKey> =
+            v.open_rack_panels.into_iter().filter(|k| self.rack_panel_key_valid(*k)).collect();
+        self.cur.view.open_rack_panels = open_rack_panels.into_iter().collect();
+        // r.md #158: 知らない id (新しい版が足した帯) は捨てる。
+        self.cur.view.inspector_folds =
+            crate::state::inspector_view::InspectorFolds::from_ids(&v.inspector_collapsed, &v.inspector_open_details);
         // レーン行高は `after_song_replaced` が前 project ぶんを消した後にここで入れ直す
         // (消えたレーンのキーは捨てる)。下限だけ効かせるのは `track_row_overrides` と同じ。
         self.cur.view.automation_lane_row_overrides = v

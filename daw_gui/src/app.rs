@@ -198,6 +198,9 @@ impl AppData {
                 master_panel_open: app_config.master_panel_open,
                 master_panel_w: app_config.master_panel_w,
                 master_panel_sections: app_config.master_panel_sections,
+                // r.md #158: トラックインスペクタの表示 / 幅 (load 側でクランプ済)。
+                inspector_open: app_config.inspector_open,
+                inspector_w: app_config.inspector_w,
                 meter_settings: app_config.meter,
                 // r.md #75: VOICEVOX 合成の塊の長さ (秒)。load 側でクランプ済。
                 voicevox_chunk_secs: app_config.voicevox_chunk_secs,
@@ -1015,6 +1018,7 @@ impl AppData {
             AppEvent::AudioRec(ev) => self.handle_audio_rec_event(ev),
             AppEvent::AudioDevice(ev) => self.handle_audio_device_event(ev),
             AppEvent::VirtualKeyboard(ev) => self.handle_virtual_keyboard_event(ev),
+            AppEvent::Inspector(ev) => self.handle_inspector_event(ev),
             AppEvent::SelectClip { target, additive } => {
                 self.select_clip(target, additive);
             }
@@ -1748,10 +1752,6 @@ impl AppData {
                 self.end_text_pip_drag_recording();
                 self.cur.song_doc.end_gesture(GestureOwner::TextPipDrag);
             }
-            AppEvent::SetClipTextMuted { target, muted } => {
-                // 字幕 clip mute も clip-level `Clip.muted` に一本化。
-                self.set_clip_muted(target, muted);
-            }
             AppEvent::SetClipTextContent { target, value } => {
                 self.set_clip_text_event_content(target, value);
             }
@@ -1917,8 +1917,6 @@ impl AppData {
                         },
                         DiscreteClipEdit::ImageFlipH(v) => self.set_clip_image_event_flip_h(t, v),
                         DiscreteClipEdit::ImageFlipV(v) => self.set_clip_image_event_flip_v(t, v),
-                        // 字幕 inspector の "Mute" も clip-level `Clip.muted` に一本化。
-                        DiscreteClipEdit::TextMuted(v) => self.set_clip_muted(t, v),
                         DiscreteClipEdit::TextAlign(a) => self.set_clip_text_event_align(t, a),
                         DiscreteClipEdit::TextFadeCurve(edge, c) => match edge {
                             FadeEdgeKind::In => self.set_clip_text_event_fade_in_curve(t, c),
@@ -2005,8 +2003,8 @@ impl AppData {
                     }
                 }
             }
-            AppEvent::SetClipVoice { clip, speaker_id, singer_name, style_name } => {
-                self.set_clip_voice(clip, speaker_id, singer_name, style_name);
+            AppEvent::SetClipVoice { clips, speaker_id, singer_name, style_name } => {
+                self.set_clip_voice(&clips, speaker_id, singer_name, style_name);
             }
             AppEvent::RefetchSingers => {
                 self.spawn_fetch_singers();
@@ -2018,8 +2016,8 @@ impl AppData {
             AppEvent::RefetchSpeakers => {
                 self.spawn_fetch_speakers();
             }
-            AppEvent::SetClipTalkParam { clip, param, value } => {
-                self.set_clip_talk_param(clip, param, value);
+            AppEvent::SetClipTalkParam { clips, param, value } => {
+                self.set_clip_talk_param(&clips, param, value);
             }
             AppEvent::SetClipTextReads { clip, reads } => self.set_clip_text_reads(clip, reads),
             AppEvent::SetPianoRollSnapEnabled(b) => {

@@ -5,7 +5,6 @@ use super::super::*;
 use super::{PanelCtx, opened_plugin_is};
 
 pub(super) fn draw_lipsync_target(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: PanelCtx) -> f32 {
-    let p = &app.theme.core;
     let mut y = ctx.y;
     let device_id = ctx.device_id;
     // カーソルトラックの index。 None なら描かない (track 0 を誤対象にしない)。
@@ -21,8 +20,8 @@ pub(super) fn draw_lipsync_target(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: 
     // ---- 口パク (lip-sync) 出力先 binding ----------------------------
     // Vocal track のみ。生成した口画像 ImageEvent を焼き込む先の口 track
     // (立ち絵 group の子 image track) を選ぶ。設定で再生成が走る。
-    // VOICEVOX device の「Par」を押したときだけ出す (= 専用欄を常時
-    // 表示せず Par パネルに集約。声 / 話速 / 口パク先をまとめて 1 箇所で編集)。
+    // VOICEVOX device の「Par」を押したときだけ出す。口パク先はトラック (デバイス) の設定なので Par に
+    // 残す (クリップごとの声 / 話速はクリップの帯、r.md #158)。
     if opened_plugin_is(app, device_id, common::plugin_db::BUILTIN_ID_VOICEVOX)
         && let Some(track) = cursor_idx.and_then(|i| app.cur.song_doc.song().tracks.get(i))
         && track.is_voicevox_vocal()
@@ -38,21 +37,10 @@ pub(super) fn draw_lipsync_target(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: 
             candidate_ids.push(t.id);
             labels.push(t.display_name(i).into_owned());
         }
-        ui.label_at(
-            ("inspector_lipsync_target_label", device_id),
-            "口パク出力先",
-            ctx.x,
-            y,
-            12.0,
-            p.text,
-        );
-        y += 18.0;
-        let dropdown_rect = Rect {
-            x: ctx.x,
-            y,
-            w: ctx.w,
-            h: 24.0,
-        };
+        // 「口パク先 [トラック ▾]」の 1 行 (r.md #158 仕様 9: Par の中も ラベル左・値右)。
+        let c = ctx.cols();
+        super::super::form::label(ui, app, ("inspector_lipsync_target_label", device_id), vocab::FIELD_LIPSYNC_TARGET, &c, y);
+        let dropdown_rect = c.value(y);
         let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
         let selected_idx = match track.lipsync_target_track {
             None => 0,
@@ -80,7 +68,7 @@ pub(super) fn draw_lipsync_target(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: 
                 });
             }));
         }
-        y += 30.0;
+        y += super::super::layout::FORM_ROW_PITCH;
     }
     y
 }

@@ -18,7 +18,9 @@ use daw_ui_core::{Edit, MsegEditorStyle, ScrubableNumberFormat, ScrubableNumberS
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
+use crate::event_inspector::InspectorEvent;
 use crate::state::ModRackHover;
+use crate::state::inspector_view::InspectorBand;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
 
 use bodies::{draw_follower_body, draw_mseg_body, draw_random_body, draw_steps_body};
@@ -132,7 +134,8 @@ fn song_secs_at_beat(app: &AppData, beat: f64) -> f64 {
 /// モジュレーションラックを **スクロール viewport の top-down
 /// フロー** で描く (旧: 下端 pinned・2 個 cap)。各ソースは折りたたみ行で、クリックで
 /// クリックで大きなグラフィカルエディタに展開する (`app.cur.peph.expanded_mod_sources`、 複数同時可)。
-/// 戻り値は描画後の `y`。
+/// 戻り値は `(描画後の y, Q の宛先 = ポインタ下のモジュレーター / routing 行)`。 見出しと追加メニューは
+/// モジュレーションの帯 (r.md #158、 [`draw_add_source_menu`])、 hover の公開は `track_inspector::draw` の末尾。
 #[allow(clippy::too_many_lines)]
 pub(super) fn draw_modulation_rack(
     app: &AppData,
@@ -140,7 +143,7 @@ pub(super) fn draw_modulation_rack(
     area: Rect,
     pad: f32,
     mut y: f32,
-) -> f32 {
+) -> (f32, Option<ModRackHover>) {
     use common::model::ModSourceKind as K;
 
     let p = &app.theme.core;
@@ -174,32 +177,6 @@ pub(super) fn draw_modulation_rack(
         secs,
     };
 
-    ui.label_at("inspector_mod_label", "Modulation", lx, y, 12.0, p.text);
-    // [+ ▾] add-menu — 種別を選んで作成。
-    {
-        let add_w = 64.0;
-        let add_rect = Rect { x: area.x + area.w - pad - add_w, y: y - 2.0, w: add_w, h: 20.0 };
-        // 先頭は現在の選択として表示されるラベル。 dropdown widget が右端に
-        // シェブロンを描くので、 ここに `\u{25be}` を入れると下矢印が二重になる → "+" のみ。
-        let add_labels = ["+", "Follow", "LFO", "Random", "MSEG", "Steps", "ADSR"];
-        if let Some(picked) = ui.dropdown("inspector_mod_add_src", add_rect, &add_labels, 0)
-            && picked > 0
-        {
-            let tag = match picked {
-                1 => crate::app::ModSourceKindTag::Follower,
-                2 => crate::app::ModSourceKindTag::Lfo,
-                3 => crate::app::ModSourceKindTag::Random,
-                4 => crate::app::ModSourceKindTag::Mseg,
-                5 => crate::app::ModSourceKindTag::Steps,
-                _ => crate::app::ModSourceKindTag::Adsr,
-            };
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::AddModSource { kind: tag });
-            }));
-        }
-    }
-    y += 24.0;
-
     let mod_track_choices = app.mod_source_track_choices();
     let mod_track_labels: Vec<&str> = mod_track_choices.iter().map(|(_, l)| l.as_str()).collect();
     let mut any_mod_drag = false;
@@ -213,8 +190,9 @@ pub(super) fn draw_modulation_rack(
         let sid = src.id;
         let expanded = app.cur.peph.expanded_mod_sources.contains(&sid);
         let block_top = y;
-        // バイパス中は名前 / メーターを減光 (プラグイン行の bypass と同じ見せ方)。
-        let ink = if src.enabled { p.text } else { p.text_faint };
+        // バイパス中は名前を text_dim にしてメーターの位置に「オフ」の札 (Rack の行の bypass と同じ見せ方、
+        // r.md #158 仕様 10: disabled の text_faint で薄くすると「使えない部品」に見える)。
+        let ink = if src.enabled { p.text } else { p.text_dim };
 
         // --- header row: [▶/▼][name/track] [meter] [arm] [×] ---
         //
@@ -224,9 +202,14 @@ pub(super) fn draw_modulation_rack(
         let rm_rect = Rect { x: area.x + area.w - pad - 20.0, y, w: 20.0, h: 20.0 };
         let meter_w = 50.0;
         let meter_x = rm_rect.x - 4.0 - meter_w;
-        let filled = ((src.scalar.clamp(0.0, 1.0) * 6.0).round() as usize).min(6);
-        let meter: String = "\u{25ae}".repeat(filled) + &"\u{25af}".repeat(6 - filled);
-        ui.label_at(("inspector_mod_src_meter", sid), &meter, meter_x, y + 4.0, 11.0, ink);
+        if src.enabled {
+            let filled = ((src.scalar.clamp(0.0, 1.0) * 6.0).round() as usize).min(6);
+            let meter: String = "\u{25ae}".repeat(filled) + &"\u{25af}".repeat(6 - filled);
+            ui.label_at(("inspector_mod_src_meter", sid), &meter, meter_x, y + 4.0, 11.0, ink);
+        } else {
+            let tag_x = meter_x + (meter_w - super::chain_list::off_tag_w(ui)) * 0.5;
+            super::chain_list::draw_off_tag(app, ui, ("mod_src", sid), tag_x, y, ROW_H);
+        }
         let arm_w = 24.0;
         let arm_x = meter_x - 4.0 - arm_w;
         let node = plan.nodes.iter().find(|n| n.source_id == sid);
@@ -247,19 +230,26 @@ pub(super) fn draw_modulation_rack(
         // (r.md #74 で全 disclosure の glyph を `view::disclosure` へ一本化した。
         // 旧実装はここだけ小三角 ▸/▾ を使っていて、 同じ意味のマークが 2 系統
         // 存在していた)。 ▸/▾ と ▶/▼ は既定フォントで advance が同一 (0.527 em)
-        // なので、 族を変えても行のレイアウトは 1px も動かない。
-        ui.button_at(
+        // なので、 族を変えても行のレイアウトは 1px も動かない。r.md #158: 枠の無い glyph だけ (帯の見出し /
+        // Rack の Parallel・chain の行の開閉と同じ形)。当たりは glyph の列 (`MOD_DISCLOSURE_W`) の行の高さ。
+        let glyph_hit = Rect { x: lx, y, w: MOD_DISCLOSURE_W, h: 20.0 };
+        let inside = !ui.has_open_popups() && ui.pointer().pos.is_some_and(|(px, py)| glyph_hit.contains(px, py));
+        if ui.primary_click(daw_ui_core::WidgetId::ROOT.child(("inspector_mod_src_expand", sid)), inside).clicked {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                // multi-expand: 既に開いていれば閉じる、 でなければ追加 (複数同時可)。
+                if !app.cur.peph.expanded_mod_sources.insert(sid) {
+                    app.cur.peph.expanded_mod_sources.remove(&sid);
+                }
+            }));
+        }
+        let glyph_ink = if inside && ui.hovers(glyph_hit) { p.text } else if expanded { p.accent } else { p.text_dim };
+        ui.label_at(
             ("inspector_mod_src_expand", sid),
             disclosure_glyph(!expanded, RevealAxis::Block),
-            Rect { x: lx, y, w: MOD_DISCLOSURE_W, h: 20.0 },
-            move || {
-                Edit::mutate(move |app: &mut AppData| {
-                    // multi-expand: 既に開いていれば閉じる、 でなければ追加 (複数同時可)。
-                    if !app.cur.peph.expanded_mod_sources.insert(sid) {
-                        app.cur.peph.expanded_mod_sources.remove(&sid);
-                    }
-                })
-            },
+            lx + 3.0,
+            y + (20.0 - 9.0 * 1.2) * 0.5,
+            9.0,
+            glyph_ink,
         );
         let name_x = lx + MOD_NAME_INSET;
         // バッジが出ている分だけ名前 / track dropdown を詰める (行は太らせない)。
@@ -330,16 +320,11 @@ pub(super) fn draw_modulation_rack(
             if hit(Rect { x: lx, y, w: row_w, h: ROW_PITCH }) {
                 hover = Some(ModRackHover::Routing(row.id));
             }
-            let g = RoutingRowGeom { area, pad, lx, row_w, y };
+            let g = RoutingRowGeom { area, pad, lx, y };
             any_mod_drag |= draw_routing_row(ui, app, g, &row, sid);
             y += ROW_PITCH;
         }
         y += 4.0;
-    }
-    if hover != app.cur.peph.inspector_hovered_mod {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.cur.peph.inspector_hovered_mod = hover;
-        }));
     }
 
     // drag-end edge で sync (scrub 中は dirty のみ)。
@@ -355,7 +340,33 @@ pub(super) fn draw_modulation_rack(
         any_mod_drag,
     );
 
-    y
+    (y, hover)
+}
+
+/// 見出しの右端の追加メニュー `[+ ▾]` (モジュレーションの帯の見出しに置く、r.md #158)。種別を選ぶと
+/// カーソルのトラックにソースを足し、帯を畳んでいれば同じ Edit の中で開く (足したソースが見出しの直下に出る)。
+pub(super) fn draw_add_source_menu(ui: &mut Ui<'_, AppData>, rect: Rect) {
+    // 先頭は現在の選択として表示されるラベル。 dropdown widget が右端に
+    // シェブロンを描くので、 ここに `\u{25be}` を入れると下矢印が二重になる → "+" のみ。
+    let add_labels = ["+", "Follow", "LFO", "Random", "MSEG", "Steps", "ADSR"];
+    if let Some(picked) = ui.dropdown("inspector_mod_add_src", rect, &add_labels, 0)
+        && picked > 0
+    {
+        let tag = match picked {
+            1 => crate::app::ModSourceKindTag::Follower,
+            2 => crate::app::ModSourceKindTag::Lfo,
+            3 => crate::app::ModSourceKindTag::Random,
+            4 => crate::app::ModSourceKindTag::Mseg,
+            5 => crate::app::ModSourceKindTag::Steps,
+            _ => crate::app::ModSourceKindTag::Adsr,
+        };
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::AddModSource { kind: tag });
+            if !app.inspector_band_open(InspectorBand::Modulation) {
+                app.handle_event(AppEvent::Inspector(InspectorEvent::ToggleBand(InspectorBand::Modulation)));
+            }
+        }));
+    }
 }
 
 /// ヘッダ行の右寄せバッジ。 **判定はしない** — `mod_graph::build_plan` が出した
@@ -410,12 +421,11 @@ fn draw_mod_badges(
     used
 }
 
-/// routing 1 行の配置 (呼び側の y カーソルと幅をそのまま渡す)。
+/// routing 1 行の配置 (呼び側の y カーソルをそのまま渡す。右端は `area` と `pad` から)。
 struct RoutingRowGeom {
     area: Rect,
     pad: f32,
     lx: f32,
-    row_w: f32,
     y: f32,
 }
 
@@ -431,29 +441,31 @@ fn draw_routing_row(
     row: &crate::app::ModRoutingRow,
     sid: u32,
 ) -> bool {
-    let RoutingRowGeom { area, pad, lx, row_w, y: row_y } = g;
+    let RoutingRowGeom { area, pad, lx, y: row_y } = g;
     let p = &app.theme.core;
     // widget id は **1 本の変調の安定 id** (`ModRouting::id`)。 旧実装は全ソースを
     // 通したグローバル連番 `route_i` で、 routing を 1 本消すとそれ以降の行の depth
     // ドラッグ / テキストバッファが 1 つ隣へずれた (不変条件 1)。
     let rid = row.id;
-    ui.label_at_clipped(
-        ("inspector_mod_rt_lbl", rid),
-        &format!("\u{2192} {}", row.label),
-        Rect {
-            x: lx + MOD_NAME_INSET,
-            y: row_y + 4.0,
-            // 右側の depth / 極性 / × と重ねない (幅は下の x 計算と対)。
-            w: (row_w - MOD_NAME_INSET - 4.0 - 46.0 - 4.0 - 22.0 - 4.0 - 20.0).max(1.0),
-            h: 11.0 * 1.2,
-        },
-        11.0,
-        // r.md #115: 効いていない (自分かソースがバイパス中) 行は減光。
-        if row.effective { p.text } else { p.text_faint },
-    );
     let rm_x = area.x + area.w - pad - 20.0;
     let pol_x = rm_x - 4.0 - 22.0;
     let depth_x = pol_x - 4.0 - 46.0;
+    // この 1 本がバイパス中なら depth 欄の左に「オフ」の札 (Rack の行と同じ見せ方、r.md #158 仕様 10)。
+    let mut label_right = depth_x - 4.0;
+    if !row.enabled {
+        label_right -= super::chain_list::off_tag_w(ui) + 4.0;
+        super::chain_list::draw_off_tag(app, ui, ("mod_rt", rid), label_right + 4.0, row_y, ROW_H);
+    }
+    let label_x = lx + MOD_NAME_INSET;
+    ui.label_at_clipped(
+        ("inspector_mod_rt_lbl", rid),
+        &format!("\u{2192} {}", row.label),
+        // 右側の札 / depth / 極性 / × と重ねない。
+        Rect { x: label_x, y: row_y + 4.0, w: (label_right - label_x).max(1.0), h: 11.0 * 1.2 },
+        11.0,
+        // r.md #115: 効いていない (自分かソースがバイパス中) 行は text_dim (disabled の text_faint にはしない)。
+        if row.effective { p.text } else { p.text_dim },
+    );
     let (t, s) = (row.track_id, sid);
     let tgt = row.target.clone();
     // r.md #89 Q9: **深さ欄も普通のツマミ**として扱う (◉ 待受中にドラッグすれば

@@ -358,6 +358,14 @@ pub const NATIVE_DELAY_PICKER_ID: &str = "builtin://daw_01.native.delay";
 /// `def_by_id` 未ヒットで素通り)。
 pub const SUBTITLE_ID: &str = "builtin.video.subtitle";
 
+/// 字幕デバイス ([`SUBTITLE_ID`] の builtin) か。映像 device だが Par を持たない (字幕の文字と書式は
+/// daw_gui のインスペクタのクリップの帯で編集する、r.md #158)。「Par を開けるか / 開いた Par を覚えるか /
+/// param パネルを組むか」の判定はこの 1 本を通す。
+#[must_use]
+pub fn is_subtitle(format: PluginFormat, plugin_id: &str) -> bool {
+    format == PluginFormat::Builtin && plugin_id == SUBTITLE_ID
+}
+
 /// Returns the canonical list of daw_01-bundled plugin descriptors.
 /// `scan_system` appends these unconditionally so the picker UI sees
 /// them on every fresh scan. Order here is the order the picker
