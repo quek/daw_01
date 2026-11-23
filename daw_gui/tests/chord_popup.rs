@@ -119,7 +119,11 @@ fn typing_a_name_and_enter_sets_the_chord() {
     assert!(app.cur.peph.chord_band.popup.is_none(), "Enter で閉じる");
 }
 
-/// → で隣の箱へ移り、最後の箱で Tab を押すと同じ長さの箱が後ろに足されてそこへ移る。
+fn popup_box(app: &AppData) -> Option<u32> {
+    app.cur.peph.chord_band.popup.as_ref().and_then(|p| p.box_id())
+}
+
+/// → で隣の箱へ移り、最後の箱で Tab を押すと同じ長さの置く前の箱が後ろに開き、Enter でそこに置かれる。
 #[test]
 fn arrows_move_between_boxes_and_tab_appends() {
     let (mut app, _a, _p) = build_app();
@@ -127,19 +131,65 @@ fn arrows_move_between_boxes_and_tab_appends() {
     let b = place(&mut app, 2.0, 2.0, Chord::new(7, ChordKind::Major));
     let mut h = host();
     open_on(&mut h, &mut app, 1.0);
-    assert_eq!(app.cur.peph.chord_band.popup.as_ref().map(|p| p.chord_id), Some(a));
+    assert_eq!(popup_box(&app), Some(a));
     run(&mut h, &mut app, PointerFrame::default(), vec![key(PhysicalKey::ArrowRight)]);
     idle(&mut h, &mut app);
-    assert_eq!(app.cur.peph.chord_band.popup.as_ref().map(|p| p.chord_id), Some(b), "→ で隣の箱");
+    assert_eq!(popup_box(&app), Some(b), "→ で隣の箱");
     run(&mut h, &mut app, PointerFrame::default(), vec![key(PhysicalKey::Tab)]);
     idle(&mut h, &mut app);
-    let song = app.cur.song_doc.song();
-    assert_eq!(song.chords.len(), 3, "Tab で 1 つ足される");
-    let added = &song.chords[2];
-    assert_eq!((added.start_beat, added.len_beats), (4.0, 2.0));
-    assert_eq!(added.chord, Chord::new(0, ChordKind::Major), "G の次の候補の先頭 (C) が入る");
-    assert_eq!(app.cur.peph.chord_band.popup.as_ref().map(|p| p.chord_id), Some(added.id));
+    assert_eq!(app.cur.song_doc.song().chords.len(), 2, "r.md #159: Tab の行き先は選ぶまで曲に入らない");
+    let draft = app.cur.peph.chord_band.popup.as_ref().and_then(|p| p.draft()).expect("Tab で置く前の箱が開く");
+    assert_eq!((draft.start_beat, draft.len_beats), (4.0, 2.0));
+    assert_eq!(draft.chord, Chord::new(0, ChordKind::Major), "G の次の候補の先頭 (C) を出す");
     assert_eq!(app.cur.view.launcher_layout, common::model::LauncherLayout::ArrangerOnly, "Tab がランチャー帯の巡回に食われない");
+    run(&mut h, &mut app, PointerFrame::default(), vec![key(PhysicalKey::Enter)]);
+    idle(&mut h, &mut app);
+    let song = app.cur.song_doc.song();
+    assert_eq!(song.chords.len(), 3, "Enter で出しているコードに決めて置く");
+    let added = &song.chords[2];
+    assert_eq!((added.start_beat, added.len_beats, added.chord), (4.0, 2.0, Chord::new(0, ChordKind::Major)));
+}
+
+/// r.md #159: 空きのダブルクリックで開いた置く前の箱は、コードを選んだ時点で置かれる (Enter = 出しているコード、
+/// 打った名前ならその名前)。置くのは 1 undo step。
+#[test]
+fn choosing_a_chord_places_the_draft() {
+    let (mut app, _a, _p) = build_app();
+    let mut h = host();
+    let depth = app.cur.song_doc.undo_depth();
+    open_on(&mut h, &mut app, 2.0);
+    assert!(app.cur.song_doc.song().chords.is_empty(), "開いただけでは置かない");
+    run(&mut h, &mut app, PointerFrame::default(), typed("Am7"));
+    run(&mut h, &mut app, PointerFrame::default(), vec![key(PhysicalKey::Enter)]);
+    idle(&mut h, &mut app);
+    let song = app.cur.song_doc.song();
+    assert_eq!(song.chords.len(), 1);
+    assert_eq!((song.chords[0].start_beat, song.chords[0].chord), (2.0, Chord::new(9, ChordKind::Minor7)));
+    assert_eq!(app.cur.selection.selected_chord_ids, vec![song.chords[0].id]);
+    assert_eq!(app.cur.song_doc.undo_depth(), depth + 1);
+    assert!(app.cur.peph.chord_band.popup.is_none());
+}
+
+/// r.md #159: 置く前の箱は、選ばずに閉じる (Esc) / ←→ で離れると何も残さない (箱も undo step も `*` も)。
+#[test]
+fn leaving_a_draft_without_choosing_leaves_nothing() {
+    let (mut app, _a, _p) = build_app();
+    let a = place(&mut app, 0.0, 2.0, Chord::new(0, ChordKind::Major));
+    app.cur.song_doc.mark_saved();
+    let depth = app.cur.song_doc.undo_depth();
+    let mut h = host();
+    open_on(&mut h, &mut app, 4.0);
+    run(&mut h, &mut app, PointerFrame::default(), vec![key(PhysicalKey::Escape)]);
+    idle(&mut h, &mut app);
+    assert!(app.cur.peph.chord_band.popup.is_none(), "Esc で閉じる");
+    assert_eq!(app.cur.song_doc.song().chords.len(), 1, "閉じたら置く前の箱は残らない");
+    open_on(&mut h, &mut app, 4.0);
+    run(&mut h, &mut app, PointerFrame::default(), vec![key(PhysicalKey::ArrowLeft)]);
+    idle(&mut h, &mut app);
+    assert_eq!(popup_box(&app), Some(a), "← で前の箱へ");
+    assert_eq!(app.cur.song_doc.song().chords.len(), 1, "離れたら置く前の箱は残らない");
+    assert_eq!(app.cur.song_doc.undo_depth(), depth);
+    assert!(!app.cur.song_doc.is_dirty());
 }
 
 /// Instrument Input: 開く前に弾いた和音は拾わず、開いている間に弾き終えた和音 (通し番号が進む) は箱に入る。

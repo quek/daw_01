@@ -110,13 +110,17 @@
 - **帯**: Arranger 帯 (`widgets/arrangement/` の `arranger_rect` / `SECTION_LANE_H`) の直下に同じ流儀でコード帯を足す。
   描画・hit・ドラッグの session は新しいファイル (`widgets/arrangement/chord_lane*.rs`) に置き、既存ファイルには呼び出しだけ
   足す (`draw.rs` / `geometry.rs` / `mod.rs` は budget 超過、`release.rs` / `view_build.rs` / `arrangement_view.rs` は上限間近)。
-- **操作** (Arranger 帯・クリップと同じ感触): 空きのダブルクリックで 1 小節の箱を作る (範囲選択があればその長さ) /
+- **操作** (Arranger 帯・クリップと同じ感触): 空きのダブルクリックで 1 小節の箱のポップアップを開く (範囲選択があればその長さ。
+  置くのはコードを選んだとき、下の「ポップアップ」) /
   箱のドラッグで移動 (複数選択は相対位置を保つ) / 端のドラッグで伸縮 (Studio One: 境界の下半分は隣と連動、上半分は単独。
   Alt ドラッグで複数選択を比例伸縮) / Ctrl+ドラッグで複製 / Cut・Copy・Paste (OS クリップボード、`ChordTrackEvent::PlaceMany`) /
   Delete / 矩形・Shift・Ctrl の選択 (`state/selection.rs`、Delete 等は last-selection-wins) / snap は既存の `view.snap`。
 - **ポップアップ** (Q4): `open_overlay` 系 (再生継続)。文字入力は `common::chord_name::parse_chord`、読めない間は確定しない。
-  r.md #159: そのポップアップで作った箱 (空きのダブルクリック / Tab) のコードを決めるのは「置く」(`ChordTrackEvent::Recast`、
-  閉じるまで ←→ で戻っても同じ)、ほかの箱のコードを変えるのは「書き換え」(`SetChord`)。
+  r.md #159: 空きのダブルクリック / Tab で開くのは**置く前の箱** (`PopupTarget::Draft`、曲にはまだ無く、帯にはゴーストの枠)。
+  コードを選んだ時点 (ボタン / 候補 / ↑↓ / 鍵盤 / Enter・Tab は出しているコードで決める) で置き (`Place`、1 undo step)、
+  選ばずに閉じる / ←→ で離れると何も残さない — 見えている箱はどれも自分で選んだコードになる (2026-11-23 ユーザー決定)。
+  そのポップアップで置いた箱のコードを決め直すのは「置く」(`ChordTrackEvent::Recast`、閉じるまで ←→ で戻っても同じ)、
+  ほかの箱のコードを変えるのは「書き換え」(`SetChord`)。
   五度圏の輪 (クリックでルート、同じ位置の再クリックで異名同音 `Spelling`) / 種類 (`ChordKind::ALL`) / テンション
   (`Tensions::ALL`) / ベース。**次のコードの候補**: 直前のコードとキーから (ダイアトニック / 五度圏の近さ / 終止形) を並べ、
   上下キーで巡回。←→ で隣の箱、Tab で次の箱を追加。変更のたびに試聴の口 (`c157-tools` が用意、§4) を呼ぶ。

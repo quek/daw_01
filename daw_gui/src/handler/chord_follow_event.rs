@@ -357,10 +357,13 @@ mod tests {
     fn placing_in_the_popup_keeps_the_melody_and_rewriting_moves_it() {
         let mut app = crate::test_support::headless_app();
         let (piano, melody) = piano_and_melody(&mut app, ChordFollow::Parallel);
-        app.create_chord_box(0.0, 4.0);
+        let depth = app.cur.song_doc.undo_depth();
+        app.open_chord_draft(0.0, 4.0);
+        assert!(app.cur.song_doc.song().chords.is_empty(), "選ぶまで曲に箱は無い");
         app.chord_popup_typed("Am".into());
         app.chord_popup_enter();
         assert_eq!(app.chord_popup_id(), None, "Enter で閉じる");
+        assert_eq!(app.cur.song_doc.undo_depth(), depth + 1, "置くのは 1 undo step");
         assert_eq!(sounding(&app, piano), vec![57, 61, 64]);
         assert_eq!(sounding(&app, melody), vec![76, 77, 79, 81], "置いただけではメロディーは動かない");
         let id = app.cur.song_doc.song().chords[0].id;
@@ -381,7 +384,7 @@ mod tests {
     fn going_back_to_a_box_made_in_the_same_popup_still_places_it() {
         let mut app = crate::test_support::headless_app();
         let (_, melody) = piano_and_melody(&mut app, ChordFollow::Parallel);
-        app.create_chord_box(0.0, 2.0);
+        app.open_chord_draft(0.0, 2.0);
         app.chord_popup_typed("C".into());
         app.chord_popup_tab();
         app.chord_popup_typed("Am".into());

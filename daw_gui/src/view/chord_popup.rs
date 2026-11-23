@@ -4,6 +4,8 @@
 //! - 五度圏の輪 (ルート、同じ位置の再クリックで異名同音) / 種類 / テンション / ベースのボタン。
 //! - 次のコードの候補 (`AppData::chord_popup_candidates`)、↑↓ で巡回。
 //! - ←→ で隣の箱 (入力欄を打ち換えている間は caret 移動に譲る)、Tab で次の箱を追加、外クリック / Esc で閉じる。
+//! - 空きのダブルクリック / Tab で開くのは置く前の箱 (r.md #159、曲にはまだ無い): コードを選ぶ (ボタン / 候補 / ↑↓ /
+//!   鍵盤 / Enter・Tab でそのまま決める) と置く。選ばずに閉じる / ←→ で離れると何も残さない。
 //!
 //! - 開いている間に MIDI 鍵盤で和音を弾くと、そのコードを箱に入れる (Studio One の Instrument Input、
 //!   和音のまとめは c157-tools の `ChordToolsState::played`)。
@@ -36,7 +38,8 @@ const FONT: f32 = 11.0;
 pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>) {
     let popup = app.cur.peph.chord_band.popup.as_ref();
     let lane = app.cur.peph.chord_band.lane;
-    let ev = popup.and_then(|p| app.cur.song_doc.song().chord_by_id(p.chord_id));
+    // 置く前の箱 (r.md #159) は位置と入力欄のコードから作った値。
+    let ev = popup.and_then(|_| app.chord_popup_event());
     // 箱が消えた (undo / 削除) / 帯を隠した → 閉じる。
     let (Some(popup), Some(ev)) = (popup, ev.filter(|_| lane.rect.h > 0.0)) else {
         if ui.is_overlay_open(OVERLAY_ID) {
@@ -59,8 +62,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>) {
     if app.cur.chord_tools.played.is_some_and(|(_, seq)| seq != popup.played_seen) {
         ui.push_edit(Edit::mutate(|app: &mut AppData| app.chord_popup_take_played()));
     }
-    let (id, rev, typed, text, candidate) = (popup.chord_id, popup.rev, popup.typed, popup.text.clone(), popup.candidate);
-    let ev = ev.clone();
+    let (id, rev, typed, text, candidate) = (popup.box_id(), popup.rev, popup.typed, popup.text.clone(), popup.candidate);
     ui.popup_layer(("overlay", OVERLAY_ID), |ui| {
         let p = &app.theme.core;
         ui.panel_with_border("chord_popup_bg", rect, p.panel_raised, p.border, 1.0, 6.0);
@@ -72,7 +74,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>) {
         let y = tensions(ui, Rect { y, ..right }, &ev.chord, p);
         bass(ui, Rect { y, ..right }, &ev, p);
         let cand_y = body_y + WHEEL + PAD;
-        candidates(app, ui, Rect { x: rect.x + PAD, y: cand_y, w: W - PAD * 2.0, h: ROW_H }, candidate);
+        candidates(app, ui, Rect { x: rect.x + PAD, y: cand_y, w: W - PAD * 2.0, h: ROW_H }, candidate, ev.start_beat);
         ui.label_at("chord_popup_hint", "←→ 隣のコード  Tab 次を追加  ↑↓ 候補  Enter 確定  Esc 閉じる", rect.x + PAD, cand_y + ROW_H + 6.0, 10.0, p.text_dim);
     });
     // Esc は root の Esc の連鎖が譲ってくれる (ポップアップが開いている間は消費しない) ので、ここで取って閉じる。
@@ -86,7 +88,8 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>) {
 }
 
 /// 入力欄の行。欄より先に ←→ / Tab の押下を取り出す (打ち換えている間の ←→ は caret 移動に譲る)。
-fn text_row(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, (id, rev, typed): (u32, u32, bool), text: &str) {
+/// `id` = 編集中の箱 (置く前の箱なら `None`。置いた時点で欄を作り直す)。
+fn text_row(app: &AppData, ui: &mut Ui<'_, AppData>, rect: Rect, (id, rev, typed): (Option<u32>, u32, bool), text: &str) {
     let p = &app.theme.core;
     let input_id = ("chord_popup_text", id, rev);
     let wid = WidgetId::ROOT.child((b"text_input", &input_id));
@@ -229,11 +232,10 @@ fn bass(ui: &mut Ui<'_, AppData>, r: Rect, ev: &ChordEvent, p: &crate::theme::Pa
 }
 
 /// 次のコードの候補 (クリックでその候補を入れる、↑↓ の巡回と同じ並び)。
-fn candidates(app: &AppData, ui: &mut Ui<'_, AppData>, r: Rect, selected: Option<usize>) {
+fn candidates(app: &AppData, ui: &mut Ui<'_, AppData>, r: Rect, selected: Option<usize>, start_beat: f64) {
     let p = &app.theme.core;
     let style = toggle_style(p);
     ui.label_at("chord_popup_cand_label", "候補", r.x, r.y + 5.0, FONT, p.text_dim);
-    let start_beat = app.chord_popup_id().and_then(|id| app.cur.song_doc.song().chord_by_id(id)).map_or(0.0, |c| c.start_beat);
     let list = app.chord_popup_candidates();
     let x0 = r.x + 32.0;
     let bw = ((r.w - 32.0) / common::chord_suggest::MAX_SUGGESTIONS as f32).max(1.0);

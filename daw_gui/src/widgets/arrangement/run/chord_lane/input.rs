@@ -273,7 +273,8 @@ pub(super) fn double_click(ui: &mut Ui<'_, AppData>, app: &AppData, f: &Arrangem
         .map(|t| t.end_beat - t.start_beat)
         .filter(|l| *l > 0.0)
         .unwrap_or_else(|| beats_per_bar(f.view.time_sig));
-    ui.push_edit(Edit::mutate(move |app: &mut AppData| app.create_chord_box(start, len)));
+    // 曲にはまだ置かない (コードを選んだ時点で置く。r.md #159、`PopupTarget::Draft`)。
+    ui.push_edit(Edit::mutate(move |app: &mut AppData| app.open_chord_draft(start, len)));
 }
 
 pub(super) fn secondary_click(ui: &mut Ui<'_, AppData>, f: &ArrangementFrame<'_>) {

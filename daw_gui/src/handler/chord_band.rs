@@ -1,4 +1,4 @@
-//! handler::chord_band — コードトラックの帯の選択 / 作成 / ポップアップ / メニューの口 (r.md #157 §3.1)。
+//! handler::chord_band — コードトラックの帯の選択 / ポップアップ / メニューの口 (r.md #157 §3.1)。
 //!
 //! 箱の編集そのものは `AppEvent::Chord` (`handler::chord_event`) を通す — ここから Song を直接
 //! 書かない (undo / dirty / 子プロセス sync は `edit_song` の唯一の口)。ここが持つのは選択
@@ -6,8 +6,7 @@
 
 use common::model::{Chord, ChordKind};
 
-use crate::app::{AppEvent, EditSurface};
-use crate::event_chord::ChordTrackEvent;
+use crate::app::EditSurface;
 use crate::state::AppData;
 use crate::widgets::select_modifier::{SelectModifier, range_ordered};
 
@@ -95,24 +94,8 @@ impl AppData {
         self.set_chord_selection(ids);
     }
 
-    /// 空きのダブルクリック: `[start, start + len)` に箱を作り、選んでポップアップを開く。
-    /// 中身はその位置のキーのトニックの 3 和音 (キーが無ければ C) — 開いたポップアップでコードを決める前提で、
-    /// 決めるのは「置く」(r.md #159、メロディーは動かない。`ChordPopup::placing`)。
-    pub(crate) fn create_chord_box(&mut self, start: f64, len: f64) {
-        let chord = self.default_chord_at(start);
-        self.handle_event(AppEvent::Chord(ChordTrackEvent::Place { start, len, chord }));
-        let Some(id) = self.cur.song_doc.song().chord_at(start).filter(|c| c.start_beat == start).map(|c| c.id) else {
-            return;
-        };
-        self.set_chord_selection(vec![id]);
-        self.cur.selection.chord_anchor = Some(id);
-        // ダブルクリックで作るたびに、作った箱だけを「置いている最中」とするポップアップとして開き直す。
-        self.close_chord_popup();
-        self.open_chord_popup(id);
-        self.mark_chord_popup_placing(id);
-    }
-
-    /// `beat` の位置のキーのトニックの 3 和音 (短 3 度を持つスケールなら minor)。
+    /// `beat` の位置のキーのトニックの 3 和音 (短 3 度を持つスケールなら minor)。空きのダブルクリックで開く置く前の
+    /// 箱が出すコード (`AppData::open_chord_draft`)。
     #[must_use]
     pub(crate) fn default_chord_at(&self, beat: f64) -> Chord {
         self.cur.song_doc.song().scale_at(beat).map_or(Chord::new(0, ChordKind::Major), |k| {
