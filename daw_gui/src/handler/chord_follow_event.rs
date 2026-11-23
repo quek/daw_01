@@ -500,6 +500,35 @@ mod tests {
         assert_eq!(app.preview_key(track_id, 62), Some(62), "曲全体のスイッチを切ると弾いた音");
     }
 
+    /// r.md #159 Q2: 最寄りのコード音で追従するトラックで録ると、モニターで聴いた (寄せた) 音が録れ、再生でもその音で
+    /// 鳴る。押している間にコードの箱をまたいでも、離した鍵盤 (弾いた鍵盤) でノートの長さが確定する。
+    #[test]
+    fn recording_writes_the_note_heard_in_the_monitor() {
+        let mut app = crate::test_support::headless_app();
+        let track_id = app.cur.song_doc.song().tracks[0].id;
+        app.edit_song(|song| {
+            for t in &mut song.tracks {
+                t.armed = t.id == track_id;
+                t.follow_chords = if t.id == track_id { ChordFollow::Narrow } else { ChordFollow::Off };
+            }
+            song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 2.0, chord: Chord::new(9, ChordKind::Minor), color: None });
+            song.place_chord(ChordEvent { id: 0, start_beat: 2.0, len_beats: 2.0, chord: Chord::new(5, ChordKind::Major), color: None });
+        });
+        app.cur.recording.live = true;
+        app.cur.transport.playhead_beat = Some(0.0);
+        // Am の上の D (62) は同距離の C / E のうち上の E へ寄って聞こえる。
+        assert_eq!(app.preview_key(track_id, 62), Some(64));
+        app.handle_event(AppEvent::MidiNoteOn { channel: 0, pitch: 62, velocity: 100 });
+        app.cur.transport.playhead_beat = Some(3.0); // F の箱へ (F の上なら D は寄らない)
+        app.handle_event(AppEvent::MidiNoteOff { channel: 0, pitch: 62 });
+        let song = app.cur.song_doc.song();
+        let clip = song.track_by_id(track_id).and_then(|t| t.clips.first()).expect("録ったクリップ");
+        let notes = song.clip_notes(clip);
+        assert_eq!(notes.iter().map(|n| (n.pitch, n.duration_beats)).collect::<Vec<_>>(), vec![(64, 3.0)]);
+        let keys = app.clip_sounding_keys(track_id, clip.id).expect("keys");
+        assert_eq!(keys.key(&notes[0]), Some(64), "再生でも聴いた音");
+    }
+
     /// 既にあるノートの試聴 (↑↓ で音程を動かしたとき) は playhead ではなく **そのノートの位置のコード** で鳴る
     /// (ピアノロールの薄い枠と同じ鍵盤)。演奏入力 (`preview_key`) は playhead のコードのまま。
     #[test]
