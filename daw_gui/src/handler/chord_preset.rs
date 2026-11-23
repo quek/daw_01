@@ -44,6 +44,22 @@ impl AppData {
         }
     }
 
+    /// キーボードの ↑↓: 選んでいる箱を移調し、移調後のいちばん左の箱を試聴する (耳で確かめながら動かす。
+    /// ノートの ↑↓ と同じ)。
+    pub(crate) fn nudge_selected_chords(&mut self, semitones: i32) {
+        self.transpose_selected_chords(semitones);
+        let song = self.cur.song_doc.song();
+        let first = self
+            .live_chord_ids()
+            .into_iter()
+            .filter_map(|id| song.chord_by_id(id))
+            .min_by(|a, b| a.start_beat.total_cmp(&b.start_beat))
+            .map(|c| c.id);
+        if let Some(id) = first {
+            self.audition_chord_box(id);
+        }
+    }
+
     /// プリセットに保存: 選んでいる箱 (選択が無ければ全部) を書き出す先を選ばせる。
     pub(crate) fn begin_save_chord_preset(&mut self) {
         let mut ids = self.live_chord_ids();

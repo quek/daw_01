@@ -6,8 +6,25 @@
 use daw_ui_core::{Edit, Ui};
 use daw_ui_renderer::Rect;
 
-use crate::app::{AppData, AppEvent, ColorPickerTarget};
+use crate::app::{AppData, AppEvent, ColorPickerTarget, EditSurface};
 use crate::event_chord::ChordTrackEvent;
+
+/// ↑↓ = 選んでいる箱を半音上 / 下へ移調する。**対象面が帯 (`EditSurface::Chords`) のときだけ消費する** —
+/// ノートの ↑↓ (`root::dispatch_note_nudge`) と同じバインドを面で振り分ける (last-selection-wins、
+/// `AppData::edit_surface`)。Shift+↑↓ (ノートのオクターブ) はコードには割り当てない。
+pub(crate) fn dispatch_keys(ui: &mut Ui<'_, AppData>, surface: Option<EditSurface>) {
+    if !matches!(surface, Some(EditSurface::Chords)) {
+        return;
+    }
+    // 押しっぱなしで 1 フレームに複数回積まれる分をまとめる (上限は `dispatch_note_nudge` と同じ)。
+    const MAX_REPEATS_PER_FRAME: usize = 64;
+    for (name, dir) in [("daw.nudge_note_up", 1_i32), ("daw.nudge_note_down", -1)] {
+        let n = i32::try_from(ui.take_shortcut_count(name).min(MAX_REPEATS_PER_FRAME)).unwrap_or(0);
+        if n > 0 {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| app.nudge_selected_chords(dir * n)));
+        }
+    }
+}
 
 /// 箱の上のメニュー。並びは [`run_box_item`] の index と対。
 const BOX_ITEMS: [&str; 8] = [

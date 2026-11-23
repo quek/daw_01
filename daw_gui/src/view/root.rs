@@ -995,6 +995,8 @@ fn dispatch_shortcuts(app: &AppData, ui: &mut Ui<'_, AppData>, bottom_rect: Rect
     crate::view::launcher_keys::dispatch_launcher_keys(app, ui, surface);
     // 範囲がアクティブなら矢印は範囲操作 (ノート nudge と面で排他)。
     dispatch_range_nudge(app, ui, surface);
+    // r.md #157: コードの箱を選んでいれば ↑↓ は箱の移調 (同じく面で排他)。
+    crate::view::chord_menu::dispatch_keys(ui, surface);
 
     // ----- r.md #67: カーソルキーでノートを移動 / 伸縮 / 音程変更 -----
     dispatch_note_nudge(ui, surface);
