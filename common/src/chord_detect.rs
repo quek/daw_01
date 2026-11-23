@@ -260,6 +260,8 @@ fn max_polyphony(notes: &[&DetectNote], a: f64, b: f64) -> usize {
 
 /// 鳴り始めのずれをひとつの和音とみなす幅 (拍。手弾きのばらつき)。
 const ONSET_EPS_BEATS: f64 = 1.0 / 16.0;
+/// ずらして弾いた和音をひとつにまとめる幅の上限 (拍。最初の音から最後の音まで)。
+const ONSET_GROUP_MAX_BEATS: f64 = 0.25;
 /// 和音の鳴り始めで区切れない区間 (分散和音・旋律) を見る窓 (拍): この長さから始め、前半と後半で別のコードが
 /// 出るあいだ半分に割っていく (下限まで)。
 const ARP_WINDOW_BEATS: f64 = 4.0;
@@ -282,13 +284,19 @@ pub fn extract_chords(notes: &[DetectNote], opts: &DetectOptions) -> Vec<SourceC
     // 区切り: 鳴り始め (近いものは 1 つ) と、鳴っている音が無くなる位置。
     let mut bounds: Vec<f64> = Vec::new();
     let mut max_end = f64::NEG_INFINITY;
+    // 直前の鳴り始め。ずらして弾いた和音 (ストローク / ロール) は、隣どうしが近ければ頭の 1 つにまとめる
+    // (頭からの幅は [`ONSET_GROUP_MAX_BEATS`] まで — 速い連打を 1 つの和音にしない)。
+    let mut prev_onset = f64::NEG_INFINITY;
     for n in &sorted {
         if max_end.is_finite() && n.start_beat > max_end + ONSET_EPS_BEATS {
             bounds.push(max_end);
         }
-        if bounds.last().is_none_or(|l| n.start_beat - l > ONSET_EPS_BEATS) {
+        let joins = n.start_beat - prev_onset <= ONSET_EPS_BEATS
+            && bounds.last().is_some_and(|head| n.start_beat - head <= ONSET_GROUP_MAX_BEATS);
+        if !joins {
             bounds.push(n.start_beat);
         }
+        prev_onset = n.start_beat;
         max_end = max_end.max(n.start_beat + n.len_beats);
     }
     if max_end.is_finite() && bounds.last().is_some_and(|l| max_end > *l) {
@@ -317,18 +325,30 @@ pub fn extract_chords(notes: &[DetectNote], opts: &DetectOptions) -> Vec<SourceC
             },
         }
     }
+    // 区間は昇順なので、窓ごとに「窓に掛かるノート」だけを開始順の sweep で渡す (区間ごと・窓ごとに全ノートを
+    // 走査しない)。窓の数は全区間の合計で [`MAX_WINDOWS`] まで。
+    active.clear();
+    next = 0;
+    let mut budget = MAX_WINDOWS;
     for (g0, g1) in gaps {
-        let inside: Vec<&DetectNote> =
-            sorted.iter().copied().filter(|n| n.start_beat < g1 && n.start_beat + n.len_beats > g0).collect();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let first_cell = (g0 / ARP_WINDOW_BEATS).floor().max(0.0) as u64;
-        for cell in (first_cell..).take(MAX_WINDOWS) {
+        let mut cell = (g0 / ARP_WINDOW_BEATS).floor().max(0.0) as u64;
+        while budget > 0 {
             #[allow(clippy::cast_precision_loss)]
             let a = cell as f64 * ARP_WINDOW_BEATS;
             if a >= g1 {
                 break;
             }
-            split_window(&inside, (a, a + ARP_WINDOW_BEATS), (g0, g1), &opts, &mut found);
+            budget -= 1;
+            let (lo, hi) = (a.max(g0), (a + ARP_WINDOW_BEATS).min(g1));
+            while let Some(n) = sorted.get(next).filter(|n| n.start_beat < hi) {
+                active.push(n);
+                next += 1;
+            }
+            active.retain(|n| n.start_beat + n.len_beats > lo);
+            split_window(&active, (a, a + ARP_WINDOW_BEATS), (g0, g1), &opts, &mut found);
+            let Some(following) = cell.checked_add(1) else { break };
+            cell = following;
         }
     }
     found.sort_by(|x, y| x.0.total_cmp(&y.0));
@@ -560,5 +580,17 @@ mod tests {
             got,
             vec![s(0.0, 3.0, "C"), s(3.0, 1.0, "F"), s(4.0, 4.0, "Am"), s(8.0, 4.0, "G"), s(12.0, 2.0, "Dm"), s(14.0, 2.0, "E")]
         );
+    }
+
+    /// 音をずらして弾いた和音 (0.05 拍ずつ、頭から 0.1 拍) は、最初の音の位置から 1 つの箱になる
+    /// (3 つ目の音の位置で区切らない)。
+    #[test]
+    fn a_strummed_chord_starts_at_its_first_note() {
+        let strum = |at: f64, keys: [u8; 3]| [n(at, 4.0, keys[0]), n(at + 0.05, 3.95, keys[1]), n(at + 0.1, 3.9, keys[2])];
+        let mut notes = Vec::new();
+        notes.extend(strum(0.0, [48, 64, 67]));
+        notes.extend(strum(4.0, [53, 57, 60]));
+        let got = names(&extract_chords(&notes, &DetectOptions::default()));
+        assert_eq!(got, vec![(0.0, 4.0, "C".to_string()), (4.0, 4.0, "F".to_string())]);
     }
 }

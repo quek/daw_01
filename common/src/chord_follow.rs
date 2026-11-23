@@ -207,7 +207,8 @@ impl<'a> TrackChordFollow<'a> {
             return Some(pitch);
         }
         let Some(ev) = self.song.chord_at_onset(song_beat) else { return Some(pitch) };
-        follow_pitch(self.mode, pitch, &ev.chord, source, self.song.scale_at(song_beat))
+        // 境界の直前で次の箱を引いたら、Key もその箱の頭で引く (同じ拍にある Key 変更の前の Key と組ませない)。
+        follow_pitch(self.mode, pitch, &ev.chord, source, self.song.scale_at(song_beat.max(ev.start_beat)))
     }
 
     /// 曲の拍 `song_beat` でのオーディオの移動量 (半音)。
@@ -276,6 +277,21 @@ mod tests {
         // キーに無い E メジャー (G# を持つ): E メジャースケールへ寄せるので F は F# へ。
         let e = Chord::new(4, ChordKind::Major);
         assert_eq!(follow_pitch(ChordFollow::Scale, 65, &e, None, Some(&key)), Some(66));
+    }
+
+    /// 箱の境界の直前 (拍の丸め) に始まるノートは次の箱を引く。同じ拍に Key の変更があれば Key も変更後を引く:
+    /// D は C メジャーキーに無い (D メジャースケールへ寄せ、C# はそのまま) が、G メジャーキーにはある (C# は D へ)。
+    #[test]
+    fn a_note_just_before_a_boundary_takes_the_key_change_on_that_boundary() {
+        let (c, d) = (Chord::new(0, ChordKind::Major), Chord::new(2, ChordKind::Major));
+        let mut song = song_with(&[(0.0, 4.0, c), (4.0, 4.0, d)], ChordFollow::Scale);
+        song.scale_changes = vec![
+            ScaleChange { beat: 0.0, root: 0, scale: Scale::Major },
+            ScaleChange { beat: 4.0, root: 7, scale: Scale::Major },
+        ];
+        let f = TrackChordFollow::of(&song, 1);
+        assert_eq!(f.key(61, 4.0, None), Some(62));
+        assert_eq!(f.key(61, 4.0 - 1e-9, None), Some(62));
     }
 
     /// 素材のコードが無ければ、キーのトニック (無ければ C) を基準にする。範囲外へ出たら鳴らさない。

@@ -63,7 +63,9 @@ impl TrackMenuItem {
             Self::Color => "色...".into(),
             Self::ResetClipColors => "クリップ色をトラックに揃える".into(),
             Self::FollowTranspose => checked("移調に追従", state.follows),
-            Self::FollowChords(mode) => checked(&format!("コードに追従: {}", mode.label()), state.chord_follow == mode),
+            Self::FollowChords(mode) => {
+                checked(&format!("コードに追従: {}", mode.label()), state.chord_follow == Some(mode))
+            }
             Self::FreezePitch => "鳴る音で確定".into(),
             Self::ToggleEnabled => if state.enabled { "無効化" } else { "有効化" }.into(),
             Self::Delete => "Delete".into(),
@@ -72,12 +74,13 @@ impl TrackMenuItem {
 }
 
 /// 右クリックしたトラック**自身**の値 (無効な group / 追従しない group の子でも自分の値で文言と向きを決める)。
+/// コードへの追従だけは、グループなら設定が入る子孫の値 (`AppData::track_menu_chord_follow`)。
 #[derive(Debug, Clone, Copy)]
 struct TrackMenuState {
     /// `Track::follow_transpose`。
     follows: bool,
-    /// `Track::follow_chords` (曲全体のスイッチを切っていても自分の値)。
-    chord_follow: ChordFollow,
+    /// チェックを付ける追従モード (曲全体のスイッチを切っていても設定の値)。グループの子孫で混ざっていれば `None`。
+    chord_follow: Option<ChordFollow>,
     /// `Track::enabled`。
     enabled: bool,
 }
@@ -96,7 +99,7 @@ pub(crate) fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, resp: &ArrangementRe
         let track = song.track_by_id(track_id);
         let state = TrackMenuState {
             follows: track.is_none_or(|t| t.follow_transpose),
-            chord_follow: track.map_or(ChordFollow::Off, |t| t.follow_chords),
+            chord_follow: if track.is_some() { app.track_menu_chord_follow(track_id) } else { Some(ChordFollow::Off) },
             enabled: track.is_none_or(|t| t.enabled),
         };
         let labels = TrackMenuItem::ALL.map(|item| item.label(state));

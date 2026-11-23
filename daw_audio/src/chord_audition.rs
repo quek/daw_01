@@ -216,6 +216,13 @@ impl ChordAuditionVoices {
             return;
         }
         let cap = out.capacity();
+        // 和音の全部を積めないなら、この buffer では鳴らさない。途中まで鳴らすと「同じ箱が鳴っている」と判定され、
+        // 残りの鍵盤が箱の終わりまで鳴らない。鳴っていない状態のままにして、次の buffer の窓の頭で鳴らす。
+        let wanted = c.keys().iter().filter(|&&p| common::transpose::sounding_key(p, transpose).is_some()).count();
+        if cap.min(MAX_EVENTS).saturating_sub(out.len()) < wanted {
+            self.n = 0;
+            return;
+        }
         let mut n = 0usize;
         for &p in c.keys() {
             let Some(key) = common::transpose::sounding_key(p, transpose) else { continue };
@@ -419,6 +426,20 @@ mod tests {
         let ev = transitions(&bus);
         assert_eq!(ev.iter().map(|e| e.1).collect::<Vec<_>>(), [false, false, false, false, true, true, true, true]);
         assert!(bus.iter().all(|e| matches!(e.event, NoteTransition::Off { note_id, .. } | NoteTransition::On { note_id, .. } if note_id >= VOICE_ID_BASE)));
+    }
+
+    /// バスの空きが和音の音数に足りない buffer では 1 音も鳴らさず、空いた次の buffer で全部鳴らす
+    /// (途中まで鳴らすと「同じ箱が鳴っている」と判定され、残りの鍵盤が箱の終わりまで鳴らない)。
+    #[test]
+    fn a_chord_that_does_not_fit_in_the_bus_waits_for_the_next_buffer() {
+        let plan = ChordAuditionPlan::build(Some(&song()), Some(7), Voicing::Basic);
+        let mut v = ChordAuditionVoices::default();
+        let mut bus = Vec::with_capacity(MAX_EVENTS);
+        bus.extend((0..MAX_EVENTS - 2).map(|_| TimedNoteEvent { time: 0, event: NoteTransition::Off { note_id: 1, key: 1 } }));
+        emit(&plan, &mut v, 0.0, 100.0, 100, 0, &mut bus);
+        assert_eq!(bus.len(), MAX_EVENTS - 2, "空き 2 に 4 音の和音は積まない");
+        let ev = render(&plan, &mut v, 1.0, 100);
+        assert_eq!(ev.iter().filter(|e| e.0 == 0 && e.1).count(), 4, "{ev:?}");
     }
 
     /// テンポのランプ / 段差では、窓の頭の拍は「前の窓 + frames を窓の頭のテンポで」からずれる (刻みが積分した拍)。
