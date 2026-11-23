@@ -93,8 +93,11 @@ fn build_icon() {
         let ico_for_rc = ico_path.to_str().expect("ico path utf-8").replace('\\', "/");
         let rc_path = out_dir.join("daw_gui.rc");
         fs::write(&rc_path, format!("1 ICON \"{ico_for_rc}\"\n")).expect("write daw_gui.rc");
-        // embed-resource does not emit rerun-if-changed itself.
-        println!("cargo:rerun-if-changed={}", rc_path.display());
+        // The .rc / .ico are generated here from icon.svg + build.rs, both already
+        // tracked above — do NOT rerun-if-changed them. This script rewrites them on
+        // every run, so they are always newer than the run cargo recorded, and cargo
+        // would re-run the script and recompile daw_gui on every build (it did from
+        // 1de8027c until 2026-11-23: each `make run` recompiled daw_gui twice).
         embed_resource::compile(&rc_path, embed_resource::NONE)
             .manifest_optional()
             .expect("embed daw_gui icon resource");
@@ -115,6 +118,9 @@ fn copy_ffmpeg_dlls() {
     let Some(bin) = PathBuf::from(&libs_dir).parent().map(|p| p.join("bin")) else {
         return;
     };
+    // Re-copy when the DLLs are (re)fetched (`make fetch-ffmpeg-force`, a pin bump, or a
+    // build that ran before the first fetch). cargo scans a directory for any change.
+    println!("cargo:rerun-if-changed={}", bin.display());
     let Ok(out_dir) = env::var("OUT_DIR") else {
         return;
     };
