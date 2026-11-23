@@ -1,6 +1,6 @@
-//! インスペクタの「口パク (口形状 → 画像)」 セクション。
+//! インスペクタの「口パク」の帯の中身 (口形状 → 画像)。
 //!
-//! contract は `chain_sections.rs` / `launch_section.rs` と同じ
+//! contract は `clip_band` / `input_section` と同じ
 //! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。 `track_inspector/mod.rs::draw` から
 //! 切り出したもの (サイズ budget、 不変条件 9)。
 
@@ -27,8 +27,17 @@ fn image_source_label(src: &common::model::ImageSource) -> String {
         .to_string()
 }
 
-/// この track を口パク出力先に指定している vocal track があるとき、7 形状
-/// (a/i/u/e/o/N/閉口) の画像割当を表示する。各 slot は import 済み image を選ぶ。
+/// 口パクの帯を出すか: カーソルのトラックを口パク出力先に指定している vocal track がある。
+pub(super) fn mouth_map_shown(app: &AppData) -> bool {
+    let song = app.cur.song_doc.song();
+    let Some(this_id) = app.cursor_track_index().and_then(|i| song.tracks.get(i)).map(|t| t.id) else {
+        return false;
+    };
+    song.tracks.iter().any(|t| t.lipsync_target_track == Some(this_id))
+}
+
+/// 口パクの帯の中身: 7 形状 (a/i/u/e/o/N/閉口) の画像割当。各 slot は import 済み image を選ぶ。
+/// 出すかどうかは [`mouth_map_shown`]、見出しは帯 (r.md #158)。
 pub(super) fn draw_mouth_map_section(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -36,29 +45,11 @@ pub(super) fn draw_mouth_map_section(
     pad: f32,
     mut y: f32,
 ) -> f32 {
-    let p = &app.theme.core;
     let cursor_idx = app.cursor_track_index();
     let Some(track) = cursor_idx.and_then(|i| app.cur.song_doc.song().tracks.get(i)) else {
         return y;
     };
     let this_id = track.id;
-    let is_target = app
-        .cur.song_doc.song()
-        .tracks
-        .iter()
-        .any(|t| t.lipsync_target_track == Some(this_id));
-    if !is_target {
-        return y;
-    }
-    ui.label_at(
-        "inspector_mouthmap_label",
-        "口パク (口形状 → 画像)",
-        area.x + pad,
-        y,
-        12.0,
-        p.text,
-    );
-    y += 18.0;
     // import 済み image source の (id, ファイル名) 一覧 (id 昇順)。
     // image_ids[k] と labels[k+1] が対応 (labels[0] = "(なし)" sentinel)。
     // ラベル文字列を別 Vec へ再 clone せず、 ソート後そのまま labels へ move する。
@@ -88,21 +79,11 @@ pub(super) fn draw_mouth_map_section(
         labels.push(name);
     }
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    // 形状ごとに「あ [画像 ▾]」の欄 (ラベル左・値右、r.md #158 仕様 9)。
+    let c = super::form::cols(area.x + pad, area.w - pad * 2.0);
     for (slot_i, (shape, shape_label)) in SHAPES.iter().enumerate() {
-        ui.label_at(
-            format!("inspector_mouthmap_slot_label_{slot_i}"),
-            shape_label,
-            area.x + pad,
-            y + 5.0,
-            11.0,
-            p.text,
-        );
-        let dropdown_rect = Rect {
-            x: area.x + pad + 40.0,
-            y,
-            w: area.w - pad * 2.0 - 40.0,
-            h: 22.0,
-        };
+        super::form::label(ui, app, ("inspector_mouthmap_slot_label", slot_i), shape_label, &c, y);
+        let dropdown_rect = c.value(y);
         let cur = map.map_or(0, |m| m.get(*shape));
         let selected_idx = if cur == 0 {
             0
@@ -114,7 +95,7 @@ pub(super) fn draw_mouth_map_section(
                 .unwrap_or(0)
         };
         if let Some(picked) = ui.dropdown(
-            format!("inspector_mouthmap_dropdown_{slot_i}"),
+            ("inspector_mouthmap_dropdown", slot_i),
             dropdown_rect,
             &label_refs,
             selected_idx,
@@ -133,7 +114,7 @@ pub(super) fn draw_mouth_map_section(
                 });
             }));
         }
-        y += 26.0;
+        y += super::layout::FORM_ROW_PITCH;
     }
-    y + 4.0
+    y
 }

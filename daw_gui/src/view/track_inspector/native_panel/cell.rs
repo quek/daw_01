@@ -80,7 +80,8 @@ pub(super) fn switch_style(app: &AppData) -> ToggleButtonStyle {
 }
 
 /// セクションの小見出し (`TIME ────`)。`right` は右端に右寄せで出す補助表示
-/// (Delay の実効 ms など)。ラベルの右から右端まで細い罫線を引く。
+/// (Delay の実効 ms など)。ラベルの右から右端まで細い罫線を引く。描き方はインスペクタの帯の中の
+/// 小見出しと同じ 1 本 (`track_inspector::band::sub_heading`、r.md #158)。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn section_label(
     app: &AppData,
@@ -92,24 +93,8 @@ pub(super) fn section_label(
     label: &str,
     right: Option<&str>,
 ) {
-    let color = app.theme.core.text_dim;
-    let (x0, right_edge) = (ctx.rect.x, ctx.rect.x + ctx.rect.w);
-    let label_w = ui.measure_text(label, HEAD_FONT);
-    ui.label_at(wid(ParamSurface::Rack, key, part, 0), label, x0, y, HEAD_FONT, color);
-    let rule_end = match right {
-        Some(text) => {
-            let w = ui.measure_text(text, HEAD_FONT);
-            let x = (right_edge - w).max(x0 + label_w + 8.0);
-            ui.label_at(wid(ParamSurface::Rack, key, part, 1), text, x, y, HEAD_FONT, color);
-            x - 6.0
-        }
-        None => right_edge,
-    };
-    let rule_x = x0 + label_w + 6.0;
-    if rule_end > rule_x {
-        let r = Rect { x: rule_x, y: y + HEAD_FONT * 0.5, w: rule_end - rule_x, h: 1.0 };
-        ui.panel(wid(ParamSurface::Rack, key, part, 2), r, color, 0.0);
-    }
+    let id = (ParamSurface::Rack, key, part);
+    crate::view::track_inspector::band::sub_heading(app, ui, id, ctx.rect.x, ctx.rect.w, y, label, right);
 }
 
 /// 段階式パラメータの小さなセレクタ (`Pat [Stereo]`)。押すと次の段へ (末尾で先頭に戻る)。

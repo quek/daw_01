@@ -133,6 +133,7 @@ impl AppData {
         self.cur.view.multi_clip_view_key.clear();
         self.cur.view.collapsed_groups.clear();
         self.cur.view.open_rack_panels.clear();
+        self.cur.view.inspector_folds = crate::state::inspector_view::InspectorFolds::default();
 
         // -- 子プロセスに関する帳簿 (すべて device_id keyed) ----------------
         // teardown_all_loaded_plugins が消し損ねる分をここで確実に落とす。

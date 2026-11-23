@@ -30,6 +30,7 @@ pub mod oscilloscope;
 pub mod panel;
 pub mod playhead;
 pub mod reorderable_list;
+pub mod resize_handle;
 pub mod scroll_area;
 pub mod scrubable_number;
 pub mod spectrum;

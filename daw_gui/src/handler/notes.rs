@@ -682,35 +682,34 @@ impl AppData {
     }
 
     /// per-clip 声を設定。 Clip Inspector の 2 段 dropdown から
-    /// `SetClipVoice` 経由で呼ばれる。 stable `ClipKey` で対象 clip を引き、
+    /// `SetClipVoice` 経由で呼ばれる。 stable `ClipKey` で対象 clip を引き (複数選択なら全部、1 undo step)、
     /// 声 3 値を焼き込んで builtin へ再 flush (= 新しい声で再合成)。
     pub(crate) fn set_clip_voice(
         &mut self,
-        key: common::model::ClipKey,
+        keys: &[common::model::ClipKey],
         speaker_id: u32,
         singer_name: String,
         style_name: String,
     ) {
-        let Some(r) = self.live_clip_key(key) else {
+        let live: Vec<common::model::ClipKey> = keys.iter().filter_map(|k| self.live_clip_key(*k)).collect();
+        if live.is_empty() {
             return;
-        };
+        }
         let changed = self.edit_song_checked(move |song| {
-            let Some(clip) = song
-                .track_by_id_mut(r.track_id)
-                .and_then(|t| t.clip_by_id_mut(r.clip_id))
-            else {
-                return false;
-            };
-            if clip.speaker_id == speaker_id
-                && clip.singer_name == singer_name
-                && clip.style_name == style_name
-            {
-                return false;
+            let mut changed = false;
+            for r in &live {
+                let Some(clip) = song.track_by_id_mut(r.track_id).and_then(|t| t.clip_by_id_mut(r.clip_id)) else {
+                    continue;
+                };
+                if clip.speaker_id == speaker_id && clip.singer_name == singer_name && clip.style_name == style_name {
+                    continue;
+                }
+                clip.speaker_id = speaker_id;
+                clip.singer_name.clone_from(&singer_name);
+                clip.style_name.clone_from(&style_name);
+                changed = true;
             }
-            clip.speaker_id = speaker_id;
-            clip.singer_name = singer_name;
-            clip.style_name = style_name;
-            true
+            changed
         });
         if changed {
             // 声変更を builtin に反映 (= clip 単位で再合成)。
@@ -722,42 +721,39 @@ impl AppData {
     }
 
     /// (talk) `SetClipTalkParam` 経由。Text clip の読み上げスケール 1 項目を
-    /// `Clip::talk` に焼き込み、builtin へ再 flush (= 新スケールで再合成)。全項目が
+    /// `Clip::talk` に焼き込み (複数選択なら全部)、builtin へ再 flush (= 新スケールで再合成)。全項目が
     /// 既定なら `None` に畳む (serialize しない)。値が変わらないなら no-op。
     pub(crate) fn set_clip_talk_param(
         &mut self,
-        key: common::model::ClipKey,
+        keys: &[common::model::ClipKey],
         param: TalkParamKind,
         value: f32,
     ) {
-        let Some(r) = self.live_clip_key(key) else {
+        let live: Vec<common::model::ClipKey> = keys.iter().filter_map(|k| self.live_clip_key(*k)).collect();
+        if live.is_empty() {
             return;
-        };
+        }
         let changed = self.edit_song_checked(|song| {
-            let Some(clip) = song
-                .track_by_id_mut(r.track_id)
-                .and_then(|t| t.clip_by_id_mut(r.clip_id))
-            else {
-                return false;
-            };
-            let mut talk = clip.talk.unwrap_or_default();
-            // VOICEVOX `audio_query` の受理範囲にクランプ (範囲外は 422 を返す)。
-            match param {
-                TalkParamKind::Speed => talk.speed_scale = value.clamp(0.5, 2.0),
-                TalkParamKind::Pitch => talk.pitch_scale = value.clamp(-0.15, 0.15),
-                TalkParamKind::Intonation => talk.intonation_scale = value.clamp(0.0, 2.0),
-                TalkParamKind::Volume => talk.volume_scale = value.clamp(0.0, 2.0),
+            let mut changed = false;
+            for r in &live {
+                let Some(clip) = song.track_by_id_mut(r.track_id).and_then(|t| t.clip_by_id_mut(r.clip_id)) else {
+                    continue;
+                };
+                let mut talk = clip.talk.unwrap_or_default();
+                // VOICEVOX `audio_query` の受理範囲にクランプ (範囲外は 422 を返す)。
+                match param {
+                    TalkParamKind::Speed => talk.speed_scale = value.clamp(0.5, 2.0),
+                    TalkParamKind::Pitch => talk.pitch_scale = value.clamp(-0.15, 0.15),
+                    TalkParamKind::Intonation => talk.intonation_scale = value.clamp(0.0, 2.0),
+                    TalkParamKind::Volume => talk.volume_scale = value.clamp(0.0, 2.0),
+                }
+                let new_talk = if talk == common::model::TalkParams::default() { None } else { Some(talk) };
+                if clip.talk != new_talk {
+                    clip.talk = new_talk;
+                    changed = true;
+                }
             }
-            let new_talk = if talk == common::model::TalkParams::default() {
-                None
-            } else {
-                Some(talk)
-            };
-            if clip.talk == new_talk {
-                return false;
-            }
-            clip.talk = new_talk;
-            true
+            changed
         });
         if changed {
             self.sync_vocal_metadata();

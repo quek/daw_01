@@ -180,17 +180,17 @@ pub(crate) fn scrub_field_mod(
         F::ImageH => (AutomationTarget::ImageBuiltin(ImageBuiltinParam::H), false),
         F::ImageOpacity => (AutomationTarget::ImageBuiltin(ImageBuiltinParam::Opacity), false),
         F::ImageRotation => (AutomationTarget::ImageBuiltin(ImageBuiltinParam::Rotation), true),
-        F::Text { field: TextNumField::X, .. } => (AutomationTarget::TextBuiltin(TextBuiltinParam::X), false),
-        F::Text { field: TextNumField::Y, .. } => (AutomationTarget::TextBuiltin(TextBuiltinParam::Y), false),
-        F::Text { field: TextNumField::W, .. } => (AutomationTarget::TextBuiltin(TextBuiltinParam::W), false),
-        F::Text { field: TextNumField::H, .. } => (AutomationTarget::TextBuiltin(TextBuiltinParam::H), false),
-        F::Text { field: TextNumField::Opacity, .. } => {
+        F::Text { field: TextNumField::X } => (AutomationTarget::TextBuiltin(TextBuiltinParam::X), false),
+        F::Text { field: TextNumField::Y } => (AutomationTarget::TextBuiltin(TextBuiltinParam::Y), false),
+        F::Text { field: TextNumField::W } => (AutomationTarget::TextBuiltin(TextBuiltinParam::W), false),
+        F::Text { field: TextNumField::H } => (AutomationTarget::TextBuiltin(TextBuiltinParam::H), false),
+        F::Text { field: TextNumField::Opacity } => {
             (AutomationTarget::TextBuiltin(TextBuiltinParam::Opacity), false)
         }
-        F::Text { field: TextNumField::Rotation, .. } => {
+        F::Text { field: TextNumField::Rotation } => {
             (AutomationTarget::TextBuiltin(TextBuiltinParam::Rotation), true)
         }
-        F::Text { field: TextNumField::FontSize, .. } => {
+        F::Text { field: TextNumField::FontSize } => {
             (AutomationTarget::TextBuiltin(TextBuiltinParam::FontSize), false)
         }
         _ => return None,

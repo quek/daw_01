@@ -41,7 +41,7 @@ pub enum DeviceEvent {
         device_id: u64,
         modifier: SelectModifier,
     },
-    /// inspector 「読み込み失敗」 セクションの「再読込」 ボタン: ロードに
+    /// インスペクタの Rack の plugin 行の「再読込」 ボタン (r.md #158): ロードに
     /// 失敗した device を、 保存済み state 込みで plugin_host に load し直す。
     /// 自動リトライはしない (恒常的失敗で無限ループになる) ので、 再試行の
     /// トリガーは常にこのユーザー操作。 Song は変えない (= 非 undoable)。

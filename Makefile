@@ -246,7 +246,7 @@ help:
 	@echo "  make test-real-vst3 DAW01_TEST_VST3_<名前>=<.vst3 のパス> ..."
 	@echo "                     実物の VST3 を読む検査 (env が欠けていれば落ちる。test の最後でも回る)"
 	@echo "  make clippy        clippy をエラー扱いで走らせる"
-	@echo "  make gates         常設ゲート (license-check + lockfile-guard + audit スタンプ)"
+	@echo "  make gates         常設ゲート (license-check + lockfile-guard + audit スタンプ + feature の揃い)"
 	@echo "                     clippy / test / test-nolaunch の前提条件。単体でも打てる"
 	@echo "  make arch-lint     アーキテクチャ不変条件の機械検査 (baseline 比の行単位 ratchet)"
 	@echo "  make license-check ライセンス表示の検査 (REUSE 準拠 / 依存の GPLv3 互換性)"
@@ -280,6 +280,8 @@ ffmpeg-mirror:
 build: fetch-ffmpeg
 	cargo build $(RUN_PKGS)
 
+# `cargo run -p daw_gui` は daw_gui だけを選んだビルドになるが、依存の feature が `build` と揃っているので
+# (gates の scripts/feature_unification_check.sh が保証) 作り直しは起きず、確認だけで起動する。
 run: preflight-no-app build
 	cargo run -p daw_gui
 
@@ -433,8 +435,9 @@ gates:
 	    exit 1; \
 	  fi; \
 	fi
+	@$(BASH) "$(CURDIR)/scripts/feature_unification_check.sh"
 	@$(MAKE) --no-print-directory license-check
-	@echo "gates: OK (lockfile-guard / audit-stamp / license-check)"
+	@echo "gates: OK (lockfile-guard / audit-stamp / feature-unification / license-check)"
 
 # アーキテクチャ不変条件の機械検査 (CLAUDE.md「アーキテクチャ不変条件」/
 # docs/plan_arch_refactor.md §11)。**exit 0 = 「違反ゼロ、または

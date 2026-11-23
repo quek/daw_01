@@ -212,7 +212,7 @@ fn ブロックの_hover_は_q_の宛先になり_描かないフレームでは
     app.handle_event(AppEvent::ToggleMasterPanel);
 
     // 数値欄の列が READOUT_MIN_W より狭い (ブロックを描かない早期 return) → 消える。
-    let narrow = ((daw_gui::view::root::INSPECTOR_W + 160.0) as u32, TALL.1);
+    let narrow = ((daw_gui::view::root::INSPECTOR_DEFAULT_W + 160.0) as u32, TALL.1);
     run(&mut host, &mut app, TALL, Some(needle));
     assert_eq!(app.cur.peph.master_panel_hovered, Some(BypassTarget::Device(bus)));
     let scene = run(&mut host, &mut app, narrow, Some(needle));

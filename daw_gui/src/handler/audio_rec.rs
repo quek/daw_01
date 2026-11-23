@@ -18,11 +18,69 @@ use crate::event_audio_rec::AudioRecEvent;
 use crate::media_dest::MediaPool;
 use crate::state::*;
 
+/// 「入力元」で、MIDI を録れないトラックの既定 (MIDI) の表示 ([`AppData::audio_input_choices`])。
+pub const INPUT_UNSET: &str = "未選択";
+
 /// インスペクタの「入力」の選択肢 1 つ。
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputChoice {
     pub input: TrackInput,
     pub label: String,
+}
+
+/// r.md #158 仕様 14: トラックで録れる入力の種類 (インスペクタの「入力」の帯に何を出すか)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecordableInputs {
+    pub midi: bool,
+    pub audio: bool,
+}
+
+impl RecordableInputs {
+    /// どちらかを録れる (入力の帯を出す)。
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.midi || self.audio
+    }
+
+    /// `input` の種類を録れるか。
+    #[must_use]
+    pub fn allows(self, input: TrackInput) -> bool {
+        if input.is_midi() { self.midi } else { self.audio }
+    }
+}
+
+/// トラックで録れる入力の種類。トラックの「種類」は持たず (`[[feedback_no_role_classification]]`)、
+/// 中身から導く:
+/// - **MIDI**: ノートを受ける device (Parallel の中も。port 未解決は受けるとみなす) か MIDI クリップを持つ、
+///   または まだ何者でもない (子も、クリップも、組み込み以外の device も無い) トラック。
+/// - **音声**: 子トラックを持たず (グループのバスは自分で音を録らない)、映像系の中身 (画像 / 映像 / テキストの
+///   クリップ、映像 device) を持たないトラック。
+/// - master はどちらも録れない。
+#[must_use]
+pub fn recordable_inputs(song: &common::model::Song, track: &common::model::Track) -> RecordableInputs {
+    use common::model::ClipContent as C;
+    if track.id == MASTER_TRACK_ID {
+        return RecordableInputs::default();
+    }
+    let has_children = song.track_has_children(track.id);
+    let (mut midi_clips, mut visual_clips, mut any_clip) = (false, false, false);
+    for clip in track.all_clips() {
+        any_clip = true;
+        match song.clip_contents.get(&clip.content_id) {
+            Some(C::Midi(_)) => midi_clips = true,
+            Some(C::Image(_) | C::Video(_) | C::Text(_)) => visual_clips = true,
+            _ => {}
+        }
+    }
+    let note_device =
+        common::model::any_plugin(&track.devices, &mut |p| p.ports.has_note_input || p.ports.is_unresolved());
+    let video_device = common::model::any_plugin(&track.devices, &mut |p| p.ports.is_video());
+    let added_device = track.devices.iter().any(|d| !d.is_builtin_native());
+    let blank = !has_children && !any_clip && !added_device;
+    RecordableInputs {
+        midi: note_device || midi_clips || blank,
+        audio: !has_children && !visual_clips && !video_device,
+    }
 }
 
 /// engine に頼んだ録音 1 回ぶん (結果待ち)。
@@ -78,7 +136,8 @@ impl AppData {
     }
 
     /// インスペクタの「入力 / モニター」が編集するトラック: 複数選択ならその全部、そうでなければ
-    /// cursor track。master は入力を持たない。
+    /// cursor track。録れる入力が 1 つも無いトラック (master / グループのバス / 画像・映像のトラック、
+    /// [`recordable_inputs`]) は含めない。
     #[must_use]
     pub fn input_target_track_ids(&self) -> Vec<u32> {
         let song = self.cur.song_doc.song();
@@ -88,7 +147,17 @@ impl AppData {
         } else {
             self.cursor_track_id().into_iter().collect()
         };
-        ids.into_iter().filter(|&id| id != MASTER_TRACK_ID && song.track_by_id(id).is_some()).collect()
+        ids.into_iter().filter(|&id| song.track_by_id(id).is_some_and(|t| recordable_inputs(song, t).any())).collect()
+    }
+
+    /// `track_ids` のどれかで録れる入力の種類 (インスペクタの「入力元」の選択肢)。
+    #[must_use]
+    pub fn recordable_inputs_of(&self, track_ids: &[u32]) -> RecordableInputs {
+        let song = self.cur.song_doc.song();
+        track_ids.iter().filter_map(|id| song.track_by_id(*id)).fold(RecordableInputs::default(), |acc, t| {
+            let r = recordable_inputs(song, t);
+            RecordableInputs { midi: acc.midi || r.midi, audio: acc.audio || r.audio }
+        })
     }
 
     /// 今開いているデバイスで **engine に届いている** 入力 ch (`(デバイスの ch 番号, 名前)`、ch 番号順)。
@@ -110,13 +179,21 @@ impl AppData {
         input.audio_channels().is_none_or(|(l, r)| active(l) && active(r))
     }
 
-    /// 「入力」の選択肢: MIDI、デバイスの入力 ch (モノ)、隣り合う 2 ch (ステレオ、1+2 / 3+4 …)。
-    /// `current` (いま選ばれている入力) がデバイスに無ければ、末尾に「無い入力」として足す
-    /// (黙って別の ch に付け替えない)。
+    /// 「入力元」の選択肢: 録れる種類 (`kinds`) のうち、MIDI、デバイスの入力 ch (モノ)、隣り合う 2 ch
+    /// (ステレオ、1+2 / 3+4 …)。`current` (いま選ばれている入力) が選択肢に無ければ、末尾に「無い入力」
+    /// (デバイスに無い) / 「録れない」(そのトラックで意味が無い) として足す (黙って別の入力に付け替えない)。
+    ///
+    /// ただし MIDI を録れないトラックの MIDI は「未選択」と出す: `TrackInput` の既定は MIDI なので、音声だけの
+    /// トラック (取り込んだ音声 / 効果だけのトラック) は誰も選んでいないのに MIDI を持っている。それを
+    /// 「録れない」と出すと、何も触っていない普通の状態が警告に見える。選べば書けるのは録れるトラックだけ
+    /// (インスペクタの書き込み側が絞る) なので、この項目を選んでも何も変わらない。
     #[must_use]
-    pub fn audio_input_choices(&self, current: &[TrackInput]) -> Vec<InputChoice> {
-        let inputs = self.device_inputs();
-        let mut out = vec![InputChoice { input: TrackInput::Midi, label: TrackInput::Midi.label() }];
+    pub fn audio_input_choices(&self, current: &[TrackInput], kinds: RecordableInputs) -> Vec<InputChoice> {
+        let mut out = Vec::new();
+        if kinds.midi {
+            out.push(InputChoice { input: TrackInput::Midi, label: TrackInput::Midi.label() });
+        }
+        let inputs = if kinds.audio { self.device_inputs() } else { Vec::new() };
         for &(channel, name) in &inputs {
             let input = TrackInput::AudioMono { channel };
             let label = if name.is_empty() { input.label() } else { format!("{} ({name})", input.label()) };
@@ -131,7 +208,13 @@ impl AppData {
         }
         for &input in current {
             if !out.iter().any(|c| c.input == input) {
-                out.push(InputChoice { input, label: format!("{} (無い入力)", input.label()) });
+                let label = if input.is_midi() && !kinds.midi {
+                    INPUT_UNSET.to_string()
+                } else {
+                    let why = if kinds.allows(input) { "無い入力" } else { "録れない" };
+                    format!("{} ({why})", input.label())
+                };
+                out.push(InputChoice { input, label });
             }
         }
         out
@@ -359,5 +442,81 @@ impl AppData {
             }
             changed
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::model::{
+        AudioContent, Clip, ClipContent, Device, ImageContent, MidiContent, NativeDevice, NativeKind, PluginInstance, Song,
+        TextContent, Track,
+    };
+    use common::plugin_format::PluginFormat;
+    use common::port_config::PortConfig;
+
+    fn plugin(ports: PortConfig) -> Device {
+        Device::Plugin(PluginInstance { ports, ..PluginInstance::new("x".into(), PluginFormat::Builtin) })
+    }
+
+    /// 新しいトラックと同じ、組み込みの Comp / EQ だけを持つ chain (+ `extra`)。
+    fn chain(extra: Vec<Device>) -> Vec<Device> {
+        let mut d = vec![
+            Device::Native(NativeDevice::new_builtin(NativeKind::Comp, 0)),
+            Device::Native(NativeDevice::new_builtin(NativeKind::Eq, 0)),
+        ];
+        d.extend(extra);
+        d
+    }
+
+    fn add(song: &mut Song, id: u32, devices: Vec<Device>, clip: Option<ClipContent>, parent: Option<u32>) {
+        let mut t = Track { id, devices, parent_group_id: parent, ..Track::default() };
+        if let Some(content) = clip {
+            let content_id = song.alloc_content(content, String::new());
+            t.place_clip(Clip { length_beats: 4.0, content_id, ..Clip::default() });
+        }
+        song.tracks.push(t);
+    }
+
+    /// r.md #158 仕様 14: 入力の帯に出す入力は、トラックの中身から決まる。
+    #[test]
+    fn recordable_inputs_follow_what_the_track_holds() {
+        let instrument = PortConfig { has_note_input: true, has_audio_output: true, ..PortConfig::default() };
+        let effect = PortConfig { has_audio_input: true, has_audio_output: true, ..PortConfig::default() };
+        let video = PortConfig { has_video_input: true, has_video_output: true, ..PortConfig::default() };
+        let midi = || Some(ClipContent::Midi(MidiContent::default()));
+        let mut song = Song::default();
+        song.tracks.clear();
+        add(&mut song, 1, chain(vec![plugin(instrument)]), midi(), None); // Synth
+        add(&mut song, 2, chain(vec![plugin(instrument)]), None, None); // 歌声 (VOICEVOX = ノートを受ける)
+        add(&mut song, 3, chain(vec![plugin(effect)]), Some(ClipContent::Audio(AudioContent::default())), None); // Audio
+        add(&mut song, 4, chain(vec![plugin(video)]), Some(ClipContent::Image(ImageContent::default())), None); // 画像 + 映像 FX
+        add(&mut song, 5, chain(vec![]), None, None); // グループのバス
+        add(&mut song, 6, chain(vec![]), None, Some(5));
+        add(&mut song, 7, chain(vec![plugin(instrument)]), None, None); // 楽器付きグループ (パラアウト)
+        add(&mut song, 8, chain(vec![]), midi(), Some(7));
+        add(&mut song, 9, chain(vec![]), None, None); // 空の新規トラック
+        add(&mut song, 10, chain(vec![plugin(instrument), plugin(video)]), Some(ClipContent::Text(TextContent::default())), None); // 読み上げ + 字幕
+        add(&mut song, 11, chain(vec![Device::Native(NativeDevice::new_added(NativeKind::Reverb, 0, 1))]), None, None); // 効果だけ
+        let both = RecordableInputs { midi: true, audio: true };
+        let midi_only = RecordableInputs { midi: true, audio: false };
+        let audio_only = RecordableInputs { midi: false, audio: true };
+        let none = RecordableInputs::default();
+        for (id, what, want) in [
+            (1, "Synth", both),
+            (2, "歌声", both),
+            (3, "Audio", audio_only),
+            (4, "画像 + 映像 FX", none),
+            (5, "グループのバス", none),
+            (7, "楽器付きグループ", midi_only),
+            (9, "空の新規トラック", both),
+            (10, "読み上げ + 字幕", midi_only),
+            (11, "効果だけ", audio_only),
+        ] {
+            let track = song.track_by_id(id).expect("track");
+            assert_eq!(recordable_inputs(&song, track), want, "{what}");
+        }
+        let master = Track { id: MASTER_TRACK_ID, ..Track::default() };
+        assert_eq!(recordable_inputs(&song, &master), none, "マスター");
     }
 }

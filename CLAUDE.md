@@ -44,7 +44,9 @@ make fetch-ffmpeg   # third_party/ffmpeg 取得 (gitignore なので fresh machi
 絞ってよい。避けるのは `--workspace` の無条件多用。
 
 **`gates` は `clippy` / `test` / `test-nolaunch` の前提条件**なので、意識せず必ず通る
-(license-check + lockfile-guard + 「`Cargo.lock` を変えたのに `make audit` を通していない」の検出)。
+(license-check + lockfile-guard + 「`Cargo.lock` を変えたのに `make audit` を通していない」の検出 +
+`-p daw_gui` 単独と `make build` で依存の feature が揃っているか — 揃わないと daw_gui.exe が毎回作り直し。
+`scripts/feature_unification_check.sh`)。
 `audit` 本体は advisory DB にネットワークが要るので前提条件にはしない — 代わりに
 **lock が HEAD と違うのに監査済みスタンプと一致しなければ落ちる**。`cargo update` を打ったら
 `make audit`。方針は `deny.toml`、`ignore` を足すときは「何を / なぜ / どうなったら見直すか」を

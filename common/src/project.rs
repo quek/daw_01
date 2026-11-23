@@ -1055,6 +1055,8 @@ mod tests {
                 crate::model::RackPanelKey::Device(7),
                 crate::model::RackPanelKey::MasterLimiter,
             ],
+            inspector_collapsed: vec!["clip.audio".into(), "track.rack".into()],
+            inspector_open_details: vec!["detail.launch_midi".into()],
             chord_lane_hidden: true,
             chord_notation: crate::chord_name::ChordNotation::Roman,
             chord_tools: crate::model::ChordToolsView {

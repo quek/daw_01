@@ -11,8 +11,8 @@ use daw_ui_renderer::Rect;
 pub const PAD: f32 = 6.0;
 /// 列の見出し (`HP LF …` / `Thr Rat …`) の行高。
 pub const HEAD: f32 = 14.0;
-/// 見出しの文字サイズ。
-pub const HEAD_FONT: f32 = 10.0;
+/// 列の見出し (つまみの上の短い記号) の文字サイズ。小見出しと同じ 10px (`track_inspector::layout::SUB_HEAD_FONT`)。
+pub const HEAD_FONT: f32 = super::super::layout::SUB_HEAD_FONT;
 /// つまみの直径。
 pub const KNOB: f32 = 24.0;
 /// つまみと数値欄の間。
@@ -33,8 +33,9 @@ pub const SWITCH_W: f32 = 44.0;
 pub const SWITCH_H: f32 = 16.0;
 /// 列数。
 pub const COLUMNS: usize = 6;
-/// セクションの小見出し (`── TIME ──`) の行高。
-pub const SECTION_H: f32 = 14.0;
+/// セクションの小見出し (`TIME ──`) の行高。描き方も送りもインスペクタの帯の中の小見出しと同じ 1 組
+/// (`track_inspector::layout::SUB_HEAD_H`、`band::sub_heading`)。
+pub const SECTION_H: f32 = super::super::layout::SUB_HEAD_H;
 /// 切り替え帯の中で、段階式セレクタの手前に置く小ラベルの幅。
 pub const SELECTOR_LABEL_W: f32 = 30.0;
 /// 段階式セレクタ (`[Stereo]`) のボタン幅。

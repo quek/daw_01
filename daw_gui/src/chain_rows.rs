@@ -19,8 +19,11 @@ pub struct ChainEntry {
     /// この device が内蔵映像 FX (= `ports.is_video()`) か。 映像 FX は専用の
     /// インライン param パネル (`open_video_fx_params`) を持つ。
     pub is_video: bool,
-    /// この device が VOICEVOX builtin か (= 声選択パネルを出す対象)。
+    /// この device が VOICEVOX builtin か (= Par に口パク先を出す対象)。
     pub is_voicevox: bool,
+    /// この device が字幕 (`builtin.video.subtitle`) か。映像 device だが Par を持たない (字幕の文字と書式は
+    /// クリップの帯で編集する、r.md #158)。
+    pub is_subtitle: bool,
     /// host から param 一覧が届いていて 1 つ以上 param があるか (= 汎用 param
     /// パネルに出す中身がある)。
     pub has_params: bool,
@@ -28,16 +31,21 @@ pub struct ChainEntry {
     pub send_all_keys: bool,
     /// plugin_host での load が失敗した device の理由 (`SlotPluginLoadFailed`)。
     /// `Some` = song には居るが host には instance が無い = **無音**。
-    /// チェーン行に警告色 + ⚠ を出し、 「読み込み失敗」 セクションで理由と
-    /// 「再読込」 ボタンを出す (自動リトライはしない)。
+    /// 行の名前を警告色 (「[未ロード]」付き) にし、 行の `[再読込]` と直下の理由 1 行を出す
+    /// (自動リトライはしない、 r.md #158 で別セクションから行の中へ移した)。
     pub load_error: Option<String>,
-    /// r.md #105: 信号経路から外れている (`PluginInstance::bypassed`)。 行の名前を
-    /// dim 色で描く。 切替は `Q` / 右クリックメニュー (行にトグルは置かない)。
+    /// r.md #105: 信号経路から外れている (`PluginInstance::bypassed`)。 行の名前の横に「オフ」の札を出す。
+    /// 切替は `Q` / 右クリックメニュー (行にトグルは置かない)。
     pub bypassed: bool,
     /// r.md #110: host が報告した aux 入力 port 数。 1 以上の device にだけ `SC` を出す。
     pub aux_input_count: u8,
     /// r.md #110: sidechain が 1 port でも配線済み (`SC` ボタンの強調)。
     pub sc_wired: bool,
+    /// パラアウト (`docs/plan_paraout.md`): host が報告した aux 出力 port 数。 1 以上の device にだけ
+    /// `Out▾` を出す (行の直下に出力のパネル、 r.md #158)。
+    pub aux_output_count: u8,
+    /// aux 出力が 1 port でも配線済み (= 展開済み、 `Out▾` の強調)。
+    pub aux_out_wired: bool,
 }
 
 /// r.md #129 (`docs/plan_rack_native_devices.md` §10.5): 内蔵 device (`Device::Native`) の行の表示情報。
@@ -89,6 +97,9 @@ pub enum ChainRowKind {
         gain_match: bool,
         /// r.md #112: 入力の配り方 (ヘッダ行の dropdown)。
         split: common::model::Split,
+        /// 畳んでいて見えない中身のうち、読み込みに失敗した plugin の数 (開いていれば 0 = 行が見えている)。
+        /// 行の名前の横に警告色で出す (r.md #158: 失敗は行の中に出すので、畳むと見えなくなる)。
+        hidden_failures: usize,
     },
     /// r.md #112: Split の param 行 (ヘッダ行の直下、 `Split::None` 以外のときだけ)。
     /// `Frequency3` なら `Low [hz] Mid [hz] High`。
@@ -110,10 +121,12 @@ pub enum ChainRowKind {
         /// r.md #114: Selector で **非アクティブ** な chain (名前を薄く出す。 Selector 以外は常に
         /// `false`)。 表示だけで、 切替はヘッダ直下の `Active` 欄 (編集面は 1 つ)。
         inactive: bool,
+        /// 畳んでいて見えない中身のうち、読み込みに失敗した plugin の数 (`ParallelBegin` と同じ)。
+        hidden_failures: usize,
     },
-    /// `+ chain`。
+    /// `+ チェーン`。
     AddChain { parallel_id: u64 },
-    /// `+ Plugin` (その chain の末尾へ)。
+    /// `+ プラグイン` (その chain の末尾へ。マスターは `+ エフェクト`)。
     AddPlugin { chain: common::model::ChainRef },
     /// `╰` (終了行)。
     ParallelEnd { parallel_id: u64, color: Option<[f32; 3]> },
@@ -132,7 +145,7 @@ pub struct ChainRow {
     pub depth: u32,
     /// 左端の色帯 (外側の Parallel から順に、 展開中 chain の色)。 深さぶんの本数。
     pub bars: Vec<Option<[f32; 3]>>,
-    /// この行が Parallel の直接の行 (開始 / Split / chain / `+ chain` / 終了) なら、 その Parallel の
+    /// この行が Parallel の直接の行 (開始 / Split / chain / `+ チェーン` / 終了) なら、 その Parallel の
     /// 色。 描画は `bars` の次の位置 (= 行内容の左端、 chain 行の色見本と同じ x / 幅) に Parallel 色の
     /// 帯を通し、 開始行の `「` から終了行の `L` まで 1 本に繋げる (chain の帯はその上に乗る)。
     /// chain の中身の行は chain の帯が同じ x を占めるので `None`。
@@ -193,10 +206,10 @@ pub struct SidechainPort {
 
 impl ChainEntry {
     /// チェーン行ボタンが「埋め込み GUI window を開く」 のではなく
-    /// 「インライン param パネルをトグルする」 種類か。 映像 FX / VOICEVOX /
+    /// 「インライン param パネルをトグルする」 種類か。 映像 FX (字幕を除く) / VOICEVOX /
     /// 埋め込み GUI を持たないが param がある plugin が該当。
     pub fn shows_param_panel(&self) -> bool {
-        self.is_video || self.is_voicevox || (!self.has_embedded_gui && self.has_params)
+        (self.is_video && !self.is_subtitle) || self.is_voicevox || (!self.has_embedded_gui && self.has_params)
     }
 
     /// チェーン行にボタンを出すか。 GUI も param パネルも無い device

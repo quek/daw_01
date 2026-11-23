@@ -22,7 +22,7 @@ use common::model::{AutomationTarget, Device, SELECTOR_FADE_RANGE, SPLIT_FREQ_RA
 use super::chain_list::ROW_H;
 use super::chain_row::{CHAIN_BTN_W, CHAIN_KNOB, draw_disclosure, draw_rename_input};
 use super::mix_knob::MIX_COL_W;
-use super::{push_scrub_bracket, scrub_style, toggle_audio_style};
+use super::{push_scrub_bracket, scrub_style, toggle_audio_style, vocab};
 
 /// dropdown の項目 (順序 = [`split_index`] / [`split_from_index`])。
 const SPLIT_LABELS: &[&str] = &["No split", "3 bands", "Mid/Side", "Selector"];
@@ -97,29 +97,28 @@ pub(super) fn draw_split_row(
     let field_h = ROW_H - 8.0;
     let fy = content.y + (ROW_H - field_h) * 0.5;
     let label_y = content.y + 8.0;
-    let mut x = content.x + 8.0;
-    let label = |ui: &mut Ui<'_, AppData>, key: &'static str, text: &'static str, x: f32| {
+    let mut x = content.x + super::layout::ROW_NAME_X;
+    // ラベルを描き、その右 (+4px) の x を返す (幅は測る — 手で見積もると訳語で食い込む)。
+    let label = |ui: &mut Ui<'_, AppData>, key: &'static str, text: &str, x: f32| -> f32 {
         ui.label_at((key, i), text, x, label_y, 10.0, p.text_dim);
+        x + ui.measure_text(text, 10.0) + 4.0
     };
     match split {
+        // 帯域の名前 (Low / Mid / High) は chain 行の名前と同じ語のまま (`Split::Frequency3` の chain 名)。
         Split::Frequency3 { low_hz, high_hz } => {
-            label(ui, "inspector_split_low_label", "Low", x);
-            x += 26.0;
+            x = label(ui, "inspector_split_low_label", "Low", x);
             draw_freq_field(app, ui, i, parallel_id, SplitEdge::LowMid, low_hz, Rect { x, y: fy, w: field_w, h: field_h }, popup_open);
             x += field_w + 6.0;
-            label(ui, "inspector_split_mid_label", "Mid", x);
-            x += 26.0;
+            x = label(ui, "inspector_split_mid_label", "Mid", x);
             draw_freq_field(app, ui, i, parallel_id, SplitEdge::MidHigh, high_hz, Rect { x, y: fy, w: field_w, h: field_h }, popup_open);
             x += field_w + 6.0;
             label(ui, "inspector_split_high_label", "High", x);
         }
         Split::Selector { fade_ms, .. } => {
-            label(ui, "inspector_select_active_label", "Active", x);
-            x += 38.0;
+            x = label(ui, "inspector_select_active_label", vocab::SPLIT_ACTIVE, x);
             draw_active_field(app, ui, i, parallel_id, Rect { x, y: fy, w: 44.0, h: field_h }, popup_open);
             x += 44.0 + 10.0;
-            label(ui, "inspector_select_fade_label", "Fade", x);
-            x += 30.0;
+            x = label(ui, "inspector_select_fade_label", vocab::SPLIT_FADE, x);
             draw_fade_field(app, ui, i, parallel_id, fade_ms, Rect { x, y: fy, w: field_w, h: field_h }, popup_open);
             ui.label_at(("inspector_select_fade_unit", i), "ms", x + field_w + 4.0, label_y, 10.0, p.text_dim);
         }
@@ -308,6 +307,8 @@ pub(super) struct ParallelHead<'a> {
     pub out_gain: f32,
     pub gain_match: bool,
     pub split: Split,
+    /// 畳んでいて見えない中身のうち、読み込みに失敗した plugin の数 (名前の欄の右端に警告色)。
+    pub hidden_failures: usize,
 }
 
 /// Parallel ヘッダ行: 「 ▼ 名前 … [Split ▾] [out knob] [Match] [Mix] [x]。 出力 trim と gain match は
@@ -320,7 +321,7 @@ pub(super) fn draw_parallel_begin_row(
     row: Rect,
     popup_open: bool,
 ) {
-    let ParallelHead { parallel_id, name, bypassed, open, out_gain, gain_match, split } = *head;
+    let ParallelHead { parallel_id, name, bypassed, open, out_gain, gain_match, split, hidden_failures } = *head;
     let p = &app.theme.core;
     let btn_x_w = 26.0;
     let by = row.y + 2.0;
@@ -389,7 +390,8 @@ pub(super) fn draw_parallel_begin_row(
     // 括弧 `「` は chain_list の `draw_parallel_band` (chain の帯と同じ x / 幅で終了行の `L` まで繋ぐ)。
     // ここは 開閉 disclosure + 名前。
     draw_disclosure(ui, ("inspector_parallel_disclosure", i), parallel_id, open, row.x + 14.0, row, popup_open, p);
-    let name_rect = Rect { x: row.x + 28.0, y: row.y + 3.0, w: (right - 6.0 - row.x - 28.0).max(1.0), h: ROW_H - 6.0 };
+    let fail_w = super::chain_list::draw_hidden_failures(app, ui, ("parallel", i), right - 6.0, row.y, hidden_failures);
+    let name_rect = Rect { x: row.x + 28.0, y: row.y + 3.0, w: (right - 6.0 - fail_w - row.x - 28.0).max(1.0), h: ROW_H - 6.0 };
     if let Some((id, buf)) = &app.cur.peph.renaming_chain
         && *id == parallel_id
     {
@@ -397,12 +399,7 @@ pub(super) fn draw_parallel_begin_row(
             app.handle_event(AppEvent::Device(DeviceEvent::RenameParallel { parallel_id, name: text }));
         });
     } else {
-        ui.label_at_clipped(
-            ("inspector_parallel_name", i),
-            name,
-            Rect { x: name_rect.x, y: row.y + 8.0, w: name_rect.w, h: 11.0 * 1.2 },
-            11.0,
-            if bypassed { p.text_faint } else { p.text },
-        );
+        // バイパス中は名前を text_dim + 「オフ」の札 (plugin 行と同じ規則、r.md #158 仕様 10)。
+        super::chain_list::draw_row_name(app, ui, ("parallel", i), name, name_rect.x, row.y, name_rect.w, p.text, bypassed);
     }
 }

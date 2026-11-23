@@ -69,6 +69,7 @@ pub use widgets::oscilloscope::{OscilloscopeStyle, ScopeColumn};
 pub use widgets::spectrum::SpectrumStyle;
 pub use widgets::scroll_area::SCROLLBAR_W;
 pub use widgets::split_view::Orientation;
+pub use widgets::resize_handle::ResizeDrag;
 pub use widgets::tab_view::TAB_BAR_H;
 pub use widgets::automation::{AutomationCurveResponse, AutomationCurveStyle};
 pub use widgets::modulator_editor::{MsegAction, MsegEditorResponse, MsegEditorStyle, MsegNode};
