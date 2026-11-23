@@ -18,6 +18,9 @@ use crate::event_audio_rec::AudioRecEvent;
 use crate::media_dest::MediaPool;
 use crate::state::*;
 
+/// 「入力元」で、MIDI を録れないトラックの既定 (MIDI) の表示 ([`AppData::audio_input_choices`])。
+pub const INPUT_UNSET: &str = "未選択";
+
 /// インスペクタの「入力」の選択肢 1 つ。
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputChoice {
@@ -179,6 +182,11 @@ impl AppData {
     /// 「入力元」の選択肢: 録れる種類 (`kinds`) のうち、MIDI、デバイスの入力 ch (モノ)、隣り合う 2 ch
     /// (ステレオ、1+2 / 3+4 …)。`current` (いま選ばれている入力) が選択肢に無ければ、末尾に「無い入力」
     /// (デバイスに無い) / 「録れない」(そのトラックで意味が無い) として足す (黙って別の入力に付け替えない)。
+    ///
+    /// ただし MIDI を録れないトラックの MIDI は「未選択」と出す: `TrackInput` の既定は MIDI なので、音声だけの
+    /// トラック (取り込んだ音声 / 効果だけのトラック) は誰も選んでいないのに MIDI を持っている。それを
+    /// 「録れない」と出すと、何も触っていない普通の状態が警告に見える。選べば書けるのは録れるトラックだけ
+    /// (インスペクタの書き込み側が絞る) なので、この項目を選んでも何も変わらない。
     #[must_use]
     pub fn audio_input_choices(&self, current: &[TrackInput], kinds: RecordableInputs) -> Vec<InputChoice> {
         let mut out = Vec::new();
@@ -200,8 +208,13 @@ impl AppData {
         }
         for &input in current {
             if !out.iter().any(|c| c.input == input) {
-                let why = if kinds.allows(input) { "無い入力" } else { "録れない" };
-                out.push(InputChoice { input, label: format!("{} ({why})", input.label()) });
+                let label = if input.is_midi() && !kinds.midi {
+                    INPUT_UNSET.to_string()
+                } else {
+                    let why = if kinds.allows(input) { "無い入力" } else { "録れない" };
+                    format!("{} ({why})", input.label())
+                };
+                out.push(InputChoice { input, label });
             }
         }
         out

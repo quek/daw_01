@@ -29,6 +29,20 @@ impl AppData {
         self.cur.view.open_rack_panels.contains(&key)
     }
 
+    /// `key` が「開いている Par」として覚えてよい鍵か: 現存する device で、Par を持つもの (字幕デバイスは
+    /// 持たない、`common::plugin_db::is_subtitle`)。master の Limiter は常に居る。ViewState の保存と復元が
+    /// 同じこの 1 本を通す (r.md #158 より前のファイルの字幕の鍵を、復元の時点で落とす)。
+    pub(crate) fn rack_panel_key_valid(&self, key: RackPanelKey) -> bool {
+        match key {
+            RackPanelKey::Device(id) => {
+                let song = self.cur.song_doc.song();
+                song.device_by_id(id).is_some()
+                    && song.plugin_by_id(id).is_none_or(|p| !common::plugin_db::is_subtitle(p.format, &p.plugin_id))
+            }
+            RackPanelKey::MasterLimiter => true,
+        }
+    }
+
     /// `ids` (node id) の Par を閉じる。削除 / 移動 (同じトラック内の並べ替えを含む、Q18) の後始末。
     pub(crate) fn close_rack_panels_of(&mut self, ids: &[u64]) {
         for &id in ids {

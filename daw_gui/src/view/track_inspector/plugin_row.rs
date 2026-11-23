@@ -11,10 +11,12 @@ use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent, ChainEntry};
 use crate::event_device::DeviceEvent;
-use common::model::{MASTER_TRACK_ID, RackPanelKey, TapPoint, TapSource};
+use common::model::{RackPanelKey, TapPoint, TapSource};
 
 use super::chain_list::{ROW_H, RowCtx, draw_row_name, panel_height};
-use super::layout::{FAIL_REASON_H, FORM_GAP, FORM_ROW_PITCH, LABEL_FONT, PAR_PAD, ROW_NAME_X, expansion_inset, form_block_h};
+use super::layout::{
+    FAIL_REASON_H, FORM_GAP, FORM_ROW_PITCH, LABEL_FONT, PAR_PAD, ROW_NAME_X, expansion_inset, expansion_rect, form_block_h,
+};
 use super::mix_knob::MIX_COL_W;
 use super::native_row::claim_expansion_press;
 use super::{aux_out_panel, device_panel, form, vocab};
@@ -34,31 +36,44 @@ pub(super) fn expansion_cols(ctx: &RowCtx<'_>, full: Rect) -> form::FormCols {
 /// `chain_list::build_list_rows` が同じ順で足す)。
 pub(super) fn draw_plugin_expansions(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &RowCtx<'_>, entry: &ChainEntry, content: Rect) {
     let device_id = entry.device_id;
-    let mut ey = content.y + ROW_H;
-    let full = |y: f32, h: f32| Rect { x: content.x, y, w: content.w, h };
+    // 行の直下に先に積んだ展開の高さ (y は `layout::expansion_rect` の 1 本で決める)。
+    let mut above = 0.0;
+    let full = |above: f32, h: f32| expansion_rect(content, above, h);
     if let Some(reason) = entry.load_error.as_deref() {
         // 理由は 1 行で切る (長い FFI エラーでも行が伸びない)。全文は status bar / ログに出ている。
         let h = LABEL_FONT * 1.2;
-        let rect = Rect { y: ey + (FAIL_REASON_H - h) * 0.5 - 2.0, h, ..expansion_inset(full(ey, FAIL_REASON_H)) };
+        let line = expansion_inset(full(above, FAIL_REASON_H));
+        let rect = Rect { y: line.y + (FAIL_REASON_H - h) * 0.5 - 2.0, h, ..line };
         ui.label_at_clipped(("inspector_row_fail_reason", device_id), reason, rect, LABEL_FONT, app.theme.core.text_dim);
-        ey += FAIL_REASON_H;
+        above += FAIL_REASON_H;
     }
+    // 展開を 2 つ以上開いたら、2 つ目からは上端に細い罫線 (出力のパネルの下に続く Par の口パク先が、出力の
+    // 欄の続きに見えない)。
+    let mut stacked = false;
     if ctx.sc_open == Some(device_id) && ctx.sc_panel_h > 0.0 {
-        let rect = full(ey, ctx.sc_panel_h);
+        let rect = full(above, ctx.sc_panel_h);
         claim_expansion_press(ui, rect, ("sc", device_id), ctx.popup_open);
         draw_sidechain_panel(app, ui, device_id, ctx.sc_ports, &expansion_cols(ctx, rect), rect.y);
-        ey += ctx.sc_panel_h;
+        above += ctx.sc_panel_h;
+        stacked = true;
     }
     if let Some(aux) = ctx.aux_entry.filter(|a| a.device_id == device_id) {
-        let rect = full(ey, ctx.aux_panel_h);
+        let rect = full(above, ctx.aux_panel_h);
         claim_expansion_press(ui, rect, ("aux_out", device_id), ctx.popup_open);
+        if stacked {
+            expansion_rule(app, ui, ("aux_out", device_id), rect);
+        }
         aux_out_panel::draw(app, ui, aux, &expansion_cols(ctx, rect), rect.y);
-        ey += ctx.aux_panel_h;
+        above += ctx.aux_panel_h;
+        stacked = true;
     }
     let key = RackPanelKey::Device(device_id);
     if app.rack_panel_open(key) {
-        let rect = full(ey, panel_height(app, device_id));
+        let rect = full(above, panel_height(app, device_id));
         claim_expansion_press(ui, rect, ("par", key), ctx.popup_open);
+        if stacked {
+            expansion_rule(app, ui, ("par", key), rect);
+        }
         let inner = expansion_inset(rect);
         let panel = device_panel::PanelCtx { device_id, x: inner.x, w: inner.w, y: inner.y, form_left: ctx.form_left };
         let measured = (device_panel::draw_device_panel(app, ui, panel) - inner.y).max(0.0);
@@ -69,6 +84,12 @@ pub(super) fn draw_plugin_expansions(app: &AppData, ui: &mut Ui<'_, AppData>, ct
             }));
         }
     }
+}
+
+/// 行の直下に重ねて開いた展開の境目 (2 つ目以降の展開の上端、中身と同じ左端から行の右端まで)。
+pub(super) fn expansion_rule(app: &AppData, ui: &mut Ui<'_, AppData>, key: impl std::hash::Hash, full: Rect) {
+    let inner = expansion_inset(full);
+    ui.panel(("inspector_expansion_rule", key), Rect { h: 1.0, ..inner }, app.theme.core.border, 0.0);
 }
 
 /// 右端からボタンを詰めて置く列 (行の上端 `y` から 2px、高さは行 - 4)。
@@ -156,9 +177,10 @@ pub(super) fn draw_plugin_row(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Row
             })
         });
     }
-    // [Out] (aux 出力 port を持つ plugin だけ。マスターは子トラックへ展開できないので出さない —
-    // `AppData::aux_out_entry` と同じ規則)。配線済み (展開済み) は ON 色。
-    if entry.aux_output_count > 0 && ctx.cursor_tid != Some(MASTER_TRACK_ID) {
+    // [Out] (aux 出力 port を持つ plugin だけ。マスターは子トラックへ展開できないので出さない)。出すかどうかは
+    // 開いたパネルの中身と同じ `AppData::aux_out_entry` の 1 本で決める (規則を 2 か所に書かない)。
+    // 配線済み (展開済み) は ON 色。
+    if entry.aux_output_count > 0 && app.aux_out_entry(device_id).is_some() {
         let open = app.cur.peph.open_aux_out_panel == Some(device_id);
         let label = if open { "Out\u{25B4}" } else { "Out\u{25BE}" };
         ui.toggle_button_at(("inspector_row_aux_out", i), label, col.take(BTN_SC_W + 6.0), entry.aux_out_wired || open, &ctx.keys_style, move |_| {

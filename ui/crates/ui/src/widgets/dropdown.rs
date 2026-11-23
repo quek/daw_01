@@ -35,6 +35,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     ///
     /// `selected` は現在選択中の index (0-based、`items` 範囲外なら何も表示しない)。
     /// 本体の文字サイズは [`Ui::control_font_size`] (アプリの操作 widget 共通値)。
+    ///
+    /// **一覧が開いている間は毎フレーム呼ぶこと。** 呼ばれなかったフレーム (帯を畳んだ / パネルを隠した /
+    /// 欄ごと消えた) の末尾で一覧は閉じる ([`Ui::close_popups_without_owner`]) — 見えない本体の一覧が
+    /// 背後の入力を止め続けないため ([`Ui::context_menu_at`] の「毎フレーム呼ぶ」と同じ約束)。
     pub fn dropdown(
         &mut self,
         id: impl Hash,

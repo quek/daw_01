@@ -102,23 +102,29 @@ pub const RESIZE_HANDLE_W: f32 = 5.0;
 
 ```rust
 pub(super) struct BandHead<'a> {
-    pub key: InspectorBand,          // 開閉状態の鍵 (§2.5)
-    pub title: &'a str,              // 「音声クリップ」「Rack」…
-    pub target: Option<&'a str>,     // 「Drums」「選択中の 3 トラック」「Vocal のみ」…
+    pub key: InspectorBand,   // 開閉状態の鍵 (§2.5)
+    pub title: &'a str,       // 「音声クリップ」「Rack」…
+    pub target: &'a str,      // 「Drums」「選択中の 3 トラック」「Vocal のみ」… (空なら出さない)
+    pub warn: &'a str,        // 対象の左に警告色 (Rack の「読み込み失敗 N」)
+    pub actions_w: f32,       // 見出しの右端に子の操作を置く幅 (モジュレーションの「+」)
 }
-/// 見出し (BAND_H) を描き、開いていれば `body(ui, y)` を呼ぶ。返り値 = (次の y, body の返り値)。
-/// `actions` は見出しの右端に置く操作 (モジュレーションの「+」)。見出しのクリックより後に描くので、
-/// press の所有者は後勝ちで子が取る (click.rs:159-161)。
-pub(super) fn band<R: Default>(app, ui, area: Rect, y: f32, head: BandHead,
-    actions: impl FnOnce(&mut Ui<'_, AppData>, Rect),
-    body: impl FnOnce(&mut Ui<'_, AppData>, f32) -> (f32, R)) -> (f32, R);
-/// 帯の中の「詳細」行 (▶ 詳細の名前)。開いていれば `body`。置くのは帯の本文の末尾だけ。
-pub(super) fn details<R: Default>(app, ui, area, y, key: InspectorDetail, label: &str,
-    body: impl FnOnce(&mut Ui<'_, AppData>, f32) -> (f32, R)) -> (f32, R);
+/// 見出しを描いて開閉を取り、`BandHeadOut { open, actions, body_y, .. }` を返す。子の操作 (actions の矩形) は
+/// 見出しのクリックより後に描くので、press の所有者は後勝ちで子が取る (click.rs:159-161)。
+pub(super) fn head(app, ui, area: Rect, y: f32, h: &BandHead) -> BandHeadOut;
+/// 中身を描き終えた y から帯の次の y (中身が空なら見出しだけで閉じる)。
+pub(super) fn end(out: &BandHeadOut, body_end: f32) -> f32;
+/// 普通の帯: head → (開いていれば) body → end。Q の宛先を返す中身 (Rack) は body の外の変数へ書く。
+pub(super) fn band(app, ui, area, y, h: &BandHead, body: impl FnOnce(&mut Ui, f32) -> f32) -> f32;
+/// 帯の中の「詳細」行 (▶ 詳細の名前)。開いていれば `body`。置くのは小まとまりの末尾だけ。
+pub(super) fn details(app, ui, x, w, y, key: InspectorDetail, label: &str, body: impl FnOnce(&mut Ui, f32) -> f32) -> f32;
 ```
 
-- 見出しの面: palette の `header` (ui `theme.rs` の「クローム面のバー類」、ダーク / ライト両方で `panel` より一段沈む)。hover は `control_hover`、下端に 1px の `border`。
-  - 仕様の例は `panel_raised` だが、Rack の行が既に `panel_raised` で塗られている (`chain_list.rs:406-411`)。帯と行が同じ色になると境目が消えるので `header` を使う (§8-1)。
+(当初の案は `band<R>(…, actions, body) -> (f32, R)` の 1 本だったが、子の操作を見出しの上に置く帯が
+モジュレーションの 1 本だけで、返り値の型引数が全部の帯に要るので、`head` / `end` に分けた。)
+
+- 見出しの面: palette の `control` (押せる面。hover は `control_hover`)、下端に 1px の `border` (§8-1)。
+  - 仕様の例は `panel_raised` だが、Rack の行が既に `panel_raised` で塗られている (`chain_list.rs:406-411`)。帯と行が同じ色になると境目が消える。
+  - 段 3 までは `header` だったが、`header` は地 (`panel`) より沈む色で、子の Rack の行 (`panel_raised`) の方が親の見出しより目立った (レビューの指摘、ダーク 1.15:1)。`control` は両テーマで地から離れる向きで、行より 1 段持ち上がる。
 - 見出しの文字: 名前は 12px `text`、対象は 11px `text_dim` を右寄せで、幅で切る。
 - 見出しのクリック判定は `!ui.has_open_popups()` のときだけ取る (`chain_list.rs:87` と同じガード)。
 
@@ -711,7 +717,8 @@ pub struct InspectorTitle {
 
 5. **入力中の文字が確定せずに消える**
    - text_input は `blurred` で確定する (`talk.rs:127-131`、`text_event.rs:100-105`)。帯を畳んだ次のフレームでは text_input が描かれず、blur を報告できない。
-   - 対処: `handler/inspector_view.rs` の開閉で、先に `CommitClipTextContentEdit` / `CommitRenameClip` を呼ぶ。どちらも同じ値なら no-op (`tracks.rs:1318-1322`)。
+   - 当初の対処案: `handler/inspector_view.rs` の開閉で、先に `CommitClipTextContentEdit` / `CommitRenameClip` を呼ぶ。
+   - 実装 (段 1 で変えた): 開閉の handler では何もしない。見出しを押した press のフレームで、入力欄は「欄の外の press」で blur して確定する (`text_input.rs:220` の `blurred`)。見出しの開閉は release のフレームなので、畳む時点で確定は済んでいる (`handler/inspector_view.rs` の module doc)。
 
 6. **持ち主の消えた dropdown の popup** — §2.7 (b) で core 側を直す。
 
@@ -784,12 +791,13 @@ pub struct InspectorTitle {
 
 ## 8. 計画で決めたこと (委任判断の中身。実装前に見直せるように一覧にする)
 
-1. **帯の面の色は `header`。** 仕様の例は `panel_raised` だが、Rack の行と同じ色になって境目が消えるため。
-2. **帯の対象はいつも出す。** トラックの帯は単一選択ならトラック名、複数なら「選択中の N トラック」/「… のみ」。仕様 1 の「対象を出す」を字義どおりに取った。タイトルと重なることがあっても規則を 1 本にする。
+1. **帯の面の色は `control` (段 4 で `header` から変えた、§2.2)。** 仕様の例は `panel_raised` だが、Rack の行と同じ色になって境目が消えるため。
+2. **帯の対象は、タイトルの 1 行目と同じ語なら省く (段 4 で変えた)。** トラックの帯は単一選択ならトラック名、複数なら「選択中の N トラック」/「… のみ」。段 3 までは「いつも出す」だったが、1 本のトラックを選んだだけでトラック名が 4 回並んだ (レビューの指摘)。タイトルはスクロールしないので、省いても対象は常に見えている。複数選択の対象は 1 行目と違う語なので残る。
 3. **何も選んでいないとき、選択の帯は出さない。** 使わない欄の空白を残さない (仕様 14 と同じ考え)。帯を畳んでいれば、クリップを選んだときの Rack のずれは見出し 1 本ぶん (24 + 6px) で済む。
 4. **トラック色の操作はタイトルに置く。** クリップや列を選んでいるときは 2 行目の小さな色見本 (スクロールしない場所なので必ず見える)。
 5. **幅の下限 360 / 上限 640 / 既定 360、キーは I。** 下限の理由は §6-10、キーは Logic と同じ。
-6. **フォローアクションの 3 列の格子と、モジュレーションの変調器の本体 (Smooth / Dly / HP などの密な行) は、行の形を変えない。** 音のパラメータの格子 (内蔵 Par) と同じ扱いにした。揃えるのは左端と小見出しだけ。
+6. **モジュレーションの変調器の本体 (Shp / Jit / Smo / Steps / Dly / Fade / φ / Free の密な行) と、映像 FX の Par の param 名 (Exposure …) は、行の形も名前も変えない。** どちらも device (変調器 / 映像効果) そのもののパラメータで、名前は効果の定義が持ち、オートメーションのレーン名・変調先の名前と同じ語 — Par の中だけ訳すと 1 つの param に 2 つの呼び名ができる。内蔵 Par の格子 (HP / Thr / ROOM) と同じ扱い。揃えるのは左端と小見出しと開閉マーク (枠の無い glyph) だけ。
+   - **フォローアクションと MIDI 割り当ては段 4 で欄の行に直した。** 段 3 までは 3 列の格子 ([有効][クリップ終端▾][1] / [なし▾][100][なし▾]) だったが、欄名が無く「1」「100」が何か読めず、右端も欄の列からはみ出した (レビューの指摘)。これらは音のパラメータではなくクリップ / 列の設定なので仕様 9 の例外に当たらない。発動 [有効][クリップ終端▾] / 回数 or 間隔 / アクション A / A の確率 % / アクション B、ジャンプの飛び先は同じ行の右半分 (行が増えない)。MIDI 割り当ては 鳴らす [セル][列] / 止める [行][全部] / アレンジへ戻す [行][全部] / 消去。
 7. **選択肢の値 (Repitch / Trigger / Linear / Pre-FX / Split の値 / Match) は英語のまま。** 仕様 11 の対象は見出しと欄名なので。ただしカーブの表記は 1 本 (「S-Curve」) に揃える。
 8. **「オフ」の見せ方。** 組み込み Comp / EQ だけでなく、バイパス中の行すべて (plugin / Parallel / Limiter) を同じ規則にする: 名前を text_dim + 「オフ」の札。トラック無効 (r.md #131) は text_faint のまま区別する。
 9. **読み込み失敗も行の中へ移す。** 仕様 2 の「トリガから離れて出ているもの」と同じ型だと判断した。
@@ -807,3 +815,52 @@ pub struct InspectorTitle {
 - `launch_section.rs:8-13, 37-39` の古いコメント (移すときに直す)。
 - `view_model.rs:285-290`、`chain_rows.rs:29-32` の「セクション」への言及。
 - この計画書は `docs/plan_rmd_158_inspector.md` に置く。r.md は編集しない。
+
+---
+
+## 10. 段 4 レビューの指摘の修正 (見た目 / 正しさと操作 / 規約と構造)
+
+直したもの (撮影は `inspector_visual.rs` の `s4_*`、テストは `inspector_bands.rs` / `native_rack_visual.rs`):
+
+- **タイトル**: 2 行目のトラック名と色見本は、クリップを選んでいればクリップの居るトラック (カーソルではない)。
+  名前の無いクリップは「(名前なし)」、2 行目に種類と「セル」(ランチャーのセルのとき)。マスターは 2 行目を出さない。
+  色見本の当たりは `primary_click` だけ (button を下に敷くと枠が 1px はみ出した)。
+- **帯の対象**: タイトルの 1 行目と同じ語なら省く (§8-2)。入力の帯の対象は書き込み先 (`input_target_track_ids`)
+  の名前。Rack の見出しに「読み込み失敗 N」(警告色、畳んでも見える)、畳んだ Parallel / 閉じた chain の行に
+  「失敗 N」— 読み込み失敗を行の中へ移したことで、隠れた行の失敗が見えなくなっていた。
+- **見出しの面**は `control` (§2.2 / §8-1)。
+- **入力元**: MIDI を録れないトラックの既定 (MIDI) は「未選択」(「MIDI (録れない)」の警告にしない)。
+- **フォローアクション / MIDI 割り当て**は欄の行 (§8-6)。MIDI 割り当ての詳細は学習の待ち受け中に「· 学習中」を
+  添える (畳んでいても次の MIDI 入力が割り当てられることが見える)。Learn の「シーン」は帯と同じ「列」。
+- **オフの札**は全部の行で名前の直後 (内蔵 device / Limiter もダブルクリックで札の上からも ON に戻る)。文字は
+  `text_dim` を窪みの上で 4.5:1 まで寄せた色 (ライトで 3.8:1 だった)。
+- **字幕の欄名**: アルファは「不透明度」(自動化の「A」と並んで紛れた)、W / H は「幅」「高さ」。
+- **+ チェーン**は chain 行と同じ幅の枠だけの行 (chain の中の小さい「+ プラグイン」と形で分ける)。
+- **行の直下に重ねて開いた展開** (出力のパネル → Par など) の 2 つ目から上端に罫線。
+- **モジュレーションの開閉マーク**は枠の無い glyph (帯 / Parallel / chain と同じ形)。
+- **複数選択**: 歌声の声と読み上げの話者 / スケールは選んでいる同じ種類のクリップ全部へ (`SetClipVoice` /
+  `SetClipTalkParam` が `clips: Vec<ClipKey>`、1 undo step)。割れていれば dropdown は空 / 数値は「—」。名前・本文・
+  「ここから読む」はクリップ 1 つの値なので 1 つだけ選んでいるときだけ。
+- **窓に字幕の片が無いテキストクリップ**: 編集バッファの対象を `Some` に揃える (`None` に戻すと毎フレーム resync が
+  積まれ、再描画が止まらなかった)。
+- **幅のドラッグ**: `ResizeDrag::handle_origin` (帯の中の掴んだ位置を保った帯の左上) で縁を出す (掴んだ瞬間に最大
+  5px 跳んでいた)。マスターパネルのセクション境界も `resize_handle` (Vertical) にし、設定 / ラウドネスの浮動窓の
+  右端・下端も `resize_handle` (カーソル / popup の間は掴まない) にした。隅 (2 軸) は `CursorIcon` に斜めの形が
+  無いので今のまま。
+- **SSoT**: 行の寸法 (`layout::RACK_INDENT` / 見出しの隙間 / タイトルの余白 / `BAND_ADD_W`)、内蔵 Par の小見出しの
+  送り (`native_panel::layout::SECTION_H` = `SUB_HEAD_H`)、展開の y (`layout::expansion_rect`、描画と `par_rect` が
+  同じ 1 本)、文言 (タイトルの語・フォローアクション・MIDI 割り当て・X / Y / 幅 / 高さ を `vocab`)、「字幕は Par を
+  持たない」(`common::plugin_db::is_subtitle` + `AppData::rack_panel_key_valid`、ViewState の保存と復元が同じ判定)、
+  「マスターは Out▾ を出さない」(`aux_out_entry` の 1 本)。
+- **消し忘れ**: `PluginParamsInspector.plugin_name`、`AppEvent::SetClipTextMuted` (誰も送っていない別名)、
+  `let active = true`、`F::Text { .. }` の `..`。
+
+直さなかったもの (理由):
+
+- **入力の帯が操作の結果で消えて Rack が上へずれる** (空のトラックに映像 FX を足す等): 開閉の操作ではなく、トラックの
+  中身が変わって入力の意味が無くなった結果。仕様 14 は意味の無い欄の空白を残さないことを求め、押した「+ プラグイン」は
+  行が 1 本増えるのでどのみち動く。高さを保つと、説明の無い空白が帯の上に残る。
+- **モジュレーションの変調器の本体と映像 FX の Par の param 名の英語** (§8-6): device そのもののパラメータ名
+  (オートメーション / 変調先の名前と同じ語)。
+- **帯の中の小見出しと欄名の区別が罫線だけ**: 小見出しの形 (10px・text_dim・罫線) は仕様 9 が `native_panel/cell.rs` の
+  「ROOM ――」に揃えると決めたもの。見出しの面を `control` にして帯の見出しとの差は付いた。

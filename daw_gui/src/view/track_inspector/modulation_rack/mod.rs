@@ -230,19 +230,26 @@ pub(super) fn draw_modulation_rack(
         // (r.md #74 で全 disclosure の glyph を `view::disclosure` へ一本化した。
         // 旧実装はここだけ小三角 ▸/▾ を使っていて、 同じ意味のマークが 2 系統
         // 存在していた)。 ▸/▾ と ▶/▼ は既定フォントで advance が同一 (0.527 em)
-        // なので、 族を変えても行のレイアウトは 1px も動かない。
-        ui.button_at(
+        // なので、 族を変えても行のレイアウトは 1px も動かない。r.md #158: 枠の無い glyph だけ (帯の見出し /
+        // Rack の Parallel・chain の行の開閉と同じ形)。当たりは glyph の列 (`MOD_DISCLOSURE_W`) の行の高さ。
+        let glyph_hit = Rect { x: lx, y, w: MOD_DISCLOSURE_W, h: 20.0 };
+        let inside = !ui.has_open_popups() && ui.pointer().pos.is_some_and(|(px, py)| glyph_hit.contains(px, py));
+        if ui.primary_click(daw_ui_core::WidgetId::ROOT.child(("inspector_mod_src_expand", sid)), inside).clicked {
+            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+                // multi-expand: 既に開いていれば閉じる、 でなければ追加 (複数同時可)。
+                if !app.cur.peph.expanded_mod_sources.insert(sid) {
+                    app.cur.peph.expanded_mod_sources.remove(&sid);
+                }
+            }));
+        }
+        let glyph_ink = if inside && ui.hovers(glyph_hit) { p.text } else if expanded { p.accent } else { p.text_dim };
+        ui.label_at(
             ("inspector_mod_src_expand", sid),
             disclosure_glyph(!expanded, RevealAxis::Block),
-            Rect { x: lx, y, w: MOD_DISCLOSURE_W, h: 20.0 },
-            move || {
-                Edit::mutate(move |app: &mut AppData| {
-                    // multi-expand: 既に開いていれば閉じる、 でなければ追加 (複数同時可)。
-                    if !app.cur.peph.expanded_mod_sources.insert(sid) {
-                        app.cur.peph.expanded_mod_sources.remove(&sid);
-                    }
-                })
-            },
+            lx + 3.0,
+            y + (20.0 - 9.0 * 1.2) * 0.5,
+            9.0,
+            glyph_ink,
         );
         let name_x = lx + MOD_NAME_INSET;
         // バッジが出ている分だけ名前 / track dropdown を詰める (行は太らせない)。

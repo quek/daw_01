@@ -519,8 +519,9 @@ fn off_tag_in_row(scene: &Scene, row_name: &str) -> Option<Glyph> {
 /// 小表示 (GR の溝) のままで、札は出ない。停止中 (GR 0 = 塗りが出ない) で比べる。
 #[test]
 fn off_rows_show_an_off_tag_instead_of_a_greyed_mini_display_in_both_themes() {
-    /// 札の文字 (10px) と札の面のコントラスト (非テキストの UI 部品として 3:1 以上)。
-    const MIN_CONTRAST: f32 = 3.0;
+    /// 札の文字 (10px) と札の面のコントラスト (本文の文字の 4.5:1 以上 — 3:1 の薄い文字だと、ライトテーマの灰色の
+    /// 窪みの上で「押せない部品」に見えた。レビューの実測でライト 3.8:1)。
+    const MIN_CONTRAST: f32 = 4.5;
     /// ON の行の溝の輪郭が見える下限 (80×8 の無彩色の面なら数 % の輝度差で見える)。
     const MIN_VISIBLE: f32 = 1.04;
     // `hovered` なら行の名前の上にポインタを置いたフレームで撮る。
@@ -538,6 +539,9 @@ fn off_rows_show_an_off_tag_instead_of_a_greyed_mini_display_in_both_themes() {
         assert!(gr_mini_slot_contrast(scene, row).is_none(), "{what}: OFF の `{row}` 行に灰色の小表示を描かない");
         let ratio = contrast_ratio(tag.color, backdrop(scene, tag.center(), tag.order));
         assert!(ratio >= MIN_CONTRAST, "{what}: 札の文字 {:?} のコントラスト {ratio:.2}", tag.color);
+        // 札の位置は plugin / Parallel の行と同じ「名前の直後」(行ごとにボタン列の左へずれてガタつかない)。
+        let name = one(scene, row);
+        assert!(tag.left > name.left && tag.left < name.left + 70.0, "{what}: 札は `{row}` の名前の直後 ({} → {})", name.left, tag.left);
     };
     let check_on = |what: String, scene: &Scene, row: &str| {
         assert!(off_tag_in_row(scene, row).is_none(), "{what}: ON の `{row}` 行に札は出ない");

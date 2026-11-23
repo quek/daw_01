@@ -82,9 +82,15 @@ pub const FIELD_MONITOR: &str = "モニター";
 
 /// VOICEVOX の Par の欄「口パク先」(口形状の画像を焼き込むトラック)。
 pub const FIELD_LIPSYNC_TARGET: &str = "口パク先";
-/// Transform (立ち絵グループ) の Par の欄 (X / Y はそのまま、回転 / 不透明度は画像クリップと同じ語)。
+/// 位置と大きさ (画像クリップ / 字幕 / Transform の Par。X / Y は記号のまま、回転 / 不透明度は同じ語を使う)。
 pub const FIELD_X: &str = "X";
 pub const FIELD_Y: &str = "Y";
+pub const FIELD_W: &str = "幅";
+pub const FIELD_H: &str = "高さ";
+/// 字幕の塗り / 縁 / 影の色 (R / G / B は記号のまま、アルファは「不透明度」— 自動化の「A」と紛れない)。
+pub const FIELD_R: &str = "R";
+pub const FIELD_G: &str = "G";
+pub const FIELD_B: &str = "B";
 pub const FIELD_SCALE_X: &str = "拡大 X";
 pub const FIELD_SCALE_Y: &str = "拡大 Y";
 pub const FIELD_ANCHOR_X: &str = "基準点 X";
@@ -123,7 +129,8 @@ pub fn aux_out_port(n: usize) -> String {
     format!("出力 {n}")
 }
 
-/// ラベル列 (`layout::FORM_LABEL_W`) に入る欄名の全部。テストが全部を測り、ラベル列に収まることを確かめる。
+/// 帯の欄 (`form::cols`) のラベル列 (`layout::FORM_LABEL_W`) に入る欄名の全部。テストが全部を測り、ラベル列に
+/// 収まることを確かめる (登録し忘れは、描いた画面で「…」に切れた欄名を探すテストが拾う)。
 pub const FORM_LABELS: &[&str] = &[
     FIELD_NAME,
     FIELD_PLAYBACK,
@@ -166,6 +173,39 @@ pub const FORM_LABELS: &[&str] = &[
     FIELD_ANCHOR_X,
     FIELD_ANCHOR_Y,
     FIELD_CHILD_TRACKS,
+    FIELD_X,
+    FIELD_Y,
+    FIELD_W,
+    FIELD_H,
+    FIELD_R,
+    FIELD_G,
+    FIELD_B,
+    FIELD_FOLLOW_TRIGGER,
+    FIELD_FOLLOW_COUNT,
+    FIELD_FOLLOW_INTERVAL,
+    FIELD_FOLLOW_A,
+    FIELD_FOLLOW_CHANCE_A,
+    FIELD_FOLLOW_B,
+    FIELD_LEARN_LAUNCH,
+    FIELD_LEARN_STOP,
+    FIELD_LEARN_TO_ARRANGER,
+    FIELD_LEARN_CLEAR,
+];
+
+/// Rack の行の直下 (Par / SC / 出力、`form::cols_nested`) の欄名。ラベル列は行の名前の左端から始まるぶん狭い
+/// (深さ 0 で `FORM_LABEL_W - ROW_NAME_X`、Parallel の中は 1 段ごとに `BAR_W` 狭い)。SC / 出力の「入力 N」/
+/// 「出力 N」は [`sc_port`] / [`aux_out_port`] で、テストが別に測る。
+pub const NESTED_FORM_LABELS: &[&str] = &[
+    FIELD_LIPSYNC_TARGET,
+    FIELD_X,
+    FIELD_Y,
+    FIELD_ROTATION,
+    FIELD_SCALE_X,
+    FIELD_SCALE_Y,
+    FIELD_ANCHOR_X,
+    FIELD_ANCHOR_Y,
+    FIELD_OPACITY,
+    FIELD_CHILD_TRACKS,
 ];
 
 // ---- ローンチ / 読み上げのスケール ----
@@ -180,8 +220,76 @@ pub const FIELD_TALK_PITCH: &str = "音高";
 pub const FIELD_TALK_INTONATION: &str = "抑揚";
 pub const FIELD_TALK_VOLUME: &str = "音量";
 
-/// 対象の表示に添える「無効なトラック」(r.md #131: チェーンは host に居ない)。
-pub const TARGET_DISABLED: &str = "(無効中)";
+// ---- フォローアクション (セル / 列) と MIDI 割り当て ----
+
+/// 小見出し「フォローアクション」(セルと列で同じ形)。
+pub const SUB_FOLLOW: &str = "フォローアクション";
+/// [有効] [クリップ終端 ▾ / 指定時間 ▾]。
+pub const FIELD_FOLLOW_TRIGGER: &str = "発動";
+pub const TOGGLE_FOLLOW_ON: &str = "有効";
+/// 発動が「クリップ終端」のときのループ回数 / 「指定時間」のときの間隔 (同じ行で入れ替わる)。
+pub const FIELD_FOLLOW_COUNT: &str = "回数";
+pub const FIELD_FOLLOW_INTERVAL: &str = "間隔 (拍)";
+/// 次に何をするか (A / B と、A を選ぶ確率。B は 100 − A)。ジャンプのときは同じ行の右に飛び先。
+pub const FIELD_FOLLOW_A: &str = "アクション A";
+pub const FIELD_FOLLOW_CHANCE_A: &str = "A の確率 %";
+pub const FIELD_FOLLOW_B: &str = "アクション B";
+/// MIDI 割り当て (Learn) の行: 何を MIDI に割り当てるか。ボタンは押すと学習を始める宛先。
+pub const FIELD_LEARN_LAUNCH: &str = "鳴らす";
+pub const FIELD_LEARN_STOP: &str = "止める";
+pub const FIELD_LEARN_TO_ARRANGER: &str = "アレンジへ戻す";
+pub const FIELD_LEARN_CLEAR: &str = "消去";
+pub const LEARN_CELL: &str = PLACE_CELL;
+/// 列 (シーン) — 帯の名前と同じ語 (同じものに 2 つの呼び名を付けない)。
+pub const LEARN_SCENE: &str = BAND_SCENE;
+pub const LEARN_ROW: &str = "行";
+pub const LEARN_ALL: &str = "全部";
+pub const CLEAR_BINDINGS: &str = "割り当てを全部消す";
+
+/// 詳細「MIDI 割り当て (N 件)」。学習の待ち受け中は「· 学習中」を添える (詳細を畳んでいても、次の MIDI 入力が
+/// 割り当てられることが見える)。
+#[must_use]
+pub fn launch_midi_detail(n: usize, learning: bool) -> String {
+    let head = format!("MIDI 割り当て ({n} 件)");
+    if learning { format!("{head}{SEP}学習中") } else { head }
+}
+
+// ---- タイトルと帯の対象 ----
+
+/// 語と語の区切り (タイトルの 2 行目「音声クリップ · トラック Audio」/ 帯の対象「Synth · 無効中」)。
+pub const SEP: &str = " · ";
+/// 無効なトラック (r.md #131: チェーンは host に居ない)。タイトルの 2 行目と Rack の帯の対象に添える。
+pub const DISABLED: &str = "無効中";
+/// タイトルの 2 行目: 普通のトラックの種類。
+pub const KIND_TRACK: &str = "トラック";
+/// タイトルの 2 行目: ランチャーのセル (アレンジのクリップと見分ける)。
+pub const PLACE_CELL: &str = "セル";
+/// タイトル: 名前の無いクリップ (種類は 2 行目に出す)。
+pub const UNNAMED_CLIP: &str = "(名前なし)";
+
+/// タイトルの 2 行目: クリップの居るトラック。
+#[must_use]
+pub fn track_label(name: &str) -> String {
+    format!("{KIND_TRACK} {name}")
+}
+
+/// タイトルの 2 行目: グループ (バス) トラックの種類と子の数。
+#[must_use]
+pub fn group_kind(children: usize) -> String {
+    format!("グループ{SEP}子 {children} 本")
+}
+
+/// Rack の帯の対象に添える、読み込みに失敗した plugin の数 (警告色、畳んだ Parallel の中も数える)。
+#[must_use]
+pub fn failed_loads(n: usize) -> String {
+    format!("読み込み失敗 {n}")
+}
+
+/// 畳んだ Parallel / 開いていない chain の行に添える、中に隠れた読み込み失敗の数 (警告色)。
+#[must_use]
+pub fn hidden_failures(n: usize) -> String {
+    format!("失敗 {n}")
+}
 
 /// クリップの帯の見出し (クリップの種類)。
 #[must_use]

@@ -59,10 +59,10 @@ pub(super) fn draw_subtitle(app: &AppData, ui: &mut Ui<'_, AppData>, c: &FormCol
     y += FORM_ROW_PITCH;
 
     for (label, field) in [
-        ("X", TextNumField::X),
-        ("Y", TextNumField::Y),
-        ("W", TextNumField::W),
-        ("H", TextNumField::H),
+        (vocab::FIELD_X, TextNumField::X),
+        (vocab::FIELD_Y, TextNumField::Y),
+        (vocab::FIELD_W, TextNumField::W),
+        (vocab::FIELD_H, TextNumField::H),
         (vocab::FIELD_FONT_SIZE, TextNumField::FontSize),
         (vocab::FIELD_OPACITY, TextNumField::Opacity),
     ] {
@@ -107,28 +107,30 @@ fn draw_style_details(
     y: f32,
 ) -> f32 {
     let mut y = num_row(app, ui, c, summary, y, vocab::FIELD_ROTATION, TextNumField::Rotation);
+    // アルファの欄名は「不透明度」(「A」だと右の自動化の「A」と並んで紛れる)。
+    let (r, g, b, a) = (vocab::FIELD_R, vocab::FIELD_G, vocab::FIELD_B, vocab::FIELD_OPACITY);
     let groups: [(&str, &[(&str, TextNumField)]); 3] = [
         (
             vocab::SUB_FILL,
-            &[("R", TextNumField::FillR), ("G", TextNumField::FillG), ("B", TextNumField::FillB), ("A", TextNumField::FillA)],
+            &[(r, TextNumField::FillR), (g, TextNumField::FillG), (b, TextNumField::FillB), (a, TextNumField::FillA)],
         ),
         (
             vocab::SUB_OUTLINE,
             &[
-                ("R", TextNumField::OutlineR),
-                ("G", TextNumField::OutlineG),
-                ("B", TextNumField::OutlineB),
-                ("A", TextNumField::OutlineA),
+                (r, TextNumField::OutlineR),
+                (g, TextNumField::OutlineG),
+                (b, TextNumField::OutlineB),
+                (a, TextNumField::OutlineA),
                 (vocab::FIELD_OUTLINE_W, TextNumField::OutlineWidth),
             ],
         ),
         (
             vocab::SUB_SHADOW,
             &[
-                ("R", TextNumField::ShadowR),
-                ("G", TextNumField::ShadowG),
-                ("B", TextNumField::ShadowB),
-                ("A", TextNumField::ShadowA),
+                (r, TextNumField::ShadowR),
+                (g, TextNumField::ShadowG),
+                (b, TextNumField::ShadowB),
+                (a, TextNumField::ShadowA),
                 (vocab::FIELD_OFFSET_X, TextNumField::ShadowOffsetX),
                 (vocab::FIELD_OFFSET_Y, TextNumField::ShadowOffsetY),
                 (vocab::FIELD_BLUR, TextNumField::ShadowBlur),

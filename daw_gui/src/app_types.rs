@@ -1000,14 +1000,12 @@ pub struct VideoFxParamsInspector {
     pub values: Vec<f32>,
 }
 
-/// 埋め込み GUI を持たない plugin の「⚙」インライン param パネルの
-/// read snapshot。 `open_plugin_params` が cursor track の device を指すとき
-/// `inspector_plugin_params()` が返す。 VOICEVOX builtin は `voice` に device
-/// 既定の声を、 汎用 plugin は `params` に編集可能な param 行を載せる。
+/// 埋め込み GUI を持たない plugin の Par (インライン param パネル) の read snapshot。Par を開いた device が
+/// cursor track に居るとき `inspector_plugin_params()` が返す。中身は編集可能な param 行だけ (plugin の名前は
+/// 行の見出しが出すので持たない、r.md #158)。VOICEVOX / 字幕は host param を持たないので返らない。
 pub struct PluginParamsInspector {
     pub track_id: u32,
     pub device_id: u64,
-    pub plugin_name: String,
     /// 汎用 plugin param 行 (lane default_value を実レンジ化した現値つき)。
     pub params: Vec<PluginParamRow>,
 }

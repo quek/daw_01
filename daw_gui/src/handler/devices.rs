@@ -512,7 +512,7 @@ impl AppData {
         if let Some(d) = device
             && d.ports.is_video()
         {
-            if d.plugin_id != common::plugin_db::SUBTITLE_ID {
+            if !common::plugin_db::is_subtitle(d.format, &d.plugin_id) {
                 self.toggle_rack_panel(common::model::RackPanelKey::Device(device_id));
             }
             return;

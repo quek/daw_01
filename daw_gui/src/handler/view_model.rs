@@ -272,7 +272,7 @@ impl AppData {
     /// `is_main=false` の音声出力を持つ (`aux_output_count > 0`) なら、その配線。Rack の plugin 行の
     /// `Out▾` で行の直下に開く出力のパネル (展開ボタン + port ごとの宛先) の中身 (r.md #158)。
     /// マスターは対象外 — 子トラックへ展開する形は、出元が実トラック (`parent_group_id` の子を持てる) で
-    /// あることを要る (行の `Out▾` も同じ規則で出さない)。
+    /// あることを要る。行の `Out▾` を出すかどうかもこの関数で決める (規則は 1 か所)。
     pub fn aux_out_entry(&self, device_id: u64) -> Option<ParallelOutputEntry> {
         let track = self.cursor_track_index().and_then(|i| self.cur.song_doc.song().tracks.get(i))?;
         if track.id == common::model::MASTER_TRACK_ID {

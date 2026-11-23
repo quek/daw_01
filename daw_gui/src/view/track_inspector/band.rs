@@ -13,8 +13,8 @@ use daw_ui_core::{Edit, Ui, WidgetId};
 use daw_ui_renderer::Rect;
 
 use super::layout::{
-    BAND_BODY_BOTTOM, BAND_BODY_TOP, BAND_H, DISCLOSURE_FONT, DISCLOSURE_W, HEAD_FONT, PAD, SUB_HEAD_FONT, SUB_HEAD_H,
-    TARGET_FONT,
+    BAND_ACTIONS_GAP, BAND_BODY_BOTTOM, BAND_BODY_TOP, BAND_H, BAND_TARGET_GAP, DETAIL_GAP, DETAIL_ROW_H,
+    DISCLOSURE_FONT, DISCLOSURE_W, HEAD_FONT, PAD, SUB_HEAD_FONT, SUB_HEAD_GAP, SUB_HEAD_H, TARGET_FONT,
 };
 use crate::app::{AppData, AppEvent};
 use crate::event_inspector::InspectorEvent;
@@ -27,10 +27,20 @@ pub(super) struct BandHead<'s> {
     pub key: InspectorBand,
     /// 名前 (「音声クリップ」「Rack」…)。
     pub title: &'s str,
-    /// 対象 (「Drums」「選択中の 3 トラック」「Vocal のみ」…)。右寄せで、幅が足りなければ省略。
+    /// 対象 (「Drums」「選択中の 3 トラック」「Vocal のみ」…)。右寄せで、幅が足りなければ省略。空なら出さない
+    /// (タイトルの 1 行目と同じ語は呼び出し側が空にする、`track_inspector::draw_bands`)。
     pub target: &'s str,
+    /// 対象の左に警告色で添える注意 (Rack の「読み込み失敗 N」)。空なら出さない。畳んでいても見える。
+    pub warn: &'s str,
     /// 見出しの右端に子の操作を置く幅 (モジュレーションの「+」)。対象はその左に寄せる。
     pub actions_w: f32,
+}
+
+impl<'s> BandHead<'s> {
+    /// 対象だけの見出し (注意も子の操作も無い)。
+    pub fn new(key: InspectorBand, title: &'s str, target: &'s str) -> Self {
+        Self { key, title, target, warn: "", actions_w: 0.0 }
+    }
 }
 
 /// 見出しを描いた結果。
@@ -61,7 +71,9 @@ pub(super) fn head(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, y: f32, 
             app.handle_event(AppEvent::Inspector(InspectorEvent::ToggleBand(key)));
         }));
     }
-    let fill = if inside && ui.hovers(rect) { p.control_hover } else { p.header };
+    // 見出しは押せる面なので button と同じ `control` / `control_hover` で塗る — 中の Rack の行
+    // (`panel_raised`) より 1 段持ち上がり、親の見出しが子の行より目立つ (両テーマで地から離れる向き)。
+    let fill = if inside && ui.hovers(rect) { p.control_hover } else { p.control };
     ui.panel(("inspector_band_bg", h.key), rect, fill, 0.0);
     ui.panel(("inspector_band_rule", h.key), Rect { y: y + BAND_H - 1.0, h: 1.0, ..rect }, p.border, 0.0);
 
@@ -78,8 +90,8 @@ pub(super) fn head(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, y: f32, 
     let title_x = x + DISCLOSURE_W;
     let right = area.x + area.w - PAD;
     let actions = Rect { x: right - h.actions_w, y: y + 2.0, w: h.actions_w, h: BAND_H - 4.0 };
-    let target_right = if h.actions_w > 0.0 { actions.x - 8.0 } else { right };
-    let title_w = ui.measure_text(h.title, HEAD_FONT).min((target_right - title_x).max(0.0));
+    let mut tail_right = if h.actions_w > 0.0 { actions.x - BAND_ACTIONS_GAP } else { right };
+    let title_w = ui.measure_text(h.title, HEAD_FONT).min((tail_right - title_x).max(0.0));
     ui.label_at_clipped(
         ("inspector_band_title", h.key),
         h.title,
@@ -87,18 +99,19 @@ pub(super) fn head(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, y: f32, 
         HEAD_FONT,
         p.text,
     );
-    if !h.target.is_empty() {
-        let left = title_x + title_w + 12.0;
-        let w = ui.measure_text(h.target, TARGET_FONT).min((target_right - left).max(0.0));
-        if w > 0.0 {
-            ui.label_at_clipped(
-                ("inspector_band_target", h.key),
-                h.target,
-                Rect { x: target_right - w, y: text_y(TARGET_FONT), w, h: TARGET_FONT * 1.2 },
-                TARGET_FONT,
-                p.text_dim,
-            );
+    // 右から 対象 (text_dim) → 注意 (text_error) の順に詰める。名前に食い込む分は省略する。
+    let left = title_x + title_w + BAND_TARGET_GAP;
+    for (k, text, color) in [(0u8, h.target, p.text_dim), (1u8, h.warn, p.text_error)] {
+        if text.is_empty() {
+            continue;
         }
+        let w = ui.measure_text(text, TARGET_FONT).min((tail_right - left).max(0.0));
+        if w <= 0.0 {
+            break;
+        }
+        let rect = Rect { x: tail_right - w, y: text_y(TARGET_FONT), w, h: TARGET_FONT * 1.2 };
+        ui.label_at_clipped(("inspector_band_target", h.key, k), text, rect, TARGET_FONT, color);
+        tail_right = rect.x - BAND_ACTIONS_GAP;
     }
     BandHeadOut { open, actions, body_y: y + BAND_H + BAND_BODY_TOP, head_end: y + BAND_H }
 }
@@ -136,7 +149,7 @@ pub(super) fn details<'u>(
     body: impl FnOnce(&mut Ui<'u, AppData>, f32) -> f32,
 ) -> f32 {
     let p = &app.theme.core;
-    let row = Rect { x, y, w, h: SUB_HEAD_H + 4.0 };
+    let row = Rect { x, y, w, h: DETAIL_ROW_H };
     let open = app.cur.view.inspector_folds.detail_open(key);
     let inside = !ui.has_open_popups() && ui.pointer().pos.is_some_and(|(px, py)| row.contains(px, py));
     if ui.primary_click(WidgetId::ROOT.child(("inspector_detail_row", key)), inside).clicked {
@@ -161,7 +174,7 @@ pub(super) fn details<'u>(
         TARGET_FONT,
         ink,
     );
-    let next = y + row.h + 4.0;
+    let next = y + row.h + DETAIL_GAP;
     if open { body(ui, next) } else { next }
 }
 
@@ -186,13 +199,13 @@ pub(super) fn sub_heading(
     let rule_end = match right {
         Some(text) => {
             let tw = ui.measure_text(text, SUB_HEAD_FONT);
-            let tx = (right_edge - tw).max(x + label_w + 8.0);
+            let tx = (right_edge - tw).max(x + label_w + SUB_HEAD_GAP * 2.0);
             ui.label_at((id, 1u8), text, tx, y, SUB_HEAD_FONT, color);
-            tx - 6.0
+            tx - SUB_HEAD_GAP
         }
         None => right_edge,
     };
-    let rule_x = x + label_w + 6.0;
+    let rule_x = x + label_w + SUB_HEAD_GAP;
     if rule_end > rule_x {
         let r = Rect { x: rule_x, y: y + SUB_HEAD_FONT * 0.5, w: rule_end - rule_x, h: 1.0 };
         ui.panel((id, 2u8), r, color, 0.0);

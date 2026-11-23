@@ -638,10 +638,11 @@ pub struct ProjectEphemeral {
     /// content_size として使う (= lag-by-one)。 描画末尾で実測値に更新。
     /// session-only (save / Undo 対象外)。
     pub inspector_body_h: f32,
-    /// r.md #158 §6-1: インスペクタの本文高の「床」。帯 / Par を開閉した瞬間の
-    /// `scroll offset + viewport 高` を覚え、本文が縮んでも scroll_area が offset を詰めない
-    /// (= 末尾までスクロールした状態で畳んでも、押した見出しが下へずれない)。上へスクロールすると
-    /// 床は下がって空白が消え、選択の主が変わるか本文が床を超えたら捨てる。session-only。
+    /// r.md #158 §6-1: インスペクタの本文高の「床」。本文が見えている下端 (`scroll offset + viewport 高`)
+    /// より短くなったフレームでは、理由を問わず (帯 / Par の開閉に限らず、行が消えた等でも) その下端を床にし、
+    /// scroll_area が offset を詰めない (= 末尾までスクロールした状態で畳んでも、押した見出しが下へずれない)。
+    /// 上へスクロールすると床は下がって空白が消え、選択の主が変わるか本文が床に追いついたら捨てる
+    /// (`InspectorScrollFloor::next`)。session-only。
     pub inspector_scroll_floor: Option<crate::state::inspector_view::InspectorScrollFloor>,
     /// r.md #129: Rack の Par パネルの実測高 (px、前フレーム測定値、`RackPanelKey` ごと)。
     /// `reorderable_list_expandable` の `row_extra_h` に渡して開いた行の直下に確保する展開高に

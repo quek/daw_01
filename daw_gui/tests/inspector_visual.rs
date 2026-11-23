@@ -3,11 +3,13 @@
 //! 1 つの曲 (MIDI / VOICEVOX 歌声 / オーディオ / 画像 + 映像 FX / グループ + Parallel / 読み上げ + 字幕 / 映像) を
 //! 組み、状態ごとに選択・帯の開閉・Par の開閉・幅・テーマを変えてルート view を GPU でオフスクリーン描画し、
 //! `target/inspector_shots/<名前>.png` に保存する。今の見た目は、スクロールしない 2 行のタイトル
-//! (選んでいるもの + 色見本) の下に、見出しの帯 (選択 → 列 → 入力 → Rack → 口パク → モジュレーション) を
-//! 積んだ 1 本の縦スクロール。クリップの設定 (音声 / 画像 / 歌声 / 読み上げ / 字幕 / ローンチ) は全部一番上の
-//! 選択の帯に「ラベル左・値右」の欄で並び、Par にはデバイスそのものの設定だけが残る。Rack の行の直下に開く
-//! Par / SC / 出力は行の名前の左端から始まり (行の背景と hover は見出しだけ)、欄の値は帯の欄と同じ列。OFF の
-//! 行は「オフ」の札、読み込み失敗と出力 (パラアウト) は行の中。
+//! (選んでいるもの + 色見本。クリップならクリップの居るトラックを 2 行目に) の下に、見出しの帯
+//! (選択 → 列 → 入力 → Rack → 口パク → モジュレーション。見出しは押せる面の色、タイトルと同じ語の対象は省く) を
+//! 積んだ 1 本の縦スクロール。クリップの設定 (音声 / 画像 / 歌声 / 読み上げ / 字幕 / ローンチ・フォローアクション・
+//! MIDI 割り当て) は全部一番上の選択の帯に「ラベル左・値右」の欄で並び、Par にはデバイスそのものの設定だけが
+//! 残る。Rack の行の直下に開く Par / SC / 出力は行の名前の左端から始まり (行の背景と hover は見出しだけ、重ねて
+//! 開けば境目に罫線)、欄の値は帯の欄と同じ列。OFF の行は名前の直後に「オフ」の札、読み込み失敗と出力
+//! (パラアウト) は行の中 (畳んだ Parallel と Rack の見出しには失敗の数)。
 //! 見た目の良し悪しは人が判断するので、ここで確かめるのは
 //! 「PNG が書けた」ことだけ (インスペクタの文言に依存する assert を置くと、作り直すたびにこのカメラが壊れる)。
 //! 各状態で期待した見出しが描かれたかは `--nocapture` の出力に出す (文言は `track_inspector::vocab`)。
@@ -31,7 +33,7 @@ use daw_gui::device_addr::InsertAt;
 use daw_gui::dispatcher::{BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher};
 use daw_gui::event_device::DeviceEvent;
 use daw_gui::event_inspector::InspectorEvent;
-use daw_gui::event_launcher::{LauncherEvent, LauncherRow};
+use daw_gui::event_launcher::{LaunchEdit, LauncherEvent, LauncherRow};
 use daw_gui::state::inspector_view::{ClipBandKind, InspectorBand, InspectorDetail};
 use daw_gui::view::track_inspector::vocab;
 use daw_gui::voicevox_client::{VoiceVoxSinger, VoiceVoxStyle};
@@ -138,17 +140,19 @@ impl Harness {
     }
 
     /// 数フレーム回して (インスペクタの本文高さの lag-by-one / edit buffer の resync を落ち着かせる) 最後の Scene。
+    /// ポインタはステータスバーの右端 (どの行にも hover しない)。
     fn settle(&mut self) -> Scene {
+        self.settle_at((W as f32 - 5.0, H as f32 - 5.0))
+    }
+
+    /// [`Self::settle`] のポインタを `pos` に置く版 (hover の見た目を撮る)。
+    fn settle_at(&mut self, pos: (f32, f32)) -> Scene {
         let screen = PhysicalSize { width: W, height: H };
-        // ポインタはステータスバーの右端 (どの行にも hover しない)。
-        let idle = || FrameInput {
-            pointer: PointerFrame { pos: Some((W as f32 - 5.0, H as f32 - 5.0)), ..PointerFrame::default() },
-            ..FrameInput::default()
-        };
+        let input = || FrameInput { pointer: PointerFrame { pos: Some(pos), ..PointerFrame::default() }, ..FrameInput::default() };
         let mut scene = Scene::new();
         for _ in 0..4 {
             scene = Scene::new();
-            self.host.frame(&mut self.app, &mut scene, screen, idle(), |app, ui| {
+            self.host.frame(&mut self.app, &mut scene, screen, input(), |app, ui| {
                 daw_gui::view::root::build_root(app, ui, screen);
             });
         }
@@ -247,7 +251,7 @@ fn add_native(app: &mut AppData, chain: ChainRef, kind: NativeKind) -> u64 {
     })
 }
 
-/// picker から内蔵 plugin を足す (本番の「+ Plugin」と同じ経路)。
+/// picker から内蔵 plugin を足す (本番の「+ プラグイン」と同じ経路)。
 fn add_plugin(app: &mut AppData, track: u32, id: &str) -> u64 {
     select_track(app, track);
     let id = id.to_string();
@@ -438,6 +442,24 @@ fn shot(renderer: &mut OffscreenRenderer, name: &str, expect: &[&str], setup: im
     save(renderer, &scene, name, expect, w);
 }
 
+/// [`shot`] の、インスペクタに描かれた `hover_text` の上にポインタを置いて撮る版 (行の hover の見た目)。
+fn shot_hover(renderer: &mut OffscreenRenderer, name: &str, expect: &[&str], hover_text: &str, setup: impl FnOnce(&mut Harness)) {
+    let mut h = Harness::new();
+    setup(&mut h);
+    let scene = h.settle();
+    let w = h.inspector_w();
+    let target = scene
+        .primitives
+        .iter()
+        .find_map(|p| match p {
+            Primitive::Glyph(g) if g.left < w && &*g.text == hover_text => Some((g.left + 6.0, g.top + 6.0)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("`{hover_text}` がインスペクタに描かれている"));
+    let scene = h.settle_at(target);
+    save(renderer, &scene, name, expect, w);
+}
+
 fn save(renderer: &mut OffscreenRenderer, scene: &Scene, name: &str, expect: &[&str], inspector_w: f32) {
     let texts = inspector_texts(scene, inspector_w);
     let missing: Vec<&str> = expect.iter().copied().filter(|e| !texts.iter().any(|t| t == e)).collect();
@@ -504,7 +526,7 @@ fn capture_track_inspector_states() {
         h.select_clip(h.project.audio_clip);
     });
     // 16. ランチャーのセルで MIDI 割り当ての詳細を開いた。
-    shot(r, "s1_16_launcher_cell_midi_open", &["セル", "割り当てを消す"], |h| {
+    shot(r, "s1_16_launcher_cell_midi_open", &[vocab::LEARN_CELL, vocab::FIELD_LEARN_LAUNCH, vocab::CLEAR_BINDINGS], |h| {
         let row = LauncherRow::Track(h.project.synth);
         h.app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell { row, scene_index: 0 }));
         h.inspector(InspectorEvent::ToggleDetail(InspectorDetail::LaunchMidi));
@@ -563,12 +585,12 @@ fn capture_track_inspector_states() {
         h.select_clip(h.project.video_clip);
     });
     // 9. ランチャーのセル: クリップの帯に共通の欄と小見出し「ローンチ」、MIDI 割り当ては詳細で畳まれている。
-    shot(r, "s2_9_launcher_cell", &[vocab::FIELD_PLAYBACK, vocab::SUB_LAUNCH, "フォローアクション"], |h| {
+    shot(r, "s2_9_launcher_cell", &[vocab::UNNAMED_CLIP, vocab::SUB_LAUNCH, vocab::SUB_FOLLOW, vocab::FIELD_FOLLOW_A], |h| {
         let row = LauncherRow::Track(h.project.synth);
         h.app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell { row, scene_index: 0 }));
     });
     // 10. 列 (シーン) の見出しを選んだ: 列の帯 (対象 = 列名) にフォローアクション。
-    shot(r, "s2_10_scene_column", &[vocab::BAND_SCENE, "フォローアクション"], |h| {
+    shot(r, "s2_10_scene_column", &[vocab::BAND_SCENE, vocab::SUB_FOLLOW, vocab::FIELD_FOLLOW_TRIGGER], |h| {
         // 既定の曲は列を持たないので 1 本足す。
         h.app.handle_event(AppEvent::Launcher(LauncherEvent::AddScene));
         let scene_id = h.app.cur.song_doc.song().scenes.first().expect("足した列").id;
@@ -638,5 +660,108 @@ fn capture_track_inspector_states() {
         h.set_theme("light");
         h.select_track(h.project.synth);
         h.open_panel(h.project.synth_eq);
+    });
+
+    capture_review_fixes(r);
+}
+
+/// 段 4 (r.md #158 レビューの指摘の修正) と、段 3 までに撮っていなかった状態。
+fn capture_review_fixes(r: &mut OffscreenRenderer) {
+    let audio_band = vocab::clip_band_title(ClipBandKind::Audio);
+    // 1. 2 つのクリップ: タイトル「2 クリップ」、2 行目に種類とトラック。歌声の声は 2 つとも同じなので出ている。
+    shot(r, "s4_1_two_vocal_clips", &[&vocab::n_clips(2), vocab::SUB_VOICE, vocab::FIELD_CHARACTER], |h| {
+        let vocal = h.project.vocal;
+        let second = place(&mut h.app, vocal, 8.0, 8.0, notes(&[60, 62], Some(&["ら", "ら"])), "Chorus");
+        h.select_clip(h.project.vocal_clip);
+        h.app.handle_event(AppEvent::SelectClip { target: second, additive: true });
+    });
+    // 2. 音声入力のトラック: 入力元 (デバイスに無い ch) とモニターの行。既定の MIDI は「未選択」にならない側。
+    shot(r, "s4_2_audio_input_monitor", &[vocab::FIELD_INPUT_SOURCE, vocab::FIELD_MONITOR], |h| {
+        let audio = h.project.audio;
+        h.app.edit_song(move |song| {
+            song.track_by_id_mut(audio).expect("track").input = common::model::TrackInput::AudioMono { channel: 0 };
+        });
+        h.select_track(audio);
+    });
+    // 3. 音声だけのトラック (既定の MIDI 入力): 入力元は「未選択」(「録れない」の警告にしない)。
+    shot(r, "s4_3_audio_track_input_unset", &[daw_gui::handler::audio_rec::INPUT_UNSET], |h| {
+        h.select_track(h.project.audio);
+    });
+    // 4. 口パクの帯: 画像トラックを歌声トラックの口パク先にする。
+    shot(r, "s4_4_mouth_band", &[vocab::BAND_MOUTH], |h| {
+        let (vocal, image) = (h.project.vocal, h.project.image);
+        h.app.edit_song(move |song| {
+            song.track_by_id_mut(vocal).expect("track").lipsync_target_track = Some(image);
+        });
+        h.select_track(image);
+        h.inspector(InspectorEvent::ToggleBand(InspectorBand::Rack));
+    });
+    // 5. グループの Transform の Par (欄の形、値の列は帯と同じ)。
+    shot(r, "s4_5_group_transform_par", &[vocab::FIELD_SCALE_X, vocab::FIELD_ANCHOR_Y], |h| {
+        let group = h.project.group;
+        let transform = add_plugin(&mut h.app, group, common::video_fx::TRANSFORM_ID);
+        h.select_track(group);
+        h.open_panel(transform);
+    });
+    // 6. Par を開いた EQ の行に hover: 行の背景の hover は見出しの 26px だけ (Par にかからない)。
+    shot_hover(r, "s4_6_row_hover_par_open", &["HP"], "EQ", |h| {
+        h.select_track(h.project.synth);
+        h.open_panel(h.project.synth_eq);
+    });
+    // 7. 幅 360 のまま Parallel の Mid の chain の EQ の Par を開く (深さ 1 の内蔵 Par)。
+    shot(r, "s4_7_parallel_native_par", &["EQ 2", "HP"], |h| {
+        h.select_track(h.project.group);
+        let song = h.app.cur.song_doc.song();
+        let eq2 = song
+            .track_by_id(h.project.group)
+            .and_then(|t| {
+                t.devices.iter().find_map(|d| match d {
+                    Device::Parallel(p) => p.chains.get(1).and_then(|c| c.devices.first().map(Device::id)),
+                    _ => None,
+                })
+            })
+            .expect("Mid の EQ");
+        h.open_panel(eq2);
+    });
+    // 8. セルのフォローアクション: 発動「指定時間」で 間隔 の行、アクション A が「ジャンプ」で同じ行の右に飛び先。
+    shot(r, "s4_8_follow_jump_interval", &[vocab::FIELD_FOLLOW_INTERVAL, vocab::FIELD_FOLLOW_A], |h| {
+        h.app.handle_event(AppEvent::Launcher(LauncherEvent::AddScene));
+        let row = LauncherRow::Track(h.project.synth);
+        h.app.handle_event(AppEvent::Launcher(LauncherEvent::CreateCell { row, scene_index: 0 }));
+        let cells = h.app.live_launcher_cells();
+        let scene_id = h.app.cur.song_doc.song().scenes.first().expect("列").id;
+        for edit in [
+            LaunchEdit::FollowEnabled(true),
+            LaunchEdit::FollowLinked(false),
+            LaunchEdit::FollowA(common::model::FollowActionKind::Jump { scene_id }),
+        ] {
+            h.app.handle_event(AppEvent::Launcher(LauncherEvent::SetLaunchSettings { cells: cells.clone(), edit }));
+        }
+        h.inspector(InspectorEvent::ToggleBand(InspectorBand::Rack));
+    });
+    // 9. 畳んだ Parallel の中の読み込み失敗: Parallel の行に「失敗 1」、Rack の見出しに「読み込み失敗 1」。
+    shot(r, "s4_9_failed_load_hidden", &[&vocab::hidden_failures(1), &vocab::failed_loads(1)], |h| {
+        h.select_track(h.project.group);
+        let parallel = parallel_of(&h.app, h.project.group);
+        // High の chain の末尾に (chain の「+ プラグイン」と同じ経路で) 映像 FX を足し、その読み込みが失敗した。
+        let high = parallel.chains[2].id;
+        let fx = added_device(&mut h.app, |app| {
+            app.handle_event(AppEvent::OpenPluginPicker { chain: Some(ChainRef::Chain(high)) });
+            app.handle_event(AppEvent::SelectPluginFromDb { id: VIGNETTE_ID.to_string(), keep_open: false, open_gui: false });
+        });
+        h.app.cur.pipc.failed_plugin_loads.insert(fx, "shmem create failed".to_string());
+        h.app.handle_event(AppEvent::Device(DeviceEvent::ToggleParallelNodeCollapsed { id: parallel.id }));
+    });
+    // 10. ライトテーマのマスター: 見出しの面、名前の直後の「オフ」の札 (Limiter / Bus Comp / Tone EQ)。
+    shot(r, "s4_10_light_master", &[vocab::OFF_TAG, "Limiter"], |h| {
+        h.set_theme("light");
+        h.select_track(MASTER_TRACK_ID);
+    });
+    // 11. 音声クリップを選んだまま別のトラック (Synth) をカーソルにする: 2 行目と色見本はクリップの居るトラック。
+    shot(r, "s4_11_clip_with_other_cursor", &["Drums", audio_band], |h| {
+        h.select_clip(h.project.audio_clip);
+        let visible: Vec<u32> = h.app.cur.song_doc.song().tracks.iter().map(|t| t.id).collect();
+        let synth = h.project.synth;
+        h.app.apply_select_tracks(synth, SelectModifier::Single, &visible);
     });
 }

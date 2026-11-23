@@ -58,7 +58,7 @@ impl AppData {
     /// clip-level mute (`Clip.muted`) を設定する。MIDI / audio / video / image /
     /// 字幕 / 歌唱すべての content type 共通の単一 SSoT。`q` ショートカット (`SetClipsMuted`)、
     /// インスペクタのクリップの帯の「ミュート」(`DiscreteClipEdit::Muted`、全種類で 1 本)、単発の
-    /// `SetClipMuted` / `SetClipTextMuted` event がすべてここを経由する。変更があれば
+    /// `SetClipMuted` event がすべてここを経由する。変更があれば
     /// `flush_song_sync` で daw_audio へ LoadSong flush し、再生・書き出しに反映する
     /// (is_dirty もそこで立つ)。
     pub(crate) fn set_clip_muted(&mut self, target: ClipKey, muted: bool) {
@@ -748,17 +748,22 @@ impl AppData {
     /// 化され現値を summary から直接読むため、 数値 buffer の再生成は不要に
     /// なった。 target が Text variant でないなら文字列 buffer を空にして
     /// `clip_edit_buffer_target` を `None`。
+    ///
+    /// Text clip なのに窓に字幕の片が 1 つも見えていない (行と行の間の空白だけになるよう trim / split した
+    /// 読み上げクリップ) ときは、buffer を空にして **target は `Some(target)` に揃える**。`None` に戻すと
+    /// インスペクタが「target が代表クリップと違う」と見て毎フレーム resync を積み、再描画が止まらない
+    /// (アイドル省電力が効かない)。
     pub(crate) fn resync_clip_text_event_edit_buffers(&mut self, target: ClipKey) {
         let event_snapshot = self.text_first_event(target, |e| (e.text.clone(), e.font_family.clone()));
-        let Some((text, font_family)) = event_snapshot else {
-            self.cur.peph.clip_text_content_edit_text.clear();
-            self.cur.peph.clip_text_font_family_edit_text.clear();
-            self.cur.peph.clip_edit_buffer_target = None;
-            return;
-        };
+        let (text, font_family) = event_snapshot.unwrap_or_default();
         self.cur.peph.clip_text_content_edit_text = text;
         self.cur.peph.clip_text_font_family_edit_text = font_family;
-        self.cur.peph.clip_edit_buffer_target = Some(target);
+        let is_text = self
+            .cur.song_doc.song()
+            .clip_by_key(target)
+            .and_then(|c| self.cur.song_doc.song().clip_contents.get(&c.content_id))
+            .is_some_and(|content| matches!(content, common::model::ClipContent::Text(_)));
+        self.cur.peph.clip_edit_buffer_target = is_text.then_some(target);
     }
 
     /// docs/plan_text_overlay.md §4 P5: text inspector が表示する

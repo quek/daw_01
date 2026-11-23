@@ -478,14 +478,14 @@ pub enum AppEvent {
     EndTextPiPDrag,
 
     /// docs/plan_text_overlay.md §4 P5: text inspector の編集パス。
-    /// Mute / Text content / Font family は string-shaped で個別 event、
+    /// Text content / Font family は string-shaped で個別 event (ミュートは全種類共通の
+    /// `SetClipMuted` / `DiscreteClipEdit::Muted`)、
     /// 23 numeric field + 2 fade beats は `SetClipTextNumField` 1 event で
     /// `TextNumField` discriminator dispatch する。 数値入力は
     /// scrubable_number 化され、 on_change が直接 `SetClipTextNumField` を
     /// 発火 (= 旧 buffer 経路 `ClipTextNumEditChanged` / `CommitClipTextNumEdit`
     /// は撤去)。 lane override 経由でも同様、 lane が effective なら
     /// TextEvent.field の直接書き込みは preview に反映されない。
-    SetClipTextMuted { target: ClipKey, muted: bool },
     SetClipTextContent { target: ClipKey, value: String },
     SetClipTextFontFamily { target: ClipKey, value: String },
     SetClipTextAlign { target: ClipKey, value: common::model::TextAlign },
@@ -1205,10 +1205,10 @@ pub enum AppEvent {
     /// (= それ以降変更なし) 全 bound vocal track を再生成する。Undo 対象外。
     LipsyncDebounceFired { project: common::protocol::ProjectKey, generation: u64 },
     /// Clip Inspector の 2 段 dropdown で選択された声を、 対象
-    /// clip (stable `ClipKey`) に焼き込む。 builtin へ再 flush して新しい声で
+    /// clip (stable `ClipKey`、複数選択なら全部 — 1 undo step) に焼き込む。 builtin へ再 flush して新しい声で
     /// 再合成する。
     SetClipVoice {
-        clip: common::model::ClipKey,
+        clips: Vec<common::model::ClipKey>,
         speaker_id: u32,
         singer_name: String,
         style_name: String,
@@ -1222,10 +1222,10 @@ pub enum AppEvent {
     /// (talk) Text clip Inspector の「再取得」ボタン。`/speakers` を再取得する。
     RefetchSpeakers,
     /// (talk) Text clip Inspector の talk スケール (話速/音高/抑揚/音量) を 1 つ
-    /// 編集する。対象 clip (stable `ClipKey`) の `Clip::talk` に焼き込んで builtin へ
+    /// 編集する。対象 clip (stable `ClipKey`、複数選択なら全部) の `Clip::talk` に焼き込んで builtin へ
     /// 再 flush (= 新しいスケールで再合成)。
     SetClipTalkParam {
-        clip: common::model::ClipKey,
+        clips: Vec<common::model::ClipKey>,
         param: TalkParamKind,
         value: f32,
     },
@@ -1859,8 +1859,7 @@ impl AppEvent {
             E::BounceClipInPlace(..) | E::BounceClipWithFx(..) => "バウンス",
 
             // ---- テキスト / 画像 クリップ ----
-            E::SetClipTextMuted { .. }
-            | E::SetClipTextContent { .. }
+            E::SetClipTextContent { .. }
             | E::SetClipTextFontFamily { .. }
             | E::SetClipTextAlign { .. }
             | E::SetClipTextFadeInCurve { .. }

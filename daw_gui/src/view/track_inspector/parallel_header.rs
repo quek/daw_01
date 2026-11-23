@@ -307,6 +307,8 @@ pub(super) struct ParallelHead<'a> {
     pub out_gain: f32,
     pub gain_match: bool,
     pub split: Split,
+    /// 畳んでいて見えない中身のうち、読み込みに失敗した plugin の数 (名前の欄の右端に警告色)。
+    pub hidden_failures: usize,
 }
 
 /// Parallel ヘッダ行: 「 ▼ 名前 … [Split ▾] [out knob] [Match] [Mix] [x]。 出力 trim と gain match は
@@ -319,7 +321,7 @@ pub(super) fn draw_parallel_begin_row(
     row: Rect,
     popup_open: bool,
 ) {
-    let ParallelHead { parallel_id, name, bypassed, open, out_gain, gain_match, split } = *head;
+    let ParallelHead { parallel_id, name, bypassed, open, out_gain, gain_match, split, hidden_failures } = *head;
     let p = &app.theme.core;
     let btn_x_w = 26.0;
     let by = row.y + 2.0;
@@ -388,7 +390,8 @@ pub(super) fn draw_parallel_begin_row(
     // 括弧 `「` は chain_list の `draw_parallel_band` (chain の帯と同じ x / 幅で終了行の `L` まで繋ぐ)。
     // ここは 開閉 disclosure + 名前。
     draw_disclosure(ui, ("inspector_parallel_disclosure", i), parallel_id, open, row.x + 14.0, row, popup_open, p);
-    let name_rect = Rect { x: row.x + 28.0, y: row.y + 3.0, w: (right - 6.0 - row.x - 28.0).max(1.0), h: ROW_H - 6.0 };
+    let fail_w = super::chain_list::draw_hidden_failures(app, ui, ("parallel", i), right - 6.0, row.y, hidden_failures);
+    let name_rect = Rect { x: row.x + 28.0, y: row.y + 3.0, w: (right - 6.0 - fail_w - row.x - 28.0).max(1.0), h: ROW_H - 6.0 };
     if let Some((id, buf)) = &app.cur.peph.renaming_chain
         && *id == parallel_id
     {

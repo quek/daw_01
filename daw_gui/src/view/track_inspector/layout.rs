@@ -14,6 +14,16 @@ pub const TITLE_SUB_FONT: f32 = 11.0;
 pub const TITLE_SWATCH: f32 = 16.0;
 /// タイトル 2 行目の色見本の一辺。
 pub const TITLE_SUB_SWATCH: f32 = 10.0;
+/// タイトルの上端から 1 行目まで。
+pub const TITLE_TOP: f32 = 10.0;
+/// タイトルの 1 行目と 2 行目の間。
+pub const TITLE_LINE_GAP: f32 = 4.0;
+/// 1 行目の色見本と文字の間。
+pub const TITLE_SWATCH_GAP: f32 = 8.0;
+/// 2 行目の文字と色見本の間。
+pub const TITLE_SUB_SWATCH_GAP: f32 = 6.0;
+/// 色見本の周りの当たり代 (小さい見本を狙わせない)。
+pub const SWATCH_HIT_PAD: f32 = 3.0;
 
 /// 帯の見出しの高さ。
 pub const BAND_H: f32 = 24.0;
@@ -31,11 +41,22 @@ pub const TARGET_FONT: f32 = 11.0;
 pub const DISCLOSURE_FONT: f32 = 9.0;
 /// 開閉マークの列の幅 (名前はこの右から)。
 pub const DISCLOSURE_W: f32 = 14.0;
+/// 帯の名前と対象の間の最小の隙間。
+pub const BAND_TARGET_GAP: f32 = 12.0;
+/// 対象と、見出しの右端に置く子の操作 (モジュレーションの「+」) の間。
+pub const BAND_ACTIONS_GAP: f32 = 8.0;
+/// モジュレーションの帯の見出しの右端の「+」(変調器を足す dropdown) の幅。
+pub const BAND_ADD_W: f32 = 56.0;
 
 /// 帯の中の小見出し (「ローンチ」など、`native_panel/cell.rs` の「ROOM ――」と同じ形) の文字。
 pub const SUB_HEAD_FONT: f32 = 10.0;
-/// 小見出しの行の高さ。
+/// 小見出しの行の高さ (内蔵 device の Par の中の小見出しも同じ送り、`native_panel::layout`)。
 pub const SUB_HEAD_H: f32 = 16.0;
+/// 小見出しの文字と罫線の間。
+pub const SUB_HEAD_GAP: f32 = 6.0;
+/// 帯の中の「詳細」の行 (`▶ ラベル`) の高さと、その下の隙間。
+pub const DETAIL_ROW_H: f32 = SUB_HEAD_H + 4.0;
+pub const DETAIL_GAP: f32 = 4.0;
 
 /// 右端の幅のドラッグ帯 (scroll viewport の外の列)。
 pub const RESIZE_HANDLE_W: f32 = 5.0;
@@ -64,6 +85,8 @@ pub const HINT_PITCH: f32 = 16.0;
 pub const RACK_ROW_H: f32 = 26.0;
 /// 行の名前の左端 (行の中身の左端から)。行の直下に開く Par / SC / 出力の中身もここから始める。
 pub const ROW_NAME_X: f32 = 8.0;
+/// Parallel の中の深さ 1 段ぶんのインデント (= 展開中の chain の色帯の幅)。
+pub const RACK_INDENT: f32 = 4.0;
 /// 行の名前の上端 (行の上端から)。
 pub const ROW_NAME_TOP: f32 = 8.0;
 /// 行の名前の文字。
@@ -76,6 +99,8 @@ pub const FAIL_REASON_H: f32 = 18.0;
 pub const OFF_TAG_FONT: f32 = 10.0;
 pub const OFF_TAG_H: f32 = 16.0;
 pub const OFF_TAG_PAD_X: f32 = 8.0;
+/// 行の名前と札の間 (札は名前の直後)。
+pub const OFF_TAG_GAP: f32 = 6.0;
 
 /// 行の直下に開く展開 (Par / SC / 出力) の行幅いっぱいの矩形 `full` から、中身を描く矩形を返す。左端は
 /// 行の名前と同じ ([`ROW_NAME_X`])、右端は行の右端。余白の press は `full` で名乗る (行が動かない)。
@@ -84,11 +109,19 @@ pub fn expansion_inset(full: daw_ui_renderer::Rect) -> daw_ui_renderer::Rect {
     daw_ui_renderer::Rect { x: full.x + ROW_NAME_X, w: (full.w - ROW_NAME_X).max(1.0), ..full }
 }
 
-/// 行の中身 `row_content` (行の上端 = 見出しの上端) の直下に開く Par の矩形 (他の展開が開いていないとき)。
-/// 描画とテスト (座標を求める側) が同じ関数を通す。
+/// 行の中身 `row_content` (行の上端 = 見出しの上端) の直下に開く展開 (読み込み失敗の理由 / SC / 出力 / Par) の
+/// 行幅いっぱいの矩形。`above` は同じ行の直下に先に積んだ展開の高さの合計 (順は `chain_list::build_list_rows`)、
+/// `h` はこの展開の高さ。plugin 行と内蔵 device の行の描画はこの 1 本で y を決める。
+#[must_use]
+pub fn expansion_rect(row_content: daw_ui_renderer::Rect, above: f32, h: f32) -> daw_ui_renderer::Rect {
+    daw_ui_renderer::Rect { y: row_content.y + RACK_ROW_H + above, h, ..row_content }
+}
+
+/// 行の直下に開く Par の中身の矩形 (他の展開が開いていないとき = [`expansion_rect`] の `above` が 0)。描画と
+/// 同じ [`expansion_rect`] / [`expansion_inset`] を通るので、テスト (座標を求める側) はこれで Par の位置を引く。
 #[must_use]
 pub fn par_rect(row_content: daw_ui_renderer::Rect, panel_h: f32) -> daw_ui_renderer::Rect {
-    expansion_inset(daw_ui_renderer::Rect { y: row_content.y + RACK_ROW_H, h: panel_h, ..row_content })
+    expansion_inset(expansion_rect(row_content, 0.0, panel_h))
 }
 
 /// 欄 (ラベル左・値右) を `rows` 行積んだ展開 (SC / 出力のパネル) の高さ (上下の [`PAR_PAD`] 込み)。

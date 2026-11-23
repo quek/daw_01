@@ -4,8 +4,9 @@
 //!
 //! 行のボタン列は右から plugin 行と同じ x に揃える。組み込みは × を出さず列だけ空ける (Q10: 組み込みと
 //! 足した分は × の有無で見分ける)。ON/OFF のボタンは置かない (Q15: `Q` / 右クリック / 小表示の
-//! ダブルクリック)。OFF の行は小表示の位置に「オフ」の札を出す (r.md #158 仕様 10: 組み込みの Comp / EQ は
-//! 信号の流れを見せるためにいつも行があるので、灰色の小表示だと「使えない部品」に見える)。
+//! ダブルクリック)。OFF の行は小表示を描かず、名前の直後に「オフ」の札を出す (r.md #158 仕様 10: 組み込みの
+//! Comp / EQ は信号の流れを見せるためにいつも行があるので、灰色の小表示だと「使えない部品」に見える。札の位置は
+//! plugin / Parallel の行と同じ規則 — 縦に並べてもガタつかない)。
 
 use common::model::{
     GR_METER_RANGE_DB, MASTER_TRACK_ID, NativeDevice, NativeKind, RackPanelKey,
@@ -21,11 +22,11 @@ use crate::view::native_device::{
     CurveLook, EqCurveSource, LIMITER_GR_SEGMENTS, draw_eq_curve, draw_gr_horizontal, draw_gr_segments, wid,
 };
 
-use super::chain_list::{ROW_GAP, ROW_H, RowCtx, draw_off_tag, draw_row_bg, off_tag_w};
-use super::layout::{ROW_NAME_FONT as NAME_FONT, ROW_NAME_TOP, ROW_NAME_X, expansion_inset};
+use super::chain_list::{ROW_GAP, ROW_H, RowCtx, draw_row_bg, draw_row_name};
+use super::layout::{ROW_NAME_X, expansion_inset, expansion_rect};
 use super::mix_knob::MIX_COL_W;
 use super::native_panel::{self, PanelCtx, layout};
-use super::plugin_row::{draw_sidechain_panel, expansion_cols};
+use super::plugin_row::{draw_sidechain_panel, expansion_cols, expansion_rule};
 use super::vocab;
 
 /// ボタン列 (plugin 行と同じ寸法)。
@@ -85,38 +86,38 @@ pub(super) fn draw_native_row(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Row
             })
         });
     }
-    // 小表示 (EQ 系はミニカーブ、Comp 系は横 GR バー)。OFF はその位置に「オフ」の札。
-    // ダブルクリックで ON/OFF (Q15)。単クリックは drag_list の click (選択) に流す。
+    // 小表示 (EQ 系はミニカーブ、Comp 系は横 GR バー)。OFF の行は小表示を描かず、名前の直後に「オフ」の札
+    // (plugin / Parallel の行と同じ位置)。ダブルクリックで ON/OFF (Q15): 小表示の位置と、OFF なら札の上。
+    // 単クリックは drag_list の click (選択) に流す。
     right -= MINI_W + MINI_GAP;
     let mini_hit = Rect { x: right, y: row.y + 2.0, w: MINI_W, h: ROW_H - 4.0 };
-    if entry.bypassed {
-        let tag_x = mini_hit.x + (MINI_W - off_tag_w(ui)) * 0.5;
-        draw_off_tag(app, ui, wid(ParamSurface::Rack, key, "off", ()), tag_x, row.y, ROW_H);
-    } else {
+    if !entry.bypassed {
         draw_mini(app, ui, ctx, entry, mini_hit);
     }
-    if !popup_open && ui.take_double_click_in_rect(mini_hit).is_some() {
+    // 名前 (「Comp」 / 「Comp 2」、OFF は text_dim — disabled の text_faint にはしない)。
+    let name_x = row.x + ROW_NAME_X;
+    let name_w = (right - 6.0 - name_x).max(1.0);
+    let tag = draw_row_name(app, ui, wid(ParamSurface::Rack, key, "name", ()), &entry.name, name_x, row.y, name_w, p.text, entry.bypassed);
+    if !popup_open && double_clicked(ui, mini_hit, tag) {
         let bypassed = !entry.bypassed;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::Device(DeviceEvent::SetDevicesBypassed { device_ids: vec![id], bypassed }));
         }));
     }
-    // 名前 (「Comp」 / 「Comp 2」、OFF は text_dim — disabled の text_faint にはしない)。
-    let name_x = row.x + ROW_NAME_X;
-    ui.label_at_clipped(
-        wid(ParamSurface::Rack, key, "name", ()),
-        &entry.name,
-        Rect { x: name_x, y: row.y + ROW_NAME_TOP, w: (right - 6.0 - name_x).max(1.0), h: NAME_FONT * 1.2 },
-        NAME_FONT,
-        if entry.bypassed { p.text_dim } else { p.text },
-    );
 }
 
-/// 行の小表示 (ON の行だけ)。値はレーンを重ねた live 値 (§12.2)。
+/// 小表示の位置か「オフ」の札の上でダブルクリックしたか (ON/OFF の切り替え、Q15)。
+fn double_clicked(ui: &mut Ui<'_, AppData>, mini: Rect, tag: Option<Rect>) -> bool {
+    let on_mini = ui.take_double_click_in_rect(mini).is_some();
+    let on_tag = tag.is_some_and(|t| ui.take_double_click_in_rect(t).is_some());
+    on_mini || on_tag
+}
+
+/// 行の小表示 (ON の行だけ — OFF の行は札なので、ここは常に「効いている」見た目で描く)。値はレーンを重ねた
+/// live 値 (§12.2)。
 fn draw_mini(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &RowCtx<'_>, entry: &NativeRowEntry, area: Rect) {
     let id = entry.device_id;
     let key = RackPanelKey::Device(id);
-    let active = true;
     match entry.kind {
         NativeKind::Eq | NativeKind::ToneEq => {
             let Some(dev) = row_native(app, ctx, id) else { return };
@@ -124,12 +125,12 @@ fn draw_mini(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &RowCtx<'_>, entry: &
             let Some(src) = EqCurveSource::from_params(&live.params) else { return };
             let rect = Rect { y: area.y + (area.h - MINI_CURVE_H) * 0.5, h: MINI_CURVE_H, ..area };
             ui.panel(wid(ParamSurface::Rack, key, "mini_well", ()), rect, app.theme.core.inset_bg, 2.0);
-            draw_eq_curve(app, ui, rect, &src, &CurveLook { active, spectrum_db: None });
+            draw_eq_curve(app, ui, rect, &src, &CurveLook { active: true, spectrum_db: None });
         }
         NativeKind::Comp | NativeKind::BusComp => {
             let rect = Rect { y: area.y + (area.h - MINI_GR_H) * 0.5, h: MINI_GR_H, ..area };
             let gr = app.cur.transport.native_gr.get(id);
-            draw_gr_horizontal(app, ui, wid(ParamSurface::Rack, key, "mini_gr", ()), rect, gr, active, GR_METER_RANGE_DB, None);
+            draw_gr_horizontal(app, ui, wid(ParamSurface::Rack, key, "mini_gr", ()), rect, gr, true, GR_METER_RANGE_DB, None);
         }
         // Reverb / Delay は行に小表示を持たない (名前と ON/OFF だけ)。
         NativeKind::Reverb | NativeKind::Delay => {}
@@ -154,12 +155,13 @@ fn live_device(app: &AppData, ctx: &RowCtx<'_>, dev: &NativeDevice) -> NativeDev
 /// 内蔵 device の行の直下の展開 (SC パネル → Par)。
 pub(super) fn draw_native_expansions(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &RowCtx<'_>, entry: &NativeRowEntry, content: Rect) {
     let id = entry.device_id;
-    let mut ey = content.y + ROW_H;
+    // 行の直下に先に積んだ展開の高さ (y は `layout::expansion_rect` の 1 本で決める、plugin 行と同じ)。
+    let mut above = 0.0;
     if ctx.sc_open == Some(id) && ctx.sc_panel_h > 0.0 {
-        let rect = Rect { x: content.x, y: ey, w: content.w, h: ctx.sc_panel_h };
+        let rect = expansion_rect(content, above, ctx.sc_panel_h);
         claim_expansion_press(ui, rect, ("sc", id), ctx.popup_open);
         draw_sidechain_panel(app, ui, id, ctx.sc_ports, &expansion_cols(ctx, rect), rect.y);
-        ey += ctx.sc_panel_h;
+        above += ctx.sc_panel_h;
     }
     let key = RackPanelKey::Device(id);
     if !app.rack_panel_open(key) {
@@ -167,8 +169,12 @@ pub(super) fn draw_native_expansions(app: &AppData, ui: &mut Ui<'_, AppData>, ct
     }
     let Some(dev) = row_native(app, ctx, id) else { return };
     let Some(owner) = ctx.owner else { return };
-    let full = Rect { x: content.x, y: ey, w: content.w, h: layout::panel_height(entry.kind) };
+    let full = expansion_rect(content, above, layout::panel_height(entry.kind));
     let bg = draw_panel_bg(app, ui, key, full, ctx.popup_open);
+    if above > 0.0 {
+        // SC パネルの下に続く Par (plugin 行と同じ境目)。
+        expansion_rule(app, ui, ("par", key), full);
+    }
     let rect = expansion_inset(full);
     let panel = PanelCtx { dev, live: app.live_native_device(ctx.scope, owner, dev), owner, scope: ctx.scope, rect, bg };
     native_panel::draw_native_panel(app, ui, &panel);
@@ -240,22 +246,14 @@ pub(super) fn draw_master_tail(app: &AppData, ui: &mut Ui<'_, AppData>, ctx: &Ro
     let mini_hit = Rect { x: right, y: y + 2.0, w: MINI_W, h: ROW_H - 4.0 };
     if on {
         let seg = Rect { y: y + (ROW_H - MINI_GR_H) * 0.5, h: MINI_GR_H, ..mini_hit };
-        draw_gr_segments(app, ui, wid(ParamSurface::Rack, key, "mini_gr", ()), seg, app.cur.transport.master_limiter_gr, on, LIMITER_GR_SEGMENTS);
-    } else {
-        let tag_x = mini_hit.x + (MINI_W - off_tag_w(ui)) * 0.5;
-        draw_off_tag(app, ui, wid(ParamSurface::Rack, key, "off", ()), tag_x, y, ROW_H);
+        draw_gr_segments(app, ui, wid(ParamSurface::Rack, key, "mini_gr", ()), seg, app.cur.transport.master_limiter_gr, true, LIMITER_GR_SEGMENTS);
     }
-    if !popup_open && ui.take_double_click_in_rect(mini_hit).is_some() {
+    // 名前と、OFF なら直後に札 (内蔵 device の行と同じ)。
+    let name_x = x + ROW_NAME_X;
+    let tag = draw_row_name(app, ui, wid(ParamSurface::Rack, key, "name", ()), "Limiter", name_x, y, (right - 6.0 - name_x).max(1.0), p.text, !on);
+    if !popup_open && double_clicked(ui, mini_hit, tag) {
         ui.push_edit(limiter_on_edit(!on));
     }
-    let name_x = x + ROW_NAME_X;
-    ui.label_at_clipped(
-        wid(ParamSurface::Rack, key, "name", ()),
-        "Limiter",
-        Rect { x: name_x, y: y + ROW_NAME_TOP, w: (right - 6.0 - name_x).max(1.0), h: NAME_FONT * 1.2 },
-        NAME_FONT,
-        if on { p.text } else { p.text_dim },
-    );
     // 右クリックは「有効化 / 無効化」だけ (動かせず消せない)。
     let labels = [if on { "無効化" } else { "有効化" }];
     ui.context_menu_for(head, &labels, move |_, ui| {

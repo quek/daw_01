@@ -43,7 +43,7 @@ use crate::widgets::select_modifier::SelectModifier;
 use common::model::{ChainRef, MASTER_TRACK_ID, RackPanelKey};
 
 use super::chain_row::{draw_add_chain_row, draw_add_plugin_row, draw_chain_row};
-use super::layout::{FAIL_REASON_H, OFF_TAG_FONT, OFF_TAG_H, OFF_TAG_PAD_X, ROW_NAME_FONT, ROW_NAME_TOP};
+use super::layout::{FAIL_REASON_H, OFF_TAG_FONT, OFF_TAG_GAP, OFF_TAG_H, OFF_TAG_PAD_X, ROW_NAME_FONT, ROW_NAME_TOP};
 use super::native_panel::layout;
 use super::native_row::{draw_master_tail, draw_native_expansions, draw_native_row};
 use super::plugin_row::{draw_plugin_expansions, draw_plugin_row, sc_panel_height};
@@ -56,8 +56,8 @@ pub(super) use super::layout::RACK_ROW_H as ROW_H;
 const OP_ROW_H: f32 = 22.0;
 const END_ROW_H: f32 = 10.0;
 pub(super) const ROW_GAP: f32 = 3.0;
-/// 深さ 1 段ぶんの色帯の幅 (= インデント)。
-pub(super) const BAR_W: f32 = 4.0;
+/// 深さ 1 段ぶんの色帯の幅 (= インデント)。寸法の SSoT は `layout` (テストも読む)。
+pub(super) use super::layout::RACK_INDENT as BAR_W;
 /// Parallel の括弧 (`「` / `L`) の横棒の長さ (開閉 disclosure の手前まで)。
 const BRACKET_STUB_W: f32 = 10.0;
 /// plugin / 映像 FX / VOICEVOX の Par をまだ測っていないときに仮に取る高さ (1 度描いて実測する)。
@@ -433,10 +433,11 @@ pub(super) fn off_tag_w(ui: &mut Ui<'_, AppData>) -> f32 {
     ui.measure_text(vocab::OFF_TAG, OFF_TAG_FONT) + OFF_TAG_PAD_X * 2.0
 }
 
-/// バイパス中の行の「オフ」の札 (r.md #158 仕様 10)。`inset_bg` の窪みに 10px `text_dim` を中央寄せ —
+/// バイパス中の行の「オフ」の札 (r.md #158 仕様 10)。`inset_bg` の窪みに 10px の文字を中央寄せ —
 /// 名前や小表示を disabled の色 (`text_faint`) で薄く描くと「使えない部品」に見えるので、状態は札で言う。
-/// `x` は札の左端、`row_y` / `row_h` は行の上端と高さ (札は行の高さの中央)。Rack の行と、モジュレーションの
-/// 変調器 / 変調先の行が使う。
+/// 文字は `text_dim` を窪みの上で本文の 4.5:1 まで寄せた色 (ライトテーマの灰色の窪みでも無効なボタンに
+/// 見えない)。`x` は札の左端、`row_y` / `row_h` は行の上端と高さ (札は行の高さの中央)。返り値 = 札の矩形。
+/// Rack の行 ([`draw_row_name`]) と、モジュレーションの変調器 / 変調先の行が使う。
 pub(super) fn draw_off_tag(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -444,17 +445,21 @@ pub(super) fn draw_off_tag(
     x: f32,
     row_y: f32,
     row_h: f32,
-) {
+) -> Rect {
     let p = &app.theme.core;
     let w = off_tag_w(ui);
     let rect = Rect { x, y: row_y + (row_h - OFF_TAG_H) * 0.5, w, h: OFF_TAG_H };
     ui.panel(("inspector_off_tag", key), rect, p.inset_bg, 3.0);
     let line_h = OFF_TAG_FONT * 1.2;
-    ui.label_at(("inspector_off_tag_text", key), vocab::OFF_TAG, x + OFF_TAG_PAD_X, rect.y + (OFF_TAG_H - line_h) * 0.5, OFF_TAG_FONT, p.text_dim);
+    let ink = p.adapt_text_on(p.inset_bg, p.text_dim);
+    ui.label_at(("inspector_off_tag_text", key), vocab::OFF_TAG, x + OFF_TAG_PAD_X, rect.y + (OFF_TAG_H - line_h) * 0.5, OFF_TAG_FONT, ink);
+    rect
 }
 
-/// 行の名前 (行の左端から `ROW_NAME_X`、幅 `w` で切る)。`off` なら名前を `text_dim` にして直後に「オフ」の札
-/// (plugin / Parallel の行。内蔵 device の行は札を小表示の位置に出す)。`color` はオフでないときの色。
+/// 行の名前 (行の左端から `ROW_NAME_X`、幅 `w` で切る)。`off` なら名前を `text_dim` にして **名前の直後** に
+/// 「オフ」の札 (plugin / 内蔵 device / Parallel / master の Limiter の行で同じ位置 — 札は名前を修飾する語)。
+/// `color` はオフでないときの色。返り値 = 札の矩形 (オフのときだけ。内蔵 device の行はここもダブルクリックで
+/// ON に戻す)。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_row_name(
     app: &AppData,
@@ -466,8 +471,8 @@ pub(super) fn draw_row_name(
     w: f32,
     color: Color,
     off: bool,
-) {
-    let tag_w = if off { off_tag_w(ui) + 6.0 } else { 0.0 };
+) -> Option<Rect> {
+    let tag_w = if off { off_tag_w(ui) + OFF_TAG_GAP } else { 0.0 };
     let name_w = ui.measure_text(name, ROW_NAME_FONT).min((w - tag_w).max(1.0));
     let color = if off { app.theme.core.text_dim } else { color };
     ui.label_at_clipped(
@@ -477,9 +482,28 @@ pub(super) fn draw_row_name(
         ROW_NAME_FONT,
         color,
     );
-    if off {
-        draw_off_tag(app, ui, key, x + name_w + 6.0, row_y, ROW_H);
+    off.then(|| draw_off_tag(app, ui, key, x + name_w + OFF_TAG_GAP, row_y, ROW_H))
+}
+
+/// 畳んだ Parallel / 開いていない chain の行に、中に隠れた読み込み失敗の数を警告色で添える (r.md #158: 失敗は
+/// plugin 行の中に出すので、畳むと見えなくなる)。名前の欄の右端 `right` に右寄せで描き、使った幅 (名前との
+/// 隙間込み、`n == 0` なら 0) を返す — 呼び出し側はそのぶん名前を狭めて描く。
+pub(super) fn draw_hidden_failures(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    key: impl std::hash::Hash,
+    right: f32,
+    row_y: f32,
+    n: usize,
+) -> f32 {
+    if n == 0 {
+        return 0.0;
     }
+    let text = vocab::hidden_failures(n);
+    let w = ui.measure_text(&text, ROW_NAME_FONT);
+    let rect = Rect { x: right - w, y: row_y + ROW_NAME_TOP, w: w + 1.0, h: ROW_NAME_FONT * 1.2 };
+    ui.label_at_clipped(("inspector_hidden_failures", key), &text, rect, ROW_NAME_FONT, app.theme.core.text_error);
+    w + OFF_TAG_GAP
 }
 
 /// 1 行ぶんの描画に要る、buffer 全体で共通の文脈 (drag_list の row closure から呼ぶ)。
@@ -551,7 +575,9 @@ fn draw_row(
             draw_native_row(app, ui, ctx, n, content);
             draw_native_expansions(app, ui, ctx, n, content);
         }
-        ChainRowKind::ParallelBegin { parallel_id, name, bypassed, open, out_gain, gain_match, split, .. } => {
+        ChainRowKind::ParallelBegin {
+            parallel_id, name, bypassed, open, out_gain, gain_match, split, hidden_failures, ..
+        } => {
             let head = super::parallel_header::ParallelHead {
                 parallel_id: *parallel_id,
                 name,
@@ -560,19 +586,15 @@ fn draw_row(
                 out_gain: *out_gain,
                 gain_match: *gain_match,
                 split: *split,
+                hidden_failures: *hidden_failures,
             };
             super::parallel_header::draw_parallel_begin_row(app, ui, i, &head, content, popup_open);
         }
         ChainRowKind::SplitParams { parallel_id, split } => {
             super::parallel_header::draw_split_row(app, ui, i, *parallel_id, *split, content, popup_open);
         }
-        ChainRowKind::Chain { parallel_id, chain_id, name, color, gain, pan, muted, solo, open, n_devices, inactive } => {
-            draw_chain_row(
-                app, ui, i, *parallel_id, *chain_id, name, *color, *gain, *pan, *muted, *solo, *open, *n_devices, *inactive, content,
-                popup_open,
-            );
-        }
-        ChainRowKind::AddChain { parallel_id } => draw_add_chain_row(ui, i, *parallel_id, content, popup_open),
+        ChainRowKind::Chain { .. } => draw_chain_row(app, ui, i, &r.kind, content, popup_open),
+        ChainRowKind::AddChain { parallel_id } => draw_add_chain_row(app, ui, i, *parallel_id, content, popup_open),
         ChainRowKind::AddPlugin { chain } => {
             let is_master = cursor_tid == Some(common::model::MASTER_TRACK_ID);
             draw_add_plugin_row(ui, i, *chain, is_master, r.depth > 0, content, popup_open);

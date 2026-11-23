@@ -97,6 +97,9 @@ pub enum ChainRowKind {
         gain_match: bool,
         /// r.md #112: 入力の配り方 (ヘッダ行の dropdown)。
         split: common::model::Split,
+        /// 畳んでいて見えない中身のうち、読み込みに失敗した plugin の数 (開いていれば 0 = 行が見えている)。
+        /// 行の名前の横に警告色で出す (r.md #158: 失敗は行の中に出すので、畳むと見えなくなる)。
+        hidden_failures: usize,
     },
     /// r.md #112: Split の param 行 (ヘッダ行の直下、 `Split::None` 以外のときだけ)。
     /// `Frequency3` なら `Low [hz] Mid [hz] High`。
@@ -118,6 +121,8 @@ pub enum ChainRowKind {
         /// r.md #114: Selector で **非アクティブ** な chain (名前を薄く出す。 Selector 以外は常に
         /// `false`)。 表示だけで、 切替はヘッダ直下の `Active` 欄 (編集面は 1 つ)。
         inactive: bool,
+        /// 畳んでいて見えない中身のうち、読み込みに失敗した plugin の数 (`ParallelBegin` と同じ)。
+        hidden_failures: usize,
     },
     /// `+ チェーン`。
     AddChain { parallel_id: u64 },

@@ -18,6 +18,10 @@
 //!
 //! 段 3 (仕様 2・9): 欄の値の列は帯でも Par / SC でも同じ x。読み込み失敗と aux 出力は行の中。
 //!
+//! 段 4 (レビューの指摘): 描いた欄名が「…」で切れない、隠れた行の読み込み失敗が見出しに出る、タイトル / 帯の対象が
+//! 正しい相手を指す、複数選択の声 / 読み上げは全部へ書く、字幕の片が無いテキストクリップで resync が落ち着く、
+//! 幅のドラッグで縁が跳ばない。
+//!
 //! daw_gui 本体は起動しない (AppData を直に組む)。
 
 use std::cell::Cell;
@@ -25,8 +29,8 @@ use std::sync::Arc;
 
 use common::app_dirs::AppDirs;
 use common::model::{
-    AudioContent, AudioEvent, Clip, ClipContent, ClipKey, ImageContent, MidiContent, NativeKind, RackPanelKey, TextContent,
-    TextEvent,
+    AudioContent, AudioEvent, Clip, ClipContent, ClipKey, ImageContent, ImageEvent, MidiContent, NativeKind, RackPanelKey,
+    TextContent, TextEvent,
 };
 use common::plugin_db::{BUILTIN_ID_VOICEVOX, PluginDatabase, SUBTITLE_ID, builtin_descriptors};
 use common::protocol::{AudioCommand, PluginCommand};
@@ -36,9 +40,9 @@ use daw_gui::app::{AppData, AppEvent, ModSourceKindTag};
 use daw_gui::dispatcher::{BackgroundDispatcher, JobDispatcher, NoopJobDispatcher, RecordingDispatcher};
 use daw_gui::event_device::DeviceEvent;
 use daw_gui::event_inspector::InspectorEvent;
-use daw_gui::handler::inspector_view::{INSPECTOR_MAX_W, INSPECTOR_MIN_W};
+use daw_gui::handler::inspector_view::{INSPECTOR_DEFAULT_W, INSPECTOR_MAX_W, INSPECTOR_MIN_W};
 use daw_gui::state::inspector_view::{ClipBandKind, InspectorBand, InspectorDetail, InspectorFolds};
-use daw_gui::view::track_inspector::layout::{FORM_GAP, FORM_LABEL_W, FORM_ROW_H, LABEL_FONT};
+use daw_gui::view::track_inspector::layout::{FORM_GAP, FORM_LABEL_W, FORM_ROW_H, LABEL_FONT, RACK_INDENT, ROW_NAME_X};
 use daw_gui::view::track_inspector::{panel_width, vocab};
 use daw_gui::voicevox_client::{VoiceVoxSinger, VoiceVoxStyle};
 use daw_gui::widgets::select_modifier::SelectModifier;
@@ -108,7 +112,7 @@ impl Harness {
         self.app.handle_event(AppEvent::Inspector(ev));
     }
 
-    /// picker から内蔵 plugin を `track` に足す (本番の「+ Plugin」と同じ経路)。返り値 = 足した device。
+    /// picker から内蔵 plugin を `track` に足す (本番の「+ プラグイン」と同じ経路)。返り値 = 足した device。
     fn add_builtin(&mut self, track: u32, id: &str) -> u64 {
         self.select(track);
         self.app.handle_event(AppEvent::OpenPluginPicker { chain: None });
@@ -376,8 +380,12 @@ fn hidden_or_collapsed_bands_leave_no_hover_scopes_or_popups() {
     h.inspector(InspectorEvent::ToggleBand(InspectorBand::Rack));
     let scene = h.settle();
     let snap_before = find(&scene, W as f32, "Snap").expect("アレンジのツールバー").left;
-    // 入力元の dropdown (効果だけのトラックなので「MIDI (録れない)」と出ている)。
-    let input = glyphs_left_of(&scene, 360.0).into_iter().find(|g| g.text.starts_with("MIDI")).expect("入力元の dropdown");
+    // 入力元の dropdown (効果だけのトラックなので、既定の MIDI は「未選択」と出ている — 警告にしない)。
+    let input = one(&h, &scene, daw_gui::handler::audio_rec::INPUT_UNSET);
+    assert!(
+        !glyphs_left_of(&scene, 360.0).iter().any(|g| g.text.contains("録れない")),
+        "何も触っていない状態に「録れない」を出さない"
+    );
     h.click(center(&input));
     h.hover_at((W as f32 - 5.0, H as f32 - 5.0));
     assert!(h.popups_open.get(), "入力の dropdown が開いた");
@@ -387,7 +395,10 @@ fn hidden_or_collapsed_bands_leave_no_hover_scopes_or_popups() {
     assert_eq!(h.app.cur.peph.inspector_hovered_row, None);
     assert!(h.app.wanted_device_scopes().is_empty(), "隠したインスペクタはスペクトラムを要求しない");
     let snap_after = find(&scene, W as f32, "Snap").expect("アレンジのツールバー").left;
-    assert!((snap_before - snap_after - INSPECTOR_MIN_W).abs() < 0.5, "右の領域が 360px 広がる: {snap_before} → {snap_after}");
+    assert!(
+        (snap_before - snap_after - INSPECTOR_DEFAULT_W).abs() < 0.5,
+        "右の領域が隠す前の幅ぶん広がる: {snap_before} → {snap_after}"
+    );
 }
 
 /// 右端のドラッグで幅が 360〜640 に畳まれ、離したときに app_config へ書かれる。
@@ -409,10 +420,21 @@ fn edge_drag_clamps_the_width_and_persists_on_release() {
         };
         h.frame_with(p, false);
     };
+    // 帯 (右端の 5px) のどこを掴んでも縁は跳ばない: 掴んだだけでは幅は変わらず、10px 動かすと 10px 広がる。
+    let grab = (panel_width(&h.app) - 4.0, 400.0);
+    drag(&mut h, grab, true, true, false);
+    assert_eq!(h.app.ui_prefs.inspector_w, INSPECTOR_DEFAULT_W, "掴んだだけでは幅が跳ばない");
+    drag(&mut h, (grab.0 + 10.0, 400.0), false, true, false);
+    assert_eq!(h.app.ui_prefs.inspector_w, INSPECTOR_DEFAULT_W + 10.0, "動かした分だけ広がる");
+    drag(&mut h, (grab.0 + 10.0, 400.0), false, false, true);
+    h.settle();
+    h.inspector(InspectorEvent::SetWidth { w: INSPECTOR_DEFAULT_W, commit: true });
+    h.settle();
+
     drag(&mut h, edge, true, true, false);
     drag(&mut h, (1200.0, 400.0), false, true, false);
     assert_eq!(h.app.ui_prefs.inspector_w, INSPECTOR_MAX_W, "上限で止まる");
-    assert_eq!(saved_w(), INSPECTOR_MIN_W, "ドラッグ中は書かない");
+    assert_eq!(saved_w(), INSPECTOR_DEFAULT_W, "ドラッグ中は書かない (まだ書いていないのは掴む前の幅)");
     drag(&mut h, (1200.0, 400.0), false, false, true);
     assert_eq!(saved_w(), INSPECTOR_MAX_W, "離したら書く");
 
@@ -549,22 +571,87 @@ fn name_field_renames_without_the_arrangement_rename_box() {
     assert_eq!(h.app.cur.song_doc.undo_depth(), undo + 1, "改名は 1 undo step");
 }
 
-/// 欄名 (`vocab::FORM_LABELS`) は全部ラベル列に収まる (「…」で切れない)。
+/// 欄名は全部ラベル列に収まる (「…」で切れない)。帯の欄 (`vocab::FORM_LABELS`) は帯のラベル列、Rack の行の
+/// 直下の欄 (`vocab::NESTED_FORM_LABELS` と SC / 出力の「入力 N」「出力 N」) は Parallel の深さ 2 の狭いラベル列
+/// (行の名前の左端から始まり、1 段ごとにインデントするぶん狭い — `form::cols_nested`)。
 #[test]
 fn form_labels_fit_the_label_column() {
     let mut h = Harness::new(None);
+    let band_w = FORM_LABEL_W - FORM_GAP;
+    let nested_w = FORM_LABEL_W - ROW_NAME_X - 2.0 * RACK_INDENT - FORM_GAP;
+    let mut nested: Vec<String> = vocab::NESTED_FORM_LABELS.iter().map(|l| l.to_string()).collect();
+    nested.extend((1..=8).map(vocab::sc_port));
+    nested.extend((1..=16).map(vocab::aux_out_port));
     let too_wide = Cell::new(Vec::new());
     let widest = Cell::new(0.0_f32);
     let mut scene = Scene::new();
     h.host.frame(&mut h.app, &mut scene, SCREEN, FrameInput::default(), |_, ui| {
-        let measured: Vec<(String, f32)> =
-            vocab::FORM_LABELS.iter().map(|l| (l.to_string(), ui.measure_text(l, LABEL_FONT))).collect();
-        widest.set(measured.iter().map(|(_, w)| *w).fold(0.0, f32::max));
-        too_wide.set(measured.into_iter().filter(|(_, w)| *w > FORM_LABEL_W - FORM_GAP).collect());
+        let band: Vec<(String, f32, f32)> =
+            vocab::FORM_LABELS.iter().map(|l| (l.to_string(), ui.measure_text(l, LABEL_FONT), band_w)).collect();
+        let nest: Vec<(String, f32, f32)> =
+            nested.iter().map(|l| (l.clone(), ui.measure_text(l, LABEL_FONT), nested_w)).collect();
+        widest.set(band.iter().map(|(_, w, _)| *w).fold(0.0, f32::max));
+        too_wide.set(band.into_iter().chain(nest).filter(|(_, w, col)| w > col).collect());
     });
     // 測れていること (0 を返す測り方ならこの検査は素通りしてしまう)。
     assert!(widest.get() > FORM_LABEL_W * 0.6, "一番長い欄名の幅 {} px", widest.get());
-    assert_eq!(too_wide.take(), Vec::<(String, f32)>::new(), "ラベル列 ({} px) に収まらない欄名", FORM_LABEL_W - FORM_GAP);
+    assert_eq!(
+        too_wide.take(),
+        Vec::<(String, f32, f32)>::new(),
+        "ラベル列 (帯 {band_w} / 入れ子 {nested_w} px) に収まらない欄名"
+    );
+}
+
+/// 描いた画面で、インスペクタの 11px の文字 (欄名・行の名前・帯の対象) が「…」で切れていない。欄名を vocab の
+/// 一覧に登録し忘れても、ここが拾う (一覧を測るだけのテストは、一覧に無い欄名を素通りする)。帯を開いた状態を
+/// 一通り描く: 音声 / 画像 / 読み上げ + 字幕 (詳細も) / セル (MIDI 割り当ても) と、EQ の Par / Comp の SC を
+/// 開いた Rack。
+#[test]
+fn drawn_inspector_labels_are_never_cut() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    let eq = h.app.cur.song_doc.song().builtin_native(t0, NativeKind::Eq).expect("組み込み EQ").id;
+    let comp = h.app.cur.song_doc.song().builtin_native(t0, NativeKind::Comp).expect("組み込み Comp").id;
+    h.app.handle_event(AppEvent::Device(DeviceEvent::ToggleRackPanel(RackPanelKey::Device(eq))));
+    h.app.cur.peph.open_sidechain_panel = Some(comp);
+    h.inspector(InspectorEvent::ToggleDetail(InspectorDetail::SubtitleStyle));
+    h.inspector(InspectorEvent::ToggleDetail(InspectorDetail::LaunchMidi));
+    let audio_content = AudioContent { events: vec![AudioEvent::default()], next_event_id: 2 };
+    let audio = place(&mut h.app, t0, 0.0, ClipContent::Audio(audio_content), "A");
+    let image = place(&mut h.app, t0, 8.0, ClipContent::Image(ImageContent { events: vec![ImageEvent::default()] }), "I");
+    // 読み上げのトラック (足したトラックがカーソルになる。並びの位置は選択で変わるので index では引かない)。
+    h.app.handle_event(AppEvent::AddInstrumentTrack);
+    let talk = h.app.cursor_track_id().expect("足したトラック");
+    assert_ne!(talk, t0);
+    h.add_builtin(talk, BUILTIN_ID_VOICEVOX);
+    h.add_builtin(talk, SUBTITLE_ID);
+    let line = TextEvent { text: "こんにちは".to_string(), event_length_beats: 4.0, ..TextEvent::default() };
+    let text = place(&mut h.app, talk, 0.0, ClipContent::Text(TextContent { events: vec![line] }), "");
+    let mut checked = 0;
+    let mut check = |h: &mut Harness, what: &str| {
+        let scene = h.settle();
+        let w = panel_width(&h.app);
+        let small: Vec<String> = scene
+            .primitives
+            .iter()
+            .filter_map(|p| match p {
+                Primitive::Glyph(g) if g.left < w && (g.font_size - LABEL_FONT).abs() < 0.01 => Some(g.text.to_string()),
+                _ => None,
+            })
+            .collect();
+        checked += small.len();
+        let cut: Vec<&String> = small.iter().filter(|t| t.ends_with('…')).collect();
+        assert!(cut.is_empty(), "{what}: 「…」で切れた文字 {cut:?}");
+    };
+    for (what, clip) in [("音声クリップ", audio), ("画像クリップ", image), ("読み上げ + 字幕", text)] {
+        h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
+        check(&mut h, what);
+    }
+    h.select(t0);
+    let row = daw_gui::event_launcher::LauncherRow::Track(t0);
+    h.app.handle_event(AppEvent::Launcher(daw_gui::event_launcher::LauncherEvent::CreateCell { row, scene_index: 0 }));
+    check(&mut h, "セル");
+    assert!(checked > 60, "11px の文字を描いている ({checked})");
 }
 
 /// 字幕の数値欄は欄の種類ごとに別の undo の束ね (§6-13: `InspectorScrubField::Text` から device を外しても、
@@ -682,4 +769,166 @@ fn failed_load_and_aux_outputs_live_in_their_own_row() {
     assert!(h.app.aux_out_entry(vv).is_some_and(|e| e.exploded), "展開で配線された");
     let port2 = one(&h, &scene, &vocab::aux_out_port(2));
     assert!(port2.top > one(&h, &scene, vocab::FIELD_CHILD_TRACKS).top, "port の行は展開の行の下");
+}
+
+/// 読み込みに失敗した plugin は、行が見えていなくても気付ける: 畳んだ Parallel の見出しの行に「失敗 N」、Rack の帯の
+/// 見出しに「読み込み失敗 N」(Rack を畳んでいても見える)。
+#[test]
+fn failed_loads_stay_visible_when_their_row_is_hidden() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    h.app.handle_event(AppEvent::Device(DeviceEvent::AddParallel {
+        chain: common::model::ChainRef::Track(t0),
+        at: daw_gui::device_addr::InsertAt::Default,
+    }));
+    let song = h.app.cur.song_doc.song();
+    let (parallel_id, chain_id) = song
+        .track_by_id(t0)
+        .and_then(|t| {
+            t.devices.iter().find_map(|d| match d {
+                common::model::Device::Parallel(p) => Some((p.id, p.chains[0].id)),
+                _ => None,
+            })
+        })
+        .expect("Parallel");
+    // chain の中に映像 FX を足し、その読み込みが失敗した。
+    h.app.handle_event(AppEvent::OpenPluginPicker { chain: Some(common::model::ChainRef::Chain(chain_id)) });
+    h.app.handle_event(AppEvent::SelectPluginFromDb {
+        id: "builtin.video.vignette".to_string(),
+        keep_open: false,
+        open_gui: false,
+    });
+    let fx = h.app.cur.song_doc.song().track_by_id(t0).and_then(|t| t.plugins().last().map(|p| p.id)).expect("足した FX");
+    h.app.cur.pipc.failed_plugin_loads.insert(fx, "shmem create failed".to_string());
+    h.app.handle_event(AppEvent::Device(DeviceEvent::ToggleParallelNodeCollapsed { id: parallel_id }));
+    let scene = h.settle();
+    let hidden = one(&h, &scene, &vocab::hidden_failures(1));
+    let parallel = one(&h, &scene, "Parallel");
+    assert!((hidden.top - parallel.top).abs() < 4.0, "畳んだ Parallel の見出しの行に「失敗 1」");
+    assert!(find(&scene, 360.0, vocab::RELOAD).is_none(), "行は畳まれて見えない");
+    one(&h, &scene, &vocab::failed_loads(1));
+
+    // Rack を畳んでも、見出しの「読み込み失敗 1」は残る。
+    h.inspector(InspectorEvent::ToggleBand(InspectorBand::Rack));
+    let scene = h.settle();
+    assert!(find(&scene, 360.0, "Parallel").is_none(), "Rack の中身は描かれない");
+    let warn = one(&h, &scene, &vocab::failed_loads(1));
+    assert!((warn.top - one(&h, &scene, vocab::BAND_RACK).top).abs() < 4.0, "Rack の見出しの行");
+}
+
+/// タイトルと帯の対象が、指している相手を正しく言う:
+/// - クリップを選んだまま別のトラックをカーソルにしても、2 行目と色見本はクリップの居るトラック。
+/// - 名前の無いセルは「(名前なし)」、2 行目に種類と「セル」。
+/// - 1 本だけ選んだトラックの名前は、帯の見出しに繰り返さない (タイトルだけ)。
+/// - 複数選択で録れるトラックが 1 本だけなら、入力の帯の対象はその 1 本 (カーソルではない)。
+#[test]
+fn title_and_band_targets_name_the_right_track() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    let a_name = h.app.cur.song_doc.song().track_display_name(t0).into_owned();
+    h.app.cur.selection.selected_track_ids.clear();
+    h.app.handle_event(AppEvent::AddInstrumentTrack);
+    let t1 = h.app.cursor_track_id().expect("足したトラック");
+    let b_name = h.app.cur.song_doc.song().track_display_name(t1).into_owned();
+    let clip = place(&mut h.app, t0, 0.0, ClipContent::Midi(MidiContent::default()), "Lead");
+
+    // クリップを選んで、トラック B のヘッダを押す (クリップの選択は残る)。
+    h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
+    h.select(t1);
+    assert_eq!(h.app.inspector_target_refs(), vec![clip], "クリップの選択は残る");
+    let title = h.app.inspector_title();
+    assert_eq!(title.main, "Lead");
+    assert!(title.sub.ends_with(&vocab::track_label(&a_name)), "2 行目はクリップの居るトラック: {}", title.sub);
+    assert_eq!(
+        title.sub_swatch.map(|s| s.target),
+        Some(daw_gui::color_target::ColorPickerTarget::Track(t0)),
+        "色見本もクリップの居るトラック (カーソルの {b_name} ではない)"
+    );
+
+    // 名前の無いセル。
+    let row = daw_gui::event_launcher::LauncherRow::Track(t0);
+    h.app.handle_event(AppEvent::Launcher(daw_gui::event_launcher::LauncherEvent::CreateCell { row, scene_index: 0 }));
+    let title = h.app.inspector_title();
+    assert_eq!(title.main, vocab::UNNAMED_CLIP);
+    let kind = vocab::clip_band_title(ClipBandKind::Midi);
+    let expected = [kind, vocab::PLACE_CELL, &vocab::track_label(&a_name)].join(vocab::SEP);
+    assert_eq!(title.sub, expected);
+
+    // 1 本だけ選んだトラック: 名前はタイトルだけ (帯の見出しに繰り返さない)。
+    h.app.handle_event(AppEvent::ClearSelection);
+    h.select(t0);
+    let scene = h.settle();
+    assert!(h.app.inspector_target_refs().is_empty(), "クリップを選んでいない");
+    assert_eq!(count(&h, &scene, &a_name), 1, "トラック名はタイトルの 1 回だけ");
+
+    // 複数選択のうち録れるのは t1 だけ (t2 は映像 FX だけのトラック = 何も録れない)、カーソルは t2。
+    h.app.cur.selection.selected_track_ids.clear();
+    h.app.handle_event(AppEvent::AddInstrumentTrack);
+    let t2 = h.app.cursor_track_id().expect("足したトラック");
+    h.add_builtin(t2, "builtin.video.vignette");
+    h.select(t1);
+    h.add_to_selection(t2);
+    assert_eq!(h.app.cursor_track_id(), Some(t2));
+    assert_eq!(h.app.input_target_track_ids(), vec![t1]);
+    assert_eq!(h.app.inspector_track_band_target(true), b_name, "入力の帯の対象は書き込み先の 1 本");
+}
+
+/// 歌声の声と読み上げのスケールは、選んでいる同じ種類のクリップ全部へ 1 undo step で書く。値が割れていれば欄は「—」。
+#[test]
+fn voice_and_talk_edits_reach_every_selected_clip() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    h.add_builtin(t0, BUILTIN_ID_VOICEVOX);
+    h.app.handle_event(AppEvent::SingersLoaded(vec![singer("ずんだもん", &[(3, "ノーマル"), (1, "あまあま")])]));
+    let a = place(&mut h.app, t0, 0.0, ClipContent::Midi(MidiContent::default()), "A");
+    let b = place(&mut h.app, t0, 8.0, ClipContent::Midi(MidiContent::default()), "B");
+    h.app.handle_event(AppEvent::SelectClip { target: a, additive: false });
+    h.app.handle_event(AppEvent::SelectClip { target: b, additive: true });
+    let scene = h.settle();
+    assert_eq!(count(&h, &scene, vocab::FIELD_CHARACTER), 1, "2 つ選んでいても声の欄がある");
+    let undo = h.app.cur.song_doc.undo_depth();
+    h.app.handle_event(AppEvent::SetClipVoice {
+        clips: vec![a, b],
+        speaker_id: 1,
+        singer_name: "ずんだもん".to_string(),
+        style_name: "あまあま".to_string(),
+    });
+    let song = h.app.cur.song_doc.song();
+    assert!([a, b].iter().all(|k| song.clip_by_key(*k).is_some_and(|c| c.speaker_id == 1)), "2 つとも声が変わる");
+    assert_eq!(h.app.cur.song_doc.undo_depth(), undo + 1, "1 undo step");
+
+    // 読み上げのスケール: 割れていれば「—」、書けば全部が揃う。
+    let line = || TextEvent { text: "あ".to_string(), event_length_beats: 4.0, ..TextEvent::default() };
+    let x = place(&mut h.app, t0, 16.0, ClipContent::Text(TextContent { events: vec![line()] }), "");
+    let y = place(&mut h.app, t0, 24.0, ClipContent::Text(TextContent { events: vec![line()] }), "");
+    let speed = daw_gui::app::TalkParamKind::Speed;
+    h.app.handle_event(AppEvent::SetClipTalkParam { clips: vec![x], param: speed, value: 1.5 });
+    h.app.handle_event(AppEvent::SelectClip { target: x, additive: false });
+    h.app.handle_event(AppEvent::SelectClip { target: y, additive: true });
+    let scene = h.settle();
+    field_value(&h, &scene, vocab::FIELD_TALK_SPEED, "\u{2014}");
+    h.app.handle_event(AppEvent::SetClipTalkParam { clips: vec![x, y], param: speed, value: 1.25 });
+    let song = h.app.cur.song_doc.song();
+    let speeds: Vec<f32> =
+        [x, y].iter().map(|k| song.clip_by_key(*k).and_then(|c| c.talk).map_or(1.0, |t| t.speed_scale)).collect();
+    assert_eq!(speeds, vec![1.25, 1.25]);
+}
+
+/// 窓に字幕の片が 1 つも見えていないテキストクリップを選んでも、編集バッファの resync は 1 回で落ち着く
+/// (毎フレーム積み続けると再描画が止まらない)。
+#[test]
+fn text_clip_without_visible_lines_settles_its_edit_buffers() {
+    let mut h = Harness::with_builtins();
+    let t0 = h.track(0);
+    h.add_builtin(t0, SUBTITLE_ID);
+    let clip = place(&mut h.app, t0, 0.0, ClipContent::Text(TextContent { events: Vec::new() }), "");
+    h.app.handle_event(AppEvent::SelectClip { target: clip, additive: false });
+    h.settle();
+    assert_eq!(h.app.cur.peph.clip_edit_buffer_target, Some(clip), "対象はそのクリップに揃う");
+    let idle = PointerFrame { pos: Some((W as f32 - 5.0, H as f32 - 5.0)), ..PointerFrame::default() };
+    let mut scene = Scene::new();
+    let edits = h.host.frame_to_edits(&h.app, &mut scene, SCREEN, FrameInput { pointer: idle, ..FrameInput::default() }, |app, ui| {
+        daw_gui::view::root::build_root(app, ui, SCREEN);
+    });
+    assert!(edits.is_empty(), "落ち着いたフレームは Edit を積まない ({} 件)", edits.len());
 }

@@ -36,8 +36,9 @@ pub(super) fn draw_clip_band_body(app: &AppData, ui: &mut Ui<'_, AppData>, area:
     launch::draw_cell_launch(app, ui, area, pad, y)
 }
 
-/// 共通の欄と種類ごとの欄。値は代表クリップ (`selected_clip_ref`) から、編集は選んでいるクリップ全部へ
-/// (声 / 読み上げ / 本文 / 名前のように 1 つのクリップにしか書けない欄は、1 つだけ選んでいるときに出す)。
+/// 共通の欄と種類ごとの欄。値は選んでいるクリップ全部を畳んだもの (割れていれば「—」/ 空)、編集は全部へ
+/// (歌声の声 / 読み上げの話者とスケールも)。名前と本文 (と「ここから読む」) はクリップ 1 つの値なので、
+/// 1 つだけ選んでいるときに出す (何本ものクリップを同じ名前 / 同じセリフにする操作は無い)。
 fn draw_clip_fields(app: &AppData, ui: &mut Ui<'_, AppData>, c: &FormCols, w: f32, y: f32) -> f32 {
     let song = app.cur.song_doc.song();
     let Some(rep) = app.selected_clip_ref() else {
@@ -47,7 +48,8 @@ fn draw_clip_fields(app: &AppData, ui: &mut Ui<'_, AppData>, c: &FormCols, w: f3
     else {
         return y;
     };
-    let single = app.inspector_target_refs().len() == 1;
+    let refs = app.inspector_target_refs();
+    let single = refs.len() == 1;
     // 表示中の編集バッファ (本文 / フォント) を代表クリップへ向ける。1 フレームだけ古い値が見えるが、
     // 次のフレームで書き戻る。同じクリップを選び直しただけでは走らない。
     if app.cur.peph.clip_edit_buffer_target != Some(rep) {
@@ -69,14 +71,14 @@ fn draw_clip_fields(app: &AppData, ui: &mut Ui<'_, AppData>, c: &FormCols, w: f3
     match kind {
         ClipBandKind::Audio => audio.map_or(y, |s| audio::draw_audio_fields(app, ui, c, &s, y)),
         ClipBandKind::Image => app.inspector_image_event_summary().map_or(y, |s| image::draw_image_fields(app, ui, c, &s, y)),
-        ClipBandKind::Midi if single => voice::draw_clip_voice(app, ui, c, w, rep, y),
+        ClipBandKind::Midi => voice::draw_clip_voice(app, ui, c, w, &refs, y),
         ClipBandKind::Text => {
-            let y = if single { talk::draw_talk(app, ui, c, w, rep, y) } else { y };
+            let y = talk::draw_talk(app, ui, c, w, rep, &refs, y);
             subtitle::draw_subtitle(app, ui, c, w, y)
         }
         // 映像クリップの速度は端の Shift ドラッグが唯一の編集面 (`ClipContent::Video` の doc)、
         // オートメーションクリップは中身をレーンで描く。どちらも共通の欄だけ。
-        ClipBandKind::Midi | ClipBandKind::Video | ClipBandKind::Automation => y,
+        ClipBandKind::Video | ClipBandKind::Automation => y,
     }
 }
 

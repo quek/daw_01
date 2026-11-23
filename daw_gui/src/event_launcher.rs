@@ -350,7 +350,7 @@ pub enum LauncherEvent {
     /// 次に届いたノート / CC をこの操作へ bind する。
     StartLearn(common::model::BindingTarget),
     CancelLearn,
-    /// bind 表を空にする (インスペクタの「割り当てを消す」)。
+    /// bind 表を空にする (インスペクタの MIDI 割り当ての「割り当てを全部消す」)。
     ClearBindings,
 }
 

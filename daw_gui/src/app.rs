@@ -1752,10 +1752,6 @@ impl AppData {
                 self.end_text_pip_drag_recording();
                 self.cur.song_doc.end_gesture(GestureOwner::TextPipDrag);
             }
-            AppEvent::SetClipTextMuted { target, muted } => {
-                // 字幕 clip mute も clip-level `Clip.muted` に一本化。
-                self.set_clip_muted(target, muted);
-            }
             AppEvent::SetClipTextContent { target, value } => {
                 self.set_clip_text_event_content(target, value);
             }
@@ -2007,8 +2003,8 @@ impl AppData {
                     }
                 }
             }
-            AppEvent::SetClipVoice { clip, speaker_id, singer_name, style_name } => {
-                self.set_clip_voice(clip, speaker_id, singer_name, style_name);
+            AppEvent::SetClipVoice { clips, speaker_id, singer_name, style_name } => {
+                self.set_clip_voice(&clips, speaker_id, singer_name, style_name);
             }
             AppEvent::RefetchSingers => {
                 self.spawn_fetch_singers();
@@ -2020,8 +2016,8 @@ impl AppData {
             AppEvent::RefetchSpeakers => {
                 self.spawn_fetch_speakers();
             }
-            AppEvent::SetClipTalkParam { clip, param, value } => {
-                self.set_clip_talk_param(clip, param, value);
+            AppEvent::SetClipTalkParam { clips, param, value } => {
+                self.set_clip_talk_param(&clips, param, value);
             }
             AppEvent::SetClipTextReads { clip, reads } => self.set_clip_text_reads(clip, reads),
             AppEvent::SetPianoRollSnapEnabled(b) => {

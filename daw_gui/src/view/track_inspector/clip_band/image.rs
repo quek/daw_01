@@ -24,10 +24,10 @@ const PIP_FIELDS: [ImageBuiltinParam; 6] = [
 
 fn pip_label(p: ImageBuiltinParam) -> &'static str {
     match p {
-        ImageBuiltinParam::X => "X",
-        ImageBuiltinParam::Y => "Y",
-        ImageBuiltinParam::W => "W",
-        ImageBuiltinParam::H => "H",
+        ImageBuiltinParam::X => vocab::FIELD_X,
+        ImageBuiltinParam::Y => vocab::FIELD_Y,
+        ImageBuiltinParam::W => vocab::FIELD_W,
+        ImageBuiltinParam::H => vocab::FIELD_H,
         ImageBuiltinParam::Opacity => vocab::FIELD_OPACITY,
         ImageBuiltinParam::Rotation => vocab::FIELD_ROTATION,
     }

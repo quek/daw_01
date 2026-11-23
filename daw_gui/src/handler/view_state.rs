@@ -95,24 +95,10 @@ impl AppData {
             .map(|(id, g)| (*id, *g))
             .collect();
         plugin_editor_windows.sort_unstable_by_key(|(id, _)| *id);
-        // r.md #129 (Q18): 開いている Par。現存する device の分だけ (Limiter は常に居る)、キー順
-        // (`BTreeSet` の順) で save 差分を安定させる。Par を持たない字幕デバイスの鍵 (r.md #158 より前の
-        // ファイルから来たもの) は書かない。
-        let open_rack_panels: Vec<common::model::RackPanelKey> = self
-            .cur
-            .view
-            .open_rack_panels
-            .iter()
-            .filter(|k| match k {
-                common::model::RackPanelKey::Device(id) => {
-                    let song = self.cur.song_doc.song();
-                    song.device_by_id(*id).is_some()
-                        && song.plugin_by_id(*id).is_none_or(|p| p.plugin_id != common::plugin_db::SUBTITLE_ID)
-                }
-                common::model::RackPanelKey::MasterLimiter => true,
-            })
-            .copied()
-            .collect();
+        // r.md #129 (Q18): 開いている Par。現存して Par を持つ device の分だけ (`rack_panel_key_valid`)、キー順
+        // (`BTreeSet` の順) で save 差分を安定させる。
+        let open_rack_panels: Vec<common::model::RackPanelKey> =
+            self.cur.view.open_rack_panels.iter().copied().filter(|k| self.rack_panel_key_valid(*k)).collect();
         common::model::ViewState {
             arrange_zoom_x: self.cur.view.arrange_zoom_x,
             arrangement_split_ratio: self.cur.view.arrangement_split_ratio,
@@ -224,15 +210,11 @@ impl AppData {
             .collect();
         self.cur.view.expanded_automation_tracks = v.expanded_automation_tracks.into_iter().collect();
         self.cur.view.collapsed_parallel_nodes = v.collapsed_parallel_nodes.into_iter().collect();
-        // r.md #129 (Q18): 開いている Par。現存する device の分だけ入れる (Limiter は常に居る)。
-        self.cur.view.open_rack_panels = v
-            .open_rack_panels
-            .into_iter()
-            .filter(|k| match k {
-                common::model::RackPanelKey::Device(id) => self.cur.song_doc.song().device_by_id(*id).is_some(),
-                common::model::RackPanelKey::MasterLimiter => true,
-            })
-            .collect();
+        // r.md #129 (Q18): 開いている Par。現存して Par を持つ device の分だけ入れる (保存と同じ
+        // `rack_panel_key_valid`。r.md #158 より前のファイルの字幕デバイスの鍵はここで落ちる)。
+        let open_rack_panels: Vec<common::model::RackPanelKey> =
+            v.open_rack_panels.into_iter().filter(|k| self.rack_panel_key_valid(*k)).collect();
+        self.cur.view.open_rack_panels = open_rack_panels.into_iter().collect();
         // r.md #158: 知らない id (新しい版が足した帯) は捨てる。
         self.cur.view.inspector_folds =
             crate::state::inspector_view::InspectorFolds::from_ids(&v.inspector_collapsed, &v.inspector_open_details);
