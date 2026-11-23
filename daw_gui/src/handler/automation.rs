@@ -870,25 +870,8 @@ impl AppData {
             let content =
                 song.clip_contents.get(&c.content_id).map(|x| x.copied_from(song.project_id, c.content_id)).unwrap_or_default();
             let name = self.cur.song_doc.song().clip_content_names.get(&c.content_id).cloned();
-            clips.push(crate::clipboard::ClipCopy {
-                track_offset: (*ti as i64) - (min_track as i64),
-                start_beat: c.start_beat - base,
-                length_beats: c.length_beats,
-                color: c.color,
-                // clip-level mute も clipboard へ。
-                muted: c.muted,
-                content_id: c.content_id,
-                // r.md #44: trim で決まった「content のどこを見せるか」も clipboard へ。
-                content_offset_beats: c.content_offset_beats,
-                content,
-                name,
-                // per-clip 声を clipboard へ。
-                speaker_id: c.speaker_id,
-                singer_name: c.singer_name.clone(),
-                style_name: c.style_name.clone(),
-                // (talk) per-clip 読み上げスケールも clipboard へ。
-                talk: c.talk,
-            });
+            let track_offset = (*ti as i64) - (min_track as i64);
+            clips.push(crate::clipboard::ClipCopy::of(c, content, name, track_offset, c.start_beat - base));
         }
         let envelope = self.envelope_with_media(crate::clipboard::ClipboardPayload::Clips(clips));
         Some((envelope, base, min_track))
@@ -967,30 +950,8 @@ impl AppData {
                     continue;
                 };
                 let to_track_id = to_track.id;
-                let new_clip_id = to_track.place_clip(common::model::Clip {
-                    id: 0,
-                    start_beat: (at_beat + cc.start_beat).max(0.0),
-                    length_beats: cc.length_beats,
-                    content_id,
-                    // clipboard が運んできた窓をそのまま復元 (r.md #44)。
-                    content_offset_beats: cc.content_offset_beats,
-                    // 新規クリップにクロスフェードの張り出しは無い。
-                    xfade_lead_beats: 0.0,
-                    xfade_tail_beats: 0.0,
-                    color: cc.color,
-                    // paste した clip は派生データではなくユーザーの持ち物
-                    // (clipboard は `auto_lipsync` を運ばない — clipboard.rs 参照)。
-                    auto_lipsync: false,
-                    lipsync_gen: 0,
-                    // clipboard の clip-level mute を paste 先 clip へ引き継ぐ。
-                    muted: cc.muted,
-                    // clipboard の per-clip 声を paste 先 clip へ引き継ぐ。
-                    speaker_id: cc.speaker_id,
-                    singer_name: cc.singer_name.clone(),
-                    style_name: cc.style_name.clone(),
-                    // (talk) per-clip 読み上げスケールも引き継ぐ。
-                    talk: cc.talk,
-                });
+                // clipboard が運んできた窓・声・mute・コードの記録をそのまま復元する (`ClipCopy::to_clip`)。
+                let new_clip_id = to_track.place_clip(cc.to_clip((at_beat + cc.start_beat).max(0.0), content_id));
                 // 住所は **安定 id**。 index (`target_idx` / `clips.len()`) で組むと
                 // paste 直後の選択が別のクリップを指す (= 貼った先ではないものが
                 // 選択され、 続く操作がそちらに当たる)。

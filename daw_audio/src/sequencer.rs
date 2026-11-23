@@ -393,7 +393,7 @@ pub fn collect_events_for_buffer<'p>(
             if !clip.window_has_onset(note.start_beat) {
                 return;
             }
-            let key = pitch.note_key(clip.content_id, note.pitch, note.start_beat, clip.content_to_song_beat(note.start_beat));
+            let key = pitch.note_key(clip, note, clip.content_to_song_beat(note.start_beat));
             emit_note_events(win, clip, clip_end_beats, note, key, out, ledger);
         });
     });

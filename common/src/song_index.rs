@@ -64,9 +64,9 @@ pub struct SongIndex {
     nodes: nodes::NodeIndex,
     /// content id → MIDI の note `[start, start + duration)` / 読み上げの event `[start, start]` (content-local 拍)。
     contents: HashMap<ContentId, RangeIndex>,
-    /// r.md #157: 平行移動 / ベースで追従するトラックが鳴らす MIDI の content の、素材のコード
-    /// (`chord_follow::note_source_chords`、content-local 拍)。RT がノートから検出し直さないため。
-    source_chords: HashMap<ContentId, Vec<SourceChord>>,
+    /// r.md #157 / #159: 追従するトラックが鳴らす MIDI の content の、自分の和音
+    /// (`chord_follow::note_own_chords`、content-local 拍)。RT がノートから検出し直さないため。
+    own_chords: HashMap<ContentId, Vec<SourceChord>>,
     launcher: launcher::LauncherIndex,
 }
 
@@ -120,9 +120,9 @@ impl SongIndex {
                 Some((id, ranges))
             })
             .collect();
-        let mut source_chords: HashMap<ContentId, Vec<SourceChord>> = HashMap::new();
-        for t in song.tracks.iter().filter(|t| matches!(chord_follow(t), ChordFollow::Parallel | ChordFollow::Bass)) {
-            crate::chord_follow::collect_source_chords(song, t, &mut source_chords);
+        let mut own_chords: HashMap<ContentId, Vec<SourceChord>> = HashMap::new();
+        for t in song.tracks.iter().filter(|t| !chord_follow(t).is_off()) {
+            crate::chord_follow::collect_own_chords(song, t, &mut own_chords);
         }
         let mut index = Self {
             song: ParamStoreIndex::build(&song.song_lanes, &song.song_mod_routings),
@@ -131,7 +131,7 @@ impl SongIndex {
             scene_pos: id_positions(song.scenes.iter().map(|s| s.id)),
             nodes: nodes::NodeIndex::build(song),
             contents,
-            source_chords,
+            own_chords,
             launcher: launcher::LauncherIndex::default(),
         };
         index.launcher = launcher::LauncherIndex::build(song, &index);
@@ -193,10 +193,10 @@ impl SongIndex {
         self.tracks.get(track_idx).map_or(ChordFollow::Off, |t| t.chord_follow)
     }
 
-    /// content の素材のコード (content-local 拍、平行移動 / ベースで追従するトラックの content だけ)。
+    /// content の自分の和音 (content-local 拍、追従するトラックの content だけ)。
     #[must_use]
-    pub fn source_chords(&self, content_id: ContentId) -> &[SourceChord] {
-        self.source_chords.get(&content_id).map_or(&[], Vec::as_slice)
+    pub fn own_chords(&self, content_id: ContentId) -> &[SourceChord] {
+        self.own_chords.get(&content_id).map_or(&[], Vec::as_slice)
     }
 
     /// `tracks[track_idx]` の send id の send。

@@ -320,6 +320,50 @@ pub struct AudioChordSpan {
     pub start_frame: u64,
     pub end_frame: u64,
     pub chord: Chord,
+    /// r.md #159: この区間で **同時に 3 つ以上の音が鳴っている** (和音を弾いている) か。`true` の区間だけが
+    /// 自分の和音として追従の基準になる (`crate::chord_detect::audio_own_chord_at`)。歌声や単音の楽器を窓で
+    /// 集めた結果 (旋律の音が偶然コードに見えたもの) は `false` で、帯へ抽出するときにだけ使う。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chordal: bool,
+}
+
+/// クリップ 1 つの **書かれたときのコード** の記録 (r.md #159、`Clip::chord_basis`)。
+///
+/// 和音を持たない素材 (メロディー / ベースライン / 歌声) の追従の基準。コードの箱を **書き換えた** とき
+/// (`Song::set_chord` / `Song::transpose_chords`) にだけ、その箱の下にあって記録の無い素材へ、書き換える前の
+/// コードを書く。記録の無い素材は今のコードが基準 = 動かない (置いただけでは動かない)。規則の正本は
+/// `crate::model::chord_basis` の module doc。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ClipChordBasis {
+    /// note id (clip の content の `Note::id`) 昇順・重複なし。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<NoteChordBasis>,
+    /// `(take, start_frame)` 昇順。同じ take の中は互いに重ならない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<AudioChordBasis>,
+}
+
+impl ClipChordBasis {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.notes.is_empty() && self.audio.is_empty()
+    }
+}
+
+/// ノート 1 つが書かれたときのコード。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct NoteChordBasis {
+    pub note_id: u32,
+    pub chord: Chord,
+}
+
+/// オーディオの take (`AudioEvent::take_key`) の音源フレーム `[start_frame, end_frame)` が書かれたときのコード。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct AudioChordBasis {
+    pub take: u32,
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub chord: Chord,
 }
 
 /// コードを鍵盤にする並べ方 (Cubase の Voicings: Piano / Guitar / Basic + Adaptive Voicings)。

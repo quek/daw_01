@@ -256,6 +256,8 @@ impl AppData {
                 style_name,
                 // (talk) 新規 clip は読み上げスケール未設定 (= 全既定)。
                 talk: None,
+                // 新規 clip の素材は今のコードに対して書く (記録なし、r.md #159)。
+                chord_basis: common::model::ClipChordBasis::default(),
             });
             // デフォルトでクリップ名は無し (= content_name 未設定)。 表示名は
             // arrangement_view::clip_display_label が内容 (Text 本文 / ノート歌詞)

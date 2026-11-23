@@ -51,15 +51,19 @@ impl AppData {
     /// 扱う)。移調量は playhead の位置のレーン値 + engine が publish した変調 — 再生と同じ
     /// `common::transpose::transpose_in_clip` を通る。追従しないトラックは弾いた鍵盤のまま、範囲外は `None`。
     ///
-    /// r.md #157 (演奏入力のリアルタイム変換、Cubase の Live Input): コードトラックに追従するトラックで弾いた音は、
-    /// 移調の前に playhead の位置のコードへ寄せる (`common::chord_follow::TrackChordFollow`)。弾いた音に素材の
-    /// コードは無いので、平行移動 / ベースの基準はその位置のキーのトニック (キーも無ければ C)。録音されるのは
-    /// 弾いた音 (#130 Q2 と同じ移調楽器の扱い)。
+    /// r.md #157 / #159 Q2 (演奏入力のリアルタイム変換、Cubase の Live Input): 最寄りのコード音 / スケールで追従する
+    /// トラックで弾いた音は、移調の前に playhead の位置のコードへ寄せる ([`Self::live_input_key`])。録音されるのも
+    /// 寄せた音 (`record_midi_note_on_tracks`) なので、聴いた音 = 録れた音 = 再生の音。平行移動 / ベースは弾いた音の
+    /// まま (弾いた音は今のコードに対して書いた音 = 動かない)。移調は #130 Q2 と同じ移調楽器の扱い (録るのは移調の前)。
     pub(crate) fn preview_key(&self, track_id: u32, pitch: u8) -> Option<u8> {
+        self.transposed_preview_key(track_id, self.live_input_key(track_id, pitch))
+    }
+
+    /// トラック `track_id` で弾いた音 `pitch` を、playhead の位置のコードへ寄せた鍵盤 (書いた音の空間、移調の前)。
+    /// 演奏のモニター ([`Self::preview_key`]) と録音 (書くノートの音程) が同じこれを通す。
+    pub(crate) fn live_input_key(&self, track_id: u32, pitch: u8) -> u8 {
         let song = self.cur.song_doc.song();
-        let beat = self.preview_beat();
-        let followed = common::chord_follow::TrackChordFollow::of(song, track_id).key(pitch, beat, None)?;
-        self.transposed_preview_key(track_id, followed)
+        common::chord_follow::TrackChordFollow::of(song, track_id).live_key(pitch, self.preview_beat())
     }
 
     /// 既にあるノート (トラック `track_id` のクリップ `clip_id` の `note`) の試聴で **いま鳴らす鍵盤**: ノートの位置の

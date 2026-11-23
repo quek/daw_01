@@ -1,0 +1,377 @@
+//! 素材が **書かれたときのコード** の記録 (`Clip::chord_basis`、r.md #159) の書き込み・引き継ぎ・正規化。
+//!
+//! 型 ([`ClipChordBasis`]) は wire を渡るので `chords.rs` に置き、ここは wire に載らないロジックだけを持つ
+//! (`common/build.rs` の `WIRE_SOURCES` 対象外)。評価 (記録から鳴る音を決める式) は `crate::chord_follow`。
+//!
+//! ## 規則 (確定仕様: 2026-11-23 ユーザー確定、`docs/plan_chord_track.md` §1 Q8)
+//!
+//! コードの帯にコードを **置いた時点** のコードがメロディーの基準で、メロディーが動くのは後からそのコードを
+//! **書き換えた** ときだけ。和音のパートは今どおり、自分の和音から帯のコードへ合わせる (`crate::chord_follow`)。
+//!
+//! - **記録を書くのは書き換えだけ** ([`Song::set_chord`] / [`Song::transpose_chords`])。書き換える箱の下にある
+//!   素材のうち、**まだ記録の無いもの** に、書き換える **前** のコードを書く。同じ `edit_song` の中なので undo は 1 段。
+//!   - 書くのは追従するトラック (実効のモードが Off 以外) のアレンジのクリップだけ。Off の間に書き換えた分は、
+//!     後で ON にしても動かない (ON にした時点が基準)。曲全体のスイッチも同じ。
+//!   - MIDI: ノートの頭 (`Clip::content_to_song_beat`) が書き換える箱にあるもの (ミュートしたノート / 窓の外へ
+//!     隠したノートも書く — 後で出したときに、そこだけ動かないまま残らない)。
+//!   - オーディオ: 見えている event ∩ 箱の範囲を、波形と再生の写像 (`crate::audio_render::event_wave_spans`) で
+//!     音源フレームの範囲へ写し、その take (`AudioEvent::take_key`) で記録の無い部分にだけ書く。
+//! - **記録は素材の事実** — 「この素材は R に対して書かれた」。箱には縛らない: 記録のある素材は、どの箱の下へ
+//!   動かしても / 写しても「R → 今のコード」で鳴る (参照製品も基準を素材の側に持つ)。記録の無い素材は、どの箱の
+//!   下でも書いた音のまま。だから箱を置く / 動かす / 伸ばす / 割る / 時間操作で箱が割れても、記録は触らない。
+//! - 書き換えを重ねても記録は最初のコードのまま (C → Dm → Em なら C → Em へ直接写す。差は積み重ならない)。
+//!   元のコードへ書き戻せば動かない。
+//! - 置いている最中の箱 (ダブルクリックで作ってポップアップでコードを決める) のコードを決めるのは書き換えではない
+//!   (`ChordTrackEvent::Recast` → [`Song::recast_chords`]、記録を書かない)。
+//! - **引き継ぎ**: クリップの分割 / 複製 / コピーは `Clip` ごと運ぶ (note id と take が保たれる)。ノートを割ると
+//!   後ろの片が新しい id になるので、元の id の記録を写す ([`Song::copy_note_basis`])。
+//! - **鳴る音で確定** したノートの記録は消す ([`Song::forget_note_basis`]、確定した音 = 今のコードに対して書いた音)。
+//! - 読み込みと保存の前に [`Song::normalize_chord_basis`] で並びと値域を揃え、もう無いノート / take の記録を捨てる。
+//!   ランチャーのセルの記録は捨てない (セルへ動かしたクリップをアレンジへ戻すと、元どおり鳴る)。
+
+use super::*;
+use crate::audio_render::{TempoMap, WaveSpan, event_wave_spans};
+
+/// 書き換える箱 1 つ (書き換える前の値)。
+#[derive(Debug, Clone, Copy)]
+struct Rewritten {
+    id: u32,
+    start: f64,
+    end: f64,
+    chord: Chord,
+}
+
+/// コードの箱 1 つの下での、オーディオ event の基準 (engine の compile が箱ごとに 1 回決める。
+/// [`Song::audio_event_bases`])。位置は曲の拍。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioBoxBasis {
+    pub start_beat: f64,
+    pub end_beat: f64,
+    /// その範囲でいちばん長く鳴っている、和音を弾いている区間のコード (`Song.audio_chords`)。
+    pub own: Option<Chord>,
+    /// その範囲でいちばん長い記録 (`Clip::chord_basis.audio`)。
+    pub placed: Option<Chord>,
+}
+
+impl AudioBoxBasis {
+    #[must_use]
+    pub fn basis(&self) -> crate::chord_follow::Basis<'_> {
+        crate::chord_follow::Basis { own: self.own.as_ref(), placed: self.placed.as_ref() }
+    }
+}
+
+/// 拍の範囲 `[b0, b1)` (span と同じ event-local 拍) が読む音源フレームの範囲。
+fn span_frames(s: &WaveSpan, b0: f64, b1: f64) -> Option<(u64, u64)> {
+    let (b0, b1) = (b0.max(s.start_beat), b1.min(s.end_beat));
+    let beats = s.end_beat - s.start_beat;
+    if b1 <= b0 || beats <= 0.0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let frames = s.source_end.saturating_sub(s.source_start) as f64;
+    let (fa, fb) = ((b0 - s.start_beat) / beats, (b1 - s.start_beat) / beats);
+    let (lo, hi) = if s.reversed { (frames * (1.0 - fb), frames * (1.0 - fa)) } else { (frames * fa, frames * fb) };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (f0, f1) = (
+        s.source_start.saturating_add(lo.floor().max(0.0) as u64),
+        s.source_start.saturating_add(hi.ceil().max(0.0) as u64).min(s.source_end),
+    );
+    (f1 > f0).then_some((f0, f1))
+}
+
+impl Song {
+    /// オーディオ event `event` (クリップ `clip` の content) の、曲の拍 `[a, b)` が読む音源フレームの範囲の列
+    /// (見えている event とクリップの窓で切る)。音源が無ければ空。
+    fn event_frames(&self, tempo: &TempoMap<'_>, clip: &Clip, event: &AudioEvent, a: f64, b: f64) -> Vec<(u64, u64)> {
+        let Some(source) = self.media.audio_sources.get(&event.source_id) else { return Vec::new() };
+        let visible = clip.content_to_song_beat(event.event_start_in_clip_beats);
+        let (w0, w1) = clip.song_window();
+        let (a, b) = (a.max(visible).max(w0), b.min(visible + event.event_length_beats).min(w1));
+        if !(b > a) {
+            return Vec::new();
+        }
+        let mut spans = Vec::new();
+        event_wave_spans(event, source.sample_rate, tempo, visible, &mut spans);
+        spans.iter().filter_map(|s| span_frames(s, a - visible, b - visible)).collect()
+    }
+
+    /// 書き換える箱 `boxes` の下にある、記録の無い素材へ書き換える前のコードを記録する (module doc の規則)。
+    fn remember_chord_basis(&mut self, boxes: &[Rewritten]) {
+        if boxes.is_empty() {
+            return;
+        }
+        let (lo, hi) = boxes.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), b| (l.min(b.start), h.max(b.end)));
+        let tempo = TempoMap::from_song(self);
+        let rewritten_at = |song: &Song, beat: f64| {
+            let id = song.chord_at_onset(beat)?.id;
+            boxes.iter().find(|b| b.id == id)
+        };
+        // (track 位置, clip 位置, 足す記録)。先に全部決めてから書く (Song を読みながら書かない)。
+        let mut notes: Vec<(usize, usize, NoteChordBasis)> = Vec::new();
+        let mut audio: Vec<(usize, usize, AudioChordBasis)> = Vec::new();
+        for (ti, track) in self.tracks.iter().enumerate() {
+            // 実効のモード (`Song::track_chord_follow`) を手元の値で (id から引き直すと全トラックで O(T²))。
+            if !self.chord_follow_enabled || track.follow_chords.is_off() {
+                continue;
+            }
+            for (ci, clip) in track.clips.iter().enumerate() {
+                let (w0, w1) = clip.song_window();
+                match self.clip_contents.get(&clip.content_id) {
+                    Some(ClipContent::Midi(m)) => {
+                        for n in &m.notes {
+                            let Some(b) = rewritten_at(self, clip.content_to_song_beat(n.start_beat)) else { continue };
+                            if crate::chord_follow::note_basis_at(&clip.chord_basis.notes, n.id).is_none() {
+                                notes.push((ti, ci, NoteChordBasis { note_id: n.id, chord: b.chord }));
+                            }
+                        }
+                    }
+                    Some(ClipContent::Audio(content)) if w1 > lo && w0 < hi => {
+                        for event in &content.events {
+                            for b in boxes {
+                                for (f0, f1) in self.event_frames(&tempo, clip, event, b.start, b.end) {
+                                    let take = event.take_key();
+                                    for (s, e) in uncovered(&clip.chord_basis.audio, take, f0, f1) {
+                                        audio.push((ti, ci, AudioChordBasis { take, start_frame: s, end_frame: e, chord: b.chord }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (ti, ci, rec) in notes {
+            let basis = &mut self.tracks[ti].clips[ci].chord_basis.notes;
+            if let Err(pos) = basis.binary_search_by_key(&rec.note_id, |b| b.note_id) {
+                basis.insert(pos, rec);
+            }
+        }
+        for (ti, ci, rec) in audio {
+            self.tracks[ti].clips[ci].chord_basis.audio.push(rec);
+        }
+        for track in &mut self.tracks {
+            for clip in &mut track.clips {
+                normalize_audio_basis(&mut clip.chord_basis.audio);
+            }
+        }
+    }
+
+    /// 書き換える前の箱の値 (`ids` が空なら全部、`changes` がコードを変えるものだけ)。
+    fn rewritten_boxes(&self, ids: &[u32], changes: impl Fn(&Chord) -> bool) -> Vec<Rewritten> {
+        self.chords
+            .iter()
+            .filter(|c| (ids.is_empty() || ids.contains(&c.id)) && changes(&c.chord))
+            .map(|c| Rewritten { id: c.id, start: c.start_beat, end: c.end_beat(), chord: c.chord })
+            .collect()
+    }
+
+    /// 選んだ箱のコードを `chord` に **書き換える** (記録を書く、module doc)。変わったら `true`。
+    pub fn set_chord(&mut self, ids: &[u32], chord: Chord) -> bool {
+        let chord = chord.sanitized();
+        let boxes = self.rewritten_boxes(ids, |c| *c != chord);
+        if ids.is_empty() || boxes.is_empty() {
+            return false;
+        }
+        self.remember_chord_basis(&boxes);
+        self.recast_chords(ids, chord)
+    }
+
+    /// 選んだ箱 (空なら全部) のコードを `semitones` 移調する (書き換え = 記録を書く)。変わったら `true`。
+    pub fn transpose_chords(&mut self, ids: &[u32], semitones: i32) -> bool {
+        if semitones.rem_euclid(12) == 0 {
+            return false;
+        }
+        let boxes = self.rewritten_boxes(ids, |_| true);
+        if boxes.is_empty() {
+            return false;
+        }
+        self.remember_chord_basis(&boxes);
+        for c in self.chords.iter_mut().filter(|c| ids.is_empty() || ids.contains(&c.id)) {
+            c.chord = c.chord.transposed(semitones);
+        }
+        true
+    }
+
+    /// 選んだ箱のコードを `chord` に **置き直す** — 置いている最中の箱のコードを決める (記録を書かない =
+    /// メロディーは動かない、module doc)。変わったら `true`。
+    pub fn recast_chords(&mut self, ids: &[u32], chord: Chord) -> bool {
+        let chord = chord.sanitized();
+        let mut changed = false;
+        for c in self.chords.iter_mut().filter(|c| ids.contains(&c.id)) {
+            if c.chord != chord {
+                c.chord = chord;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// トラック `track_id` のクリップ `clip_id` (アレンジ / セル) から、ノート `note_ids` (空なら全部) の記録を消す
+    /// (鳴る音で確定したノート)。消したら `true`。
+    pub fn forget_note_basis(&mut self, track_id: u32, clip_id: u32, note_ids: &[u32]) -> bool {
+        let Some(clip) = self.track_by_id_mut(track_id).and_then(|t| t.clip_by_id_mut(clip_id)) else { return false };
+        let before = clip.chord_basis.notes.len();
+        clip.chord_basis.notes.retain(|b| !note_ids.is_empty() && !note_ids.contains(&b.note_id));
+        clip.chord_basis.notes.len() != before
+    }
+
+    /// content `content_id` を見る全クリップ (アレンジとセル) で、ノートの記録を `pairs` の `(元の id, 写す先の id)`
+    /// へ写す (ノートを割った後ろの片 / 同じ content の中で複製したノート)。元に記録が無ければ何もしない。
+    /// 共有している content を割る前に fork した場合は、張り替えた **後** で呼ぶ (張り替える前は fork 先を見る
+    /// クリップが無い)。
+    pub fn copy_note_basis(&mut self, content_id: ContentId, pairs: &[(u32, u32)]) {
+        if pairs.is_empty() {
+            return;
+        }
+        for track in &mut self.tracks {
+            let clips = track.clips.iter_mut().chain(track.session_clips.iter_mut().map(|c| &mut c.clip));
+            for clip in clips.filter(|c| c.content_id == content_id) {
+                let basis = &mut clip.chord_basis.notes;
+                let copies: Vec<NoteChordBasis> = pairs
+                    .iter()
+                    .filter_map(|&(from, to)| {
+                        let chord = *crate::chord_follow::note_basis_at(basis, from)?;
+                        Some(NoteChordBasis { note_id: to, chord })
+                    })
+                    .collect();
+                for rec in copies {
+                    match basis.binary_search_by_key(&rec.note_id, |b| b.note_id) {
+                        Ok(i) => basis[i] = rec,
+                        Err(i) => basis.insert(i, rec),
+                    }
+                }
+            }
+        }
+    }
+
+    /// 全クリップ (アレンジとセル) の記録の不変条件を回復する: 並び (note id 昇順 / `(take, start_frame)` 昇順)・
+    /// 重複なし・同じ take の中で非交差・コードの値域、もう content に無いノート / take の記録を捨てる。
+    /// 読み込みと保存の前に通す。idempotent。
+    pub fn normalize_chord_basis(&mut self) {
+        let contents = &self.clip_contents;
+        for track in &mut self.tracks {
+            let clips = track.clips.iter_mut().chain(track.session_clips.iter_mut().map(|c| &mut c.clip));
+            for clip in clips {
+                let basis = &mut clip.chord_basis;
+                if basis.is_empty() {
+                    continue;
+                }
+                match contents.get(&clip.content_id) {
+                    Some(ClipContent::Midi(m)) => {
+                        let ids: std::collections::HashSet<u32> = m.notes.iter().map(|n| n.id).collect();
+                        basis.notes.retain(|b| ids.contains(&b.note_id));
+                        basis.audio.clear();
+                    }
+                    Some(ClipContent::Audio(a)) => {
+                        let takes: std::collections::HashSet<u32> = a.events.iter().map(AudioEvent::take_key).collect();
+                        basis.audio.retain(|b| takes.contains(&b.take));
+                        basis.notes.clear();
+                    }
+                    _ => *basis = ClipChordBasis::default(),
+                }
+                *basis = std::mem::take(basis).normalized();
+            }
+        }
+    }
+
+    /// クリップ `clip` のオーディオ event `event` の、箱ごとの基準 (engine の compile が 1 回だけ作る。RT は曲の拍で
+    /// 引くだけ)。箱の下では基準を 1 つに決める — 減衰・休符・単音の窓で音程を跳ねさせない。`audio_chords` は
+    /// 音源の検出結果、`tempo` は [`TempoMap::from_song`]。
+    #[must_use]
+    pub fn audio_event_bases(&self, tempo: &TempoMap<'_>, clip: &Clip, event: &AudioEvent) -> Vec<AudioBoxBasis> {
+        let visible = clip.content_to_song_beat(event.event_start_in_clip_beats);
+        let (w0, w1) = clip.song_window();
+        let (a, b) = (visible.max(w0), (visible + event.event_length_beats).min(w1));
+        if !(b > a) {
+            return Vec::new();
+        }
+        let spans = self.audio_chords.get(&event.source_id).map_or(&[][..], Vec::as_slice);
+        let take = event.take_key();
+        let first = self.chords.partition_point(|c| c.end_beat() <= a);
+        self.chords[first..]
+            .iter()
+            .take_while(|c| c.start_beat < b)
+            .map(|c| {
+                let frames = self.event_frames(tempo, clip, event, c.start_beat, c.end_beat());
+                let own = frames
+                    .iter()
+                    .filter_map(|&(f0, f1)| crate::chord_detect::audio_longest_own_in(spans, f0, f1))
+                    .max_by_key(|(_, overlap)| *overlap)
+                    .map(|(chord, _)| *chord);
+                let placed = frames
+                    .iter()
+                    .flat_map(|&(f0, f1)| {
+                        clip.chord_basis.audio.iter().filter(move |r| r.take == take).filter_map(move |r| {
+                            let overlap = r.end_frame.min(f1).saturating_sub(r.start_frame.max(f0));
+                            (overlap > 0).then_some((r.chord, overlap))
+                        })
+                    })
+                    .max_by_key(|(_, overlap)| *overlap)
+                    .map(|(chord, _)| chord);
+                AudioBoxBasis { start_beat: c.start_beat.max(a), end_beat: c.end_beat().min(b), own, placed }
+            })
+            .filter(|basis| basis.own.is_some() || basis.placed.is_some())
+            .collect()
+    }
+}
+
+impl ClipChordBasis {
+    /// 並び (note id 昇順 / `(take, start_frame)` 昇順)・重複なし・同じ take の中で非交差・コードの値域を揃えたもの
+    /// (外 = ファイル / clipboard から来た値。記録は二分探索で引くので並びが崩れると黙って外れる)。idempotent。
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        for b in &mut self.notes {
+            b.chord = b.chord.sanitized();
+        }
+        self.notes.sort_by_key(|b| b.note_id);
+        self.notes.dedup_by_key(|b| b.note_id);
+        normalize_audio_basis(&mut self.audio);
+        self
+    }
+}
+
+/// `records` (同じクリップの記録) のうち take `take` で、`[f0, f1)` のまだ記録の無い部分。
+fn uncovered(records: &[AudioChordBasis], take: u32, f0: u64, f1: u64) -> Vec<(u64, u64)> {
+    let mut covered: Vec<(u64, u64)> = records
+        .iter()
+        .filter(|r| r.take == take && r.end_frame > f0 && r.start_frame < f1)
+        .map(|r| (r.start_frame, r.end_frame))
+        .collect();
+    covered.sort_unstable();
+    let mut out = Vec::new();
+    let mut at = f0;
+    for (s, e) in covered {
+        if s > at {
+            out.push((at, s.min(f1)));
+        }
+        at = at.max(e);
+    }
+    if at < f1 {
+        out.push((at, f1));
+    }
+    out
+}
+
+/// オーディオの記録の並び (`(take, start_frame)` 昇順) と、同じ take の中の非交差 (先に始まる方を残して後発の頭を
+/// 削る)、隣り合う同じコードの結合、コードの値域。idempotent。
+fn normalize_audio_basis(records: &mut Vec<AudioChordBasis>) {
+    records.retain(|r| r.end_frame > r.start_frame);
+    records.sort_by_key(|r| (r.take, r.start_frame));
+    let mut out: Vec<AudioChordBasis> = Vec::with_capacity(records.len());
+    for mut r in records.drain(..) {
+        r.chord = r.chord.sanitized();
+        if let Some(last) = out.last_mut().filter(|l| l.take == r.take) {
+            r.start_frame = r.start_frame.max(last.end_frame);
+            if r.end_frame <= r.start_frame {
+                continue;
+            }
+            if last.end_frame == r.start_frame && last.chord == r.chord {
+                last.end_frame = r.end_frame;
+                continue;
+            }
+        }
+        out.push(r);
+    }
+    *records = out;
+}

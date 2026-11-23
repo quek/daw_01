@@ -65,7 +65,7 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("chordEvent", chords::daw_chord_event, 1),
     ("chordsJson", chords::daw_chords_json, 0),
     ("parseChord", chords::daw_parse_chord, 1),
-    ("followedKey", chords::daw_followed_key, 3),
+    ("soundingKey", chords::daw_sounding_key, 3),
     ("auditionChord", chord_tools::daw_audition_chord, 1),
     ("chordToolsJson", chord_tools::daw_chord_tools_json, 0),
     ("pumpAssetDecode", chord_tools::daw_pump_asset_decode, 0),

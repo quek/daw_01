@@ -1494,7 +1494,9 @@ fn current_version_is_pinned() {
     // v46 (r.md #156): `Track.input` / `Track.monitor` (serde default の MIDI / 自動で読める)。
     // v47 (r.md #157): コードトラック (`Song.chords` / `chord_follow_enabled` / `audio_chords`、`Track.follow_chords`。
     // serde default の空 / ON / Off で読める)。
-    assert_eq!(CURRENT_VERSION, 47);
+    // v48 (r.md #159): `Clip.chord_basis` (serde default の空 = 置いたままで読める) と `AudioChordSpan.chordal`
+    // (旧ファイルの `audio_chords` は `project::drop_audio_chords_without_chordal` が捨てる)。
+    assert_eq!(CURRENT_VERSION, 48);
 }
 
 #[test]

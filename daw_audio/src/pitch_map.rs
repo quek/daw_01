@@ -2,18 +2,21 @@
 //!
 //! sequencer (ノートの鍵盤) と audio clip renderer (オーディオの移動量) は、移調量の `i32` の代わりにこれを受け取る。
 //! 評価の式は持たない — 追従は `common::chord_follow`、移調は `common::transpose` が唯一の口で、ここは
-//! engine の索引 (`SongIndex` に焼いた実効モードと素材のコード) から引数を揃えて呼ぶだけ。
+//! engine の索引 (`SongIndex` に焼いた実効モードと自分の和音) とクリップの記録 (r.md #159 `Clip::chord_basis`)
+//! から引数を揃えて呼ぶだけ。
 //!
 //! RT 安全: `Copy` の参照の束。評価は二分探索と HashMap の参照だけ (確保・ロックなし)。
 
-use common::chord_follow::TrackChordFollow;
-use common::model::{AudioSourceId, ContentId, Song};
+use common::chord_follow::{Basis, NoteSource, TrackChordFollow};
+use common::model::{Clip, Note, Song};
 use common::song_index::SongIndex;
 
+use crate::audio_clip_renderer::RenderedEvent;
+
 /// event の中の読み出し位置 `pos_in_event` (source 窓の頭からのフレーム、`source_frame_lerp` と同じ座標) の、
-/// 音源のフレーム (オーディオの素材のコード `Song.audio_chords` を引く位置)。reversed は窓の末尾から数える。
+/// 音源のフレーム (オーディオの自分の和音 `Song.audio_chords` を引く位置)。reversed は窓の末尾から数える。
 #[must_use]
-pub fn event_source_frame(event: &crate::audio_clip_renderer::RenderedEvent, pos_in_event: f64) -> u64 {
+pub fn event_source_frame(event: &RenderedEvent, pos_in_event: f64) -> u64 {
     let len = event.source_end_frames.saturating_sub(event.source_start_frames);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let pos = if pos_in_event.is_finite() { pos_in_event.max(0.0) as u64 } else { 0 };
@@ -64,33 +67,48 @@ impl<'a> PitchMap<'a> {
         self
     }
 
-    /// content `content_id` の、content-local 拍 `content_beat` に始まるノート `pitch` が鳴らす鍵盤。
-    /// `song_beat` はノートの開始の (行の) 拍。コードはノートの **開始位置** で決まる。範囲外は `None`。
+    /// クリップ `clip` のノート `note` (content-local 拍) が鳴らす鍵盤。`song_beat` はノートの開始の (行の) 拍。
+    /// コードはノートの **開始位置** で決まる。範囲外は `None`。
     #[must_use]
-    pub fn note_key(&self, content_id: ContentId, pitch: u8, content_beat: f64, song_beat: f64) -> Option<u8> {
+    pub fn note_key(&self, clip: &Clip, note: &Note, song_beat: f64) -> Option<u8> {
         let followed = match self.follow {
-            None => Some(pitch),
+            None => Some(note.pitch),
             Some(f) => {
-                let source = if f.chords.needs_source() {
-                    common::chord_detect::source_chord_at(f.index.source_chords(content_id), content_beat)
-                } else {
-                    None
+                let src = NoteSource {
+                    own: f.index.own_chords(clip.content_id),
+                    basis: &clip.chord_basis.notes,
+                    note_id: note.id,
+                    start_beat: note.start_beat,
                 };
-                f.chords.key(pitch, song_beat + f.song_beat_offset, source)
+                f.chords.key(note.pitch, song_beat + f.song_beat_offset, &src)
             }
         };
         followed.and_then(|k| common::transpose::sounding_key(k, self.transpose))
     }
 
-    /// オーディオの移動量 (半音) = 追従 (曲の拍 `song_beat` のコード、素材は音源 `source_id` のフレーム
-    /// `source_frame` で検出済みのコード) + 移調。
+    /// オーディオ event `event` の移動量 (半音) = 追従 (曲の拍 `song_beat` のコード) + 移調。基準は、アレンジの
+    /// event なら compile 時に箱ごとに決めた値 (`RenderedEvent::chord_bases`)、ランチャーのセルなら音源のフレーム
+    /// `source_frame` を覆う、和音を弾いている区間 (セルは曲の位置を持たないので箱ごとに決めておけない)。
     #[must_use]
-    pub fn audio_semitones(&self, source_id: AudioSourceId, source_frame: u64, song_beat: f64) -> i32 {
-        // オーディオは全体を平行移動するだけなので、どのモードでも素材のコードを基準にする (`follow_shift`)。
+    pub fn audio_semitones(&self, event: &RenderedEvent, source_frame: u64, song_beat: f64) -> i32 {
         let shift = self.follow.map_or(0, |f| {
-            let source =
-                f.song.audio_chords.get(&source_id).and_then(|s| common::chord_detect::audio_chord_at(s, source_frame));
-            f.chords.shift(song_beat + f.song_beat_offset, source)
+            let at = song_beat + f.song_beat_offset;
+            if event.cell_clip_id == 0 {
+                let i = event.chord_bases.partition_point(|b| b.start_beat <= at);
+                let basis = i
+                    .checked_sub(1)
+                    .and_then(|i| event.chord_bases.get(i))
+                    .filter(|b| at < b.end_beat)
+                    .map_or(Basis::NONE, |b| b.basis());
+                f.chords.shift(at, basis)
+            } else {
+                let own = f
+                    .song
+                    .audio_chords
+                    .get(&event.source_id)
+                    .and_then(|s| common::chord_detect::audio_own_chord_at(s, source_frame));
+                f.chords.shift(at, Basis { own, placed: None })
+            }
         });
         self.transpose + shift
     }

@@ -16,6 +16,7 @@ use crate::scale::ScaleChange;
 mod audio_take;
 mod automation;
 mod bounce_ops;
+mod chord_basis;
 mod chord_ops;
 mod chords;
 mod clip_window;
@@ -50,6 +51,7 @@ mod window_edit;
 pub use audio_take::TAKE_ORIGIN_DEPTH;
 pub use automation::*;
 pub use bounce_ops::*;
+pub use chord_basis::AudioBoxBasis;
 pub use chords::*;
 pub use record_ops::RecordedWav;
 pub use clip_window::*;
@@ -352,7 +354,12 @@ pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, ru
 /// [`ChordEvent`]) とトラックの追従モード (`Track::follow_chords`、[`ChordFollow`])。旧ファイルは
 /// `serde(default)` の「箱なし / 追従しない」で読める (migration 不要)。新ファイルを旧ビルドで開くとコードと
 /// 追従が黙って捨てられ、追従していたトラックが書いた音で鳴る (保存し直すと消える) ので、版を上げて gate で弾く。
-pub const CURRENT_VERSION: u32 = 47;
+///
+/// v48 (r.md #159): 素材が書かれたときのコードの記録 (`Clip::chord_basis`、[`ClipChordBasis`]) と、オーディオの
+/// 検出結果の「和音を弾いているか」(`AudioChordSpan::chordal`)。旧ファイルは記録なし (= コードを置いたままの状態)
+/// で開く。旧ファイルの `audio_chords` は「和音を弾いているか」を持たないので捨てる (`project::SONG_MIGRATIONS`)。
+/// 新ファイルを旧ビルドで開くと記録が黙って捨てられ、書き換えで動いていたメロディーが書いた音で鳴るので、版を上げる。
+pub const CURRENT_VERSION: u32 = 48;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.
@@ -995,6 +1002,8 @@ impl Song {
     /// on a clone from `project::save` (does not mutate the live song).
     pub fn normalize_for_save(&mut self) {
         self.gc_clip_contents();
+        // r.md #159: もう無いノート / take の記録を捨てる (content の GC の後)。
+        self.normalize_chord_basis();
         self.gc_audio_sources();
         self.gc_video_sources();
         self.gc_image_sources();

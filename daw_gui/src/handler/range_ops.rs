@@ -253,22 +253,9 @@ impl AppData {
             // 写しから content を作る貼り付けは、audio の take を元の編集から始める (`AudioEvent::take_origins`)。
             let content = song.clip_contents.get(&c.content_id).map(|x| x.copied_from(song.project_id, c.content_id)).unwrap_or_default();
             let name = song.clip_content_names.get(&c.content_id).cloned();
-            clips.push(crate::clipboard::ClipCopy {
-                track_offset: (*ti as i64) - (min_track as i64),
-                // **範囲の先頭が原点** — 前後の空白がそのまま運ばれる。
-                start_beat: c.start_beat - sel.start_beat,
-                length_beats: c.length_beats,
-                color: c.color,
-                muted: c.muted,
-                content_id: c.content_id,
-                content_offset_beats: c.content_offset_beats,
-                content,
-                name,
-                speaker_id: c.speaker_id,
-                singer_name: c.singer_name.clone(),
-                style_name: c.style_name.clone(),
-                talk: c.talk,
-            });
+            let track_offset = (*ti as i64) - (min_track as i64);
+            // **範囲の先頭が原点** — 前後の空白がそのまま運ばれる。
+            clips.push(crate::clipboard::ClipCopy::of(c, content, name, track_offset, c.start_beat - sel.start_beat));
         }
         Some((clips, sel.start_beat, min_track))
     }

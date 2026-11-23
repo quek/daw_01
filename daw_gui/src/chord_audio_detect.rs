@@ -15,6 +15,13 @@
 //!
 //! 窓の区切りは拍の格子 ([`DetectGrid`]): 呼び出し側がクリップの置き方から「曲の拍 0 が音源のどのフレームか」と
 //! 「1 窓が何フレームか」を渡す。窓の中で音が小さすぎる (−50 dBFS 未満) ところはコードを作らない。
+//!
+//! **和音を弾いているか** (r.md #159、`AudioChordSpan::chordal`): 窓で chroma を足し合わせると、歌声や単音の楽器の
+//! 旋律もコードに見える。追従の基準 (自分の和音) にするのは、音のある FFT フレームの半分以上が **単音ではなく**
+//! (山の強さの [`MONO_EXPLAINED`] 以上が 1 つの倍音列に乗らない — フォルマントで第 3〜5 倍音が強い歌声も 1 つの
+//! 倍音列に乗る)、かつ pitch class が 3 つ以上鳴っている窓だけ。倍音列の判定は強さに依らず周波数の比だけで見るので、
+//! 平均律の長 3 度 (第 5 倍音から 14 cent ずれる) や短 3 度は和音として残り、ルートと 5 度だけ (パワーコード) は
+//! 単音と区別できない (和音にしない)。
 
 use std::sync::Arc;
 
@@ -41,6 +48,13 @@ const SILENCE_RMS: f32 = 0.003_16;
 const MAX_DEVIATION: f32 = 0.25;
 /// 窓の chroma で、最も強い pitch class に対してこれ未満の pitch class は落とす。
 const RELATIVE_FLOOR: f64 = 0.2;
+/// 1 つの倍音列に乗る山の強さ (振幅の 2 乗) がこの割合以上なら、そのフレームは単音。
+const MONO_EXPLAINED: f32 = 0.9;
+/// 倍音列に乗るとみなす周波数のずれ (比)。平均律の長 3 度と第 5 倍音のずれ (0.8%) より狭く、山の位置の推定の
+/// 誤差 (放物線補間) より広い。
+const HARMONIC_TOLERANCE: f32 = 0.004;
+/// 和音を弾いているとみなすのに要る、同時に鳴る pitch class の数。
+const CHORDAL_VOICES: u32 = 3;
 
 /// 1 FFT フレームの解析結果。
 #[derive(Debug, Clone, Copy, Default)]
@@ -50,6 +64,20 @@ struct Frame {
     bass: Option<(u8, f64)>,
     /// フレームの RMS (無音の判定)。
     rms: f32,
+    /// 山がある (音がある) フレームか。
+    sounding: bool,
+    /// 単音 (山のほとんどが 1 つの倍音列に乗る)。
+    mono: bool,
+}
+
+impl Frame {
+    /// このフレームで和音を弾いているか (単音でなく、最も強い pitch class の [`RELATIVE_FLOOR`] 以上の pitch class が
+    /// [`CHORDAL_VOICES`] 以上)。
+    fn chordal(&self) -> bool {
+        let max = self.chroma.iter().copied().fold(0.0f64, f64::max);
+        let voices = self.chroma.iter().filter(|c| max > 0.0 && **c >= max * RELATIVE_FLOOR).count();
+        !self.mono && u32::try_from(voices).unwrap_or(0) >= CHORDAL_VOICES
+    }
 }
 
 /// 平面 (チャンネルごと) の音声 `samples` (サンプルレート `sample_rate`) から、`grid` の窓ごとにコードを検出する。
@@ -83,12 +111,12 @@ pub fn detect_audio_chords(
         if b - a < 1.0 {
             continue;
         }
-        let Some(chord) = chord_in(&analysed, hop, fft_len, a, b, opts) else { continue };
+        let Some((chord, chordal)) = chord_in(&analysed, hop, fft_len, a, b, opts) else { continue };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let (sa, sb) = (a.round() as u64, b.round() as u64);
         match out.last_mut() {
-            Some(last) if last.chord == chord && last.end_frame == sa => last.end_frame = sb,
-            _ => out.push(AudioChordSpan { start_frame: sa, end_frame: sb, chord }),
+            Some(last) if last.chord == chord && last.chordal == chordal && last.end_frame == sa => last.end_frame = sb,
+            _ => out.push(AudioChordSpan { start_frame: sa, end_frame: sb, chord, chordal }),
         }
     }
     out
@@ -100,12 +128,21 @@ fn fft_len_for(sample_rate: u32) -> usize {
     want.next_power_of_two().clamp(2048, 32_768)
 }
 
-/// 窓 `[a, b)` (フレーム) に中心が入る FFT フレームを足し合わせてコードを決める。
-fn chord_in(analysed: &[Frame], hop: usize, fft_len: usize, a: f64, b: f64, opts: &DetectOptions) -> Option<Chord> {
+/// 窓 `[a, b)` (フレーム) に中心が入る FFT フレームを足し合わせてコードを決める。2 つ目は和音を弾いている窓か
+/// (音のあるフレームの半分以上が [`Frame::chordal`])。
+fn chord_in(
+    analysed: &[Frame],
+    hop: usize,
+    fft_len: usize,
+    a: f64,
+    b: f64,
+    opts: &DetectOptions,
+) -> Option<(Chord, bool)> {
     let mut chroma = [0.0f64; 12];
     let mut bass = [0.0f64; 12];
     let mut rms_sum = 0.0f64;
     let mut n = 0u32;
+    let (mut sounding, mut chordal) = (0u32, 0u32);
     // フレーム i の中心は i × hop + fft_len / 2 (単調) なので、窓に入りうる番号だけを見る (前後 1 つ広く取り、
     // 境界は下の判定で決める)。窓ごとに全フレームをなめると、窓の数 × フレーム数になる。
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -126,6 +163,10 @@ fn chord_in(analysed: &[Frame], hop: usize, fft_len: usize, a: f64, b: f64, opts
         }
         rms_sum += f64::from(f.rms);
         n += 1;
+        if f.sounding {
+            sounding += 1;
+            chordal += u32::from(f.chordal());
+        }
     }
     if n == 0 || rms_sum / f64::from(n) < f64::from(SILENCE_RMS) {
         return None;
@@ -141,7 +182,7 @@ fn chord_in(analysed: &[Frame], hop: usize, fft_len: usize, a: f64, b: f64, opts
     let lowest = (0..12u8)
         .filter(|&pc| bass[usize::from(pc)] > 0.0)
         .max_by(|&x, &y| bass[usize::from(x)].total_cmp(&bass[usize::from(y)]));
-    match_chord(&chroma, lowest, opts)
+    Some((match_chord(&chroma, lowest, opts)?, sounding > 0 && chordal * 2 >= sounding))
 }
 
 /// 全体を `hop` 刻みで解析する。
@@ -207,6 +248,8 @@ fn fill_chroma(mags: &[f32], bin_hz: f32, frame: &mut Frame) {
             peaks.push((f, c));
         }
     }
+    frame.sounding = !peaks.is_empty();
+    frame.mono = is_monophonic(&peaks);
     // 倍音の差し引き: 低い山から、その 2〜8 倍に当たる山を「基音の強さ / 倍数」(弦・管・鋸歯波の
     // おおよその倍音の減り方) だけ減らす。差し引いた後の山が次の山の基音として働く (低い順なので、
     // 和音の上の音の基音が下の音の倍音と重なっても、残りが上の音として残る)。
@@ -253,6 +296,27 @@ fn fill_chroma(mags: &[f32], bin_hz: f32, frame: &mut Frame) {
     frame.bass = bass_lowest.map(|(pc, a)| (pc, f64::from(a)));
 }
 
+/// 山 (周波数, 振幅。低い順) の強さ (振幅の 2 乗) の [`MONO_EXPLAINED`] 以上が、どれか 1 つの山を基音とする倍音列
+/// (整数倍から [`HARMONIC_TOLERANCE`] 以内) に乗るか。基音の候補は、最大の山の 5% 以上ある 1 kHz 以下の山。
+fn is_monophonic(peaks: &[(f32, f32)]) -> bool {
+    let total: f32 = peaks.iter().map(|(_, a)| a * a).sum();
+    if total <= 0.0 {
+        return false;
+    }
+    let max = peaks.iter().map(|(_, a)| *a).fold(0.0f32, f32::max);
+    peaks.iter().filter(|(f, a)| *f <= 1_000.0 && *a >= max * 0.05).any(|&(f0, _)| {
+        let explained: f32 = peaks
+            .iter()
+            .filter(|(f, _)| {
+                let h = (f / f0).round();
+                h >= 1.0 && (f / (f0 * h) - 1.0).abs() <= HARMONIC_TOLERANCE
+            })
+            .map(|(_, a)| a * a)
+            .sum();
+        explained >= total * MONO_EXPLAINED
+    })
+}
+
 /// 放物線補間した山の位置 (ビンからのずれ、−0.5..=0.5)。
 fn parabolic_offset(l: f32, c: f32, r: f32) -> f32 {
     let d = l - 2.0 * c + r;
@@ -291,6 +355,51 @@ mod tests {
         );
         assert_eq!(spans[0].start_frame, 0);
         assert_eq!(spans[3].end_frame, 8 * u64::from(sr));
+    }
+
+    /// r.md #159: 和音を弾いている窓だけが `chordal`。鋸歯波の単旋律 (C E G を 0.5 秒ずつ = 2 秒の窓に集めると C) と、
+    /// 第 3・第 5 倍音が基音より強い歌声のような単音 (A3 で E と C# が残る) は和音ではない。3 和音は和音。
+    #[test]
+    fn only_played_chords_are_chordal() {
+        let sr = 48_000u32;
+        let midi_hz = |p: u8| 440.0 * 2f64.powf((f64::from(p) - 69.0) / 12.0);
+        // `amp(h)` = 第 h 倍音の振幅。
+        let tone = |out: &mut [f32], p: u8, amp: &dyn Fn(u32) -> f64| {
+            let f = midi_hz(p);
+            for (n, s) in out.iter_mut().enumerate() {
+                let t = n as f64 / f64::from(sr);
+                let v: f64 = (1..=12u32).map(|h| (std::f64::consts::TAU * f * f64::from(h) * t).sin() * amp(h)).sum();
+                *s += (v * 0.05) as f32;
+            }
+        };
+        let saw = |h: u32| 1.0 / f64::from(h);
+        let grid = DetectGrid { origin_frame: 0.0, window_frames: f64::from(sr) * 2.0 };
+        let detect = |mono: Vec<f32>| detect_audio_chords(&[mono], sr, grid, &DetectOptions::default());
+        let half = sr as usize / 2;
+
+        let mut melody = vec![0.0f32; half * 4];
+        for (i, p) in [60u8, 64, 67, 64].into_iter().enumerate() {
+            tone(&mut melody[i * half..(i + 1) * half], p, &saw);
+        }
+        let spans = detect(melody);
+        assert!(!spans.is_empty(), "窓に集めるとコードには見える");
+        assert!(spans.iter().all(|s| !s.chordal), "{spans:?}");
+
+        // 歌声のような単音: 第 3 / 第 5 倍音を基音の 2 倍にする (フォルマント)。
+        let formant = |h: u32| match h {
+            3 | 5 => 2.0,
+            _ => 1.0 / f64::from(h),
+        };
+        let mut voice = vec![0.0f32; half * 4];
+        tone(&mut voice, 57, &formant);
+        assert!(detect(voice).iter().all(|s| !s.chordal));
+
+        let mut triad = vec![0.0f32; half * 4];
+        for p in [48u8, 64, 67, 72] {
+            tone(&mut triad, p, &saw);
+        }
+        let spans = detect(triad);
+        assert_eq!(spans.iter().map(|s| (s.chord.root, s.chord.kind, s.chordal)).collect::<Vec<_>>(), vec![(0, ChordKind::Major, true)]);
     }
 
     /// 無音はコードにしない。

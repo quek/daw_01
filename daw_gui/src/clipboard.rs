@@ -14,7 +14,7 @@
 
 use common::model::MediaManifest;
 use common::model::{
-    AudioEvent, AutomationCurve, ClipContent, ContentId, Note, Track,
+    AudioEvent, AutomationCurve, Clip, ClipContent, ContentId, Note, Track,
 };
 use serde::{Deserialize, Serialize};
 
@@ -257,6 +257,62 @@ pub struct ClipCopy {
     /// JSON との互換のため serde default (`None`)。
     #[serde(default)]
     pub talk: Option<common::model::TalkParams>,
+    /// r.md #159: 素材が書かれたときのコードの記録 (`Clip::chord_basis`)。コピーは素材の事実を運ぶ (貼った先でも
+    /// 書かれたときのコードから今のコードへ合わせて鳴る。note id / take は content の写しで保たれる)。旧 clipboard
+    /// JSON との互換のため serde default (空)。
+    #[serde(default)]
+    pub chord_basis: common::model::ClipChordBasis,
+}
+
+impl ClipCopy {
+    /// クリップ `clip` の写し (content は `content`、共有名は `name`)。位置 (`track_offset` / `start_beat`) は
+    /// 呼び出し側が選択群の基準から決める。clipboard へ載せる口はここだけ (載せるフィールドを経路ごとに写さない)。
+    #[must_use]
+    pub fn of(clip: &Clip, content: ClipContent, name: Option<String>, track_offset: i64, start_beat: f64) -> Self {
+        Self {
+            track_offset,
+            start_beat,
+            length_beats: clip.length_beats,
+            color: clip.color,
+            muted: clip.muted,
+            content_id: clip.content_id,
+            // r.md #44: trim で決まった「content のどこを見せるか」も運ぶ。
+            content_offset_beats: clip.content_offset_beats,
+            content,
+            name,
+            speaker_id: clip.speaker_id,
+            singer_name: clip.singer_name.clone(),
+            style_name: clip.style_name.clone(),
+            talk: clip.talk,
+            chord_basis: clip.chord_basis.clone(),
+        }
+    }
+
+    /// 貼るクリップ (id は 0 = 置く側が採番、content は `content_id`)。clipboard から戻す口はここだけ。
+    #[must_use]
+    pub fn to_clip(&self, start_beat: f64, content_id: ContentId) -> Clip {
+        Clip {
+            id: 0,
+            start_beat,
+            length_beats: self.length_beats,
+            content_id,
+            content_offset_beats: self.content_offset_beats,
+            // 新規クリップにクロスフェードの張り出しは無い。
+            xfade_lead_beats: 0.0,
+            xfade_tail_beats: 0.0,
+            color: self.color,
+            // paste した clip は派生データではなくユーザーの持ち物 (`auto_lipsync` は運ばない — 上の doc)。
+            auto_lipsync: false,
+            lipsync_gen: 0,
+            muted: self.muted,
+            speaker_id: self.speaker_id,
+            singer_name: self.singer_name.clone(),
+            style_name: self.style_name.clone(),
+            talk: self.talk,
+            // 外 (OS の clipboard) から来た値は並びが崩れていうる (記録は二分探索で引く)。
+            chord_basis: self.chord_basis.clone().normalized(),
+        }
+    }
 }
 
 /// 正規化済みオートメーションクリップ (= lane 内の 1 curve clip)。`start_beat` は
@@ -919,6 +975,7 @@ mod tests {
             singer_name: String::new(),
             style_name: String::new(),
             talk: None,
+            chord_basis: common::model::ClipChordBasis::default(),
         };
         let out = sanitize_clips(vec![
             mk(4.0, 0.0),          // valid

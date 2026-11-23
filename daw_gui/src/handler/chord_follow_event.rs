@@ -16,6 +16,7 @@ use crate::state::AppData;
 impl AppData {
     /// [`ChordFollowEvent`] の処理 (`AppEvent::ChordFollow` の 1 arm)。変化が無ければ undo を積まない。
     pub(crate) fn handle_chord_follow_event(&mut self, ev: ChordFollowEvent) {
+        let mut refused = 0usize;
         self.edit_song_checked(|song| match ev {
             ChordFollowEvent::SetEnabled(on) => {
                 let changed = song.chord_follow_enabled != on;
@@ -27,7 +28,11 @@ impl AppData {
                 let cleared = clear_group_modes(song, &track_ids);
                 set_modes(song, &targets, mode) | cleared
             }
-            ChordFollowEvent::FreezePitch { targets } => freeze_clips(song, &targets),
+            ChordFollowEvent::FreezePitch { targets } => {
+                let (changed, skipped) = freeze_clips(song, &targets, true);
+                refused = skipped;
+                changed
+            }
             ChordFollowEvent::FreezeTracks { track_ids } => {
                 let track_ids = follow_targets(song, &track_ids);
                 let targets: Vec<FreezeTarget> = song
@@ -41,10 +46,15 @@ impl AppData {
                 // 確定してから追従を切る (切った後では鳴る音が書いた音になって確定するものが無い)。確定するのは
                 // アレンジの MIDI クリップだけ — セル / オーディオは確定できず、追従が切れて書いた音に戻る
                 // (`ChordFollowEvent::FreezeTracks` の doc)。
-                let frozen = freeze_clips(song, &targets);
+                let (frozen, _) = freeze_clips(song, &targets, false);
                 set_modes(song, &track_ids, ChordFollow::Off) | frozen
             }
         });
+        if refused > 0 {
+            self.ui_ephemeral.status_message = format!(
+                "鳴る音で確定: {refused} 個のクリップは、選んだ音だけを確定すると残りの音の鳴り方が変わるので確定しませんでした (クリップのノート全部か、トラックごと確定してください)"
+            );
+        }
     }
 
     /// クリップの右クリック「鳴る音で確定」: 対象は、右クリックしたクリップが選択に入っていれば選択の
@@ -146,17 +156,22 @@ fn set_modes(song: &mut Song, track_ids: &[u32], mode: ChordFollow) -> bool {
     changed
 }
 
-/// `targets` のクリップのノート (`note_ids` が空なら全部) の書いた音を、今の追従結果で書き換える。変わったら `true`。
+/// `targets` のクリップのノート (`note_ids` が空なら全部) の書いた音を、今の追従結果で書き換える。返すのは
+/// (変わったか、確定を断ったクリップの数)。
 ///
-/// - 鳴る音は **確定前の Song で全部解いてから** 書き換える (素材のコードの検出が書き換えの途中の値を見ない)。
+/// - 鳴る音は **確定前の Song で全部解いてから** 書き換える (自分の和音の検出が書き換えの途中の値を見ない)。
 /// - 他のクリップ (別の位置の linked clip / セル) と content を共有していれば、先に複製してから書き換える
 ///   (鳴る音は位置のコードで決まるので、共有したまま書くと別の位置のクリップの音が変わる)。
 /// - 追従で 0..=127 を外れて鳴っていなかったノートは、音程を残してミュートする (確定しても鳴らないまま)。
-/// - トラックの追従モードは変えない。最寄りのコード音 / スケールは確定した音がそのまま鳴る。平行移動 / ベースは
-///   確定した音から素材のコードを検出し直すので、検出できないクリップ (単音) はもう一度動く — トラック全体を
-///   確定して追従を切るのは [`ChordFollowEvent::FreezeTracks`]。
-fn freeze_clips(song: &mut Song, targets: &[FreezeTarget]) -> bool {
-    type Plan = ((u32, u32), Vec<(u32, Option<u8>)>);
+/// - r.md #159: 確定したノートの **書かれたときのコードの記録を消す** (確定した音 = 今のコードに対して書いた音。
+///   記録が残ると、確定した音がもう一度「書かれたときのコード → 今のコード」の差だけ動く)。
+/// - トラックの追従モードは変えない (確定した音がそのまま鳴る: 記録の無い旋律は書いた音のまま、和音のパートは
+///   確定した和音がもう今のコードに収まっている)。ただし `verify` なら確定した後の鳴る音を確定前と全ノートで比べ、
+///   1 つでも違うクリップは確定しない (和音の一部の音だけを確定すると、残りの音の和音の読みが変わる)。トラック全体を
+///   確定して追従を切る [`ChordFollowEvent::FreezeTracks`] は、切った後は書いた音で鳴るので比べない。
+fn freeze_clips(song: &mut Song, targets: &[FreezeTarget], verify: bool) -> (bool, usize) {
+    type Plan = ((u32, u32), Vec<(u32, Option<u8>)>, Vec<u32>);
+    let mut refused = 0usize;
     let plans: Vec<Plan> = targets
         .iter()
         .filter_map(|FreezeTarget { track_id, clip_id, note_ids }| {
@@ -167,21 +182,32 @@ fn freeze_clips(song: &mut Song, targets: &[FreezeTarget]) -> bool {
                 return None;
             }
             let notes = song.clip_contents.get(&clip.content_id)?.notes()?;
+            let picked = |n: &&common::model::Note| note_ids.is_empty() || note_ids.contains(&n.id);
             let changes: Vec<(u32, Option<u8>)> = notes
                 .iter()
-                .filter(|n| note_ids.is_empty() || note_ids.contains(&n.id))
+                .filter(picked)
                 .filter_map(|n| {
                     let key = keys.key(n);
                     (key != Some(n.pitch) && !(key.is_none() && n.muted)).then_some((n.id, key))
                 })
                 .collect();
-            (!changes.is_empty()).then_some(((track_id, clip_id), changes))
+            let frozen: Vec<u32> = notes.iter().filter(picked).map(|n| n.id).collect();
+            let forgets = clip.chord_basis.notes.iter().any(|b| frozen.contains(&b.note_id));
+            if changes.is_empty() && !forgets {
+                return None;
+            }
+            if verify && !keeps_the_sound(song, track_id, clip, &keys, &changes, &frozen) {
+                refused += 1;
+                return None;
+            }
+            Some(((track_id, clip_id), changes, frozen))
         })
         .collect();
     if plans.is_empty() {
-        return false;
+        return (false, refused);
     }
-    for ((track_id, clip_id), changes) in plans {
+    for ((track_id, clip_id), changes, frozen) in plans {
+        song.forget_note_basis(track_id, clip_id, &frozen);
         let Some(content_id) = song.track_by_id(track_id).and_then(|t| t.clip_by_id(clip_id)).map(|c| c.content_id)
         else {
             continue;
@@ -196,15 +222,42 @@ fn freeze_clips(song: &mut Song, targets: &[FreezeTarget]) -> bool {
             content_id
         };
         let Some(notes) = song.clip_contents.get_mut(&content_id).and_then(|c| c.notes_mut()) else { continue };
-        for n in notes.iter_mut() {
-            match changes.iter().find(|(id, _)| *id == n.id).map(|(_, key)| *key) {
-                Some(Some(key)) => n.pitch = key,
-                Some(None) => n.muted = true,
-                None => {}
-            }
+        apply_freeze(notes, &changes);
+    }
+    (true, refused)
+}
+
+/// 確定の書き換え `changes` (`(note id, 鳴る鍵盤)`、鳴らないノートは `None` = ミュート) をノート列へ当てる。
+fn apply_freeze(notes: &mut [common::model::Note], changes: &[(u32, Option<u8>)]) {
+    for n in notes.iter_mut() {
+        match changes.iter().find(|(id, _)| *id == n.id).map(|(_, key)| *key) {
+            Some(Some(key)) => n.pitch = key,
+            Some(None) => n.muted = true,
+            None => {}
         }
     }
-    true
+}
+
+/// クリップ `clip` を `changes` で確定し、`frozen` の記録を消した後も、全ノートが確定前 (`before`) と同じ鍵盤で鳴るか。
+fn keeps_the_sound(
+    song: &Song,
+    track_id: u32,
+    clip: &common::model::Clip,
+    before: &ClipSoundingKeys<'_>,
+    changes: &[(u32, Option<u8>)],
+    frozen: &[u32],
+) -> bool {
+    let notes = song.clip_notes(clip);
+    let mut after_notes = notes.to_vec();
+    apply_freeze(&mut after_notes, changes);
+    let basis: Vec<common::model::NoteChordBasis> =
+        clip.chord_basis.notes.iter().filter(|b| !frozen.contains(&b.note_id)).copied().collect();
+    let after = ClipSoundingKeys::with(song, track_id, clip, &after_notes, &basis);
+    notes.iter().zip(&after_notes).all(|(old, new)| {
+        let was = if old.muted { None } else { before.key(old) };
+        let now = if new.muted { None } else { after.key(new) };
+        was == now
+    })
 }
 
 /// content `content_id` を指すクリップ (アレンジとランチャーのセル、全トラック) の数。

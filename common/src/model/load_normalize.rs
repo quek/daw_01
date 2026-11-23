@@ -119,6 +119,7 @@ impl Song {
         self.normalize_session();
         self.ensure_scale_changes_sorted();
         self.normalize_chords();
+        self.normalize_chord_basis();
         self.ensure_automation_points_sorted();
         // 重なり解消は id 採番の後 (分割断片に id を振るため)、 overlay の
         // カバレッジ補完の前 (窓を縮めてから覆う長さを決めるため)。

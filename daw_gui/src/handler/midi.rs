@@ -447,11 +447,13 @@ impl AppData {
         if playhead < 0.0 {
             return;
         }
-        // Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input。
-        // note_off も同じ snap を適用するので、 deterministic snap で
-        // (track_id, pitch) lookup が整合する。 step input は別 path
+        // Phase 7 B5 (`docs/plan_scale.html` §5.2): Snap Live Input。 step input は別 path
         // (`step_input_note_on`) を経由するのでここの snap は録音時のみ。
-        let pitch = if self.cur.recording.snap_live_input {
+        // 押している台帳は **弾いた鍵盤** で引く (下)。 寄せた音程は書いたノートの側にある — 寄せた音程で引くと、
+        // 押している間に転調 / コードの箱の境界を越えたときに note_off が別の鍵で引いて見つからず、2 つの鍵が
+        // 同じ音へ寄ると台帳が上書きされた。
+        let played = pitch;
+        let snapped = if self.cur.recording.snap_live_input {
             self.cur.song_doc.song()
                 .scale_at(playhead)
                 .map(|sc| sc.snap(pitch))
@@ -460,6 +462,9 @@ impl AppData {
             pitch
         };
         for &track_id in tracks {
+            // r.md #159 Q2: 最寄りのコード音 / スケールで追従するトラックは、モニターと同じく playhead の位置の
+            // コードへ寄せた音を書く (聴いた音 = 録れた音 = 再生の音。モードはトラックごと)。
+            let pitch = self.live_input_key(track_id, snapped);
             self.ensure_midi_clip_at_playhead(track_id, playhead);
             let Some(key) = self.find_midi_clip_at_playhead(track_id, playhead) else {
                 continue;
@@ -494,27 +499,17 @@ impl AppData {
             if let Some(Some(note_id)) = note_id {
                 self.cur.recording
                     .midi_recording_active_notes
-                    .insert((track_id, pitch), (playhead, note_id));
+                    .insert((track_id, played), (playhead, note_id));
             }
         }
     }
 
     /// Phase 7 B4 Step D: 録音中の note_off 処理。 `active_notes` から
     /// `(start_beat, note_id)` を取り出し、 `length = playhead - start` で確定する。
+    /// 台帳は弾いた鍵盤 `pitch` で引く (note_on が Snap Live Input / コードへ寄せた音程はノートの側にある)。
     pub(crate) fn record_midi_note_off(&mut self, pitch: u8) {
         let playhead =
             self.cur.transport.playhead_beat.map(f64::from).unwrap_or(0.0);
-        // Phase 7 B5: note_on 側で snap した pitch で active_notes に登録して
-        // いるので、 note_off の lookup key も同じ snap を適用。 snap は
-        // deterministic なので転調を跨がない note なら lookup は必ず hit する。
-        let pitch = if self.cur.recording.snap_live_input {
-            self.cur.song_doc.song()
-                .scale_at(playhead)
-                .map(|sc| sc.snap(pitch))
-                .unwrap_or(pitch)
-        } else {
-            pitch
-        };
         // 押している台帳を引く (arm を外した / カーソルを移した後の note_off でも、
         // 書き込んだトラックのノートを確定できる)。
         let held: Vec<(u32, u8)> = self

@@ -193,6 +193,9 @@ pub struct RenderedEvent {
     /// dedup 済)。 Stretch mode のスペクトル render が `warp_source_frame` で
     /// 非一様タイムストレッチに使う (r.md #8 B12)。 < 2 件なら uniform stretch。
     pub beat_markers: Vec<common::model::BeatMarker>,
+    /// r.md #159: コードの箱ごとの追従の基準 (アレンジの event でトラックが追従するときだけ、`Song::audio_event_bases`、
+    /// 曲の拍の昇順)。箱の下では基準を 1 つに決める (`crate::pitch_map::PitchMap::audio_semitones`)。
+    pub chord_bases: Vec<common::model::AudioBoxBasis>,
 }
 
 /// Wait-free snapshot of "what audio events should the audio thread
@@ -641,6 +644,11 @@ fn push_clip_events(
             stretch_mode: event.stretch_mode,
             onsets: onsets_sorted,
             beat_markers: warp_markers,
+            chord_bases: if follows_chords && cell_clip_id == 0 {
+                song.audio_event_bases(&common::audio_render::TempoMap::from_song(song), clip, event)
+            } else {
+                Vec::new()
+            },
         });
     }
 }
@@ -1094,7 +1102,7 @@ pub fn render_audio_events<'p>(
         let transpose = if event.transposable {
             let pos = if event.stretch_mode == StretchMode::Stretch { at.u } else { el_start as f64 * effective_pitch_ratio };
             let source_frame = crate::pitch_map::event_source_frame(event, pos);
-            pitch.audio_semitones(event.source_id, source_frame, first_beat + event.origin_beat)
+            pitch.audio_semitones(event, source_frame, first_beat + event.origin_beat)
         } else {
             0
         };
@@ -1762,6 +1770,7 @@ mod render_tests {
             stretch_mode: mode,
             onsets,
             beat_markers: Vec::new(),
+                chord_bases: Vec::new(),
         }];
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));
@@ -1856,6 +1865,7 @@ mod render_tests {
                 stretch_mode: StretchMode::Raw,
                 onsets: Vec::new(),
                 beat_markers: Vec::new(),
+                chord_bases: Vec::new(),
             }];
             let mut sources = HashMap::new();
             sources.insert(1u32, Arc::clone(&source));
@@ -1965,6 +1975,7 @@ mod render_tests {
                 stretch_mode: StretchMode::Raw,
                 onsets: Vec::new(),
                 beat_markers: Vec::new(),
+                chord_bases: Vec::new(),
             }];
             let mut sources = HashMap::new();
             sources.insert(1u32, Arc::clone(&source));
@@ -2385,6 +2396,7 @@ mod render_tests {
             stretch_mode: mode,
             onsets: Vec::new(),
             beat_markers: Vec::new(),
+                chord_bases: Vec::new(),
         }
     }
 
@@ -2996,6 +3008,7 @@ mod wave_span_binding_tests {
             stretch_mode: event.stretch_mode,
             onsets,
             beat_markers,
+                chord_bases: Vec::new(),
         }];
         let mut sources = HashMap::new();
         sources.insert(1u32, Arc::new(buffer));

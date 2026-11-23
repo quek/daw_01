@@ -171,6 +171,11 @@ pub struct Clip {
     /// `Clip::speaker_id` を流用する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub talk: Option<TalkParams>,
+    /// v48 (r.md #159): この clip の素材が **書かれたときのコード** の記録 (コードトラックへの追従の基準)。
+    /// コードの箱を書き換えたときだけ書く ([`ClipChordBasis`] の doc)。content ではなく clip に持つ — linked clip
+    /// は同じノートを別の位置 (別のコードの下) で鳴らすので、記録はクリップごとに違う。
+    #[serde(default, skip_serializing_if = "ClipChordBasis::is_empty")]
+    pub chord_basis: ClipChordBasis,
 }
 
 impl Clip {

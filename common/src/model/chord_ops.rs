@@ -86,7 +86,7 @@ impl Song {
         }
         self.ids.next_chord_id = next;
         // 検出結果は音源に付く。音源が消えたら一緒に消す (保存前の GC と load の両方がここを通る)。
-        // 区間は二分探索で引く (`chord_detect::audio_chord_at`) ので、壊れたファイルの並びもここで揃える。
+        // 区間は二分探索で引く (`chord_detect::audio_own_chord_at`) ので、壊れたファイルの並びもここで揃える。
         let sources = &self.media.audio_sources;
         self.audio_chords.retain(|id, spans| {
             AudioChordSpan::normalize_spans(spans);
@@ -328,31 +328,8 @@ impl Song {
         self.chords.len() != before
     }
 
-    /// 選んだ箱のコードを差し替える。変わったら `true`。
-    pub fn set_chord(&mut self, ids: &[u32], chord: Chord) -> bool {
-        let chord = chord.sanitized();
-        let mut changed = false;
-        for c in self.chords.iter_mut().filter(|c| ids.contains(&c.id)) {
-            if c.chord != chord {
-                c.chord = chord;
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// 選んだ箱 (空なら全部) のコードを `semitones` 移調する。変わったら `true`。
-    pub fn transpose_chords(&mut self, ids: &[u32], semitones: i32) -> bool {
-        if semitones.rem_euclid(12) == 0 {
-            return false;
-        }
-        let mut changed = false;
-        for c in self.chords.iter_mut().filter(|c| ids.is_empty() || ids.contains(&c.id)) {
-            c.chord = c.chord.transposed(semitones);
-            changed = true;
-        }
-        changed
-    }
+    // コードの書き換え (`set_chord` / `transpose_chords`) と置き直し (`recast_chords`) は、素材の記録
+    // (r.md #159) と組なので `chord_basis.rs`。
 
     /// 選んだ箱の色を変える (`None` = テーマの既定色)。変わったら `true`。
     pub fn set_chord_color(&mut self, ids: &[u32], color: Option<[f32; 3]>) -> bool {
@@ -525,7 +502,7 @@ mod tests {
             ChordEvent { id: 0, start_beat: -1.0, len_beats: 2.0, chord: Chord::default(), color: None },
             ChordEvent { id: 9, start_beat: f64::NAN, len_beats: 1.0, chord: Chord::default(), color: None },
         ];
-        let span = |a: u64, b: u64, root: u8| AudioChordSpan { start_frame: a, end_frame: b, chord: Chord::new(root, ChordKind::Major) };
+        let span = |a: u64, b: u64, root: u8| AudioChordSpan { start_frame: a, end_frame: b, chord: Chord::new(root, ChordKind::Major), chordal: false };
         let mut song = Song { chords, ..Song::default() };
         song.media.audio_sources.insert(1, AudioSource {
             path: AudioSourcePath::Absolute("x.wav".into()),

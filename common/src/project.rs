@@ -80,6 +80,11 @@ const ARA_STABLE_ID_VERSION: u32 = 42;
 /// 無いアーカイブに目次を作る (`ara_ids::migrate_archive_contents`)。
 const ARA_TAKE_ORIGIN_VERSION: u32 = 43;
 
+/// v48 (r.md #159) でオーディオのコード検出に「和音を弾いているか」(`AudioChordSpan::chordal`) を足した。この版
+/// 未満のファイルの検出結果はそれを持たない (旋律の窓も和音として残っている) ので、捨てて測り直させる
+/// ([`drop_audio_chords_without_chordal`])。
+const CHORD_BASIS_VERSION: u32 = 48;
+
 /// v30 (§10) で `ClipContent` を `#[serde(untagged)]` から tagged (`type` field) 化した。
 /// この版未満のファイルは content を untagged (flat `{"notes":[...]}` 等) で保存しているので、
 /// `migrate_clip_content_add_tag` で `type` を注入してから deserialize する。
@@ -851,7 +856,15 @@ const SONG_MIGRATIONS: &[Migration<Song>] = &[
     // (v43) 目次の無い (v42 の今の id で書いた) ARA アーカイブに、トラックの document から目次を作る。 v41 以前の
     // 読み替え (上) が作った目次には触らないので、その後に走る。
     (ARA_TAKE_ORIGIN_VERSION, crate::ara_ids::migrate_archive_contents),
+    // (v48) 「和音を弾いているか」を持たないオーディオのコード検出結果を捨てる (追従するトラックの音源は
+    // GUI が派生データとして測り直す — undo にも `*` にも載らない)。
+    (CHORD_BASIS_VERSION, drop_audio_chords_without_chordal),
 ];
+
+/// v48 未満の `Song.audio_chords` を捨てる ([`CHORD_BASIS_VERSION`])。
+fn drop_audio_chords_without_chordal(song: &mut Song) {
+    song.audio_chords.clear();
+}
 
 /// Load a project including optional GUI view state. The returned
 /// `song` is fully normalized (same as `load`); `view` is `None` for legacy
@@ -975,7 +988,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use crate::model::{
-        Clip, ClipContent, InstrumentSource, MidiContent, Note, TextContent, TextEvent, Track,
+        Clip, ClipChordBasis, ClipContent, InstrumentSource, MidiContent, Note, TextContent, TextEvent, Track,
     };
     use crate::model::{
         AudioEditorViewState, ClipKey, EditorWindowGeometry, FollowMode, PianoRollViewState,
@@ -1481,6 +1494,48 @@ mod tests {
         std::fs::write(path, serde_json::to_string(&project).unwrap()).unwrap();
     }
 
+    /// r.md #159: v47 のプロジェクト (コードの箱・追従するトラック・オーディオの検出結果) は、記録なし (= 置いたまま) で
+    /// 開き、旧い検出結果は捨てる。開いただけでは `*` にならず、もう一度保存して開いても同じ (冪等)。
+    #[test]
+    fn v47_chord_projects_open_as_placed_without_dirtying() {
+        use crate::model::{Chord, ChordEvent, ChordFollow, ChordKind, AudioChordSpan};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v47.daw");
+        let mut song = Song::default();
+        let cid = song.alloc_content_id();
+        let note = |id, pitch| Note { id, start_beat: 0.0, duration_beats: 1.0, pitch, velocity: 100, lyric: None, muted: false };
+        song.clip_contents.insert(cid, ClipContent::Midi(MidiContent { notes: vec![note(1, 76), note(2, 77)], next_note_id: 3 }));
+        song.tracks.push(Track {
+            id: 1,
+            follow_chords: ChordFollow::Parallel,
+            clips: vec![Clip { id: 1, start_beat: 0.0, length_beats: 4.0, content_id: cid, ..Clip::default() }],
+            ..Track::default()
+        });
+        song.place_chord(ChordEvent { id: 0, start_beat: 0.0, len_beats: 4.0, chord: Chord::new(9, ChordKind::Minor), color: None });
+        song.media.audio_sources.insert(7, crate::model::AudioSource {
+            path: crate::model::AudioSourcePath::Absolute("x.wav".into()),
+            sample_rate: 48_000,
+            channels: 1,
+            frames: 48_000,
+            original_bpm: None,
+            root_key: None,
+        });
+        song.audio_chords
+            .insert(7, vec![AudioChordSpan { start_frame: 0, end_frame: 100, chord: Chord::new(0, ChordKind::Major), chordal: false }]);
+        write_project_with_version(&path, &song, 47);
+        let loaded = load_project(&path).unwrap();
+        assert!(!loaded.overlaps_resolved, "開いただけで `*` にしない");
+        let opened = loaded.song;
+        assert!(opened.audio_chords.is_empty(), "旧い検出結果は測り直す");
+        assert!(opened.tracks[0].clips[0].chord_basis.is_empty(), "記録なし = 置いたまま");
+        assert_eq!(opened.chords.len(), 1);
+        save(&path, &opened).unwrap();
+        let again = load_project(&path).unwrap();
+        assert!(!again.overlaps_resolved);
+        // (使っていない音源は保存の GC で消えるので、比べるのはトラックとコード。)
+        assert_eq!((&again.song.tracks, &again.song.chords), (&opened.tracks, &opened.chords), "開き直しても同じ");
+    }
+
     /// Text clip 1 つを持つ非 vocal トラック 1 本だけの song (字幕デバイス無し)。
     fn song_with_one_text_clip() -> Song {
         let mut song = Song::default();
@@ -1923,6 +1978,7 @@ mod tests {
                 singer_name: "中国うさぎ".into(),
                 style_name: "ノーマル".into(),
                 talk: None,
+                chord_basis: ClipChordBasis::default(),
             }],
             ..Track::default()
         });
