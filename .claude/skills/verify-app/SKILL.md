@@ -61,7 +61,8 @@ bash scripts/preflight_no_running_app.sh verify-app
 make run   # run_in_background: true。パイプを付けない
 ```
 - `run_in_background: true` で起動 (フォアグラウンド blocking 不可)。`make run` は §2 と同じ preflight →
-  `make build` (3 exe) → `cargo run -p daw_gui` の順に回る。
+  `make build` (3 exe) → `cargo run -p daw_gui` の順に回る。`--features script` 付きの起動 (§6) と `make run` を
+  行き来すると daw_gui.exe は毎回作り直しになる (daw_gui 自身の feature が違うので避けられない)。
 - ログの読み先は `%LOCALAPPDATA%` 配下の `daw_01/logs/<daw_gui|daw_audio|daw_plugin_host>.YYYY-MM-DD`
   (プロセスごとの日次ファイル。日付は UTC、ANSI 無し、同じ日の前回起動分も入っている)。
   background task の出力 (debug ビルドは子プロセスも同じ stdout に出る。ANSI 付き) も読める。
