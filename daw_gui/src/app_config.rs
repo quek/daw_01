@@ -55,6 +55,12 @@ pub struct AppConfig {
     /// メーター設定 (各メーターの右クリックメニューで変える)。
     #[serde(default)]
     pub meter: crate::master_meter::settings::MeterSettings,
+    /// r.md #158: 画面左のトラックインスペクタを出すか。default = true。
+    #[serde(default = "default_true")]
+    pub inspector_open: bool,
+    /// r.md #158: トラックインスペクタの幅 (px)。`load` が有効範囲へクランプする。
+    #[serde(default = "default_inspector_w")]
+    pub inspector_w: f32,
     /// r.md #54: ラウドネスレポート window が開いているか (再起動を跨いで復元)。
     #[serde(default)]
     pub loudness_report_open: bool,
@@ -141,6 +147,9 @@ impl AppConfig {
             master_panel_w: prefs.master_panel_w,
             master_panel_sections: prefs.master_panel_sections,
             meter: prefs.meter_settings,
+            // r.md #158: インスペクタの見え方も「この人の画面の使い方」側。
+            inspector_open: prefs.inspector_open,
+            inspector_w: prefs.inspector_w,
             // r.md #54: レポート window の開閉と位置も「画面の使い方」側。
             loudness_report_open: prefs.loudness_report_open,
             loudness_report_rect: prefs.loudness_report_rect.map(|r| [r.x, r.y, r.w, r.h]),
@@ -159,6 +168,10 @@ impl AppConfig {
 
 fn default_master_panel_w() -> f32 {
     300.0
+}
+
+fn default_inspector_w() -> f32 {
+    crate::handler::inspector_view::INSPECTOR_DEFAULT_W
 }
 
 /// 既定の高さ配分。MASTER (フェーダー + ラウドネス) を厚めに、残りを均等に。
@@ -189,6 +202,8 @@ impl Default for AppConfig {
             master_panel_w: default_master_panel_w(),
             master_panel_sections: default_master_panel_sections(),
             meter: crate::master_meter::settings::MeterSettings::default(),
+            inspector_open: true,
+            inspector_w: default_inspector_w(),
             loudness_report_open: false,
             loudness_report_rect: None,
             voicevox_chunk_secs: default_voicevox_chunk_secs(),
@@ -224,6 +239,8 @@ pub fn load(path: impl AsRef<Path>) -> AppConfig {
     cfg.virtual_keyboard_base_pitch =
         (cfg.virtual_keyboard_base_pitch.min(crate::virtual_keyboard::MAX_BASE_PITCH) / 12) * 12;
     cfg.virtual_keyboard_velocity = cfg.virtual_keyboard_velocity.clamp(1, 127);
+    // r.md #158: 手書き / 壊れた幅でもインスペクタの範囲に畳む (NaN は既定幅へ)。
+    cfg.inspector_w = crate::handler::inspector_view::clamp_inspector_w(cfg.inspector_w);
     cfg
 }
 
@@ -264,6 +281,8 @@ mod tests {
                 loudness_true_peak_ceiling_dbtp: -2.0,
                 ..Default::default()
             },
+            inspector_open: false,
+            inspector_w: 480.0,
             loudness_report_open: true,
             loudness_report_rect: Some([5.0, 6.0, 720.0, 500.0]),
             voicevox_chunk_secs: 120.0,
@@ -296,6 +315,8 @@ mod tests {
         assert_eq!(loaded.master_panel_sections, [0.4, 0.2, 0.2, 0.2]);
         assert_eq!(loaded.meter.loudness_target_lufs, -23.0);
         assert_eq!(loaded.meter.loudness_true_peak_ceiling_dbtp, -2.0);
+        assert!(!loaded.inspector_open);
+        assert_eq!(loaded.inspector_w, 480.0);
         assert!(loaded.loudness_report_open);
         assert_eq!(loaded.loudness_report_rect, Some([5.0, 6.0, 720.0, 500.0]));
         assert_eq!(loaded.voicevox_chunk_secs, 120.0);
@@ -322,6 +343,22 @@ mod tests {
         assert_eq!(loaded.virtual_keyboard_velocity, 1);
         std::fs::write(&path, r#"{"virtual_keyboard_base_pitch": 50}"#).unwrap();
         assert_eq!(load(&path).virtual_keyboard_base_pitch, 48, "C 揃えに切り下げる");
+    }
+
+    /// r.md #158: 手書き / 壊れたインスペクタの幅は範囲に畳み、欠落は既定 (表示・既定幅)。
+    #[test]
+    fn load_clamps_inspector_width() {
+        use crate::handler::inspector_view::{INSPECTOR_DEFAULT_W, INSPECTOR_MAX_W, INSPECTOR_MIN_W};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app_config.json");
+        std::fs::write(&path, r#"{"inspector_w": 9999.0}"#).unwrap();
+        assert_eq!(load(&path).inspector_w, INSPECTOR_MAX_W);
+        std::fs::write(&path, r#"{"inspector_w": 10.0}"#).unwrap();
+        assert_eq!(load(&path).inspector_w, INSPECTOR_MIN_W);
+        std::fs::write(&path, "{}").unwrap();
+        let loaded = load(&path);
+        assert!(loaded.inspector_open);
+        assert_eq!(loaded.inspector_w, INSPECTOR_DEFAULT_W);
     }
 
     /// r.md #75: 壊れた / 手書きの `app_config.json` で 5 秒や 9999 秒が来ても、

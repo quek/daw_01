@@ -1,16 +1,16 @@
-//! インスペクタの「ローンチ」セクション (r.md #87 / 計画書 Q7 / §3.4)。
+//! インスペクタの「ローンチ」(r.md #87 / 計画書 Q7 / §3.4)。r.md #158 で、セルの設定は選択の帯
+//! (クリップ) の中の小見出し「ローンチ」、列のフォローアクションは列の帯に置く。
 //!
 //! 選択中の **ランチャーのセル** の量子化 / ローンチモード / ループ / レガート /
 //! フォローアクション一式を出す。複数選択は一括変更で、値が割れている欄は
 //! dropdown なら空表示 (選択 index を範囲外にする)、トグルなら OFF 表示にして
 //! 「押したら全部 ON に揃う」 側へ倒す (トグルは 3 状態を持てない)。
 //!
-//! ## 行の高さは状態で変えない
+//! ## 高さが変わるのは「ジャンプ」の行だけ
 //!
-//! インスペクタは 1 本の y カーソルで積む top-down フローなので、
-//! 「Jump を選んだときだけ行が増える」 ような作りにすると **下のコントロールが
-//! 縦に逃げる**。飛び先 (Jump のシーン) は動作 dropdown と同じ行の右側に置き、
-//! Jump 以外のときはそこを空けたままにして高さを固定する。
+//! インスペクタは 1 本の y カーソルで積む top-down フローなので、行が増えると下のコントロールが
+//! 縦に逃げる。動作に「ジャンプ」を選んだときだけ、飛び先の行がフォローアクションの直下に増える
+//! (押した dropdown より下だけが動く。押した dropdown 自身は動かない)。
 //!
 //! ## 既存 idiom の流用
 //!
@@ -25,17 +25,17 @@ use daw_ui_renderer::Rect;
 
 use common::model::{FollowAction, FollowActionKind, LaunchMode, LAUNCH_QUANTIZE_CHOICES};
 
-use crate::app::{AppData, AppEvent, InspectorScrubField};
+use crate::app::{AppData, AppEvent, ClipKey, InspectorScrubField};
 use crate::event_launcher::{LaunchEdit, LauncherCellKey, LauncherEvent};
+use crate::state::inspector_view::InspectorDetail;
 
 /// 1 行の高さ (dropdown / toggle / 数値欄で共通)。
 const ROW_H: f32 = 22.0;
 /// 行間。
 const ROW_GAP: f32 = 4.0;
-/// 見出しラベルの高さ。
-const LABEL_H: f32 = 18.0;
 /// フォローアクション行の dropdown の本体フォント。3 分割の狭い列に「クリップ終端」
-/// 「次のセル」のような語が入るので、既定の 14px では詰まる。
+/// 「次のセル」のような語が入る (既定の `CONTROL_FONT_PX` と同じ 12px。既定が変わっても
+/// この列は詰まらない大きさに固定する)。
 const FOLLOW_FONT: f32 = 12.0;
 
 /// ローンチモードの表示順 (enum の並びと一致させる)。
@@ -81,77 +81,49 @@ enum FollowTarget {
     Scenes,
 }
 
-/// 「ローンチ」セクションを 1 本の y カーソルに積む。
-/// セルも列も選ばれていなければ何も描かず `y` をそのまま返す。
-pub(super) fn draw_launch_section(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    mut y: f32,
-) -> f32 {
+/// 選択の帯 (クリップ / セル) の中の「ローンチ」: 選んでいるセルのローンチ設定と、MIDI 割り当て
+/// (詳細、最初は畳む)。セルを選んでいなければ何も描かず `y` をそのまま返す (r.md #158)。
+pub(super) fn draw_cell_launch(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, pad: f32, y: f32) -> f32 {
     // 表示は **セル選択が生きているか** で決める (`shown_pianoroll_clips` と同じ判定)。
     // last-wins タグ付きの `selected_launcher_cells()` は Delete / Cut の宛先用なので、
     // セルのピアノロールでノートを選ぶと `Notes` へ倒れ、**セルを編集している最中に
     // ローンチ設定だけが消える**。
     let cells = app.live_launcher_cells();
-    let scene_ids = scenes_of(app, &cells);
-    if cells.is_empty() && scene_ids.is_empty() {
+    if cells.is_empty() {
         return y;
     }
     // セル側の行は **セルを選んでいるときだけ**出す。列見出しだけを選んだときに
     // セルの量子化 / 長さ / ループを出すと、触れる対象が無いのに操作できてしまう。
-    if !cells.is_empty() {
-        y = draw_cell_rows(app, ui, area, pad, y, &cells);
-    }
-    // 列のフォローアクションは **列見出しを選んだときだけ**出す (r.md #153)。セルを選んだだけで
-    // 「セルが乗っている列」の設定まで並ぶと、セルのフォローアクションと紛れる。
-    // `scenes_of` は明示的な列選択があればそれを返すので、表示と書き込み先は食い違わない。
-    if !app.cur.selection.selected_scene_ids.is_empty() {
-        y = draw_scene_follow_rows(app, ui, area, pad, y, &cells, &scene_ids);
-    }
+    let scene_ids = scenes_of(app, &cells);
+    let y = super::band::sub_heading(
+        app,
+        ui,
+        "inspector_launch_head",
+        area.x + pad,
+        area.w - pad * 2.0,
+        y,
+        super::vocab::SUB_LAUNCH,
+        None,
+    );
+    let y = draw_cell_rows(app, ui, area, pad, y, &cells);
     draw_midi_rows(app, ui, area, pad, y, &cells, &scene_ids)
 }
 
-/// 列 (シーン) のフォローアクション。**走行中のクリップのそれより優先する**
-/// (Live 12 の規則) ので、セル側の下に並べる。
-fn draw_scene_follow_rows(
-    app: &AppData,
-    ui: &mut Ui<'_, AppData>,
-    area: Rect,
-    pad: f32,
-    mut y: f32,
-    cells: &[LauncherCellKey],
-    scene_ids: &[u32],
-) -> f32 {
+/// 列の帯の中身: 選んでいる列 (シーン) のフォローアクション。**走行中のクリップのそれより優先する**
+/// (Live 12 の規則)。列見出しを選んだときだけ出る (r.md #153: セルを選んだだけで「セルが乗っている列」の
+/// 設定まで並ぶと、セルのフォローアクションと紛れる)。セルを選んでいなければ MIDI 割り当てもここに出す
+/// (セルがあればクリップの帯に出す — 1 つの選択に 1 か所)。どの列かは帯の対象 (列名) が示す。
+pub(super) fn draw_scene_launch(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, pad: f32, y: f32) -> f32 {
+    let cells = app.live_launcher_cells();
+    // `scenes_of` は明示的な列選択があればそれを返すので、表示と書き込み先は食い違わない。
+    let scene_ids = scenes_of(app, &cells);
     if scene_ids.is_empty() {
         return y;
     }
-    let scene_follow = fold_scene_follow(app, scene_ids).unwrap_or_default();
-    // 見出しに **列の名前** を出す (無名なら並び順の番号)。列を直接選んだときはペインの
-    // タイトルがトラック名のままなので、ここが「どの列をいじっているか」の唯一の手掛かり。
-    let song = app.cur.song_doc.song();
-    let names: Vec<String> = song
-        .scenes
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| scene_ids.contains(&s.id))
-        .map(|(i, s)| s.display_name(i))
-        .collect();
-    let label = match names.as_slice() {
-        [] => "選択中の列 (シーン) のフォローアクション".to_string(),
-        [one] => format!("列「{one}」のフォローアクション"),
-        many => format!("列 {} 本 ({}) のフォローアクション", many.len(), many.join(", ")),
-    };
-    ui.label_at_clipped(
-        "inspector_scene_follow_label",
-        &label,
-        Rect { x: area.x + pad, y, w: (area.w - pad * 2.0).max(0.0), h: LABEL_H },
-        12.0,
-        app.theme.core.text,
-    );
-    y += LABEL_H;
-    draw_follow_rows(app, ui, area, pad, y, &scene_follow, FollowTarget::Scenes, cells)
+    let scene_follow = fold_scene_follow(app, &scene_ids).unwrap_or_default();
+    let y = follow_heading(app, ui, area, pad, y, "inspector_scene_follow_head");
+    let y = draw_follow_rows(app, ui, area, pad, y, &scene_follow, FollowTarget::Scenes, &cells);
+    if cells.is_empty() { draw_midi_rows(app, ui, area, pad, y, &cells, &scene_ids) } else { y }
 }
 
 /// 選択セルのローンチ設定 (量子化 / モード / 長さ / ループ / レガート / フォロー)。
@@ -163,12 +135,8 @@ fn draw_cell_rows(
     mut y: f32,
     cells: &[LauncherCellKey],
 ) -> f32 {
-    let p = &app.theme.core;
     let row_w = area.w - pad * 2.0;
     let half = (row_w - ROW_GAP) * 0.5;
-
-    ui.label_at("inspector_launch_label", "ローンチ", area.x + pad, y, 12.0, p.text);
-    y += LABEL_H;
 
     // ---- 量子化 / モード ----
     let quantize = app.launch_fold(cells, |s| s.quantize);
@@ -279,16 +247,13 @@ fn draw_cell_rows(
 
     // ---- フォローアクション (セル) ----
     let cell_follow = app.launch_fold(cells, |s| s.follow.clone()).unwrap_or_default();
-    ui.label_at(
-        "inspector_follow_label",
-        "フォローアクション",
-        area.x + pad,
-        y,
-        12.0,
-        p.text,
-    );
-    y += LABEL_H;
+    let y = follow_heading(app, ui, area, pad, y, "inspector_follow_head");
     draw_follow_rows(app, ui, area, pad, y, &cell_follow, FollowTarget::Cells, cells)
+}
+
+/// 小見出し「フォローアクション」(セルと列で同じ形)。
+fn follow_heading(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect, pad: f32, y: f32, id: &'static str) -> f32 {
+    super::band::sub_heading(app, ui, id, area.x + pad, area.w - pad * 2.0, y + 2.0, "フォローアクション", None)
 }
 
 /// フォローアクションの 2 行 (有効・発火条件 / 動作 A・確率・動作 B) と、ジャンプの
@@ -492,13 +457,11 @@ fn draw_midi_rows(
     ui: &mut Ui<'_, AppData>,
     area: Rect,
     pad: f32,
-    mut y: f32,
+    y: f32,
     cells: &[LauncherCellKey],
     scene_ids: &[u32],
 ) -> f32 {
-    let p = &app.theme.core;
     let row_w = area.w - pad * 2.0;
-    let third = (row_w - ROW_GAP * 2.0) / 3.0;
     // 学習の宛先は「いま選んでいるセル」 (anchor = 末尾)。トラック行のセルだけが
     // パッドの宛先になる (パッドは行 × 列の格子で、オートメーションレーンには
     // 対応する物理位置が無い)。
@@ -518,16 +481,27 @@ fn draw_midi_rows(
         .or_else(|| scene_ids.last().copied());
     let learning = app.cur.launcher.learn_target;
     let n = app.launcher_bindings().len();
+    // めったに使わないので「詳細」で最初は畳む (r.md #158 仕様 7、セルと列で同じ鍵)。
+    let label = format!("MIDI 割り当て ({n} 件)");
+    super::band::details(app, ui, area.x + pad, row_w, y, InspectorDetail::LaunchMidi, &label, |ui, y| {
+        draw_midi_buttons(app, ui, area, pad, y, anchor, scene_id, learning)
+    })
+}
 
-    ui.label_at(
-        "inspector_launch_midi_label",
-        &format!("MIDI 割り当て ({n} 件)"),
-        area.x + pad,
-        y,
-        12.0,
-        p.text,
-    );
-    y += LABEL_H;
+/// MIDI 割り当ての中身: Learn の 6 ボタン + 消去。
+#[allow(clippy::too_many_arguments)]
+fn draw_midi_buttons(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    pad: f32,
+    mut y: f32,
+    anchor: Option<ClipKey>,
+    scene_id: Option<u32>,
+    learning: Option<common::model::BindingTarget>,
+) -> f32 {
+    let row_w = area.w - pad * 2.0;
+    let third = (row_w - ROW_GAP * 2.0) / 3.0;
 
     // (widget id, ラベル, 宛先)。宛先が `None` = いま決められない
     // (セル未選択 / 列が無い) ので押しても何もしない。
@@ -599,7 +573,7 @@ fn draw_midi_rows(
             })
         },
     );
-    y + ROW_H + 12.0
+    y + ROW_H
 }
 
 // ----------------------------------------------------------------------

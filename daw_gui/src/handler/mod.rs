@@ -52,6 +52,10 @@ pub mod glue;
 pub mod grouping;
 /// 履歴ジャンプ (undo / redo / 履歴リストの行) の入口と、plugin state の往復を先に挟む判断。
 pub mod history;
+/// r.md #158: トラックインスペクタの帯の開閉 / 表示 / 幅。
+pub mod inspector_view;
+/// r.md #158: トラックインスペクタのタイトル (選んでいるもの) と帯の対象の表示。
+pub mod inspector_title;
 pub mod ipc;
 /// r.md #87: クリップランチャーの発火 / 行の主導権 / 列 (シーン) の CRUD。
 pub mod launcher;

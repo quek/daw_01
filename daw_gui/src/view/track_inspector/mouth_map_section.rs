@@ -1,4 +1,4 @@
-//! インスペクタの「口パク (口形状 → 画像)」 セクション。
+//! インスペクタの「口パク」の帯の中身 (口形状 → 画像)。
 //!
 //! contract は `chain_sections.rs` / `launch_section.rs` と同じ
 //! 「`(app, ui, area, pad, 起点 y) -> 次の y`」。 `track_inspector/mod.rs::draw` から
@@ -27,8 +27,17 @@ fn image_source_label(src: &common::model::ImageSource) -> String {
         .to_string()
 }
 
-/// この track を口パク出力先に指定している vocal track があるとき、7 形状
-/// (a/i/u/e/o/N/閉口) の画像割当を表示する。各 slot は import 済み image を選ぶ。
+/// 口パクの帯を出すか: カーソルのトラックを口パク出力先に指定している vocal track がある。
+pub(super) fn mouth_map_shown(app: &AppData) -> bool {
+    let song = app.cur.song_doc.song();
+    let Some(this_id) = app.cursor_track_index().and_then(|i| song.tracks.get(i)).map(|t| t.id) else {
+        return false;
+    };
+    song.tracks.iter().any(|t| t.lipsync_target_track == Some(this_id))
+}
+
+/// 口パクの帯の中身: 7 形状 (a/i/u/e/o/N/閉口) の画像割当。各 slot は import 済み image を選ぶ。
+/// 出すかどうかは [`mouth_map_shown`]、見出しは帯 (r.md #158)。
 pub(super) fn draw_mouth_map_section(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -42,23 +51,6 @@ pub(super) fn draw_mouth_map_section(
         return y;
     };
     let this_id = track.id;
-    let is_target = app
-        .cur.song_doc.song()
-        .tracks
-        .iter()
-        .any(|t| t.lipsync_target_track == Some(this_id));
-    if !is_target {
-        return y;
-    }
-    ui.label_at(
-        "inspector_mouthmap_label",
-        "口パク (口形状 → 画像)",
-        area.x + pad,
-        y,
-        12.0,
-        p.text,
-    );
-    y += 18.0;
     // import 済み image source の (id, ファイル名) 一覧 (id 昇順)。
     // image_ids[k] と labels[k+1] が対応 (labels[0] = "(なし)" sentinel)。
     // ラベル文字列を別 Vec へ再 clone せず、 ソート後そのまま labels へ move する。
@@ -135,5 +127,5 @@ pub(super) fn draw_mouth_map_section(
         }
         y += 26.0;
     }
-    y + 4.0
+    y
 }

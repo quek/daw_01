@@ -926,7 +926,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             );
             self.open_popup(menu_id, anchor, true);
         }
-        self.mark_context_menu_seen(menu_id);
+        self.mark_popup_owner_drawn(menu_id);
 
         // popup_rect は state.anchor から取得 (open 時の固定座標、毎フレーム同じ)
         let mut clicked_idx: Option<usize> = None;

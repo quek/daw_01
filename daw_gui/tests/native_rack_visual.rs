@@ -20,7 +20,8 @@ use daw_gui::event_device::DeviceEvent;
 use daw_gui::event_native::NativeEdit;
 use daw_gui::handler::bypass_target::BypassTarget;
 use daw_gui::view::native_device::{CurveAxes, CurveBand, EqCurveSource, curve_handles};
-use daw_gui::view::root::INSPECTOR_W;
+use daw_gui::view::root::INSPECTOR_DEFAULT_W;
+use daw_gui::view::track_inspector::layout as inspector_layout;
 use daw_gui::view::track_inspector::native_panel::layout;
 use daw_gui::widgets::select_modifier::SelectModifier;
 use daw_ui_core::{FrameInput, PointerFrame, UiHost, contrast_ratio};
@@ -29,8 +30,8 @@ use daw_ui_renderer::{Color, Primitive, Rect, Scene};
 
 const W: u32 = 1400;
 const H: u32 = 900;
-/// インスペクタの左右の余白 (`track_inspector::draw` の `pad`)。
-const PAD: f32 = 12.0;
+/// インスペクタの左右の余白。
+const PAD: f32 = inspector_layout::PAD;
 /// chain list の行高 (`chain_list::ROW_H`)。
 const ROW_H: f32 = 26.0;
 /// 行の名前のラベルは行の上端から 8px 下に描かれる (`native_row` / `plugin_row`)。
@@ -151,7 +152,7 @@ fn inspector_glyphs(scene: &Scene) -> Vec<Glyph> {
         .iter()
         .enumerate()
         .filter_map(|(order, p)| match p {
-            Primitive::Glyph(g) if g.left < INSPECTOR_W => {
+            Primitive::Glyph(g) if g.left < INSPECTOR_DEFAULT_W => {
                 Some(Glyph { text: g.text.to_string(), left: g.left, top: g.top, color: g.color, order })
             }
             _ => None,
@@ -181,9 +182,11 @@ fn par_of(scene: &Scene, row_name: &str) -> (f32, f32) {
         .center()
 }
 
-/// 行の名前の glyph から、その行の Par の矩形 (行の中身の幅、行の直下)。
+/// 行の名前の glyph から、その行の Par の矩形 (行の中身の幅、行の直下)。インスペクタの右端の
+/// 幅のドラッグ帯 (`RESIZE_HANDLE_W`) は本文の外 (r.md #158)。
 fn panel_rect(name: &Glyph, kind: NativeKind) -> Rect {
-    Rect { x: PAD, y: name.top - NAME_TOP + ROW_H, w: INSPECTOR_W - PAD * 2.0, h: layout::panel_height(kind) }
+    let w = INSPECTOR_DEFAULT_W - inspector_layout::RESIZE_HANDLE_W - PAD * 2.0;
+    Rect { x: PAD, y: name.top - NAME_TOP + ROW_H, w, h: layout::panel_height(kind) }
 }
 
 /// EQ の Par のカーブ上の点の座標 (描画と同じ写像を通す)。
@@ -225,7 +228,7 @@ fn native_rows_and_panels_are_laid_out_in_the_rack() {
         assert!((w[0].top - w[1].top).abs() < 0.5 && w[0].left < w[1].left, "{w:?}");
     }
     for g in &heads {
-        assert!(g.left >= PAD && g.left < INSPECTOR_W - PAD, "{g:?}");
+        assert!(g.left >= PAD && g.left < INSPECTOR_DEFAULT_W - PAD, "{g:?}");
     }
     let eq_name = one(&scene, "EQ");
     let next = one(&scene, "+ Plugin");
@@ -492,7 +495,7 @@ fn gr_mini_slot_contrast(scene: &Scene, row_name: &str) -> f32 {
             Primitive::Rect(r)
                 if (r.rect.w - MINI_W).abs() < 0.01
                     && (r.rect.h - MINI_GR_H).abs() < 0.01
-                    && r.rect.x < INSPECTOR_W
+                    && r.rect.x < INSPECTOR_DEFAULT_W
                     && r.rect.y >= row_y
                     && r.rect.y + r.rect.h <= row_y + ROW_H =>
             {

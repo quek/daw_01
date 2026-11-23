@@ -248,6 +248,9 @@ pub struct ProjectView {
     /// Native / Limiter)。Par は行ごとに独立して何枚でも開ける。「見方の都合」なので dirty は
     /// 立てないが `ViewState.open_rack_panels` で保存する (存在しない device は保存時に落とす)。
     pub open_rack_panels: std::collections::BTreeSet<common::model::RackPanelKey>,
+    /// r.md #158: インスペクタの帯と「詳細」の開閉 (種類ごとに共通、全トラック共通)。「見方の都合」なので
+    /// dirty は立てないが `ViewState.inspector_collapsed` / `inspector_open_details` で保存する。
+    pub inspector_folds: crate::state::inspector_view::InspectorFolds,
     /// gui_01 #028 (M14 Phase 63n-1): automation lane 群を **展開中** の
     /// track id 集合 (Bitwig 流: 既定は折り畳み)。 含まれない track の
     /// `automation_lanes_collapsed = true` を widget へ渡す。 `+` / `-` click
@@ -635,6 +638,11 @@ pub struct ProjectEphemeral {
     /// content_size として使う (= lag-by-one)。 描画末尾で実測値に更新。
     /// session-only (save / Undo 対象外)。
     pub inspector_body_h: f32,
+    /// r.md #158 §6-1: インスペクタの本文高の「床」。帯 / Par を開閉した瞬間の
+    /// `scroll offset + viewport 高` を覚え、本文が縮んでも scroll_area が offset を詰めない
+    /// (= 末尾までスクロールした状態で畳んでも、押した見出しが下へずれない)。上へスクロールすると
+    /// 床は下がって空白が消え、選択の主が変わるか本文が床を超えたら捨てる。session-only。
+    pub inspector_scroll_floor: Option<crate::state::inspector_view::InspectorScrollFloor>,
     /// r.md #129: Rack の Par パネルの実測高 (px、前フレーム測定値、`RackPanelKey` ごと)。
     /// `reorderable_list_expandable` の `row_extra_h` に渡して開いた行の直下に確保する展開高に
     /// 使う (lag-by-one)。plugin / 映像 FX / VOICEVOX / 字幕 / Transform の Par だけが入る
@@ -953,6 +961,7 @@ impl ProjectState {
                 strip_eq_open: false,
                 sends_band_open: true,
                 open_rack_panels: std::collections::BTreeSet::new(),
+                inspector_folds: crate::state::inspector_view::InspectorFolds::default(),
                 expanded_automation_tracks: std::collections::HashSet::new(),
                 collapsed_parallel_nodes: std::collections::HashSet::new(),
                 master_row_automation_expanded: false,
@@ -1038,6 +1047,7 @@ impl ProjectState {
                 arrange_zoom_anchor: None,
                 zoom_lane_fill: None,
                 inspector_body_h: 800.0,
+                inspector_scroll_floor: None,
                 rack_panel_heights: std::collections::HashMap::new(),
                 last_pianoroll_grid_size: (0.0, 0.0),
                 pending_pianoroll_fit: false,

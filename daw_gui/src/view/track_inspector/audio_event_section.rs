@@ -64,16 +64,6 @@ pub(super) fn draw_audio_event_section(
         }));
     }
 
-    ui.label_at(
-        "inspector_audio_event_label",
-        "Audio Event",
-        area.x + pad,
-        y,
-        12.0,
-        p.text,
-    );
-    y += 18.0;
-
     // Reverse / Mute toggle 横並び (mixer_strips の M/S と同じ感覚)。
     let toggle_h = 24.0;
     let row_w = area.w - pad * 2.0;
@@ -380,5 +370,5 @@ pub(super) fn draw_audio_event_section(
             })
         }));
     }
-    y + input_h + 12.0
+    y + input_h
 }

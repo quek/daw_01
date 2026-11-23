@@ -126,27 +126,14 @@ fn draw_panel<'a>(app: &'a AppData, ui: &mut Ui<'a, AppData>, rect: Rect) -> Opt
     ui.panel("master_panel_bg", rect, p.panel_raised, 0.0);
 
     // ----- 左端のリサイズ帯 -----
-    // popup が開いている間は掴まない。掴むと press を消費してしまい、
-    // 「メニュー外クリックで閉じる」が効かなくなる (= 見えない popup が残る)。
     let handle = Rect { x: rect.x, y: rect.y, w: RESIZE_HANDLE_W, h: rect.h };
-    if !ui.has_open_popups()
-        && let Some(drag) = ui.take_drag_in_rect("master_panel_resize", handle)
-    {
+    if let Some(drag) = ui.resize_handle("master_panel_resize", handle, daw_ui_core::Orientation::Horizontal) {
         // 左へ動かすほど広くなる (右端固定パネル)。
-        let next = rect.x + rect.w - drag.current.0;
-        let commit = matches!(drag.kind, daw_ui_core::DragKind::Released);
-        // ドラッグ中は帯から離れても矢印のまま (掴んでいる間の形を保つ)。
-        ui.set_cursor(daw_ui_core::CursorIcon::EwResize);
+        let next = rect.x + rect.w - drag.pointer.0;
+        let commit = drag.released;
         ui.push_edit(Edit::mutate(move |app: &mut AppData| {
             app.handle_event(AppEvent::SetMasterPanelWidth { w: next, commit });
         }));
-    }
-    if ui
-        .pointer()
-        .pos
-        .is_some_and(|(x, y)| handle.contains(x, y))
-    {
-        ui.set_cursor(daw_ui_core::CursorIcon::EwResize);
     }
     ui.push_rect(RectCommand {
         rect: Rect { x: rect.x, y: rect.y, w: 1.0, h: rect.h },

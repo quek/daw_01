@@ -679,6 +679,9 @@ pub enum AppEvent {
     /// r.md #113: PC キーボードによる仮想鍵盤 (`docs/plan_virtual_keyboard.md`)。同じく
     /// 「1 arm = 1 サブ enum」。
     VirtualKeyboard(crate::event_virtual_keyboard::VirtualKeyboardEvent),
+    /// r.md #158: トラックインスペクタの帯の開閉 / 表示 / 幅 (見方の都合、Song を書かない)。同じく
+    /// 「1 arm = 1 サブ enum」。
+    Inspector(crate::event_inspector::InspectorEvent),
     /// `docs/plan_project_tabs.md` §5.2: プロジェクトタブの操作 (新規 / 開く / 切替 /
     /// 閉じる / 並べ替え)。同じく「1 arm = 1 サブ enum」。
     Tab(crate::event_tabs::TabEvent),

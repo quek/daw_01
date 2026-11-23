@@ -50,6 +50,8 @@ pub mod event_section;
 pub mod event_split;
 pub mod event_tabs;
 pub mod event_virtual_keyboard;
+/// r.md #158: トラックインスペクタの帯の開閉 / 表示 / 幅。
+pub mod event_inspector;
 pub mod handler;
 pub mod audio_source_cache;
 pub mod automation_label;

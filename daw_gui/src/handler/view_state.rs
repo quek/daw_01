@@ -147,6 +147,9 @@ impl AppData {
             launcher_scene_col_w: self.cur.view.launcher_scene_col_w,
             launcher_scroll_scene: self.cur.view.launcher_scroll_scene,
             open_rack_panels,
+            // r.md #158: インスペクタの帯 / 詳細の開閉 (id の文字列、`BTreeSet` の順で差分を安定させる)。
+            inspector_collapsed: self.cur.view.inspector_folds.collapsed_ids(),
+            inspector_open_details: self.cur.view.inspector_folds.open_detail_ids(),
             chord_lane_hidden: !self.cur.view.chord_band.visible,
             chord_notation: self.cur.view.chord_band.notation,
             chord_tools: self.cur.chord_tools.view,
@@ -181,6 +184,8 @@ impl AppData {
         self.cur.view.plugin_editor_windows.clear();
         // r.md #129 (Q18): 開いている Par も同じ (`view = None` の旧ファイルでも前プロジェクトを持ち越さない)。
         self.cur.view.open_rack_panels.clear();
+        // r.md #158: インスペクタの帯の開閉も同じ (旧ファイルは「帯は全部開・詳細は閉」で開く)。
+        self.cur.view.inspector_folds = crate::state::inspector_view::InspectorFolds::default();
         self.set_loop_region(loop_region);
         // 消えたレーンのキーは捨てる (`automation_lane_row_overrides` と同じ)。
         self.cur.view.hidden_automation_lanes = hidden_automation_lanes
@@ -225,6 +230,9 @@ impl AppData {
                 common::model::RackPanelKey::MasterLimiter => true,
             })
             .collect();
+        // r.md #158: 知らない id (新しい版が足した帯) は捨てる。
+        self.cur.view.inspector_folds =
+            crate::state::inspector_view::InspectorFolds::from_ids(&v.inspector_collapsed, &v.inspector_open_details);
         // レーン行高は `after_song_replaced` が前 project ぶんを消した後にここで入れ直す
         // (消えたレーンのキーは捨てる)。下限だけ効かせるのは `track_row_overrides` と同じ。
         self.cur.view.automation_lane_row_overrides = v

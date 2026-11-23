@@ -186,6 +186,10 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             }
             self.consume_pointer_click();
         }
+        // 開いている一覧は本体が毎フレーム描く。本体が描かれなくなったら (帯を畳んだ / パネルを
+        // 隠した / 選択が変わって欄ごと消えた) フレーム末尾で一覧も閉じる
+        // ([`Ui::close_popups_without_owner`])。残すと見えない一覧が背後の入力を止め続ける。
+        self.mark_popup_owner_drawn(popup_id);
 
         // 3. popup 描画 + 選択検出
         let mut chosen: Option<usize> = None;
@@ -259,6 +263,43 @@ mod tests {
         run(&mut host, (110.0, 110.0), true, true, false);
         run(&mut host, (110.0, 110.0), false, false, true);
         assert!(opened.get(), "本体で press + release なら開く");
+    }
+
+    /// 開いている dropdown の本体を描かないフレームが 1 つでもあれば、一覧はそのフレームの末尾で
+    /// 閉じる (daw_01 r.md #158: 帯を畳む / パネルを隠すと本体ごと消える)。残すと見えない一覧が
+    /// `has_open_popups()` を true にし続け、背後の click を止める。
+    #[test]
+    fn dropdown_closes_when_its_body_is_not_drawn() {
+        let mut host: UiHost<()> = UiHost::no_redraw();
+        let mut scene = Scene::new();
+        let items = ["a", "b"];
+        let state = std::cell::Cell::new((false, false));
+        let mut run = |host: &mut UiHost<()>, draw: bool, click: bool| {
+            let input = FrameInput {
+                pointer: PointerFrame {
+                    pos: Some((110.0, 110.0)),
+                    primary_just_pressed: click,
+                    primary_just_released: click,
+                    ..PointerFrame::default()
+                },
+                ..FrameInput::default()
+            };
+            host.frame_to_edits(&(), &mut scene, SCREEN, input, |(), ui| {
+                if draw {
+                    ui.dropdown("dd", BODY, &items, 0);
+                }
+                state.set((ui.is_dropdown_open("dd"), ui.has_open_popups()));
+            });
+        };
+        run(&mut host, true, true);
+        assert_eq!(state.get(), (true, true), "本体の click で開く");
+        run(&mut host, true, false);
+        assert_eq!(state.get(), (true, true), "描き続けている間は開いたまま");
+        run(&mut host, false, false);
+        run(&mut host, false, false);
+        assert_eq!(state.get(), (false, false), "本体を描かなかったフレームの末尾で閉じている");
+        run(&mut host, true, false);
+        assert_eq!(state.get(), (false, false), "本体がまた描かれても勝手には開かない");
     }
 
     /// 縦に並んだ dropdown の下側を画面下端で開くと、 一覧は上へ開いて上側の本体に被さる。

@@ -44,8 +44,13 @@ impl AppData {
     /// runner のフレーム末に毎フレーム呼ばれるので、行 (`chain_rows` = plugin 名の解決や帯の確保を伴う) は
     /// 組まずに **カーソルトラックの木だけ** を行と同じ順・同じ規則 (`push_chain_rows`: 折り畳んだ Parallel は
     /// 開始行だけ、折り畳んだ chain は chain 行だけ) でたどる。何も開いていなければ確保もしない。
+    ///
+    /// r.md #158: インスペクタを隠しているとき / Rack の帯を畳んでいるときは Par が描かれないので何も要求しない。
     pub fn wanted_device_scopes(&self) -> Vec<u64> {
         let mut out = Vec::new();
+        if !self.inspector_rack_visible() {
+            return out;
+        }
         if let Some(devices) = self.cursor_track_id().and_then(|t| self.cur.song_doc.song().fx_chain_by_track_id(t)) {
             collect_open_eq_scopes(self, devices, &mut out);
         }
@@ -125,6 +130,17 @@ mod tests {
         app.toggle_rack_panel(RackPanelKey::Device(bus));
         app.toggle_rack_panel(RackPanelKey::Device(tone));
         assert_eq!(app.wanted_device_scopes(), vec![tone, eq], "行の順 (組み込み → 足した分)、Comp 系は数えない");
+
+        // r.md #158: Rack の帯を畳む / インスペクタを隠すと Par は描かれないので要求しない。
+        use crate::event_inspector::InspectorEvent;
+        use crate::state::inspector_view::InspectorBand;
+        app.handle_inspector_event(InspectorEvent::ToggleBand(InspectorBand::Rack));
+        assert!(app.wanted_device_scopes().is_empty(), "Rack の帯を畳んだ");
+        app.handle_inspector_event(InspectorEvent::ToggleBand(InspectorBand::Rack));
+        app.ui_prefs.inspector_open = false;
+        assert!(app.wanted_device_scopes().is_empty(), "インスペクタを隠した");
+        app.ui_prefs.inspector_open = true;
+        assert_eq!(app.wanted_device_scopes(), vec![tone, eq], "開き直せば戻る");
 
         // 閉じたら外れ、実測高も残らない。
         app.cur.peph.rack_panel_heights.insert(RackPanelKey::Device(tone), 99.0);

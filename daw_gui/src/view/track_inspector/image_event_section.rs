@@ -40,7 +40,6 @@ pub(super) fn draw_image_event_section(
     pad: f32,
     mut y: f32,
 ) -> f32 {
-    let p = &app.theme.core;
     let Some(summary) = app.inspector_image_event_summary() else {
         return y;
     };
@@ -54,16 +53,6 @@ pub(super) fn draw_image_event_section(
             app.handle_event(AppEvent::ResyncClipEditBuffers(target));
         }));
     }
-
-    ui.label_at(
-        "inspector_image_event_label",
-        "Image Event",
-        area.x + pad,
-        y,
-        12.0,
-        p.text,
-    );
-    y += 18.0;
 
     let row_w = area.w - pad * 2.0;
     let input_h = 22.0;
@@ -136,7 +125,7 @@ pub(super) fn draw_image_event_section(
             })
         },
     );
-    y + toggle_h + 12.0
+    y + toggle_h
 }
 
 /// PiP rect / opacity / rotation の行 (数値欄 + automate `A` ボタン)。

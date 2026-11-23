@@ -198,6 +198,9 @@ impl AppData {
                 master_panel_open: app_config.master_panel_open,
                 master_panel_w: app_config.master_panel_w,
                 master_panel_sections: app_config.master_panel_sections,
+                // r.md #158: トラックインスペクタの表示 / 幅 (load 側でクランプ済)。
+                inspector_open: app_config.inspector_open,
+                inspector_w: app_config.inspector_w,
                 meter_settings: app_config.meter,
                 // r.md #75: VOICEVOX 合成の塊の長さ (秒)。load 側でクランプ済。
                 voicevox_chunk_secs: app_config.voicevox_chunk_secs,
@@ -1015,6 +1018,7 @@ impl AppData {
             AppEvent::AudioRec(ev) => self.handle_audio_rec_event(ev),
             AppEvent::AudioDevice(ev) => self.handle_audio_device_event(ev),
             AppEvent::VirtualKeyboard(ev) => self.handle_virtual_keyboard_event(ev),
+            AppEvent::Inspector(ev) => self.handle_inspector_event(ev),
             AppEvent::SelectClip { target, additive } => {
                 self.select_clip(target, additive);
             }

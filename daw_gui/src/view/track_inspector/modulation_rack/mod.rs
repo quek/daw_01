@@ -18,7 +18,9 @@ use daw_ui_core::{Edit, MsegEditorStyle, ScrubableNumberFormat, ScrubableNumberS
 use daw_ui_renderer::Rect;
 
 use crate::app::{AppData, AppEvent};
+use crate::event_inspector::InspectorEvent;
 use crate::state::ModRackHover;
+use crate::state::inspector_view::InspectorBand;
 use crate::view::disclosure::{RevealAxis, disclosure_glyph};
 
 use bodies::{draw_follower_body, draw_mseg_body, draw_random_body, draw_steps_body};
@@ -132,7 +134,8 @@ fn song_secs_at_beat(app: &AppData, beat: f64) -> f64 {
 /// モジュレーションラックを **スクロール viewport の top-down
 /// フロー** で描く (旧: 下端 pinned・2 個 cap)。各ソースは折りたたみ行で、クリックで
 /// クリックで大きなグラフィカルエディタに展開する (`app.cur.peph.expanded_mod_sources`、 複数同時可)。
-/// 戻り値は描画後の `y`。
+/// 戻り値は `(描画後の y, Q の宛先 = ポインタ下のモジュレーター / routing 行)`。 見出しと追加メニューは
+/// モジュレーションの帯 (r.md #158、 [`draw_add_source_menu`])、 hover の公開は `track_inspector::draw` の末尾。
 #[allow(clippy::too_many_lines)]
 pub(super) fn draw_modulation_rack(
     app: &AppData,
@@ -140,7 +143,7 @@ pub(super) fn draw_modulation_rack(
     area: Rect,
     pad: f32,
     mut y: f32,
-) -> f32 {
+) -> (f32, Option<ModRackHover>) {
     use common::model::ModSourceKind as K;
 
     let p = &app.theme.core;
@@ -173,32 +176,6 @@ pub(super) fn draw_modulation_rack(
         beat,
         secs,
     };
-
-    ui.label_at("inspector_mod_label", "Modulation", lx, y, 12.0, p.text);
-    // [+ ▾] add-menu — 種別を選んで作成。
-    {
-        let add_w = 64.0;
-        let add_rect = Rect { x: area.x + area.w - pad - add_w, y: y - 2.0, w: add_w, h: 20.0 };
-        // 先頭は現在の選択として表示されるラベル。 dropdown widget が右端に
-        // シェブロンを描くので、 ここに `\u{25be}` を入れると下矢印が二重になる → "+" のみ。
-        let add_labels = ["+", "Follow", "LFO", "Random", "MSEG", "Steps", "ADSR"];
-        if let Some(picked) = ui.dropdown("inspector_mod_add_src", add_rect, &add_labels, 0)
-            && picked > 0
-        {
-            let tag = match picked {
-                1 => crate::app::ModSourceKindTag::Follower,
-                2 => crate::app::ModSourceKindTag::Lfo,
-                3 => crate::app::ModSourceKindTag::Random,
-                4 => crate::app::ModSourceKindTag::Mseg,
-                5 => crate::app::ModSourceKindTag::Steps,
-                _ => crate::app::ModSourceKindTag::Adsr,
-            };
-            ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-                app.handle_event(AppEvent::AddModSource { kind: tag });
-            }));
-        }
-    }
-    y += 24.0;
 
     let mod_track_choices = app.mod_source_track_choices();
     let mod_track_labels: Vec<&str> = mod_track_choices.iter().map(|(_, l)| l.as_str()).collect();
@@ -336,11 +313,6 @@ pub(super) fn draw_modulation_rack(
         }
         y += 4.0;
     }
-    if hover != app.cur.peph.inspector_hovered_mod {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.cur.peph.inspector_hovered_mod = hover;
-        }));
-    }
 
     // drag-end edge で sync (scrub 中は dirty のみ)。
     //
@@ -355,7 +327,33 @@ pub(super) fn draw_modulation_rack(
         any_mod_drag,
     );
 
-    y
+    (y, hover)
+}
+
+/// 見出しの右端の追加メニュー `[+ ▾]` (モジュレーションの帯の見出しに置く、r.md #158)。種別を選ぶと
+/// カーソルのトラックにソースを足し、帯を畳んでいれば同じ Edit の中で開く (足したソースが見出しの直下に出る)。
+pub(super) fn draw_add_source_menu(ui: &mut Ui<'_, AppData>, rect: Rect) {
+    // 先頭は現在の選択として表示されるラベル。 dropdown widget が右端に
+    // シェブロンを描くので、 ここに `\u{25be}` を入れると下矢印が二重になる → "+" のみ。
+    let add_labels = ["+", "Follow", "LFO", "Random", "MSEG", "Steps", "ADSR"];
+    if let Some(picked) = ui.dropdown("inspector_mod_add_src", rect, &add_labels, 0)
+        && picked > 0
+    {
+        let tag = match picked {
+            1 => crate::app::ModSourceKindTag::Follower,
+            2 => crate::app::ModSourceKindTag::Lfo,
+            3 => crate::app::ModSourceKindTag::Random,
+            4 => crate::app::ModSourceKindTag::Mseg,
+            5 => crate::app::ModSourceKindTag::Steps,
+            _ => crate::app::ModSourceKindTag::Adsr,
+        };
+        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
+            app.handle_event(AppEvent::AddModSource { kind: tag });
+            if !app.inspector_band_open(InspectorBand::Modulation) {
+                app.handle_event(AppEvent::Inspector(InspectorEvent::ToggleBand(InspectorBand::Modulation)));
+            }
+        }));
+    }
 }
 
 /// ヘッダ行の右寄せバッジ。 **判定はしない** — `mod_graph::build_plan` が出した

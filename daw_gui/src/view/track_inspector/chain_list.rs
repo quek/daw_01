@@ -1,7 +1,7 @@
 //! r.md #110 (`docs/plan_parallel.md` §6.1): インスペクタの chain list — **縦回転 Live 型**。
 //!
 //! Live の Device View は「Chain List (縦) | 選択 chain の device (横)」 で、 Parallel の中の
-//! Parallel は括弧の中の括弧。 360px 固定のインスペクタでは「隣」を「下」にする: Parallel は
+//! Parallel は括弧の中の括弧。 幅の限られたインスペクタ (360〜640px) では「隣」を「下」にする: Parallel は
 //! 開始行 `「` / chain 行 × N / `+ chain` / 選択 chain の device (再帰) / `+ Plugin` /
 //! 終了行 `L`。 括弧は chain の色帯と同じ x / 幅の Parallel 色の帯で、 開始行から終了行まで 1 本に
 //! 繋がる (chain の帯はその上に乗る)。 非選択 chain は 1 行だけなので縦にも横にも爆発しない。 展開中 chain の
@@ -32,6 +32,7 @@ use crate::app::{
     RelocateDevices,
 };
 use crate::event_device::DeviceEvent;
+use crate::handler::bypass_target::BypassTarget;
 use crate::handler::device_guard::{self, DeviceOp};
 use crate::handler::view_model::LiveParamScope;
 use crate::view::native_device::ParamOwner;
@@ -71,14 +72,16 @@ pub(super) fn base_row_h(kind: &ChainRowKind) -> f32 {
     }
 }
 
-/// chain list を `y` から描き、 消費後の `y` を返す。
+/// chain list を `y` から描き、 `(消費後の y, Q の宛先 = hover 中の行)` を返す。 見出しは Rack の帯
+/// (`band.rs`、 r.md #158) が持つ。 hover の宛先は `track_inspector::draw` が末尾で 1 回だけ公開する
+/// (帯を畳んだ / インスペクタを隠したフレームに古い宛先を残さない)。
 pub(super) fn draw_chain_list(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
     area: Rect,
     pad: f32,
-    mut y: f32,
-) -> f32 {
+    y: f32,
+) -> (f32, Option<BypassTarget>) {
     let p = &app.theme.core;
     let rows = app.chain_rows();
     let cursor_tid = app.cursor_track_id();
@@ -105,11 +108,8 @@ pub(super) fn draw_chain_list(
     let (list_rows, slots, slot_targets) = build_list_rows(app, &rows, sc_open, sc_panel_h);
     let content_h: f32 = list_rows.iter().map(|r| r.height + ROW_GAP).sum::<f32>() + 4.0;
 
-    // r.md #131: 無効なトラックのチェーンは host に居ない (窓を開けない) ことを見出しで示す。
+    // r.md #131: 無効なトラックのチェーンは host に居ない (窓を開けない)。見出しの「(無効中)」は Rack の帯の対象。
     let disabled = cursor_tid.is_some_and(|tid| !app.cur.song_doc.song().track_effectively_enabled(tid));
-    let (rack_label, rack_ink) = if disabled { ("Rack (無効中)", p.text_dim) } else { ("Rack", p.text) };
-    ui.label_at("inspector_rack_label", rack_label, area.x + pad, y, 12.0, rack_ink);
-    y += 18.0;
     let list_rect = Rect { x: area.x + pad, y, w: area.w - pad * 2.0, h: content_h };
     let style = DragListStyle {
         row_gap: ROW_GAP,
@@ -179,13 +179,8 @@ pub(super) fn draw_chain_list(
     };
 
     // ---- 応答 ----
-    // hover 行 (Q の対象、 Par 込みの高さ)。 plugin / 内蔵 / Parallel と master の Limiter。 変化したときだけ書く。
+    // hover 行 (Q の対象、 Par 込みの高さ)。 plugin / 内蔵 / Parallel と master の Limiter。
     let hovered_row = resp.hovered.and_then(|i| rows.get(i)).and_then(ChainRow::bypass_target).or(tail_hover);
-    if app.cur.peph.inspector_hovered_row != hovered_row {
-        ui.push_edit(Edit::mutate(move |app: &mut AppData| {
-            app.cur.peph.inspector_hovered_row = hovered_row;
-        }));
-    }
     // click = 選択 (無修飾 / Ctrl / Shift)。 Parallel / chain の開閉は行左端の disclosure。
     if !popup_open
         && let Some(i) = resp.clicked
@@ -246,7 +241,7 @@ pub(super) fn draw_chain_list(
     }
     draw_context_menus(app, ui, &rows, &resp.row_rects);
 
-    end_y + 8.0
+    (end_y, hovered_row)
 }
 
 /// plugin / 映像 FX / VOICEVOX の Par パネルの高さ。前フレームの実測 (lag-by-one、 実測 0 もそのまま

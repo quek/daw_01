@@ -268,20 +268,6 @@ impl AppData {
             .collect()
     }
 
-    pub fn selected_track_label(&self) -> String {
-        let n_selected = self.cur.selection.selected_track_ids.len();
-        if n_selected > 1 {
-            return format!("{n_selected} tracks selected");
-        }
-        let song = self.cur.song_doc.song();
-        match self.cursor_track_id() {
-            Some(id) if id == common::model::MASTER_TRACK_ID || song.track_by_id(id).is_some() => {
-                song.track_display_name(id).into_owned()
-            }
-            _ => "(no track)".into(),
-        }
-    }
-
     /// パラアウト (docs/plan_paraout.md): one entry per chain device on the
     /// cursor track that declares `is_main=false` audio outputs
     /// (`aux_output_count > 0`). Drives the inspector's "Parallel Out" section
