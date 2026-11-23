@@ -1571,11 +1571,11 @@ mod tests {
             }
             let lineage = song.chords[0].lineage;
             song.tracks[0].clips[0].chord_basis.notes = vec![NoteChordBasis { note_id: 1, lineage, chord: c }];
-            song.normalize_after_load();
+            song.normalize_after_load().expect("箱の id は詰め直すので拒まない");
             assert!(song.ids.next_chord_id < 100, "{case}: 採番が詰め直される");
             assert_eq!(song.tracks[0].clips[0].chord_basis.notes[0].lineage, song.chords[0].lineage, "{case}: 記録も付け替える");
             let once = (song.chords.clone(), song.tracks.clone(), song.ids.next_chord_id);
-            song.normalize_after_load();
+            song.normalize_after_load().expect("normalize");
             assert_eq!((song.chords.clone(), song.tracks.clone(), song.ids.next_chord_id), once, "{case}: 冪等");
             song.place_chord(ChordEvent::new(8.0, 4.0, c));
             song.place_chord(ChordEvent::new(12.0, 4.0, c));
