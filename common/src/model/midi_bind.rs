@@ -128,6 +128,9 @@ pub enum BindingTarget {
     SwitchRowToArranger { track_id: u32 },
     /// 全行をアレンジ主導へ戻す。
     SwitchAllToArranger,
+    /// v49 (r.md #161): フォローアクションの全体 on/off を押すたびに切り替える。保存されるのはこの割り当て
+    /// だけで、on/off の状態そのものは Song に載らない (聴き方の都合)。
+    ToggleFollowActions,
 }
 
 impl BindingTarget {
@@ -143,6 +146,7 @@ impl BindingTarget {
                 | Self::StopAllLauncherRows
                 | Self::SwitchRowToArranger { .. }
                 | Self::SwitchAllToArranger
+                | Self::ToggleFollowActions
         )
     }
 
@@ -156,6 +160,7 @@ impl BindingTarget {
             Self::StopAllLauncherRows => "全行を止める",
             Self::SwitchRowToArranger { .. } => "行をアレンジへ戻す",
             Self::SwitchAllToArranger => "全行をアレンジへ戻す",
+            Self::ToggleFollowActions => "フォローアクションの全体 on/off",
             // 宛先を列挙する (ランチャー操作を足したら、ここで言葉を決めるまでコンパイルが通らない)。
             Self::TrackVolume(_)
             | Self::TrackPan(_)

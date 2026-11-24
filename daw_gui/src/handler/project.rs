@@ -123,6 +123,11 @@ impl AppData {
         if !self.cur.peph.delta_devices.is_empty() {
             self.set_delta_devices(Vec::new());
         }
+        // r.md #161: フォローアクションの全体 off も聴き方の都合で、プロジェクトを開くと常に on
+        // (off だったときだけ、LoadSong より先に届く on を送る)。
+        if !self.follow_actions_enabled() {
+            self.set_follow_actions_enabled(true);
+        }
 
         // -- track_id / ClipKey keyed の表示設定 ----------------------------
         // ViewState を持たない旧 .daw では `restore_view_state` が早期 return

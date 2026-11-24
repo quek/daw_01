@@ -412,7 +412,8 @@ impl PruneCtx {
             | BindingTarget::SongTranspose
             | BindingTarget::LaunchScene { .. }
             | BindingTarget::StopAllLauncherRows
-            | BindingTarget::SwitchAllToArranger => true,
+            | BindingTarget::SwitchAllToArranger
+            | BindingTarget::ToggleFollowActions => true,
         }
     }
 }

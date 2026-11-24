@@ -454,6 +454,20 @@ impl super::Song {
         self.scenes.iter().position(|s| s.id == scene_id)
     }
 
+    /// r.md #161: 有効なフォローアクションがセル (トラック行 / レーン行) か列に 1 つでもあるか。
+    /// 無ければ全体 on/off のボタンは切り替えるものが無いのでグレー表示にする (Live と同じ)。
+    #[must_use]
+    pub fn has_follow_actions(&self) -> bool {
+        let lanes = |lanes: &[super::AutomationLane]| {
+            lanes.iter().any(|l| l.session_clips.iter().any(|c| c.launch.follow.enabled))
+        };
+        self.scenes.iter().any(|s| s.follow.enabled)
+            || lanes(&self.song_lanes)
+            || self.tracks.iter().any(|t| {
+                t.session_clips.iter().any(|c| c.launch.follow.enabled) || lanes(&t.automation_lanes)
+            })
+    }
+
     /// 末尾に列を足して、その id を返す。**セルを置くとき以外は呼ばない**
     /// (load 時に補うと「開いただけで `*`」になる、r.md #9)。
     pub fn push_scene(&mut self) -> u32 {

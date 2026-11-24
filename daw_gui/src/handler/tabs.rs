@@ -332,6 +332,11 @@ impl AppData {
                     if !app.cur.peph.delta_devices.is_empty() {
                         app.set_delta_devices(app.cur.peph.delta_devices.clone());
                     }
+                    // r.md #161: フォローアクションの全体 off も session state (新しい engine の既定は on なので、
+                    // off のタブだけ送り直す)。
+                    if !app.follow_actions_enabled() {
+                        app.set_follow_actions_enabled(false);
+                    }
                     app.cur.peph.device_scopes_sent.clear();
                     // r.md #157: 再生中のコードの試聴も session state (次の tick の差分送信に任せる)。
                     app.cur.chord_tools.sent_playback = None;

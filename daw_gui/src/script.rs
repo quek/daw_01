@@ -20,6 +20,7 @@ mod chords;
 mod chord_tools;
 mod editing;
 mod host;
+mod launcher;
 mod native_device;
 mod settings;
 mod tabs;
@@ -165,6 +166,9 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("audioDeviceInfo", audio_device::daw_audio_device_info, 0),
     ("audioInputStats", audio_device::daw_audio_input_stats, 0),
     ("setRespawnCrashedChildren", audio_device::daw_set_respawn_crashed_children, 1),
+    // ----- r.md #161 クリップランチャー (フォローアクションの全体 on/off と行の走行状態) -----
+    ("appSetFollowActionsEnabled", launcher::daw_app_set_follow_actions_enabled, 1),
+    ("launcherStateJson", launcher::daw_launcher_state_json, 0),
 ];
 
 fn register_daw_globals(ctx: &mut Context) -> Result<()> {

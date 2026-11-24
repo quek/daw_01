@@ -362,7 +362,11 @@ pub use window_edit::{Crossfade, edit_run, edit_runs, joined_run, piece_runs, ru
 /// (`ChordEvent::lineage`。旧ファイルは `normalize_chords` が id で埋める)、オーディオの検出結果の「和音を弾いているか」
 /// (`AudioChordSpan::chordal`)。旧ファイルは記録なし (= コードを置いたままの状態) で開く。旧ファイルの `audio_chords` は「和音を弾いているか」を持たないので捨てる (`project::SONG_MIGRATIONS`)。
 /// 新ファイルを旧ビルドで開くと記録が黙って捨てられ、書き換えで動いていたメロディーが書いた音で鳴るので、版を上げる。
-pub const CURRENT_VERSION: u32 = 48;
+///
+/// v49 (r.md #161): MIDI 割り当ての宛先に「フォローアクションの全体 on/off」
+/// ([`BindingTarget::ToggleFollowActions`]) を追加。旧ファイルには存在しないので migration は要らない。
+/// 新ファイルを旧ビルドで開くとこの割り当てが unknown variant で落ちるので、版を上げて gate で弾く。
+pub const CURRENT_VERSION: u32 = 49;
 
 /// Stable id for shared clip content (notes). Allocated by
 /// `Song::alloc_content_id` and referenced by `Clip::content_id`.

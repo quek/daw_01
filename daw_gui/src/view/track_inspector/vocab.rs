@@ -191,6 +191,7 @@ pub const FORM_LABELS: &[&str] = &[
     FIELD_LEARN_LAUNCH,
     FIELD_LEARN_STOP,
     FIELD_LEARN_TO_ARRANGER,
+    FIELD_LEARN_FOLLOW,
     FIELD_LEARN_CLEAR,
 ];
 
@@ -241,6 +242,9 @@ pub const FIELD_LEARN_LAUNCH: &str = "鳴らす";
 pub const FIELD_LEARN_STOP: &str = "止める";
 pub const FIELD_LEARN_TO_ARRANGER: &str = "アレンジへ戻す";
 pub const FIELD_LEARN_CLEAR: &str = "消去";
+/// r.md #161: フォローアクションの全体 on/off (トランスポートの `Follow` ボタンと同じスイッチ)。
+pub const FIELD_LEARN_FOLLOW: &str = "フォロー";
+pub const LEARN_FOLLOW_ALL: &str = "全体 on/off";
 pub const LEARN_CELL: &str = PLACE_CELL;
 /// 列 (シーン) — 帯の名前と同じ語 (同じものに 2 つの呼び名を付けない)。
 pub const LEARN_SCENE: &str = BAND_SCENE;
