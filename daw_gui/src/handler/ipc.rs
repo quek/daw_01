@@ -373,6 +373,9 @@ impl AppData {
             PluginEvent::PluginParamGestureEnd { device: DeviceAddr { device_id, .. }, param_id } => {
                 self.plugin_window_gesture_end(device_id, param_id);
             }
+            PluginEvent::PluginStateChanged { device: DeviceAddr { device_id, .. } } => {
+                self.on_plugin_state_changed(device_id);
+            }
             PluginEvent::VoicevoxSynthStatus {
                 device: DeviceAddr { device_id, .. },
                 progress,

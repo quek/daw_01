@@ -20,10 +20,10 @@ use std::sync::{Arc, Mutex};
 use com_scrape_types::Class;
 use vst3::Steinberg::{
     FIDString, IPlugFrame, IPlugFrameTrait, IPlugView, TUID, ViewRect, kInvalidArgument,
-    kNotImplemented, kResultFalse, kResultOk, kResultTrue, tresult,
+    kNotImplemented, kResultFalse, kResultOk, kResultTrue, tresult, TBool,
     Vst::{
-        IAttributeList, IAttributeListTrait, IComponentHandler, IComponentHandlerTrait,
-        IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait, IUnitHandler,
+        IAttributeList, IAttributeListTrait, IComponentHandler, IComponentHandler2,
+        IComponentHandler2Trait, IComponentHandlerTrait, IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait, IUnitHandler,
         IUnitHandlerTrait, ParamID, ParamValue, ProgramListID, String128, TChar, UnitID,
     },
 };
@@ -301,8 +301,34 @@ impl Vst3ComponentHandler {
 
 impl Class for Vst3ComponentHandler {
     // r.md #138: `IUnitHandler` は `ivstunits.h` で「Retrieve via queryInterface from
-    // IComponentHandler」なので同じ object に載せる。
-    type Interfaces = (IComponentHandler, IUnitHandler);
+    // IComponentHandler」なので同じ object に載せる。`IComponentHandler2` も同じ (`ivsteditcontroller.h`:
+    // "Extended host callback interface … One part handles: Setting dirty state of the plug-in")。
+    type Interfaces = (IComponentHandler, IComponentHandler2, IUnitHandler);
+}
+
+impl IComponentHandler2Trait for Vst3ComponentHandler {
+    /// `ivsteditcontroller.h`: "Tells host that the plug-in is dirty (something besides parameters has
+    /// changed since last save), if true the host should apply a save before quitting." — r.md #160。
+    unsafe fn setDirty(&self, state: TBool) -> tresult {
+        if state != 0 {
+            self.callbacks.report_user_change("vst3 setDirty(true)");
+        }
+        kResultOk
+    }
+
+    /// エディタ窓を開く要求。daw_01 は plugin からの要求で窓を開かない。
+    unsafe fn requestOpenEditor(&self, _name: FIDString) -> tresult {
+        kNotImplemented
+    }
+
+    /// 複数 param の編集をまとめる印 (undo のまとめ用)。plugin の値は Song の undo に載らないので何もしない。
+    unsafe fn startGroupEdit(&self) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn finishGroupEdit(&self) -> tresult {
+        kResultOk
+    }
 }
 
 impl IUnitHandlerTrait for Vst3ComponentHandler {
@@ -343,6 +369,8 @@ impl IComponentHandlerTrait for Vst3ComponentHandler {
         //     inputParameterChanges に載せない限り音は変わらない。 この push が
         //     audio thread (Vst3Plugin::process の drain) へ値を渡す。
         self.gui_param_edits.push(id, value_normalized);
+        // (3) r.md #160: 値は plugin の中にしか無いので、daw_gui は「未保存」をこの報告でしか知れない。
+        self.callbacks.report_user_change("vst3 performEdit");
         kResultOk
     }
 
@@ -380,6 +408,12 @@ impl IComponentHandlerTrait for Vst3ComponentHandler {
         // C3 (r.md #8): re-activate / I/O / latency 変更を plugin-main loop に通知し、
         // 該当 plugin を安全に reinit + latency 再 query させる。
         (self.callbacks.on_restart_component)(flags);
+        // r.md #160: 窓の中のプリセット切替 (`ivsteditcontroller.h` の kParamValuesChanged: "Multiple parameter
+        // values have changed (as result of a program change for example)")。読み込みの state 復元で呼ぶ plugin も
+        // あるが、そのときは窓が開いていないので数えない (`crate::user_edit`)。
+        if f & RestartFlags_::kParamValuesChanged as u32 != 0 {
+            self.callbacks.report_user_change("vst3 restartComponent(kParamValuesChanged)");
+        }
         kResultOk
     }
 }

@@ -32,6 +32,7 @@ mod process_scaffold;
 mod process_server;
 mod quiesce;
 mod thread_timer;
+mod user_edit;
 mod vst3_events;
 mod vst3_host;
 mod vst3_params;
@@ -809,6 +810,13 @@ impl PluginHost {
             // `gui_destroy`) が書き込む。plugin-main は窓の所有だけを持ち、
             // この atomic には触らない (「今どの窓に attach しているか」が SSoT)。
             editor_hwnd: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            editor_session: user_edit::EditorSession::default(),
+            on_state_changed: {
+                let tx = self.evt_tx.clone();
+                Arc::new(move || {
+                    let _ = tx.send(PluginEvent::PluginStateChanged { device });
+                })
+            },
         }
     }
 

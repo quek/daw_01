@@ -182,6 +182,11 @@ pub struct HostCallbacks {
     /// attach しているか」がそのまま値になる = SSoT)。読むのは `Vst3PlugFrame` /
     /// CLAP `Host` の resize callback。窓の所有は plugin-main の `EditorWindow` のまま。
     pub editor_hwnd: Arc<AtomicU64>,
+    /// r.md #160: このインスタンスのエディタ窓が開いている間 (`gui_set_parent_hwnd` 〜 `gui_destroy` の後始末の後)。
+    /// plugin の「中身が変わった」をユーザーの変更とみなすかの判定 ([`Self::report_user_change`]) が読む。
+    pub editor_session: crate::user_edit::EditorSession,
+    /// r.md #160: `PluginEvent::PluginStateChanged` を送る。直に呼ばず [`Self::report_user_change`] を通す。
+    pub on_state_changed: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// `canResize` / `can_resize` の問い合わせ結果**と、その根拠** (r.md #65)。
@@ -339,6 +344,19 @@ impl HostCallbacks {
             on_param_gesture_end: Arc::new(|_| {}),
             on_vocal_synth_status: Arc::new(|_| {}),
             editor_hwnd: Arc::new(AtomicU64::new(0)),
+            editor_session: crate::user_edit::EditorSession::default(),
+            on_state_changed: Arc::new(|| {}),
+        }
+    }
+
+    /// r.md #160: plugin が「中身が変わった」と報告した (`what` = どの口か。ログ用)。ユーザーの手による変更と
+    /// みなせるときだけ daw_gui へ伝える (判定の正本は `crate::user_edit`)。RT 以外の thread から呼ぶ
+    /// (RT の CLAP 出力 event は `ClapAudioHalf` が同じ判定を自分で読む)。
+    pub fn report_user_change(&self, what: &'static str) {
+        let counted = self.editor_session.user_is_editing();
+        tracing::debug!(what, counted, "plugin reported a state change");
+        if counted {
+            (self.on_state_changed)();
         }
     }
 }
@@ -485,6 +503,12 @@ pub trait AudioProcessorHalf: Send {
 
     /// Drain plugin-emitted PARAM_GESTURE_END param ids. Default no-op.
     fn drain_out_param_releases_into(&mut self, _out: &mut Vec<u32>) {}
+
+    /// r.md #160: 直前の `process()` が出した値の event を、ユーザーが窓の中で変えたものと判定したか
+    /// (読むと降りる。判定の正本は `crate::user_edit`)。値を audio thread から出すのは CLAP だけ。
+    fn take_out_user_edit(&mut self) -> bool {
+        false
+    }
 
     // --- lifecycle hooks (plugin-main thread, quiesced window のみ) ------
 

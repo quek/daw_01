@@ -402,6 +402,8 @@ impl AppData {
         self.with_project(project, |app| {
             if opened.is_outermost() {
                 app.resume_after_plugin_loads();
+                // r.md #160: 読み込みが確定した plugin の「閉じるときに比べる基準」を取る。
+                app.request_plugin_state_baseline_if_due();
             }
             app.cur.song_doc.end_event(opened);
         });

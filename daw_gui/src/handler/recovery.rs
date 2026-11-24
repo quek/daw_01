@@ -7,14 +7,26 @@ use crate::state::*;
 use std::path::{Path, PathBuf};
 
 impl AppData {
-    pub(crate) fn maybe_autosave(&mut self) {
+    /// 未保存のまま 60 秒経っていれば autosave する (`pub` は integration test が間隔を進めて呼ぶため)。
+    pub fn maybe_autosave(&mut self) {
         if !self.cur.song_doc.is_dirty() {
             return;
         }
         if self.cur.song_doc.last_autosave.elapsed() < std::time::Duration::from_secs(60) {
             return;
         }
+        // r.md #160: plugin の窓の中の変更は Song の blob にまだ入っていない (plugin の中にある)。先に取り直す —
+        // そのまま書くと、plugin だけを触った作業が recovery に載らない。応答で `write_autosave` が書く。
+        if self.autosave_needs_plugin_state() {
+            self.request_plugin_state_for_autosave();
+            return;
+        }
+        self.write_autosave();
+    }
 
+    /// 未保存の中身 (live の Song) を autosave の置き場へ書く。間隔と plugin state の取り直しは
+    /// [`Self::maybe_autosave`] が見る。
+    pub(crate) fn write_autosave(&mut self) {
         // sidecar に未保存の置き場のパスを書かない (置き場は sidecar を持ち主と見なさないので、
         // 落ちた後の起動時の掃除に消される。 `settle_unsaved_place_of_saved_doc` の doc)。
         if self.cur.song_doc.file_path.is_some() {

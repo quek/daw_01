@@ -160,5 +160,16 @@ pub fn fake_plugin_loaded_with_ports(
         ports,
         generation,
     }));
+    answer_plugin_state_baseline(app);
     device_id
+}
+
+/// r.md #160: 読み込みが確定すると、アプリは「閉じるときに比べる基準」の state を host へ取りに行く。本物の host は
+/// すぐ返すので、fake もここで返す (返さないと、その往復が以後の保存 / deferred edit の前に居座る)。中身は空 =
+/// 比べる相手の無い基準なので、閉じる前の比較は起きない。比較を見るテストは自分で state を返す。
+pub fn answer_plugin_state_baseline(app: &mut AppData) {
+    use daw_gui::app::PendingStateRequest;
+    if matches!(app.cur.pipc.pending_state_queue.front(), Some(PendingStateRequest::Baseline)) {
+        app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    }
 }

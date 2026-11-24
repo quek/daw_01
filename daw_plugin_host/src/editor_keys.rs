@@ -93,7 +93,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DLGC_WANTALLKEYS, DLGC_WANTCHARS, GUITHREADINFO, GetClassNameW,
     GetGUIThreadInfo, HC_ACTION, HHOOK, IsChild, MSG, PM_REMOVE,
     SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, SetWindowsHookExW, UnhookWindowsHookEx,
-    WH_GETMESSAGE, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP, WM_NULL, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WH_GETMESSAGE, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP, WM_MOUSEFIRST, WM_MOUSELAST, WM_MOUSEMOVE,
+    WM_NULL, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::editor_window::{WM_EDITOR_KEY_RELAY_DOWN, WM_EDITOR_KEY_RELAY_UP};
@@ -415,6 +416,27 @@ impl Drop for KeyHook {
     }
 }
 
+/// r.md #160: plugin へ渡る入力を `crate::user_edit` へ知らせる (plugin の「中身が変わった」という報告を
+/// ユーザーの変更とみなすかの材料)。 daw_gui へ横取りしたキー (`swallowed`) は plugin に届かないので数えず、
+/// plugin が使わずに戻してきたキー (relay) は数えたものを取り消す。
+fn note_user_input(msg: &MSG, swallowed: bool) {
+    // `WM_MOUSEMOVE` の wParam: MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2。
+    const MK_ANY_BUTTON: usize = 0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040;
+    match msg.message {
+        WM_EDITOR_KEY_RELAY_DOWN => crate::user_edit::retract_key_input(),
+        _ if swallowed => {}
+        m if is_key_down(m) => crate::user_edit::note_key_input(),
+        // ボタンを押していない移動は入力に数えない (窓の上を通っただけ)。
+        WM_MOUSEMOVE => {
+            if msg.wParam.0 & MK_ANY_BUTTON != 0 {
+                crate::user_edit::note_mouse_input();
+            }
+        }
+        m if (WM_MOUSEFIRST..=WM_MOUSELAST).contains(&m) => crate::user_edit::note_mouse_input(),
+        _ => {}
+    }
+}
+
 /// `GetMsgProc`。 `wParam` は `PM_REMOVE` / `PM_NOREMOVE`、 `lParam` は `MSG*`。
 /// 取り出し (`PM_REMOVE`) のときだけ判定し、 飲み込むなら `WM_NULL` へ書き換える。
 /// `PM_NOREMOVE` の覗き見では触らない (同じメッセージが後で取り出されるときに判定する)。
@@ -437,6 +459,7 @@ unsafe extern "system" fn get_message_hook(code: i32, wparam: WPARAM, lparam: LP
         // 借用中なら判定せず素通し (安全側 = プラグインへ渡す)。
         let swallowed = ROUTER
             .with(|r| r.try_borrow_mut().map(|mut r| r.handle(msg)).unwrap_or(false));
+        note_user_input(msg, swallowed);
         if swallowed {
             msg.message = WM_NULL;
             msg.wParam = WPARAM(0);

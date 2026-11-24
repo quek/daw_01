@@ -5,8 +5,9 @@ use std::sync::atomic::Ordering;
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency};
 use clap_sys::ext::note_name::{CLAP_EXT_NOTE_NAME, clap_host_note_name};
-use clap_sys::ext::params::{CLAP_EXT_PARAMS, clap_host_params, clap_param_clear_flags,
-    clap_param_rescan_flags};
+use clap_sys::ext::params::{CLAP_EXT_PARAMS, CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_VALUES,
+    clap_host_params, clap_param_clear_flags, clap_param_rescan_flags};
+use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state};
 use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
 use clap_sys::host::clap_host;
 use clap_sys::version::CLAP_VERSION;
@@ -51,6 +52,7 @@ pub struct Host {
     pub clap_latency: clap_host_latency,
     pub clap_params: clap_host_params,
     pub clap_note_name: clap_host_note_name,
+    pub clap_state: clap_host_state,
     pub callbacks: HostCallbacks,
 }
 
@@ -90,6 +92,9 @@ impl Host {
             },
             clap_note_name: clap_host_note_name {
                 changed: Some(note_name_changed),
+            },
+            clap_state: clap_host_state {
+                mark_dirty: Some(state_mark_dirty),
             },
             callbacks,
         });
@@ -145,6 +150,9 @@ unsafe extern "C" fn get_extension(
     }
     if id_cstr == CLAP_EXT_NOTE_NAME {
         return std::ptr::from_ref(&this.clap_note_name) as *const c_void;
+    }
+    if id_cstr == CLAP_EXT_STATE {
+        return std::ptr::from_ref(&this.clap_state) as *const c_void;
     }
     std::ptr::null()
 }
@@ -206,6 +214,21 @@ unsafe extern "C" fn params_rescan(host: *const clap_host, flags: clap_param_res
         return;
     };
     (this.callbacks.on_params_rescan)();
+    // r.md #160: 値が変わった rescan は plugin の中のプリセット切替の報告でもある (`ext/params.h` の
+    // scenario I: "Loading a preset … call clap_host_params.rescan() if anything changed")。
+    if flags & (CLAP_PARAM_RESCAN_VALUES | CLAP_PARAM_RESCAN_ALL) != 0 {
+        this.callbacks.report_user_change("clap params.rescan(values)");
+    }
+}
+
+/// CLAP `clap_host_state.mark_dirty` (`ext/state.h`: "Tell the host that the plugin state has changed and
+/// should be saved again. [main-thread]") — r.md #160。param に載らない中身 (読み込んだサンプル / パッチ …) の
+/// 変更はこの口でしか分からない。
+unsafe extern "C" fn state_mark_dirty(host: *const clap_host) {
+    let Some(this) = (unsafe { Host::from_clap(host) }) else {
+        return;
+    };
+    this.callbacks.report_user_change("clap state.mark_dirty");
 }
 
 /// CLAP `clap_host_note_name.changed` (`ext/note-name.h`: "Informs the host that the note

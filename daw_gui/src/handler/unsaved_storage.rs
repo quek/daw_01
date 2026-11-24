@@ -207,7 +207,7 @@ mod tests {
         std::fs::create_dir_all(daw.parent().unwrap()).unwrap();
         let epoch = app.cur.song_doc.edit_epoch();
         let snapshot = Box::new(app.cur.song_doc.song().clone());
-        app.finish_save(snapshot, daw.to_path_buf(), epoch);
+        app.finish_save(snapshot, daw.to_path_buf(), epoch, None);
         assert!(daw.exists(), "saved: {}", app.ui_ephemeral.status_message);
     }
 

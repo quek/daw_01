@@ -94,6 +94,7 @@ fn 削除を戻して回したツマミは_redo_で取り寄せられ_次の_und
     app.handle_event(AppEvent::Undo);
     assert_eq!(loaded_states(&drain(&mut plugin_rx), device_id), vec![Some(vec![1])], "載せる undo は即時");
     fake_plugin_loaded(&mut app, track_id, 0, "test.synth");
+    drain(&mut plugin_rx);
 
     // ツマミを回した ([5]) → redo (削除) は取り寄せてから降ろす。
     app.handle_event(AppEvent::Redo);

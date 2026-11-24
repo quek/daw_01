@@ -83,6 +83,7 @@ pub mod native_edit;
 pub mod note_selection;
 pub mod note_nudge;
 pub mod notes;
+pub mod plugin_dirty;
 pub mod project;
 pub mod parallel;
 pub mod param_gesture;

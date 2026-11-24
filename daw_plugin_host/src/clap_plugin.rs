@@ -21,7 +21,7 @@ use clap_sys::events::{
     clap_event_note, clap_input_events, clap_output_events,
 };
 use clap_sys::events::{
-    CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_MOD,
+    CLAP_EVENT_DONT_RECORD, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_MOD,
     CLAP_EVENT_PARAM_VALUE, CLAP_EVENT_TRANSPORT, CLAP_TRANSPORT_HAS_BEATS_TIMELINE,
     CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_HAS_TEMPO,
     CLAP_TRANSPORT_HAS_TIME_SIGNATURE, CLAP_TRANSPORT_IS_LOOP_ACTIVE, CLAP_TRANSPORT_IS_PLAYING,
@@ -79,6 +79,8 @@ struct ClapParamMeta {
     /// 一致 = ある)。 buffer 頭の 1 pass で立て、 global mod を捨てる判定に使う (event ごとに
     /// 全 event を走査する O(n²) を避ける)。
     per_note_epoch: u64,
+    /// r.md #160: `CLAP_PARAM_IS_READONLY` — plugin が出すだけの値 (メーター)。値が動いても中身の変更ではない。
+    readonly: bool,
 }
 
 // ====================================================================
@@ -137,6 +139,13 @@ pub struct ClapAudioHalf {
     collected_out_param_touches: Vec<u32>,
     collected_out_param_values: Vec<(u32, f64)>,
     collected_out_param_releases: Vec<u32>,
+    /// r.md #160: 直前の `process()` が、記録してよい (`CLAP_EVENT_DONT_RECORD` でない)・読み取り専用でない
+    /// param の値を出したか。collector が立て、[`AudioProcessorHalf::take_out_user_edit`] が判定に使う。
+    out_value_edited: bool,
+    /// r.md #160: 上をユーザーの変更と判定した印 (worker が読むと降りる)。
+    collected_user_edit: bool,
+    /// r.md #160: エディタ窓が開いている間 (`HostCallbacks::editor_session` の写し)。
+    editor_session: crate::user_edit::EditorSession,
     /// r.md #140: プラグインの窓で掴まれている param (出力 event の gesture から立てる)。
     gestures: process_scaffold::GestureHold,
 }
@@ -238,6 +247,11 @@ impl ClapAudioHalf {
         }
         for &id in &self.collected_out_param_releases {
             self.gestures.end(id);
+        }
+        // r.md #160: 値を出しただけではユーザーの変更と限らない (内部の変調 / host の書き込みへの反応)。
+        // 窓が開いていて直前に入力があったときだけ数える。atomic の読みと `Instant::now()` だけ。
+        if std::mem::take(&mut self.out_value_edited) && self.editor_session.user_is_editing() {
+            self.collected_user_edit = true;
         }
     }
 }
@@ -407,6 +421,8 @@ impl AudioProcessorHalf for ClapAudioHalf {
             param_touches: std::ptr::from_mut(&mut self.collected_out_param_touches),
             param_values: std::ptr::from_mut(&mut self.collected_out_param_values),
             param_releases: std::ptr::from_mut(&mut self.collected_out_param_releases),
+            param_meta: std::ptr::from_ref(&self.param_meta),
+            value_edited: std::ptr::from_mut(&mut self.out_value_edited),
         };
         let out_events = clap_output_events {
             ctx: std::ptr::from_mut(&mut out_collector) as *mut c_void,
@@ -484,6 +500,10 @@ impl AudioProcessorHalf for ClapAudioHalf {
 
     fn drain_out_param_releases_into(&mut self, out: &mut Vec<u32>) {
         out.append(&mut self.collected_out_param_releases);
+    }
+
+    fn take_out_user_edit(&mut self) -> bool {
+        std::mem::take(&mut self.collected_user_edit)
     }
 
     fn set_ara_idle(&mut self, idle: bool) {
@@ -728,6 +748,7 @@ impl ClapPlugin {
                     modulatable,
                     per_note,
                     per_note_epoch: 0,
+                    readonly: info.flags & common::protocol::plugin_param_flags::READONLY != 0,
                 },
             );
             last_param_value.insert(info.id, info.default_value);
@@ -773,6 +794,9 @@ impl ClapPlugin {
             collected_out_param_touches: Vec::with_capacity(64),
             collected_out_param_values: Vec::with_capacity(256),
             collected_out_param_releases: Vec::with_capacity(64),
+            out_value_edited: false,
+            collected_user_edit: false,
+            editor_session: host.callbacks.editor_session.clone(),
             gestures: Default::default(),
         }));
 
@@ -1187,6 +1211,7 @@ impl LoadedPlugin for ClapPlugin {
         // `set_parent` の内側から `request_resize` を投げるプラグインがあるので、
         // 窓は呼ぶ前に公開しておく (VST3 `attached` と同じ理由)。
         self.host.callbacks.editor_hwnd.store(hwnd, Ordering::Release);
+        self.host.callbacks.editor_session.open();
         let window = clap_window {
             api: CLAP_WINDOW_API_WIN32.as_ptr(),
             specific: clap_window_handle {
@@ -1225,15 +1250,15 @@ impl LoadedPlugin for ClapPlugin {
         // **先頭で** alive を落とす (r.md #65)。以後 `ClapSizer` は FFI を呼ばない。
         self.gui_alive.store(false, Ordering::Release);
         self.host.callbacks.editor_hwnd.store(0, Ordering::Release);
-        if !self.gui_created {
-            return;
-        }
-        if let Some(gui) = self.gui_ref()
+        if self.gui_created
+            && let Some(gui) = self.gui_ref()
             && let Some(f) = gui.destroy
         {
             unsafe { f(self.plugin) };
         }
         self.gui_created = false;
+        // r.md #160: `destroy` の中で確定した編集まで数えてから閉じる。
+        self.host.callbacks.editor_session.close();
     }
 }
 
@@ -1514,6 +1539,10 @@ struct OutEventCollector {
     param_touches: *mut Vec<u32>,
     param_values: *mut Vec<(u32, f64)>,
     param_releases: *mut Vec<u32>,
+    /// r.md #160: 読み取り専用の param を見分ける (`ClapAudioHalf::param_meta`)。
+    param_meta: *const std::collections::HashMap<u32, ClapParamMeta>,
+    /// r.md #160: 記録してよい・読み取り専用でない値が来たら立てる (`ClapAudioHalf::out_value_edited`)。
+    value_edited: *mut bool,
 }
 
 /// `try_push` callback shared by all CLAP plugins. Unknown types are
@@ -1638,6 +1667,14 @@ unsafe extern "C" fn collect_out_note_try_push(
                 if out.len() < out.capacity() {
                     out.push((pv.param_id, pv.value));
                 }
+            }
+            // r.md #160: MIDI CC で動いた値 (`events.h` の CLAP_EVENT_DONT_RECORD: "useful when a parameter
+            // changes because of a MIDI CC") とメーターは、中身の変更に数えない。
+            let recordable = header.flags & CLAP_EVENT_DONT_RECORD == 0;
+            let readonly = !collector.param_meta.is_null()
+                && unsafe { &*collector.param_meta }.get(&pv.param_id).is_some_and(|m| m.readonly);
+            if recordable && !readonly && !collector.value_edited.is_null() {
+                unsafe { *collector.value_edited = true };
             }
         }
         _ => {}
@@ -2123,7 +2160,14 @@ mod tests {
     /// plugin 無しの audio half (`push_mod_event` / `track_plugin_param_edits` だけを回す)。
     /// param 1 = 非 modulatable、param 2 = modulatable。どちらも 0..=10、基準値 2。
     fn mod_half() -> ClapAudioHalf {
-        let meta = |modulatable| ClapParamMeta { min: 0.0, max: 10.0, modulatable, per_note: false, per_note_epoch: 0 };
+        let meta = |modulatable| ClapParamMeta {
+            min: 0.0,
+            max: 10.0,
+            modulatable,
+            per_note: false,
+            per_note_epoch: 0,
+            readonly: false,
+        };
         ClapAudioHalf {
             plugin: std::ptr::null(),
             processing: true,
@@ -2153,6 +2197,9 @@ mod tests {
             collected_out_param_touches: Vec::new(),
             collected_out_param_values: Vec::new(),
             collected_out_param_releases: Vec::new(),
+            out_value_edited: false,
+            collected_user_edit: false,
+            editor_session: Default::default(),
             gestures: Default::default(),
         }
     }

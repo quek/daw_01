@@ -471,6 +471,8 @@ enum RtParamKind {
     Touch,
     Value,
     Release,
+    /// r.md #160: この buffer の値の出力 event がユーザーの変更と判定された (`param_id` / `value` は使わない)。
+    Edited,
 }
 
 /// RT worker → drain thread に運ぶ param event 1 件 (`Copy`、 heap なし)。
@@ -595,6 +597,7 @@ fn rt_param_to_event(ev: RtParamEvent) -> PluginEvent {
             device: ev.device,
             param_id: ev.param_id,
         },
+        RtParamKind::Edited => PluginEvent::PluginStateChanged { device: ev.device },
     }
 }
 
@@ -1117,6 +1120,10 @@ fn run_worker(
             plugin.drain_out_param_touches_into(&mut out_param_touches);
             plugin.drain_out_param_values_into(&mut out_param_values);
             plugin.drain_out_param_releases_into(&mut out_param_releases);
+            // r.md #160: 値より先に積む (ring が満杯に近いとき、「未保存」の印の方を残す)。
+            if plugin.take_out_user_edit() {
+                outbox.params.push(RtParamEvent { kind: RtParamKind::Edited, device, param_id: 0, value: 0.0 });
+            }
             if !out_param_touches.is_empty()
                 || !out_param_values.is_empty()
                 || !out_param_releases.is_empty()

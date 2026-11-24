@@ -173,6 +173,7 @@ impl AppData {
         {
             return;
         }
+        self.reset_unreported_checks();
         self.continue_close_tabs(keys);
     }
 
@@ -198,7 +199,10 @@ impl AppData {
     /// 閉じる / 終了の前に確認 (または round-trip の drain 待ち) が要るタブか。
     fn tab_needs_guard(&mut self, key: ProjectKey) -> bool {
         self.with_project(key, |app| {
-            app.cur.song_doc.is_dirty() || !app.cur.pipc.pending_state_queue.is_empty()
+            app.cur.song_doc.is_dirty()
+                || !app.cur.pipc.pending_state_queue.is_empty()
+                // r.md #160: 変更を報告しない plugin の中身を、閉じる前に基準と比べる。
+                || app.needs_unreported_check()
         })
         .unwrap_or(false)
     }

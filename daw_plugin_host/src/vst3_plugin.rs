@@ -503,6 +503,8 @@ pub struct Vst3Plugin {
     /// r.md #65: attach 中のエディタコンテナ HWND (`0` = 未 attach)。
     /// `Vst3PlugFrame::resizeView` が同期で窓を直すために読む。
     editor_hwnd: Arc<std::sync::atomic::AtomicU64>,
+    /// r.md #160: エディタ窓が開いている間 (`HostCallbacks::editor_session` の写し)。
+    editor_session: crate::user_edit::EditorSession,
 
     /// Audio half (shared with the worker registry via `audio_half()`).
     /// Its Drop never calls into the DLL (non-owning processor pointer),
@@ -743,6 +745,7 @@ impl Vst3Plugin {
             gui_attached: std::cell::Cell::new(false),
             view_alive: Arc::new(AtomicBool::new(false)),
             editor_hwnd: Arc::clone(&callbacks.editor_hwnd),
+            editor_session: callbacks.editor_session.clone(),
             audio_half,
             _module: module,
         })
@@ -1605,6 +1608,7 @@ impl LoadedPlugin for Vst3Plugin {
         // *"Note that in this call the plug-in could call a IPlugFrame::resizeView ()!"*
         // と明記していて、attach の内側から来る resize もここで同期処理できねばならない。
         self.editor_hwnd.store(hwnd, Ordering::Release);
+        self.editor_session.open();
         let res = unsafe { view.attached(hwnd as *mut c_void, kPlatformTypeHWND) };
         tracing::info!(
             plugin = %self.name,
@@ -1661,6 +1665,8 @@ impl LoadedPlugin for Vst3Plugin {
             // view ComPtr drops -> release.
             drop(view);
         }
+        // `removed()` の中で確定した編集 (入力途中の数値欄) まで数えてから閉じる。
+        self.editor_session.close();
     }
 }
 

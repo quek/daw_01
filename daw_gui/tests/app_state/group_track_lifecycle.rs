@@ -94,6 +94,9 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     // r.md #51: `is_playing` は engine の観測値なので Play 送信直後には立たない
     // (上の `AudioCommand::Play` 送信で「再生が始まった」ことは見ている)。
 
+    // 読み込み直後の基準の取り寄せ (r.md #160 の `RequestAllStates`) を捨てる (Step 3 の assertion を汚さない)。
+    let _ = drain(&mut plugin_rx);
+
     // Step 3: instrument track を group 化。
     app.handle_event(AppEvent::GroupSelectedTracks {
         track_ids: vec![inst_track_id],

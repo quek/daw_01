@@ -1434,6 +1434,14 @@ pub enum PluginEvent {
     },
     /// Plugin GUI で knob を release した通知 (gesture end)。
     PluginParamGestureEnd { device: DeviceAddr, param_id: u32 },
+    /// r.md #160: **ユーザーがプラグインの窓の中で中身を変えた**、という plugin の報告。daw_gui はそのタブを
+    /// 未保存 (`*`) にする (plugin の state は Song の外にあるので、Song の編集としては見えない)。
+    ///
+    /// 送る条件は plugin host が決める (`daw_plugin_host::user_edit` が正本): 報告の口 (param の値 /
+    /// CLAP `mark_dirty` / VST3 `setDirty`・`restartComponent(kParamValuesChanged)` …) のどれかが来て、
+    /// かつその device のエディタ窓が開いていて直前に窓への入力があったとき。読み込みの state 復元や、
+    /// host が書いたオートメーションへの反応はここに来ない。
+    PluginStateChanged { device: DeviceAddr },
     /// builtin VOICEVOX plugin の合成スレッドの状態遷移 + 進捗。
     VoicevoxSynthStatus {
         device: DeviceAddr,
@@ -1463,6 +1471,7 @@ impl PluginEvent {
             | PluginParamTouched { device, .. }
             | PluginParamValueChanged { device, .. }
             | PluginParamGestureEnd { device, .. }
+            | PluginStateChanged { device }
             | VoicevoxSynthStatus { device, .. } => Some(device.project),
             AllPluginStates { project, .. } => Some(*project),
             PluginsReinitDone { project } => *project,
