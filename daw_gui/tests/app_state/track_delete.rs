@@ -431,6 +431,7 @@ fn deferred_delete_removes_all_selected_in_one_roundtrip_and_one_undo_step() {
     // plugin host からの応答で実行。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates {
         project: app.pk(),
+        request: app.awaited_state_request(),
         entries: Vec::new(),
     }));
 
@@ -473,6 +474,7 @@ fn deferred_delete_captures_plugin_state_before_removing() {
     // Undo で復元した track の device state に現れる。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates {
         project: app.pk(),
+        request: app.awaited_state_request(),
         entries: vec![common::protocol::SlotState {
             device_id,
             data: Some(b"knob-turned".to_vec()),

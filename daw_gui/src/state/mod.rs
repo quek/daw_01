@@ -112,6 +112,13 @@ impl AppData {
         self.cur.key
     }
 
+    /// `cur` がいま応答を待っている `RequestAllStates` の番号。待っていなければ `0` (どの要求にも振らない
+    /// 番号 = その番号の応答は捨てられる)。integration test が plugin host の応答を模すのに使う。
+    #[must_use]
+    pub fn awaited_state_request(&self) -> u64 {
+        self.cur.pipc.awaited_state_request.unwrap_or(0)
+    }
+
     /// `cur` の device の wire 上の住所 (`docs/plan_project_tabs.md` §1.2)。
     #[must_use]
     pub fn dev(&self, device_id: u64) -> common::protocol::DeviceAddr {

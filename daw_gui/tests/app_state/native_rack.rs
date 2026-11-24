@@ -79,7 +79,7 @@ fn add_track(app: &mut AppData) -> u32 {
 }
 
 fn flush_states(app: &mut AppData) {
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
 }
 
 fn relocate(app: &mut AppData, device_ids: Vec<u64>, dest: ChainRef, dest_index: InsertAt, copy: bool) {

@@ -1490,7 +1490,11 @@ impl AppData {
         }
         // r.md #160: 応答の state が確実に含むのは、この送信までに報告された plugin の変更。
         self.cur.pipc.state_request_plugin_edits = self.cur.song_doc.plugin_edits();
-        self.send_plugin(PluginCommand::RequestAllStates { project: self.pk() });
+        // 応答はこの番号で突き合わせる (`ProjectIpc::awaited_state_request`)。
+        self.cur.pipc.last_state_request += 1;
+        let request = self.cur.pipc.last_state_request;
+        self.cur.pipc.awaited_state_request = Some(request);
+        self.send_plugin(PluginCommand::RequestAllStates { project: self.pk(), request });
         // この瞬間から応答 (AllStatesReceived) までを on_tick の watchdog
         // が監視する。 host が hang して応答が来ないと永久ロックになるため。
         self.cur.pipc.state_request_sent_at = Some(std::time::Instant::now());
@@ -1539,6 +1543,8 @@ impl AppData {
     pub(crate) fn abort_state_roundtrip(&mut self) {
         let dropped: Vec<PendingStateRequest> = self.cur.pipc.pending_state_queue.drain(..).collect();
         self.cur.pipc.state_request_sent_at = None;
+        // 破棄した要求の応答が後から届いても受けない (次の要求は別の番号で待つ)。
+        self.cur.pipc.awaited_state_request = None;
         // r.md #160: 確かめられなかった「閉じる前の比較」は未保存に倒す。下の Quit の再評価より **前** に
         // (再評価が確認モーダルを出せるように)。
         self.settle_aborted_plugin_state_requests(&dropped);

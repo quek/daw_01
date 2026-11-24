@@ -26,7 +26,7 @@ fn setup_chain(app: &mut AppData) -> (u32, [u64; 3]) {
 }
 
 fn flush_states(app: &mut AppData) {
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
 }
 
 /// track 0 の最上位の device id (組み込み native はチェーン末尾に必ず居るので除く)。

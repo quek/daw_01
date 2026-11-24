@@ -20,10 +20,27 @@ fn respond(app: &mut AppData, device_id: u64, data: &[u8]) {
     respond_to(app, app.pk(), device_id, data);
 }
 
-/// [`respond`] の、宛先のタブを指定する版 (背景タブ宛の応答)。
+/// [`respond`] の、宛先のタブを指定する版 (背景タブ宛の応答)。そのタブがいま待っている要求への応答。
 fn respond_to(app: &mut AppData, project: ProjectKey, device_id: u64, data: &[u8]) {
+    let request = app.with_project(project, |app| app.awaited_state_request()).expect("tab is open");
+    respond_as(app, project, request, device_id, data);
+}
+
+/// 要求の番号を指定して応答する (待っていない番号 = 破棄した要求の遅れた応答)。
+fn respond_as(app: &mut AppData, project: ProjectKey, request: u64, device_id: u64, data: &[u8]) {
     let entries = vec![SlotState { device_id, data: Some(data.to_vec()), ara_archive: None, error: None }];
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project, entries }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project, request, entries }));
+}
+
+/// いま host へ出ている `RequestAllStates` の番号 (`msgs` の最後の要求)。
+fn last_request(msgs: &[PluginCommand]) -> u64 {
+    msgs.iter()
+        .rev()
+        .find_map(|m| match m {
+            PluginCommand::RequestAllStates { request, .. } => Some(*request),
+            _ => None,
+        })
+        .expect("a RequestAllStates was sent")
 }
 
 /// 楽器を 1 つ載せ、読み込みが確定した直後 (基準の state の要求が host へ出たところ) の app と device id。
@@ -251,6 +268,34 @@ fn 比較の応答が来なければ未保存に倒して聞き_保存せず終�
 
     app.handle_event(AppEvent::DirtyGuardDiscard);
     assert!(app.shutdown.is_shutting_down());
+}
+
+/// 待ちきれずに破棄した要求の応答が後から届いても、次の要求 (ここでは「保存して終了」の保存) の応答として
+/// 受けない。受けると、破棄から保存までの間に変わった中身 (device の増減も) が入っていない古い時点の state を
+/// 保存して終了してしまう。
+#[test]
+fn 破棄した要求の遅れた応答を_次の保存の応答として受けない() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proj.daw");
+    let (mut app, mut plugin_rx, device_id) = saved_project_with_plugin(&path, &[1]);
+    let project = app.pk();
+
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
+    let stale = last_request(&drain(&mut plugin_rx));
+    app.poll_state_roundtrip_watchdog(Instant::now() + Duration::from_secs(120));
+    app.handle_event(AppEvent::DirtyGuardSave);
+    let current = last_request(&drain(&mut plugin_rx));
+    assert_ne!(stale, current, "要求ごとに別の番号");
+
+    respond_as(&mut app, project, stale, device_id, &[9]);
+    assert!(!app.shutdown.is_shutting_down() && app.cur.song_doc.is_dirty(), "古い応答では保存しない");
+    assert_eq!(app.cur.pipc.pending_state_queue.len(), 1, "保存はまだ応答を待っている");
+
+    respond_as(&mut app, project, current, device_id, &[2]);
+    assert!(app.shutdown.is_shutting_down(), "{}", app.ui_ephemeral.status_message);
+    let saved = common::project::load_project(&path).expect("reload");
+    let state = saved.song.tracks[0].plugins().next().expect("synth").state.clone();
+    assert_eq!(state.as_deref(), Some(&[2u8][..]), "保存の要求に対する応答の state が入っている");
 }
 
 /// host が居ない (crash 後に respawn を断念): 取り直せないので比べずに終了する (保存もできない状態)。

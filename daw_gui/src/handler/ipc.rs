@@ -310,8 +310,8 @@ impl AppData {
                 self.on_plugin_load_failed_from_child(device_id, plugin_id, reason, generation);
             }
             PluginEvent::SlotPluginState { .. } => {}
-            PluginEvent::AllPluginStates { entries, .. } => {
-                self.on_all_states_from_child(entries);
+            PluginEvent::AllPluginStates { request, entries, .. } => {
+                self.on_all_states_from_child(request, entries);
             }
             PluginEvent::SlotGuiGeometry {
                 device: DeviceAddr { device_id, .. },

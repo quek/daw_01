@@ -1156,7 +1156,11 @@ pub enum PluginCommand {
     RequestSlotState { device: DeviceAddr },
     /// Ask the plugin_host to capture state for every device of `project` at once.
     /// Reply is `PluginEvent::AllPluginStates`. Used for project save.
-    RequestAllStates { project: ProjectKey },
+    ///
+    /// `request` は daw_gui が要求ごとに振る番号で、応答がそのまま返す。daw_gui は「いま待っている番号」の
+    /// 応答だけを受ける — 応答を待ちきれずに破棄した要求の応答が後から届いても、次の要求の応答として
+    /// 受け取らない (その間に device が増減していると、古い時点の state を保存してしまう)。
+    RequestAllStates { project: ProjectKey, request: u64 },
     /// r.md #138: 鍵盤ごとの名前を取り直し、 前回送った内容から変わっていたら
     /// `PluginEvent::PluginKeyNames` を送る (変わっていなければ返事は無い)。 daw_gui が
     /// ピアノロールにその音源の鍵盤を出し始めたときに送る — 通知せずに名前を変える plugin の、
@@ -1356,8 +1360,9 @@ pub enum PluginEvent {
         device: DeviceAddr,
         data: Option<Vec<u8>>,
     },
-    /// Reply to `RequestAllStates { project }`: one entry per loaded device of that project.
-    AllPluginStates { project: ProjectKey, entries: Vec<SlotState> },
+    /// Reply to `RequestAllStates { project, request }`: one entry per loaded device of that project.
+    /// `request` は要求の番号をそのまま返す。
+    AllPluginStates { project: ProjectKey, request: u64, entries: Vec<SlotState> },
     /// r.md #65: エディタ窓のジオメトリ。open 直後 / **rect が変わったとき** /
     /// close 直前に送る。rect の変化は `WM_MOVE` / `WM_SIZE` だけが拾う
     /// (`EditorWindow::take_geometry_change` の不変条件。ドラッグ中は modal ループで
@@ -1637,7 +1642,7 @@ mod tests {
             Some(P2)
         );
         assert_eq!(
-            PluginEvent::AllPluginStates { project: P1, entries: vec![] }.project(),
+            PluginEvent::AllPluginStates { project: P1, request: 1, entries: vec![] }.project(),
             Some(P1)
         );
         assert_eq!(PluginEvent::PluginsReinitDone { project: None }.project(), None);
@@ -1782,6 +1787,7 @@ mod tests {
     fn all_plugin_states_roundtrip() {
         let msg = PluginEvent::AllPluginStates {
             project: P2,
+            request: 7,
             entries: vec![
                 SlotState {
                     device_id: 1,

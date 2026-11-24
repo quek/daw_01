@@ -182,6 +182,6 @@ pub fn send_plugin_loaded(
 pub fn answer_plugin_state_baseline(app: &mut AppData) {
     use daw_gui::app::PendingStateRequest;
     if matches!(app.cur.pipc.pending_state_queue.front(), Some(PendingStateRequest::Baseline)) {
-        app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+        app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     }
 }

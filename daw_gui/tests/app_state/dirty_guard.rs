@@ -128,7 +128,7 @@ fn save_with_plugins_waits_for_states_then_quits() {
     assert!(!path.exists(), "not saved yet (awaiting states)");
 
     // plugin state 到着 → 保存実行 → 終了確定。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
 
     assert!(path.exists(), "project saved after states arrive");
     assert!(!app.cur.song_doc.is_dirty(), "is_dirty cleared after async save");
@@ -365,7 +365,7 @@ fn close_tab_during_in_flight_save_preserves_old_project() {
     );
 
     // plugin state 到着 → 実プロジェクトを保存 → queue drain → 再評価で閉じる。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
 
     let saved = common::project::load(&path).expect("project saved to disk");
     assert_eq!(
@@ -429,7 +429,7 @@ fn close_tab_during_deferred_edit_defers_then_reevaluates() {
 
     // round-trip 完了 → 削除実行で project が dirty 化 → drain 後に閉じるを再評価
     // → dirty なので確認モーダルを開く (= 黙って捨てない)。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert!(app.cur.pipc.guard_pending_action.is_none(), "deferred guard consumed");
     assert_eq!(
         app.ui_ephemeral.dirty_guard,

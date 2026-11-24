@@ -163,6 +163,13 @@ pub struct ProjectIpc {
     /// でなく **hang** した場合は応答が永久に来ないので、`on_tick` の watchdog が
     /// この時刻からの無応答経過を見て round-trip を破棄し、脱出口を作る。
     pub(crate) state_request_sent_at: Option<std::time::Instant>,
+    /// いま応答を待っている `RequestAllStates` の番号 (`PluginCommand::RequestAllStates::request`)。
+    /// `dispatch_front_state_request` が送るときに立て、その番号の応答か往復の破棄で `None` に戻す。
+    /// **これと違う番号の応答は捨てる** — 待ちきれずに破棄した要求の応答が後から届いても、次の要求の
+    /// 応答として受け取らない。
+    pub(crate) awaited_state_request: Option<u64>,
+    /// 最後に振った要求の番号 (このタブの中で単調増加。タブの key は再利用しないので、タブごとで足りる)。
+    pub(crate) last_state_request: u64,
     /// `pending_state_queue` の drain 待ちで保留しているガード操作 (`docs/plan_project_tabs.md`
     /// §5.1)。**このタブの round-trip に紐づくのでタブごとに持つ** — アプリ全体に 1 つだと、
     /// 別のタブの round-trip が drain した瞬間に「そのタブの dirty 状態」で再評価され、
@@ -957,6 +964,8 @@ impl ProjectState {
                 gui_open_requests: Vec::new(),
                 pending_state_queue: std::collections::VecDeque::new(),
                 state_request_sent_at: None,
+                awaited_state_request: None,
+                last_state_request: 0,
                 guard_pending_action: None,
                 state_request_plugin_edits: 0,
                 plugin_state_baseline: Default::default(),

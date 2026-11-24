@@ -40,7 +40,7 @@ fn disabled_while_playing(app: &mut AppData) -> (u32, u64) {
     let device_id = app.cur.song_doc.song().tracks[0].plugins().next().expect("synth").id;
     app.cur.transport.is_playing = true;
     app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![track_id], enabled: false });
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     (track_id, device_id)
 }
 
@@ -80,6 +80,7 @@ fn 無効化は_state_を書き戻してから降ろし_有効化と_undo_redo_�
     // host の最新 state が届く → Song に書き戻してから無効化 + 降ろす。
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates {
         project: app.pk(),
+        request: app.awaited_state_request(),
         entries: vec![SlotState { device_id, data: Some(vec![7, 7, 7]), ara_archive: None, error: None }],
     }));
     let msgs = drain(&mut plugin_rx);
@@ -102,7 +103,7 @@ fn 無効化は_state_を書き戻してから降ろし_有効化と_undo_redo_�
     assert!(msgs.iter().any(|m| matches!(m, PluginCommand::RequestAllStates { .. })), "{msgs:?}");
     assert_eq!(removes(&msgs, device_id), 0, "state を取り寄せる前に降ろさない: {msgs:?}");
     assert!(app.cur.song_doc.song().track_effectively_enabled(track_id), "取り寄せの間は動かさない");
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     let msgs = drain(&mut plugin_rx);
     assert!(!app.cur.song_doc.song().track_effectively_enabled(track_id));
     assert_eq!(removes(&msgs, device_id), 1, "{msgs:?}");
@@ -169,13 +170,13 @@ fn 無効な_group_へ移すと降り_解くと戻る() {
     app.handle_event(AppEvent::AddInstrumentTrack);
     let group = app.cur.song_doc.song().tracks.iter().map(|t| t.id).find(|&id| id != child).expect("group");
     app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![group], enabled: false });
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     drain(&mut plugin_rx);
     assert!(!app.cur.song_doc.song().track_effectively_enabled(group), "前提: 無効な group");
 
     app.handle_event(AppEvent::SetTrackParent { track_ids: vec![child], parent_id: Some(group), anchor_after: None });
     assert_eq!(removes(&drain(&mut plugin_rx), device_id), 0, "state の往復が済むまで降ろさない");
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert!(!app.cur.song_doc.song().track_effectively_enabled(child), "無効な group の子は実効的に無効");
     assert!(app.cur.song_doc.song().track_by_id(child).is_some_and(|t| t.enabled), "子自身の値は有効のまま");
     assert_eq!(removes(&drain(&mut plugin_rx), device_id), 1);
@@ -259,7 +260,7 @@ fn undo_redo_で有効へ戻るときも読み込み中を構造より先に届�
     // 無効へ戻る redo は読み込み済みの plugin を降ろすので、state の往復の後に動く。
     app.handle_event(AppEvent::Redo);
     assert!(app.cur.song_doc.song().track_effectively_enabled(track_id), "取り寄せの間は動かさない");
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     let msgs = drain(&mut audio_rx);
     let disabled = load_song_at(&msgs, track_id, false).expect("構造");
     let close = position(&msgs, |m| matches!(m, AudioCommand::ClosePluginShmem { device_id: d, .. } if *d == device_id));
@@ -309,7 +310,7 @@ fn child_in_disabled_group(app: &mut AppData) -> (u32, u64, u32) {
     let group = app.cur.song_doc.song().tracks.iter().map(|t| t.id).find(|&id| id != child).expect("group");
     app.handle_event(AppEvent::SetTrackParent { track_ids: vec![child], parent_id: Some(group), anchor_after: None });
     app.handle_event(AppEvent::SetTracksEnabled { track_ids: vec![group], enabled: false });
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert!(!app.cur.song_doc.song().track_effectively_enabled(child), "前提: 無効な group の子");
     (child, device_id, group)
 }
@@ -345,7 +346,7 @@ fn 無効な_group_を解くと子の読み込み中を構造より先に届け_
     drain(&mut plugin_rx);
 
     app.handle_event(AppEvent::UngroupTracks { track_ids: vec![group] });
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert!(app.cur.song_doc.song().track_by_id(group).is_none(), "前提: group を解いた");
     let msgs = drain(&mut audio_rx);
     let runs = runs_at(&msgs, child).expect("子を実行に入れる構造");

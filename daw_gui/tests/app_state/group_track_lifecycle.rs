@@ -201,7 +201,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     // RemoveDevices は plugin の最新 state を取ってから Undo snapshot → 削除 という
     // deferred path を通る。 test では plugin_host を mock していないので、 fake で
     // AllStatesReceived を流して deferred edit を実行させる。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     let plugin_msgs = drain(&mut plugin_rx);
     assert!(
         plugin_msgs.iter().any(|m| matches!(
@@ -238,7 +238,7 @@ fn group_lifecycle_keeps_instrument_loaded_after_ungroup() {
     app.handle_event(AppEvent::UngroupTracks {
         track_ids: vec![group_id],
     });
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     // ungroup handler は group を外した構造 (LoadSong) を送ってから ClosePluginShmem を直送する (UAF 防止)。
     // frame flush は残りの編集 (無ければ no-op)。
     app.flush_song_sync();
@@ -387,7 +387,7 @@ fn inspector_chain_reorder_permutes_song_and_keeps_caches() {
     })));
     // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
     // 空の AllPluginStates で flush する。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
 
     // (a) song permutation: device 順が [synth, delay, bitcrush] に。
     {
@@ -470,7 +470,7 @@ fn inspector_chain_reorder_keeps_automation_lane_device_ids() {
     })));
     // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
     // 空の AllPluginStates で flush する。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
 
     // bitcrush moved index 1 -> index 2; the lane still points at bitcrush by id.
     assert_eq!(
@@ -532,7 +532,7 @@ fn inspector_chain_reorder_works_even_with_an_unloaded_device() {
     })));
     // 運搬は plugin state の round-trip 待ちに積まれる (device_relocate.rs と同じ) ので、
     // 空の AllPluginStates で flush する。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
 
     let after: Vec<String> = app.cur.song_doc.song().tracks[0]
         .plugins()
@@ -550,7 +550,7 @@ fn inspector_chain_reorder_works_even_with_an_unloaded_device() {
     assert!(
         plugin_msgs
             .iter()
-            .all(|m| matches!(m, PluginCommand::RequestAllStates { project: _ })),
+            .all(|m| matches!(m, PluginCommand::RequestAllStates { .. })),
         "並べ替えは plugin instance を作り直さない: {plugin_msgs:?}"
     );
 }

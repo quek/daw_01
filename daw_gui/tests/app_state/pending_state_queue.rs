@@ -83,7 +83,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     let msgs = drain(&mut plugin_rx);
     assert_eq!(
         msgs.iter()
-            .filter(|m| matches!(m, PluginCommand::RequestAllStates { project: _ }))
+            .filter(|m| matches!(m, PluginCommand::RequestAllStates { .. }))
             .count(),
         1,
         "1st RemoveDevices triggers 1 RequestAllStates: {msgs:?}"
@@ -113,7 +113,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     assert!(
         !msgs
             .iter()
-            .any(|m| matches!(m, PluginCommand::RequestAllStates { project: _ })),
+            .any(|m| matches!(m, PluginCommand::RequestAllStates { .. })),
         "no extra RequestAllStates while in-flight: {msgs:?}"
     );
     assert!(
@@ -125,7 +125,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
 
     // 1 回目の AllStatesReceived → 1 件目 (index 1) が実行され、 queue 残り 1、
     // 次の RequestAllStates が再発行される。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert_eq!(
         app.cur.pipc.pending_state_queue.len(),
         1,
@@ -138,7 +138,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     assert!(removed_dev1, "RemoveSlotPlugin(bitcrush) sent: {msgs:?}");
     let req_count = msgs
         .iter()
-        .filter(|m| matches!(m, PluginCommand::RequestAllStates { project: _ }))
+        .filter(|m| matches!(m, PluginCommand::RequestAllStates { .. }))
         .count();
     assert_eq!(
         req_count, 1,
@@ -147,7 +147,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
 
     // 2 回目の AllStatesReceived → 2 件目 (index 2) が実行され、 queue 空、
     // RequestAllStates は再発行されない (= no follow-up)。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert!(
         app.cur.pipc.pending_state_queue.is_empty(),
         "queue drained after both responses"
@@ -159,7 +159,7 @@ fn consecutive_remove_slot_serializes_through_state_queue() {
     assert!(removed_dev2, "RemoveSlotPlugin(delay) sent: {msgs:?}");
     let req_count = msgs
         .iter()
-        .filter(|m| matches!(m, PluginCommand::RequestAllStates { project: _ }))
+        .filter(|m| matches!(m, PluginCommand::RequestAllStates { .. }))
         .count();
     assert_eq!(
         req_count, 0,
@@ -260,14 +260,14 @@ fn save_behind_deferred_remove_snapshots_post_removal_layout() {
     assert!(
         !msgs
             .iter()
-            .any(|m| matches!(m, PluginCommand::RequestAllStates { project: _ })),
+            .any(|m| matches!(m, PluginCommand::RequestAllStates { .. })),
         "no extra RequestAllStates while Deferred in-flight: {msgs:?}"
     );
 
     // R1 応答 → Deferred(RemoveDevices bitcrush) 実行 (live devices → [synth, delay])、
     // queue 残り [Save]、 dispatch_front_state_request が Save の snapshot を **今の**
     // live (= 削除後 layout) で充填し、 R2 を送る。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert_eq!(
         app.cur.pipc.pending_state_queue.len(),
         1,
@@ -326,7 +326,7 @@ fn save_and_quit_clean_starts_shutdown() {
     assert!(has_pending_save(&app), "Save in-flight");
 
     // 編集なしで応答到着 → finish_save が clean を確認して終了シーケンスへ。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert!(app.shutdown.is_shutting_down(), "clean async save-and-quit starts the shutdown sequence");
     assert!(
         app.ui_ephemeral.guard_after_save.is_none(),
@@ -364,7 +364,7 @@ fn save_and_quit_with_window_edit_resaves_instead_of_quitting() {
 
     // 応答到着 → finish_save: saved baseline = 編集前 snapshot、 live は編集後で
     // dirty。 終了シーケンスには入らず、 再保存が enqueue され、 終了意図は維持される。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert!(
         !app.shutdown.is_shutting_down(),
         "window edit during save-and-quit must NOT quit (would drop the edit)"
@@ -412,7 +412,7 @@ fn save_with_idle_queue_freezes_snapshot_at_invoke() {
     let msgs = drain(&mut plugin_rx);
     assert_eq!(
         msgs.iter()
-            .filter(|m| matches!(m, PluginCommand::RequestAllStates { project: _ }))
+            .filter(|m| matches!(m, PluginCommand::RequestAllStates { .. }))
             .count(),
         1,
         "idle-queue Save sends exactly 1 RequestAllStates: {msgs:?}"
