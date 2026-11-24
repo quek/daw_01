@@ -1054,6 +1054,10 @@ pub fn handle_project_command(
                 slot.store(ids.next().unwrap_or(0), Ordering::Release);
             }
         }
+        // r.md #161: フォローアクションの全体 on/off も「聴き方」。RT が buffer 頭で読む。
+        AudioCommand::SetFollowActionsEnabled { enabled, .. } => {
+            shared.follow_actions_enabled.store(enabled, Ordering::Release);
+        }
         AudioCommand::SetDeviceScopes { device_ids, .. } => {
             ctl.device_scope_watch = device_scope_watch(&ctl.device_scope_watch, &device_ids);
             ctl.republish(engine_shared, session_sample_rate, phase_tables);

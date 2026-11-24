@@ -773,6 +773,11 @@ pub enum AudioCommand {
     SwitchRowToArranger { project: ProjectKey, track_id: u32, lane_id: u32 },
     /// r.md #87: 全行の主導権をアレンジへ返す。
     SwitchAllToArranger { project: ProjectKey },
+    /// r.md #161: クリップと列のフォローアクションを全体で効かせるか (Live の Enable Follow Actions Globally)。
+    /// **聴き方の都合**で Song には書かない (`SetScListen` と同じ扱い: 書き出しは常に on で走り、engine は
+    /// LoadSong / project 切替でも値を変えない)。off の間は発火を見送り、鳴っているセルはそのまま回り続ける。
+    /// on に戻すと、発火の格子 (撃った拍からの周期) の次の境界から再開する。slot の既定は on。
+    SetFollowActionsEnabled { project: ProjectKey, enabled: bool },
     /// Global Sampler (`docs/plan_global_sampler.md` §3.2): daw_gui が create した
     /// 音声リング (`sampler_ring::sampler_shmem_id`) を open し、次の buffer から
     /// `source` の音を書き続ける。既に開いているリングは置き換える (旧世代は
@@ -871,6 +876,7 @@ impl AudioCommand {
             | StopAllRows { project, .. }
             | SwitchRowToArranger { project, .. }
             | SwitchAllToArranger { project }
+            | SetFollowActionsEnabled { project, .. }
             | PreviewSequence { project, .. }
             | PreviewSequenceStop { project } => Some(*project),
             OpenSamplerRing { source, .. } => source.project(),
