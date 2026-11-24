@@ -263,6 +263,8 @@ impl BufferSpan {
 
 /// ランチャーの走行状態一式。`LocalState` (live) と `export.rs` (書き出し) が
 /// **同じ型**を持つ — 片方だけ挙動が違うと Q9 の「聴こえた通りに書き出す」が壊れる。
+/// 例外は r.md #161 のフォローアクションの全体 off だけ (聴き方の都合で、書き出しには焼き込まない。
+/// [`Self::set_follow_enabled`])。
 #[derive(Debug)]
 pub struct LauncherRuntime {
     rows: Vec<RowRuntime>,
@@ -342,7 +344,9 @@ impl LauncherRuntime {
     ///
     /// off の間、発火の時計 (`follow_at` / `scene.at`) は止めずに **同じ格子の次の周期へ送り続ける**
     /// ([`Self::apply_follow`] / [`Self::tick_scene_follow`])。鳴っているセルの位相には触らないので
-    /// そのまま回り続け、on に戻した後の最初の境界で 1 回だけ発火する (過ぎたぶんをまとめて撃たない)。
+    /// そのまま回り続け (ループしないセルは最後まで鳴って止まる)、on に戻した後の最初の境界で 1 回だけ
+    /// 発火する (過ぎたぶんをまとめて撃たない。ループしないセルが止まった後の行も、on のときと同じく
+    /// 時計は生きているので、その境界で発火する)。off にする前に発火済みの量子化待ちは取り消さない。
     /// 乱数は `f(seed, 発火拍)` の純関数なので、見送った回の抽選を引かなくても後の目は変わらない。
     pub fn set_follow_enabled(&mut self, enabled: bool) {
         self.follow_enabled = enabled;

@@ -103,6 +103,7 @@ pub mod section_event;
 /// r.md #129: SC Listen (聴き方の都合、Song に書かない) の唯一の口。
 pub mod sc_listen;
 pub mod device_mix;
+pub mod follow_global;
 pub mod select_all;
 pub mod selection_view;
 /// r.md #156: 設定 window の開閉と、左のカテゴリの切り替え。

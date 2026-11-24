@@ -775,7 +775,8 @@ pub enum AudioCommand {
     SwitchAllToArranger { project: ProjectKey },
     /// r.md #161: クリップと列のフォローアクションを全体で効かせるか (Live の Enable Follow Actions Globally)。
     /// **聴き方の都合**で Song には書かない (`SetScListen` と同じ扱い: 書き出しは常に on で走り、engine は
-    /// LoadSong / project 切替でも値を変えない)。off の間は発火を見送り、鳴っているセルはそのまま回り続ける。
+    /// LoadSong / project 切替でも値を変えない)。off の間は発火を見送り、鳴っているセルはそのまま回り続ける
+    /// (ループしないセルは最後まで鳴って止まる)。
     /// on に戻すと、発火の格子 (撃った拍からの周期) の次の境界から再開する。slot の既定は on。
     SetFollowActionsEnabled { project: ProjectKey, enabled: bool },
     /// Global Sampler (`docs/plan_global_sampler.md` §3.2): daw_gui が create した

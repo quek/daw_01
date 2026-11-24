@@ -82,6 +82,10 @@ name = "chord_smoke"
 required-features = ["script"]
 
 [[test]]
+name = "follow_global_smoke"
+required-features = ["script"]
+
+[[test]]
 name = "clip_label_display_smoke"
 required-features = ["script"]
 

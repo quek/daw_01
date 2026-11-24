@@ -1496,7 +1496,8 @@ fn current_version_is_pinned() {
     // serde default の空 / ON / Off で読める)。
     // v48 (r.md #159): `Clip.chord_basis` (serde default の空 = 置いたままで読める) と `AudioChordSpan.chordal`
     // (旧ファイルの `audio_chords` は `project::drop_audio_chords_without_chordal` が捨てる)。
-    assert_eq!(CURRENT_VERSION, 48);
+    // v49 (r.md #161): `BindingTarget::ToggleFollowActions` (旧ファイルには存在しない)。
+    assert_eq!(CURRENT_VERSION, 49);
 }
 
 #[test]

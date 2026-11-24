@@ -269,6 +269,9 @@ pub enum LauncherEvent {
     AllToArranger,
     /// トランスポートのグローバルローンチ量子化。
     SetGlobalQuantize(LaunchQuantize),
+    /// r.md #161: フォローアクションの全体 on/off (トランスポートのボタン)。Song は書かない
+    /// (`handler::follow_global`)。
+    SetFollowActionsEnabled(bool),
 
     // ---- 表示 (計画書 Q5 / Q5-b) --------------------------------------
     SetLayout(common::model::LauncherLayout),

@@ -875,7 +875,8 @@ fn render_loop(
     // 状態から始め、以降はフォローアクションが決定論的に進む
     // (乱数は `f(seed, 発火拍)` の純ハッシュ) ので、同じプロジェクトなら
     // 何度書き出しても同じファイルになる。走行位置を `Song` に保存しないのが
-    // その前提 (§1.4)。
+    // その前提 (§1.4)。r.md #161: フォローアクションの全体 off は聴き方の都合なので渡さない
+    // (`set_follow_enabled` を呼ばない = 常に on で走る)。
     let mut launcher = crate::launcher::LauncherRuntime::for_song(song);
     launcher.arm_reseed();
     // ここから先、描画の器が指しうる物は全部この持ち主の中 (`Walk` / `WalkOwner` の doc)。
