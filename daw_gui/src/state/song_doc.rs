@@ -608,10 +608,10 @@ impl SongDoc {
         self.state_id != self.saved_state_id || self.plugin_edits != self.saved_plugin_edits
     }
 
-    /// いまの中身 (Song も plugin も) を保存済みベースラインにする。plugin state を取り直さない保存
-    /// (plugin が無い) と、「保存せず終了」で未保存を捨てるときに使う。plugin state を取り直す保存は
-    /// [`Self::mark_song_saved`] と [`Self::mark_plugin_edits_saved`] を別々に呼ぶ (取り直しの往復の間に
-    /// 来た報告を落とさないため)。
+    /// いまの中身 (Song も plugin も) を保存済みベースラインにする。「保存せず終了」で未保存を捨てるときに
+    /// 使う。保存 (`finish_save`) は [`Self::mark_song_saved`] と
+    /// [`Self::mark_plugin_edits_saved`] を別々に呼ぶ (plugin の state を取り直す往復の間に来た報告を
+    /// 落とさないため)。
     pub fn mark_saved(&mut self) {
         self.mark_song_saved();
         self.saved_plugin_edits = self.plugin_edits;

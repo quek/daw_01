@@ -1250,6 +1250,9 @@ impl AppData {
             return;
         }
         if self.cur.song_doc.is_dirty() {
+            // 待ち行列の再評価 (`advance_state_queue`) は背景タブ宛の応答からも来る。待っている間に別のタブへ
+            // 切り替えられていても、聞くのはこのタブのこと。
+            self.activate_visited_tab();
             self.ui_ephemeral.dirty_guard = Some(action);
         } else {
             self.perform_guard_action(action);
@@ -1602,10 +1605,13 @@ impl AppData {
             elapsed_s = now.saturating_duration_since(since).as_secs(),
             "plugin-state round-trip stalled past watchdog timeout; aborting (host hang?)"
         );
+        let user_waiting = self.cur.pipc.pending_state_queue.iter().any(|r| !r.is_background());
         self.abort_state_roundtrip();
-        self.ui_ephemeral.status_message =
-            "プラグインが応答しないため保存/操作を中止しました（オートセーブは保持されています）"
-                .into();
+        if user_waiting {
+            self.ui_ephemeral.status_message =
+                "プラグインが応答しないため保存/操作を中止しました（オートセーブは保持されています）"
+                    .into();
+        }
     }
 
     /// project save の trigger。 plugin がある場合は plugin_host から

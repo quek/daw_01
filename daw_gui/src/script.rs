@@ -99,6 +99,10 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("closeTab", tabs::daw_close_tab, 0),
     ("switchTab", tabs::daw_switch_tab, 1),
     ("tabsJson", tabs::daw_tabs_json, 0),
+    ("appCloseTab", tabs::daw_app_close_tab, 0),
+    ("appCloseGuardJson", tabs::daw_app_close_guard_json, 0),
+    ("pluginParamsJson", tabs::daw_plugin_params_json, 2),
+    ("appSetPluginParam", tabs::daw_app_set_plugin_param, 4),
     ("metricsJson", tabs::daw_metrics_json, 0),
     ("pendingPluginLoadsJson", daw_pending_plugin_loads, 0),
     // ----- PR7 follow-up (JS test infra) ----------------------------
@@ -946,10 +950,9 @@ fn daw_device_chain(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
 /// JSON 配列で、チェーン表示順に並べて渡す。
 ///
 /// 呼ぶのは `relocate_devices_inner` (= Song 側処理) で、
-/// [`AppData::relocate_devices`] の **plugin state round-trip 待ち**は経由しない。
-/// script mode には `AllPluginStates` を pump する口が無く、待たせると永久に
-/// 完了しないため。 round-trip 込みの経路は headless test
-/// (`daw_gui/tests/app_state/device_relocate.rs`) が応答を fake して押さえている。
+/// [`AppData::relocate_devices`] の **plugin state round-trip 待ち**は経由しない
+/// (この API は同期で結果を返す。応答は次に event を pump するまで届かない)。 round-trip 込みの経路は
+/// headless test (`daw_gui/tests/app_state/device_relocate.rs`) が応答を fake して押さえている。
 /// undo step は round-trip の完了 (`on_all_states_from_child`) と同じく、操作名の付いた
 /// 独立した 1 step で積む。
 fn daw_relocate_devices(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {

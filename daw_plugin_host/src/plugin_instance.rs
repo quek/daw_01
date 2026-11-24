@@ -353,9 +353,9 @@ impl HostCallbacks {
     /// みなせるときだけ daw_gui へ伝える (判定の正本は `crate::user_edit`)。RT 以外の thread から呼ぶ
     /// (RT の CLAP 出力 event は `ClapAudioHalf` が同じ判定を自分で読む)。
     pub fn report_user_change(&self, what: &'static str) {
-        let counted = self.editor_session.user_is_editing();
-        tracing::debug!(what, counted, "plugin reported a state change");
-        if counted {
+        let sent = self.editor_session.should_report();
+        tracing::debug!(what, sent, "plugin reported a state change");
+        if sent {
             (self.on_state_changed)();
         }
     }
@@ -509,6 +509,10 @@ pub trait AudioProcessorHalf: Send {
     fn take_out_user_edit(&mut self) -> bool {
         false
     }
+
+    /// [`Self::take_out_user_edit`] で読んだ判定を送れなかった (ring が満杯)。次の `process()` の後でもう一度
+    /// 返す — 判定は「state の取り直しごとに 1 回」しか立たないので、落とすと未保存の印が立たない。
+    fn retry_out_user_edit(&mut self) {}
 
     // --- lifecycle hooks (plugin-main thread, quiesced window のみ) ------
 

@@ -142,7 +142,9 @@ impl AppData {
         self.tabs.visiting_from = outer;
         // `f` の中でタブが切り替わっていなければ元 (active) を `cur` へ戻す。
         // 切り替わっていたら `cur` は既に新しいアクティブタブなので触らない。
-        if self.cur.key == key {
+        // `f` が訪問先をアクティブにした (`activate_visited_tab`) ときも戻さない。
+        let keep = std::mem::take(&mut self.tabs.keep_visited);
+        if self.cur.key == key && !keep {
             let _ = self.tabs.swap_in(&mut self.cur, active);
         }
         Some(r)

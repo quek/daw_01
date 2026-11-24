@@ -1104,7 +1104,7 @@ impl AppData {
             PendingStateRequest::Baseline => self.finish_plugin_state_baseline(&states),
             PendingStateRequest::UnreportedCheck => self.finish_unreported_check(&states),
             // 報告された変更を含む state は上で live の Song に書き戻した。
-            PendingStateRequest::Autosave => self.write_autosave(),
+            PendingStateRequest::Autosave => self.finish_plugin_state_for_autosave(),
             // 降ろす device の最新 state は上で live と履歴の全 Song に書き戻した。ここで動かす。
             PendingStateRequest::HistoryJump(jump) => self.execute_history_jump(jump),
             PendingStateRequest::Deferred { edit, label } => {

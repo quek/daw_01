@@ -543,9 +543,17 @@ fn dispatch_incoming_headless(app: &mut AppData, msg: &ChildEvent) {
         // (無いと project 切替 / plugin 差し替えで daw_audio に stale mapping が残る)。
         // `SlotPluginLoadFailed` は `pending_plugin_loads` を解放する (= script の
         // 「全 load 完了」判定が失敗でも進む)。
+        //
+        // r.md #160: plugin state の往復の応答 (`AllPluginStates`) と、plugin の中身の変更の報告も通す。読み込みが
+        // 確定するとアプリは「閉じるときに比べる基準」を取りに行くので、応答を届けないとその往復が待ち行列に
+        // 居座る。届けることで、保存 / deferred edit / 閉じる前の比較も headless で本番と同じ経路を通る。
         PluginEvent::SlotPluginLoaded { .. }
         | PluginEvent::SlotPluginShmemReleased { .. }
-        | PluginEvent::SlotPluginLoadFailed { .. } => {
+        | PluginEvent::SlotPluginLoadFailed { .. }
+        | PluginEvent::AllPluginStates { .. }
+        | PluginEvent::PluginStateChanged { .. }
+        // param 表 (`daw.pluginParamsJson` / `daw.appSetPluginParam` が実値を正規化するのに使う)。
+        | PluginEvent::PluginParamList { .. } => {
             app.handle_event(AppEvent::Plugin(msg.clone()));
         }
         // plugin host が落ちた。`daw.setRespawnCrashedChildren(true)` の script だけ、本番と同じ respawn +

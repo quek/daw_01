@@ -1465,6 +1465,15 @@ pub enum PendingStateRequest {
     Autosave,
 }
 
+impl PendingStateRequest {
+    /// ユーザーの操作ではなくアプリが自分で積んだ要求か (基準の取り寄せ / autosave)。破棄しても
+    /// 「操作を中止しました」とは知らせない (ユーザーは何も頼んでいない)。
+    #[must_use]
+    pub fn is_background(&self) -> bool {
+        matches!(self, Self::Baseline | Self::Autosave)
+    }
+}
+
 /// [`PendingStateRequest::CopyToClipboard`] の対象。 round-trip 待ちに積む
 /// 「何をコピーするか」 は面ごとに違うが、 待ち行列の仕組みは 1 本でよい。
 #[derive(Debug, Clone)]

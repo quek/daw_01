@@ -1439,8 +1439,9 @@ pub enum PluginEvent {
     ///
     /// 送る条件は plugin host が決める (`daw_plugin_host::user_edit` が正本): 報告の口 (param の値 /
     /// CLAP `mark_dirty` / VST3 `setDirty`・`restartComponent(kParamValuesChanged)` …) のどれかが来て、
-    /// かつその device のエディタ窓が開いていて直前に窓への入力があったとき。読み込みの state 復元や、
-    /// host が書いたオートメーションへの反応はここに来ない。
+    /// かつその device のエディタ窓が開いていて、直前に plugin host の窓 (どの plugin の窓かは区別しない) へ
+    /// 入力があったとき。daw_gui が state を取り直す (`RequestAllStates`) たびに device あたり 1 回だけ来る。
+    /// 読み込みの state 復元や、host が書いたオートメーションへの反応はここに来ない。
     PluginStateChanged { device: DeviceAddr },
     /// builtin VOICEVOX plugin の合成スレッドの状態遷移 + 進捗。
     VoicevoxSynthStatus {

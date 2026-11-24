@@ -417,14 +417,20 @@ impl Drop for KeyHook {
 }
 
 /// r.md #160: plugin へ渡る入力を `crate::user_edit` へ知らせる (plugin の「中身が変わった」という報告を
-/// ユーザーの変更とみなすかの材料)。 daw_gui へ横取りしたキー (`swallowed`) は plugin に届かないので数えず、
-/// plugin が使わずに戻してきたキー (relay) は数えたものを取り消す。
+/// ユーザーの変更とみなすかの材料)。 daw_gui へ横取りしたキー (`swallowed`) は plugin が使わなかったキー
+/// なので、 数えたものを取り消す — 子窓宛で一度 plugin へ渡したキーが、 未消化でコンテナ窓へ戻ってきて
+/// 飲み込まれる (JUCE は `PostMessage`、 iPlug2 は `SendMessage` → relay。 module doc) のがその経路。
+/// 最初から横取りしたキーは数えていないので、 取り消しても変わらない。
 fn note_user_input(msg: &MSG, swallowed: bool) {
     // `WM_MOUSEMOVE` の wParam: MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2。
     const MK_ANY_BUTTON: usize = 0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040;
     match msg.message {
         WM_EDITOR_KEY_RELAY_DOWN => crate::user_edit::retract_key_input(),
-        _ if swallowed => {}
+        m if swallowed => {
+            if is_key_down(m) {
+                crate::user_edit::retract_key_input();
+            }
+        }
         m if is_key_down(m) => crate::user_edit::note_key_input(),
         // ボタンを押していない移動は入力に数えない (窓の上を通っただけ)。
         WM_MOUSEMOVE => {

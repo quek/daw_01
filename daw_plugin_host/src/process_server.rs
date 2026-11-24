@@ -1120,9 +1120,12 @@ fn run_worker(
             plugin.drain_out_param_touches_into(&mut out_param_touches);
             plugin.drain_out_param_values_into(&mut out_param_values);
             plugin.drain_out_param_releases_into(&mut out_param_releases);
-            // r.md #160: 値より先に積む (ring が満杯に近いとき、「未保存」の印の方を残す)。
-            if plugin.take_out_user_edit() {
-                outbox.params.push(RtParamEvent { kind: RtParamKind::Edited, device, param_id: 0, value: 0.0 });
+            // r.md #160: 値より先に積む (ring が満杯に近いとき、「未保存」の印の方を残す)。積めなければ次の
+            // buffer でもう一度 (値の event と違い、落とすと取り返せない)。
+            if plugin.take_out_user_edit()
+                && !outbox.params.push(RtParamEvent { kind: RtParamKind::Edited, device, param_id: 0, value: 0.0 })
+            {
+                plugin.retry_out_user_edit();
             }
             if !out_param_touches.is_empty()
                 || !out_param_values.is_empty()

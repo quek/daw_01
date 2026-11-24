@@ -27,9 +27,7 @@ use clap_sys::events::{
     CLAP_TRANSPORT_HAS_TIME_SIGNATURE, CLAP_TRANSPORT_IS_LOOP_ACTIVE, CLAP_TRANSPORT_IS_PLAYING,
     clap_event_param_mod, clap_event_param_value, clap_event_transport,
 };
-use clap_sys::ext::audio_ports::{
-    CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports,
-};
+use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_plugin_audio_ports};
 use clap_sys::ext::gui::{
     CLAP_EXT_GUI, CLAP_WINDOW_API_WIN32, clap_gui_resize_hints, clap_plugin_gui, clap_window,
     clap_window_handle,
@@ -55,6 +53,10 @@ use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
 
 use crate::clap_host::Host;
+use crate::clap_ports::{
+    GetExtFn, query_aux_input_channels, query_aux_output_channels, query_output_channel_count,
+    query_port_channel_count,
+};
 use crate::module_cache::{ClapModule, ModuleCache};
 use crate::plugin_instance::{
     AudioHalf, AudioProcessorHalf, EditorSizer, HostCallbacks, LoadedPlugin, NoteTransition,
@@ -249,8 +251,8 @@ impl ClapAudioHalf {
             self.gestures.end(id);
         }
         // r.md #160: 値を出しただけではユーザーの変更と限らない (内部の変調 / host の書き込みへの反応)。
-        // 窓が開いていて直前に入力があったときだけ数える。atomic の読みと `Instant::now()` だけ。
-        if std::mem::take(&mut self.out_value_edited) && self.editor_session.user_is_editing() {
+        // 窓が開いていて直前に入力があったときだけ数える。atomic の読み書きと `Instant::now()` だけ。
+        if std::mem::take(&mut self.out_value_edited) && self.editor_session.should_report() {
             self.collected_user_edit = true;
         }
     }
@@ -504,6 +506,10 @@ impl AudioProcessorHalf for ClapAudioHalf {
 
     fn take_out_user_edit(&mut self) -> bool {
         std::mem::take(&mut self.collected_user_edit)
+    }
+
+    fn retry_out_user_edit(&mut self) {
+        self.collected_user_edit = true;
     }
 
     fn set_ara_idle(&mut self, idle: bool) {
@@ -1825,126 +1831,6 @@ fn encode_note(transition: NoteTransition) -> clap_event_note {
     }
 }
 
-// ====================================================================
-// port queries
-// ====================================================================
-
-fn query_output_channel_count(plugin: *const clap_plugin, get_ext: GetExtFn) -> u32 {
-    query_port_channel_count(plugin, get_ext, false)
-}
-
-/// PR4 sidechain: enumerate the plugin's `is_main=false` input ports and
-/// return their channel counts in declaration order (capped at MAX_AUX_IN).
-fn query_aux_input_channels(plugin: *const clap_plugin, get_ext: GetExtFn) -> Vec<u32> {
-    let ext_ptr =
-        unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) } as *const clap_plugin_audio_ports;
-    if ext_ptr.is_null() {
-        return Vec::new();
-    }
-    let ext = unsafe { &*ext_ptr };
-    let Some(count_fn) = ext.count else {
-        return Vec::new();
-    };
-    let Some(get) = ext.get else {
-        return Vec::new();
-    };
-    let port_count = unsafe { count_fn(plugin, true) };
-    let mut aux: Vec<u32> = Vec::new();
-    for i in 0..port_count {
-        let mut info = std::mem::MaybeUninit::<clap_audio_port_info>::zeroed();
-        let ok = unsafe { get(plugin, i, true, info.as_mut_ptr()) };
-        if !ok {
-            continue;
-        }
-        let info = unsafe { info.assume_init() };
-        if info.flags & CLAP_AUDIO_PORT_IS_MAIN == 0 {
-            if aux.len() >= common::process_data::MAX_AUX_IN {
-                tracing::warn!(
-                    port_index = i,
-                    cap = common::process_data::MAX_AUX_IN,
-                    "plugin declared more aux input ports than the host caps to"
-                );
-                break;
-            }
-            // shmem aux buffer は MAX_CHANNELS plane しか持たないので clamp。
-            aux.push(info.channel_count.min(common::process_data::MAX_CHANNELS as u32));
-        }
-    }
-    aux
-}
-
-/// パラアウト: enumerate the plugin's `is_main=false` **output** ports
-/// (capped at MAX_AUX_OUT). Symmetric to `query_aux_input_channels`.
-fn query_aux_output_channels(plugin: *const clap_plugin, get_ext: GetExtFn) -> Vec<u32> {
-    let ext_ptr =
-        unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) } as *const clap_plugin_audio_ports;
-    if ext_ptr.is_null() {
-        return Vec::new();
-    }
-    let ext = unsafe { &*ext_ptr };
-    let Some(count_fn) = ext.count else {
-        return Vec::new();
-    };
-    let Some(get) = ext.get else {
-        return Vec::new();
-    };
-    let port_count = unsafe { count_fn(plugin, false) };
-    let mut aux: Vec<u32> = Vec::new();
-    for i in 0..port_count {
-        let mut info = std::mem::MaybeUninit::<clap_audio_port_info>::zeroed();
-        let ok = unsafe { get(plugin, i, false, info.as_mut_ptr()) };
-        if !ok {
-            continue;
-        }
-        let info = unsafe { info.assume_init() };
-        if info.flags & CLAP_AUDIO_PORT_IS_MAIN == 0 {
-            if aux.len() >= common::process_data::MAX_AUX_OUT {
-                tracing::warn!(
-                    port_index = i,
-                    cap = common::process_data::MAX_AUX_OUT,
-                    "plugin declared more aux output ports than the host caps to"
-                );
-                break;
-            }
-            aux.push(info.channel_count.min(common::process_data::MAX_CHANNELS as u32));
-        }
-    }
-    aux
-}
-
-/// Queries the plugin's first audio port in the given direction. Returns `0`
-/// when the plugin declares no port of that direction.
-fn query_port_channel_count(
-    plugin: *const clap_plugin,
-    get_ext: GetExtFn,
-    is_input: bool,
-) -> u32 {
-    let ext_ptr =
-        unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) } as *const clap_plugin_audio_ports;
-    if ext_ptr.is_null() {
-        // Extension missing entirely — assume stereo output, no input.
-        return if is_input { 0 } else { 2 };
-    }
-    let ext = unsafe { &*ext_ptr };
-    let count_fn = match ext.count {
-        Some(f) => f,
-        None => return if is_input { 0 } else { 2 },
-    };
-    let port_count = unsafe { count_fn(plugin, is_input) };
-    if port_count == 0 {
-        return 0;
-    }
-    let Some(get) = ext.get else {
-        return if is_input { 0 } else { 2 };
-    };
-    let mut info = std::mem::MaybeUninit::<clap_audio_port_info>::zeroed();
-    let ok = unsafe { get(plugin, 0, is_input, info.as_mut_ptr()) };
-    if !ok {
-        return if is_input { 0 } else { 2 };
-    }
-    unsafe { info.assume_init() }.channel_count
-}
-
 fn c_str_to_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
@@ -1990,8 +1876,6 @@ fn log_descriptor(index: u32, desc: &clap_plugin_descriptor) {
     let features = read_feature_list(desc.features);
     tracing::info!(index, %id, %name, %vendor, %version, ?features, "plugin descriptor");
 }
-
-type GetExtFn = unsafe extern "C" fn(*const clap_plugin, *const c_char) -> *const c_void;
 
 fn log_audio_ports(plugin: *const clap_plugin, get_ext: GetExtFn) {
     let ext_ptr = unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) }

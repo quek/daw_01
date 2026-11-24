@@ -68,24 +68,53 @@ pub fn input_is_recent() -> bool {
     recent(LAST_MOUSE_MS.load(Ordering::Relaxed)) || recent(LAST_KEY_MS.load(Ordering::Relaxed))
 }
 
-/// 1 つの plugin instance のエディタ窓が開いているか。`gui_set_parent_hwnd` で開き、`gui_destroy` が
-/// **plugin の後始末を呼び終えてから**閉じる (閉じるときに確定する編集 — 入力途中の数値欄 — を拾うため。
-/// `HostCallbacks::editor_hwnd` は後始末の前に 0 へ落ちるので使えない)。
+/// daw_gui が plugin の state を取り直した回数 (`RequestAllStates`)。daw_gui の未保存の印は「最後に state を
+/// 取り直してから変更があったか」だけを見るので、報告は取り直しごとに device あたり 1 回で足りる
+/// (ノブのドラッグは毎秒数百回の報告になる)。
+static STATE_REQUESTS: AtomicU64 = AtomicU64::new(1);
+
+/// daw_gui が state を取り直す。**state を集める前に**呼ぶ — 集めている最中の変更 (RT worker の値) は
+/// 集めた state に入っている保証が無いので、次の報告として送らせる。
+pub fn note_state_requested() {
+    STATE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 1 つの plugin instance のエディタ窓が開いているかと、報告を送ったか。窓は `gui_set_parent_hwnd` で開き、
+/// `gui_destroy` が **plugin の後始末を呼び終えてから**閉じる (閉じるときに確定する編集 — 入力途中の
+/// 数値欄 — を拾うため。`HostCallbacks::editor_hwnd` は後始末の前に 0 へ落ちるので使えない)。
 #[derive(Clone, Default)]
-pub struct EditorSession(Arc<AtomicBool>);
+pub struct EditorSession(Arc<SessionState>);
+
+#[derive(Default)]
+struct SessionState {
+    open: AtomicBool,
+    /// 最後に報告を送ったときの [`STATE_REQUESTS`] (`0` = まだ送っていない)。
+    reported_at: AtomicU64,
+}
 
 impl EditorSession {
     pub fn open(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.open.store(true, Ordering::Release);
     }
 
     pub fn close(&self) {
-        self.0.store(false, Ordering::Release);
+        self.0.open.store(false, Ordering::Release);
     }
 
     /// plugin が今「中身が変わった」と報告したら、ユーザーの手による変更とみなすか (module doc の 1 と 2)。
-    pub fn user_is_editing(&self) -> bool {
-        self.0.load(Ordering::Acquire) && input_is_recent()
+    fn user_is_editing(&self) -> bool {
+        self.0.open.load(Ordering::Acquire) && input_is_recent()
+    }
+
+    /// plugin が「中身が変わった」と報告した。daw_gui へ送るなら `true`: ユーザーの変更で、かつ daw_gui が
+    /// 最後に state を取り直してからまだ送っていない。確保もロックもしない (RT worker から呼べる)。
+    pub fn should_report(&self) -> bool {
+        self.should_report_at(STATE_REQUESTS.load(Ordering::Relaxed))
+    }
+
+    /// [`Self::should_report`] の中身 (`requests` = 今の [`STATE_REQUESTS`])。
+    fn should_report_at(&self, requests: u64) -> bool {
+        self.user_is_editing() && self.0.reported_at.swap(requests, Ordering::Relaxed) != requests
     }
 }
 
@@ -109,7 +138,16 @@ mod tests {
 
         note_mouse_input();
         assert!(session.user_is_editing());
+
+        // 報告は、daw_gui が state を取り直すたびに 1 回だけ送る (ドラッグ中の毎回は送らない)。
+        // (入力の時刻はプロセス全体の static なので、並走する別の test に分けない。取り直しの回数も static で、
+        // 他の test の `RequestAllStates` が進めるので、ここは値を渡して見る。)
+        assert!(session.should_report_at(1));
+        assert!(!session.should_report_at(1), "同じ取り直しの間の 2 回目");
+        assert!(session.should_report_at(2), "取り直した後の変更はまた送る");
+
         session.close();
         assert!(!session.user_is_editing(), "窓が閉じている (読み込みの state 復元)");
+        assert!(!session.should_report_at(3));
     }
 }

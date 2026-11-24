@@ -21,6 +21,7 @@ mod plugin_scan;
 mod vst3_scan;
 mod clap_host;
 mod clap_plugin;
+mod clap_ports;
 mod editor_keys;
 mod key_names;
 mod load_bench;
@@ -959,6 +960,8 @@ impl PluginHost {
                 self.emit(PluginEvent::SlotPluginState { device, data });
             }
             PluginCommand::RequestAllStates { project } => {
+                // r.md #160: 以後の「中身が変わった」はまた報告させる (集める前に — `user_edit` の doc)。
+                user_edit::note_state_requested();
                 let entries = self.collect_all_states(project);
                 self.emit(PluginEvent::AllPluginStates { project, entries });
             }

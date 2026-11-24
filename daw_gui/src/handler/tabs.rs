@@ -97,6 +97,18 @@ impl AppData {
         self.on_active_tab_changed();
     }
 
+    /// `with_project` で背景タブを訪問している最中に、そのタブをアクティブにする (訪問中でなければ何もしない)。
+    /// 背景タブ宛の IPC event の完了で、そのタブについてユーザーに聞くことになったときに呼ぶ — 保存確認の
+    /// モーダルは「アクティブなタブ」について出て、「保存」「保存しない」も `cur` に効くので、別のタブを
+    /// 見せたまま出すと違うタブを保存 / 破棄する。
+    pub(crate) fn activate_visited_tab(&mut self) {
+        if self.tabs.visiting_from.is_none() || self.tabs.keep_visited {
+            return;
+        }
+        self.tabs.keep_visited = true;
+        self.on_active_tab_changed();
+    }
+
     /// アクティブなタブが変わった直後の副作用 (engine の scope / poller の重い面 /
     /// preview GPU 状態 / マスターメーター積算 / 旧タブの id を指す一時 UI)。
     fn on_active_tab_changed(&mut self) {
@@ -270,7 +282,8 @@ impl AppData {
 
     /// 終了の続き (Q9): 未保存 (or round-trip 中) のタブを表示順に 1 つずつ確認し、
     /// 全部通ったら [`Self::begin_shutdown`]。確認モーダルはアクティブなタブについて出る
-    /// ので対象タブへ切り替えてから出す。「保存せず終了」はそのタブを閉じて次へ進む。
+    /// ので対象タブへ切り替えてから出す。「保存せず終了」はそのタブの未保存の印を降ろして次へ進む
+    /// (タブは閉じない — `guard_discard`)。
     pub(crate) fn continue_quit(&mut self, req: QuitRequest) {
         for key in self.tabs.order.clone() {
             if self.tab_needs_guard(key) {

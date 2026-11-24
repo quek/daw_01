@@ -7,17 +7,46 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::protocol::{PluginCommand, PluginEvent, SlotState};
+use common::protocol::{PluginCommand, PluginEvent, ProjectKey, SlotState};
 
 use daw_gui::app::{AppData, AppEvent, DirtyGuardAction};
+use daw_gui::event_tabs::TabEvent;
 use daw_gui::shutdown::QuitRequest;
 
-use super::support::{build_app, drain, load_instrument};
+use super::support::{build_app, drain, load_instrument, select_track_single, send_plugin_loaded};
 
-/// plugin host の `RequestAllStates` 応答を模す (`device_id` の今の state = `data`)。
+/// plugin host の `RequestAllStates` 応答を模す (アクティブなタブの `device_id` の今の state = `data`)。
 fn respond(app: &mut AppData, device_id: u64, data: &[u8]) {
+    respond_to(app, app.pk(), device_id, data);
+}
+
+/// [`respond`] の、宛先のタブを指定する版 (背景タブ宛の応答)。
+fn respond_to(app: &mut AppData, project: ProjectKey, device_id: u64, data: &[u8]) {
     let entries = vec![SlotState { device_id, data: Some(data.to_vec()), ara_archive: None, error: None }];
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project, entries }));
+}
+
+/// 楽器を 1 つ載せ、読み込みが確定した直後 (基準の state の要求が host へ出たところ) の app と device id。
+fn plugin_just_loaded() -> (AppData, tokio::sync::mpsc::UnboundedReceiver<PluginCommand>, u64) {
+    let (mut app, _audio_rx, mut plugin_rx, _d) = build_app();
+    let track_id = app.cur.song_doc.song().tracks[0].id;
+    select_track_single(&mut app, 0);
+    app.handle_event(AppEvent::OpenPluginPicker { chain: None });
+    app.handle_event(AppEvent::SelectPluginFromDb { id: "test.synth".into(), keep_open: false, open_gui: true });
+    drain(&mut plugin_rx);
+    let device_id = send_plugin_loaded(&mut app, track_id, 0, "test.synth", None);
+    assert_eq!(requests(&drain(&mut plugin_rx)), 1, "読み込みが確定したら基準の state を取りに行く");
+    (app, plugin_rx, device_id)
+}
+
+/// 保存してあったプロジェクトを開いた直後: 読み込みの後で host が返した state = `state`、未保存の印なし。
+fn opened_project_with_plugin(
+    state: &[u8],
+) -> (AppData, tokio::sync::mpsc::UnboundedReceiver<PluginCommand>, u64) {
+    let (mut app, plugin_rx, device_id) = plugin_just_loaded();
+    respond(&mut app, device_id, state);
+    app.cur.song_doc.mark_saved();
+    (app, plugin_rx, device_id)
 }
 
 fn requests(msgs: &[PluginCommand]) -> usize {
@@ -140,17 +169,72 @@ fn 保存して終了は_取り直した_state_を書いて終わる() {
     assert_eq!(state.as_deref(), Some(&[2u8][..]), "保存したファイルに変更後の state が入っている");
 }
 
+/// 保存していなくても比べられる: 基準は、読み込みが確定した直後に plugin から取った state。
+#[test]
+fn 開いた直後に取った_state_を基準に比べる() {
+    let (mut app, mut plugin_rx, device_id) = opened_project_with_plugin(&[1]);
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
+    assert_eq!(requests(&drain(&mut plugin_rx)), 1);
+    respond(&mut app, device_id, &[1]);
+    assert!(app.shutdown.is_shutting_down(), "開いて、触らずに閉じる → 聞かない");
+
+    let (mut app, _plugin_rx, device_id) = opened_project_with_plugin(&[1]);
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
+    respond(&mut app, device_id, &[2]);
+    assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::Quit(QuitRequest::USER)));
+}
+
+/// 基準の応答が来ないまま往復を破棄したら、取り直す (取り直さないと、その plugin は次の保存まで比べられない)。
+/// ユーザーが頼んだ操作ではないので「中止しました」とは出さない。
+#[test]
+fn 基準の応答が来なければ取り直す() {
+    let (mut app, mut plugin_rx, device_id) = plugin_just_loaded();
+    app.poll_state_roundtrip_watchdog(Instant::now() + Duration::from_secs(120));
+    assert!(app.cur.pipc.pending_state_queue.is_empty());
+    assert!(app.ui_ephemeral.status_message.is_empty(), "{}", app.ui_ephemeral.status_message);
+
+    // 次の event の終わりで積み直す (何もしない event でよい)。
+    app.handle_event(AppEvent::DirtyGuardCancel);
+    assert_eq!(requests(&drain(&mut plugin_rx)), 1);
+    respond(&mut app, device_id, &[1]);
+    app.cur.song_doc.mark_saved();
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
+    assert_eq!(requests(&drain(&mut plugin_rx)), 1, "基準があるので、閉じる前に比べる");
+}
+
 #[test]
 fn タブを閉じるときも比べ_違えばそのタブで聞く() {
     let dir = tempfile::tempdir().unwrap();
     let (mut app, _plugin_rx, device_id) = saved_project_with_plugin(&dir.path().join("proj.daw"), &[1]);
     let key = app.cur.key;
 
-    app.handle_event(AppEvent::Tab(daw_gui::event_tabs::TabEvent::Close(key)));
+    app.handle_event(AppEvent::Tab(TabEvent::Close(key)));
     assert!(app.tab(key).is_some(), "応答までは閉じない");
     respond(&mut app, device_id, &[2]);
     assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::CloseTabs(vec![key])));
     assert!(app.tab(key).is_some());
+}
+
+/// 確認モーダルの「保存」「保存しない」はアクティブなタブに効く。比較を待つ間に別のタブへ移っていたら、
+/// 閉じようとしたタブへ戻してから聞く (移った先のタブを保存 / 破棄して、元のタブを黙って閉じない)。
+#[test]
+fn 比較を待つ間に別のタブへ移っても_閉じようとしたタブについて聞く() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, _plugin_rx, device_id) = saved_project_with_plugin(&dir.path().join("proj.daw"), &[1]);
+    let closing = app.cur.key;
+    app.handle_event(AppEvent::Tab(TabEvent::New));
+    let other = app.cur.key;
+    assert_ne!(closing, other);
+
+    app.handle_event(AppEvent::Tab(TabEvent::Close(closing)));
+    app.handle_event(AppEvent::Tab(TabEvent::Switch(other)));
+    assert_eq!(app.cur.key, other);
+    respond_to(&mut app, closing, device_id, &[2]);
+    assert_eq!(app.cur.key, closing, "閉じようとしたタブがアクティブ");
+    assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::CloseTabs(vec![closing])));
+
+    app.handle_event(AppEvent::DirtyGuardDiscard);
+    assert!(app.tab(closing).is_none() && app.tab(other).is_some());
 }
 
 /// host が応答しない: 確かめられなかったので未保存に倒して聞く。「保存せず終了」で必ず抜けられる。
@@ -199,4 +283,24 @@ fn autosave_は報告された変更の_state_を取り直してから書く() {
     let state = autosaved.song.tracks[0].plugins().next().expect("synth").state.clone();
     assert_eq!(state.as_deref(), Some(&[7u8][..]));
     assert!(app.cur.song_doc.is_dirty(), "autosave は未保存の印を降ろさない");
+}
+
+/// autosave の取り直しを待つ間に保存が済んだら、書かない (保存済みの文書に、ファイルより新しい autosave を
+/// 残すと、次の起動で復元を聞かれる)。
+#[test]
+fn autosave_の取り直しの前に保存が済んだら書かない() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proj.daw");
+    let (mut app, _plugin_rx, device_id) = saved_project_with_plugin(&path, &[1]);
+    let sidecar = common::recovery::sidecar_for(&path);
+
+    plugin_edited(&mut app, device_id);
+    app.handle_event(AppEvent::Save);
+    app.cur.song_doc.last_autosave = Instant::now().checked_sub(Duration::from_secs(61)).expect("uptime > 61s");
+    app.maybe_autosave();
+    respond(&mut app, device_id, &[2]);
+    assert!(!app.cur.song_doc.is_dirty(), "{}", app.ui_ephemeral.status_message);
+    respond(&mut app, device_id, &[2]);
+    assert!(app.cur.pipc.pending_state_queue.is_empty());
+    assert!(!sidecar.exists());
 }
