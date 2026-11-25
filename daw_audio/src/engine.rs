@@ -1200,6 +1200,8 @@ impl ProjectRt {
                 sample_rate,
                 n as u32,
             );
+            // r.md #161: フォローアクションの全体 on/off は「聴き方」(Song の外)。書き出しはここを通らない。
+            self.launcher.set_follow_enabled(self.shared.follow_actions_enabled.load(Ordering::Acquire));
             self.launcher.update(song, &self.song_index, span, global_launch_quantize, was_playing);
 
             // Global Sampler: 録音源が PreFx / PostFx tap なら、その track に

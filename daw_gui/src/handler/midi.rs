@@ -383,7 +383,8 @@ impl AppData {
             | common::model::BindingTarget::StopLauncherRow { .. }
             | common::model::BindingTarget::StopAllLauncherRows
             | common::model::BindingTarget::SwitchRowToArranger { .. }
-            | common::model::BindingTarget::SwitchAllToArranger => {}
+            | common::model::BindingTarget::SwitchAllToArranger
+            | common::model::BindingTarget::ToggleFollowActions => {}
         }
     }
 

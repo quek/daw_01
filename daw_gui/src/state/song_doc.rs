@@ -178,6 +178,17 @@ pub struct SongDoc {
     saved_state_id: u64,
     /// `state_id` の allocator (単調)。
     next_state_id: u64,
+    /// r.md #160: 「ユーザーが plugin の窓の中で中身を変えた」という報告の通し番号
+    /// (`PluginEvent::PluginStateChanged`)。plugin の state は Song の外 (plugin の中) にあるので
+    /// `state_id` には現れない。undo では戻らない (plugin のツマミは undo で戻らないので、保存時点の Song へ
+    /// 戻っても plugin は保存したものと違う)。
+    plugin_edits: u64,
+    /// 保存したファイルに入っている plugin state が、どの `plugin_edits` までを含むか。dirty = 不一致。
+    saved_plugin_edits: u64,
+    /// live の Song の plugin state blob (`PluginInstance::state`) が、どの `plugin_edits` までを含むか
+    /// (最後に書き戻した `RequestAllStates` を **送った** 時点の値)。autosave は live を書くので、
+    /// これが遅れていたら先に取り直す。
+    written_back_plugin_edits: u64,
     /// 「Song の中身が変わった」世代 (子プロセス sync が読む)。`edit_epoch` が進む
     /// ときは必ず進み、加えて [`SongDoc::edit_playback`] でも進む。
     sync_epoch: u64,
@@ -262,6 +273,9 @@ impl SongDoc {
             state_id: 1,
             saved_state_id: 1,
             next_state_id: 2,
+            plugin_edits: 0,
+            saved_plugin_edits: 0,
+            written_back_plugin_edits: 0,
             sync_epoch: 1,
             id_session: common::model::fresh_nonzero_id(),
             structure,
@@ -588,14 +602,51 @@ impl SongDoc {
         self.id_session
     }
 
-    /// dirty = 「最後に保存した epoch から編集が進んだ」 の O(1) 派生。
+    /// dirty = 「保存したファイルと中身が違う」 の O(1) 派生: Song が保存時点の state でない、または plugin の
+    /// 中身が保存より後に変わったと報告された (r.md #160)。
     pub fn is_dirty(&self) -> bool {
-        self.state_id != self.saved_state_id
+        self.state_id != self.saved_state_id || self.plugin_edits != self.saved_plugin_edits
     }
 
-    /// save 完了時に呼ぶ: 現在の state を保存済みベースラインにする。
+    /// いまの中身 (Song も plugin も) を保存済みベースラインにする。「保存せず終了」で未保存を捨てるときに
+    /// 使う。保存 (`finish_save`) は [`Self::mark_song_saved`] と
+    /// [`Self::mark_plugin_edits_saved`] を別々に呼ぶ (plugin の state を取り直す往復の間に来た報告を
+    /// 落とさないため)。
     pub fn mark_saved(&mut self) {
+        self.mark_song_saved();
+        self.saved_plugin_edits = self.plugin_edits;
+    }
+
+    /// いまの Song の state を保存済みにする (plugin の印は触らない)。
+    pub fn mark_song_saved(&mut self) {
         self.saved_state_id = self.state_id;
+    }
+
+    /// r.md #160: ユーザーが plugin の窓の中で中身を変えた (と plugin host が報告した)。`*` を立てる。
+    pub fn note_plugin_edit(&mut self) {
+        self.plugin_edits += 1;
+    }
+
+    /// plugin の変更の報告の通し番号。`RequestAllStates` を **送る瞬間** に控え、応答を書き戻した / 保存した
+    /// ときに [`Self::note_plugin_state_written_back`] / [`Self::mark_plugin_edits_saved`] へ渡す。
+    /// 送った後に来た報告は応答の state に入っている保証が無いので、控えた値より先を済みにしない。
+    pub fn plugin_edits(&self) -> u64 {
+        self.plugin_edits
+    }
+
+    /// `through` まで (それを控えた `RequestAllStates` の応答) を保存したファイルに書いた。
+    pub fn mark_plugin_edits_saved(&mut self, through: u64) {
+        self.saved_plugin_edits = self.saved_plugin_edits.max(through);
+    }
+
+    /// `through` までを live の Song の plugin state blob に書き戻した。
+    pub fn note_plugin_state_written_back(&mut self, through: u64) {
+        self.written_back_plugin_edits = self.written_back_plugin_edits.max(through);
+    }
+
+    /// live の Song の plugin state blob が、報告された変更より古いか (autosave が先に取り直す条件)。
+    pub fn plugin_state_blob_is_stale(&self) -> bool {
+        self.plugin_edits != self.written_back_plugin_edits
     }
 
     // -------- undo / redo ---------------------------------------------------
@@ -789,6 +840,9 @@ impl SongDoc {
         self.last_gesture = None;
         self.state_id = self.alloc_state_id();
         self.saved_state_id = self.state_id;
+        // plugin はこの Song の state blob から載せ直すので、前の曲の plugin への報告は持ち越さない。
+        self.saved_plugin_edits = self.plugin_edits;
+        self.written_back_plugin_edits = self.plugin_edits;
         self.id_session = common::model::fresh_nonzero_id();
         self.bump_edit_epoch();
     }

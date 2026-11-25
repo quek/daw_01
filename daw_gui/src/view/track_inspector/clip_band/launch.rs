@@ -328,7 +328,7 @@ fn draw_follow_action_row(
 
 /// MIDI 割り当て (計画書 §3.5、詳細で最初は畳む — r.md #158 仕様 7、セルと列で同じ鍵)。
 /// パッドで撃てないランチャーは半分の機能しかないので、
-/// **セル / 列 / 行停止 / 行→アレンジ / 全停止 / 全→アレンジ** を全部出す。
+/// **セル / 列 / 行停止 / 行→アレンジ / 全停止 / 全→アレンジ / フォローアクションの全体 on/off** を全部出す。
 #[allow(clippy::too_many_arguments)]
 fn draw_midi_rows(
     app: &AppData,
@@ -363,7 +363,8 @@ fn draw_midi_rows(
     })
 }
 
-/// MIDI 割り当ての中身: 鳴らす [セル][列] / 止める [行][全部] / アレンジへ戻す [行][全部] / 消去。
+/// MIDI 割り当ての中身: 鳴らす [セル][列] / 止める [行][全部] / アレンジへ戻す [行][全部] /
+/// フォロー [全体 on/off] / 消去。
 fn draw_midi_buttons(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -407,6 +408,11 @@ fn draw_midi_buttons(
         }
         y += FORM_ROW_PITCH;
     }
+
+    // r.md #161: フォローアクションの全体 on/off (押すたびに切り替える)。行にも列にも依らないので 1 つだけ。
+    form::label(ui, app, "inspector_launch_learn_follow_label", vocab::FIELD_LEARN_FOLLOW, c, y);
+    learn_toggle(app, ui, "learn_follow_all", vocab::LEARN_FOLLOW_ALL, c.value(y), Some(T::ToggleFollowActions), learning);
+    y += FORM_ROW_PITCH;
 
     form::label(ui, app, "inspector_launch_clear_label", vocab::FIELD_LEARN_CLEAR, c, y);
     ui.button_at("inspector_launch_clear_binds", vocab::CLEAR_BINDINGS, c.value(y), || {

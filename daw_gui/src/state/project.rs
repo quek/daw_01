@@ -163,11 +163,26 @@ pub struct ProjectIpc {
     /// でなく **hang** した場合は応答が永久に来ないので、`on_tick` の watchdog が
     /// この時刻からの無応答経過を見て round-trip を破棄し、脱出口を作る。
     pub(crate) state_request_sent_at: Option<std::time::Instant>,
+    /// いま応答を待っている `RequestAllStates` の番号 (`PluginCommand::RequestAllStates::request`)。
+    /// `dispatch_front_state_request` が送るときに立て、その番号の応答か往復の破棄で `None` に戻す。
+    /// **これと違う番号の応答は捨てる** — 待ちきれずに破棄した要求の応答が後から届いても、次の要求の
+    /// 応答として受け取らない。
+    pub(crate) awaited_state_request: Option<u64>,
+    /// 最後に振った要求の番号 (このタブの中で単調増加。タブの key は再利用しないので、タブごとで足りる)。
+    pub(crate) last_state_request: u64,
     /// `pending_state_queue` の drain 待ちで保留しているガード操作 (`docs/plan_project_tabs.md`
     /// §5.1)。**このタブの round-trip に紐づくのでタブごとに持つ** — アプリ全体に 1 つだと、
     /// 別のタブの round-trip が drain した瞬間に「そのタブの dirty 状態」で再評価され、
     /// 未保存のタブが無確認で閉じられる。
     pub guard_pending_action: Option<crate::app_types::DirtyGuardAction>,
+    /// r.md #160: いま in-flight な `RequestAllStates` を **送った瞬間** の `SongDoc::plugin_edits`。
+    /// 応答の state が確実に含んでいるのはここまでの変更なので、保存 / 書き戻しが済みにするのもここまで。
+    pub(crate) state_request_plugin_edits: u64,
+    /// r.md #160: 閉じるときの比較の基準 (`handler::plugin_dirty`)。
+    pub(crate) plugin_state_baseline: crate::handler::plugin_dirty::PluginStateBaseline,
+    /// r.md #160: いまの閉じる / 終了の一連の確認の中で、このタブは比べて同じだった (または答えが出た)。
+    /// 終了は全タブを頭から回り直すので、済んだタブをもう一度比べないための記録。
+    pub(crate) unreported_check_passed: bool,
     /// 子プロセス sync (pull 型、 docs/plan_arch_refactor.md §7.5) の世代キー。
     /// [`AppData::flush_song_sync`] が最後に 6 段 choreography を実行したときの
     /// `SongDoc::sync_epoch()` (= 中身が変わった世代、再生状態の変更を含む)。
@@ -949,7 +964,12 @@ impl ProjectState {
                 gui_open_requests: Vec::new(),
                 pending_state_queue: std::collections::VecDeque::new(),
                 state_request_sent_at: None,
+                awaited_state_request: None,
+                last_state_request: 0,
                 guard_pending_action: None,
+                state_request_plugin_edits: 0,
+                plugin_state_baseline: Default::default(),
+                unreported_check_passed: false,
                 last_synced_epoch: 0,
             },
             pvv: ProjectVoicevox {

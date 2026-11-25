@@ -123,6 +123,11 @@ impl AppData {
         if !self.cur.peph.delta_devices.is_empty() {
             self.set_delta_devices(Vec::new());
         }
+        // r.md #161: フォローアクションの全体 off も聴き方の都合で、プロジェクトを開くと常に on
+        // (off だったときだけ、LoadSong より先に届く on を送る)。
+        if !self.follow_actions_enabled() {
+            self.set_follow_actions_enabled(true);
+        }
 
         // -- track_id / ClipKey keyed の表示設定 ----------------------------
         // ViewState を持たない旧 .daw では `restore_view_state` が早期 return
@@ -1085,6 +1090,8 @@ impl AppData {
         // `UnloadProject` doc 参照)。
         self.send_plugin(PluginCommand::UnloadProject { project: self.pk() });
         self.cur.pipc.loaded_devices.clear();
+        // r.md #160: 基準は降ろした instance のもの (device id は曲ごとの空間)。
+        self.cur.pipc.plugin_state_baseline = Default::default();
         self.cur.pipc.open_plugin_guis.clear();
         self.cur.pipc.plugin_params.clear();
         self.cur.pipc.plugin_key_names.clear();
@@ -1241,7 +1248,16 @@ impl AppData {
             self.cur.pipc.guard_pending_action = Some(action);
             return;
         }
+        // r.md #160: 未保存の印が無くても、変更を報告しない plugin の中身が変わっているかもしれない。state を
+        // 取り直して基準と比べ、応答の後で (上の queue の再評価と同じ口から) やり直す。
+        if self.needs_unreported_check() {
+            self.begin_unreported_check(action);
+            return;
+        }
         if self.cur.song_doc.is_dirty() {
+            // 待ち行列の再評価 (`advance_state_queue`) は背景タブ宛の応答からも来る。待っている間に別のタブへ
+            // 切り替えられていても、聞くのはこのタブのこと。
+            self.activate_visited_tab();
             self.ui_ephemeral.dirty_guard = Some(action);
         } else {
             self.perform_guard_action(action);
@@ -1310,6 +1326,8 @@ impl AppData {
             return;
         };
         self.discard_current_autosave();
+        // r.md #160: 答えは出た。このタブの plugin の中身をもう一度比べて聞き直さない。
+        self.cur.pipc.unreported_check_passed = true;
         if matches!(action, DirtyGuardAction::Quit(_)) {
             // 終了の途中 (Q9): 「保存せず終了」 と答えたタブは **もう聞かない**。
             // ここで dirty を落とすのが唯一の記録で、`continue_quit` は次の未保存タブへ進む。
@@ -1475,7 +1493,13 @@ impl AppData {
                 *snap_epoch = epoch;
             }
         }
-        self.send_plugin(PluginCommand::RequestAllStates { project: self.pk() });
+        // r.md #160: 応答の state が確実に含むのは、この送信までに報告された plugin の変更。
+        self.cur.pipc.state_request_plugin_edits = self.cur.song_doc.plugin_edits();
+        // 応答はこの番号で突き合わせる (`ProjectIpc::awaited_state_request`)。
+        self.cur.pipc.last_state_request += 1;
+        let request = self.cur.pipc.last_state_request;
+        self.cur.pipc.awaited_state_request = Some(request);
+        self.send_plugin(PluginCommand::RequestAllStates { project: self.pk(), request });
         // この瞬間から応答 (AllStatesReceived) までを on_tick の watchdog
         // が監視する。 host が hang して応答が来ないと永久ロックになるため。
         self.cur.pipc.state_request_sent_at = Some(std::time::Instant::now());
@@ -1522,8 +1546,13 @@ impl AppData {
     /// 正しいのは「queue が空になった最新状態でガードをやり直す」ことで、これは
     /// `on_all_states_from_child` 末尾の正常系とまったく同じ扱い。
     pub(crate) fn abort_state_roundtrip(&mut self) {
-        self.cur.pipc.pending_state_queue.clear();
+        let dropped: Vec<PendingStateRequest> = self.cur.pipc.pending_state_queue.drain(..).collect();
         self.cur.pipc.state_request_sent_at = None;
+        // 破棄した要求の応答が後から届いても受けない (次の要求は別の番号で待つ)。
+        self.cur.pipc.awaited_state_request = None;
+        // r.md #160: 確かめられなかった「閉じる前の比較」は未保存に倒す。下の Quit の再評価より **前** に
+        // (再評価が確認モーダルを出せるように)。
+        self.settle_aborted_plugin_state_requests(&dropped);
         // 両方とも無条件に take する (`||` の短絡で 2 つ目が消えないように)。
         let after_save = self.ui_ephemeral.guard_after_save.take();
         let pending = self.cur.pipc.guard_pending_action.take();
@@ -1587,10 +1616,13 @@ impl AppData {
             elapsed_s = now.saturating_duration_since(since).as_secs(),
             "plugin-state round-trip stalled past watchdog timeout; aborting (host hang?)"
         );
+        let user_waiting = self.cur.pipc.pending_state_queue.iter().any(|r| !r.is_background());
         self.abort_state_roundtrip();
-        self.ui_ephemeral.status_message =
-            "プラグインが応答しないため保存/操作を中止しました（オートセーブは保持されています）"
-                .into();
+        if user_waiting {
+            self.ui_ephemeral.status_message =
+                "プラグインが応答しないため保存/操作を中止しました（オートセーブは保持されています）"
+                    .into();
+        }
     }
 
     /// project save の trigger。 plugin がある場合は plugin_host から
@@ -1604,7 +1636,7 @@ impl AppData {
             // 行う (= live と snapshot の両方に適用、 file_path は成功時のみ確定)。
             let snap_epoch = self.cur.song_doc.edit_epoch();
             let snapshot = Box::new(self.cur.song_doc.song().clone());
-            self.finish_save(snapshot, path, snap_epoch);
+            self.finish_save(snapshot, path, snap_epoch, None);
             return;
         }
         // plugin 有り: snapshot は **state 収集を始める瞬間** に取る (co-temporal)。

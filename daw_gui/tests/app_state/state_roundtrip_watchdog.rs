@@ -266,7 +266,7 @@ fn watchdog_does_not_fire_after_roundtrip_completes() {
     assert!(!app.cur.pipc.pending_state_queue.is_empty(), "save round-trip in flight");
 
     // 正常応答で完了。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert!(app.cur.pipc.pending_state_queue.is_empty(), "queue drained on response");
     assert!(path.exists(), "project saved");
 

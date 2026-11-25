@@ -16,7 +16,7 @@ use super::support::{build_app, drain, fake_plugin_loaded, load_instrument};
 /// plugin host の `RequestAllStates` 応答を模す (`device_id` の今の state = `data`)。
 fn respond(app: &mut AppData, device_id: u64, data: &[u8]) {
     let entries = vec![SlotState { device_id, data: Some(data.to_vec()), ara_archive: None, error: None }];
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries }));
 }
 
 fn requests(msgs: &[PluginCommand]) -> usize {
@@ -94,6 +94,7 @@ fn 削除を戻して回したツマミは_redo_で取り寄せられ_次の_und
     app.handle_event(AppEvent::Undo);
     assert_eq!(loaded_states(&drain(&mut plugin_rx), device_id), vec![Some(vec![1])], "載せる undo は即時");
     fake_plugin_loaded(&mut app, track_id, 0, "test.synth");
+    drain(&mut plugin_rx);
 
     // ツマミを回した ([5]) → redo (削除) は取り寄せてから降ろす。
     app.handle_event(AppEvent::Redo);
@@ -152,7 +153,7 @@ fn 取り寄せ待ちの間の_undo_連打は順番に処理する() {
     assert_eq!((removes(&msgs, device_id), requests(&msgs)), (1, 1), "2 回目の取り寄せを送る: {msgs:?}");
     assert_eq!(app.cur.song_doc.song().tracks[0].volume, 0.25);
 
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     assert_eq!(app.cur.song_doc.history_current(), volume_step - 1, "2 回目の undo (音量)");
     assert_eq!(app.cur.song_doc.song().tracks[0].volume, base_volume);
     assert!(app.cur.pipc.pending_state_queue.is_empty());
@@ -196,7 +197,7 @@ fn 往復待ちの削除の後に来た_undo_は削除を戻す() {
     respond(&mut app, device_id, &[7]);
     assert!(app.cur.song_doc.song().plugin_by_id(device_id).is_none(), "削除が先");
     // undo の取り寄せ (降ろした device はもう host に居ないので state は来ない)。
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
     let restored = app.cur.song_doc.song().plugin_by_id(device_id).expect("undo で削除が戻る");
     assert_eq!(restored.state.as_deref(), Some(&[7_u8][..]));
     assert_eq!(app.cur.song_doc.song().tracks[0].volume, 0.25, "その前の操作は戻らない");
@@ -219,7 +220,7 @@ fn 並んだ_undo_も自分の取り寄せの間に入った編集で行き先�
     assert!(app.cur.song_doc.song().plugin_by_id(device_id).is_none(), "削除が先");
     assert_eq!(requests(&drain(&mut plugin_rx)), 1, "undo の取り寄せが始まった");
     set_volume(&mut app, 0.5);
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() }));
 
     let restored = app.cur.song_doc.song().plugin_by_id(device_id).expect("undo は削除を戻す");
     assert_eq!(restored.state.as_deref(), Some(&[7_u8][..]));

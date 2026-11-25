@@ -5,6 +5,7 @@ use crate::state::*;
 use crate::app_types::*;
 use crate::handler::device_guard::{self, DeviceOp};
 use crate::handler::history::PluginStateWriteBack;
+use crate::handler::plugin_dirty::{PluginStateDigest, SavedPluginState};
 use common::model::InstrumentSource;
 use common::plugin_format::PluginFormat;
 use common::protocol::{AudioCommand, PlatformWindowHandle, PluginCommand, SlotState};
@@ -182,6 +183,8 @@ impl AppData {
             tracing::error!(track = track_id, index, %id, %reason, "state_load failed (notified by plugin host)");
             self.ui_ephemeral.status_message = msg;
         }
+        // r.md #160: この device の「閉じるときに比べる基準」はまだ無い (読み込みが全部確定したら取る)。
+        self.mark_plugin_state_baseline_due();
         // device 単位での load 状態 cache。 reconcile の device-level diff
         // (Undo で plugin 構成が変化した場合の同期) と、 track 削除前の
         // `ClosePluginShmem` の対象確認 (use-after-free deadlock 防止) に使う。
@@ -1022,18 +1025,33 @@ impl AppData {
     /// の front を取り出して完了処理 (save / deferred edit / 履歴ジャンプ / copy) を実行する。
     /// queue に後続がある場合は次の `RequestAllStates` を改めて発行し、
     /// 連続 deferred edit が個別に最新 state を捕まえられるようにする。
-    pub(crate) fn on_all_states_from_child(&mut self, states: Vec<SlotState>) {
+    ///
+    /// `request` = 応答が返してきた要求の番号。いま待っている番号と違う応答は **何もせずに捨てる** — 待ちきれずに
+    /// 破棄した要求 (watchdog / host の crash) の応答が後から届いたもので、次の要求の応答として受けると、
+    /// その間に増減した device の state が無い / 古い時点の state を保存や deferred edit に使ってしまう。
+    pub(crate) fn on_all_states_from_child(&mut self, request: u64, states: Vec<SlotState>) {
+        if self.cur.pipc.awaited_state_request != Some(request) {
+            tracing::warn!(
+                request,
+                awaited = ?self.cur.pipc.awaited_state_request,
+                "dropping a plugin-state response nobody is waiting for (late reply to an aborted request)"
+            );
+            return;
+        }
+        self.cur.pipc.awaited_state_request = None;
         // in-flight だった round-trip の応答が来た。 watchdog の deadline を
         // 解除する。 この後 queue に後続があれば dispatch_front_state_request が再武装する。
         self.cur.pipc.state_request_sent_at = None;
         // live song と undo / redo の全 Song の plugin state を最新化する (= Deferred の Undo snapshot が最新 knob を
         // 捕まえ、履歴ジャンプでどの state から載せ直しても最新の値で載るため — `SongDoc::write_back_plugin_state`)。
-        // queue が空だった場合 (= 想定外タイミングの応答) でも害はない。 Save の serialize
-        // 対象は live ではなく凍結 snapshot なので、 下の match 内で snapshot 側に
+        // Save の serialize 対象は live ではなく凍結 snapshot なので、 下の match 内で snapshot 側に
         // も別途適用する。
         let write_back = PluginStateWriteBack::new(&states);
         self.cur.song_doc.write_back_plugin_state(|song| write_back.apply(song));
         write_back.warn_missing(self.cur.song_doc.song());
+        // r.md #160: この応答が確実に含むのは、要求を送った時点までに報告された変更。
+        let plugin_edits = self.cur.pipc.state_request_plugin_edits;
+        self.cur.song_doc.note_plugin_state_written_back(plugin_edits);
         // Phase 6 review (silent corruption fix): plugin_host 側で
         // `state_save()` が `Err` を返したエントリは `SlotState.error`
         // 経由で報告される。 旧コードはこれを `.ok().flatten()` で握り
@@ -1092,8 +1110,13 @@ impl AppData {
                 let mut snapshot =
                     snapshot.unwrap_or_else(|| Box::new(self.cur.song_doc.song().clone()));
                 write_back.apply(&mut snapshot);
-                self.finish_save(snapshot, path, snap_epoch);
+                let saved = SavedPluginState { through_edits: plugin_edits, digest: PluginStateDigest::of(&states) };
+                self.finish_save(snapshot, path, snap_epoch, Some(saved));
             }
+            PendingStateRequest::Baseline => self.finish_plugin_state_baseline(&states),
+            PendingStateRequest::UnreportedCheck => self.finish_unreported_check(&states),
+            // 報告された変更を含む state は上で live の Song に書き戻した。
+            PendingStateRequest::Autosave => self.finish_plugin_state_for_autosave(),
             // 降ろす device の最新 state は上で live と履歴の全 Song に書き戻した。ここで動かす。
             PendingStateRequest::HistoryJump(jump) => self.execute_history_jump(jump),
             PendingStateRequest::Deferred { edit, label } => {

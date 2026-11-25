@@ -112,6 +112,13 @@ impl AppData {
         self.cur.key
     }
 
+    /// `cur` がいま応答を待っている `RequestAllStates` の番号。待っていなければ `0` (どの要求にも振らない
+    /// 番号 = その番号の応答は捨てられる)。integration test が plugin host の応答を模すのに使う。
+    #[must_use]
+    pub fn awaited_state_request(&self) -> u64 {
+        self.cur.pipc.awaited_state_request.unwrap_or(0)
+    }
+
     /// `cur` の device の wire 上の住所 (`docs/plan_project_tabs.md` §1.2)。
     #[must_use]
     pub fn dev(&self, device_id: u64) -> common::protocol::DeviceAddr {
@@ -142,7 +149,9 @@ impl AppData {
         self.tabs.visiting_from = outer;
         // `f` の中でタブが切り替わっていなければ元 (active) を `cur` へ戻す。
         // 切り替わっていたら `cur` は既に新しいアクティブタブなので触らない。
-        if self.cur.key == key {
+        // `f` が訪問先をアクティブにした (`activate_visited_tab`) ときも戻さない。
+        let keep = std::mem::take(&mut self.tabs.keep_visited);
+        if self.cur.key == key && !keep {
             let _ = self.tabs.swap_in(&mut self.cur, active);
         }
         Some(r)

@@ -36,6 +36,7 @@ mod native_rack;
 mod open_stays_clean;
 mod pending_state_queue;
 mod picker_insert;
+mod plugin_dirty;
 mod plugin_load_failure;
 mod project_tabs;
 mod parallel;

@@ -1455,6 +1455,23 @@ pub enum PendingStateRequest {
     /// **undo snapshot は積まない** (copy は履歴を汚さない) ので `Deferred` とは
     /// 別 variant にする。
     CopyToClipboard(ClipboardCopyRequest),
+    /// r.md #160: 以下 3 つは `handler::plugin_dirty` が積む (Song は変えない)。
+    ///
+    /// 閉じるときの比較の基準を取る (読み込みが落ち着いた直後)。
+    Baseline,
+    /// 閉じる / 終了の前に、報告の無い変更が無いかを基準と比べる。違えば `*` を立てる。
+    UnreportedCheck,
+    /// autosave の前に、報告された変更を含む state を live の Song へ書き戻す。
+    Autosave,
+}
+
+impl PendingStateRequest {
+    /// ユーザーの操作ではなくアプリが自分で積んだ要求か (基準の取り寄せ / autosave)。破棄しても
+    /// 「操作を中止しました」とは知らせない (ユーザーは何も頼んでいない)。
+    #[must_use]
+    pub fn is_background(&self) -> bool {
+        matches!(self, Self::Baseline | Self::Autosave)
+    }
 }
 
 /// [`PendingStateRequest::CopyToClipboard`] の対象。 round-trip 待ちに積む

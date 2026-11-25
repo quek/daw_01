@@ -263,6 +263,8 @@ impl BufferSpan {
 
 /// ランチャーの走行状態一式。`LocalState` (live) と `export.rs` (書き出し) が
 /// **同じ型**を持つ — 片方だけ挙動が違うと Q9 の「聴こえた通りに書き出す」が壊れる。
+/// 例外は r.md #161 のフォローアクションの全体 off だけ (聴き方の都合で、書き出しには焼き込まない。
+/// [`Self::set_follow_enabled`])。
 #[derive(Debug)]
 pub struct LauncherRuntime {
     rows: Vec<RowRuntime>,
@@ -284,6 +286,8 @@ pub struct LauncherRuntime {
     /// **毎周同じ目が出る** (r.md #155: `Any` が自分を引いたセル / 列は二度と動かない)。
     /// 書き出しは跳ばないので常に 0 = 「同じ起点から同じ遷移列」(Q9) は変わらない。
     jumped_beats: f64,
+    /// r.md #161: クリップと列のフォローアクションを発火させるか ([`Self::set_follow_enabled`])。
+    follow_enabled: bool,
 }
 
 impl Default for LauncherRuntime {
@@ -316,6 +320,7 @@ impl LauncherRuntime {
             last_project_id: 0,
             reseed: true,
             jumped_beats: 0.0,
+            follow_enabled: true,
         }
     }
 
@@ -330,6 +335,21 @@ impl LauncherRuntime {
     /// プロジェクト切替 / 書き出しの起点)。
     pub fn arm_reseed(&mut self) {
         self.reseed = true;
+    }
+
+    /// r.md #161: フォローアクションの全体 on/off (Live の Enable Follow Actions Globally)。
+    ///
+    /// **聴き方の都合で、`Song` にも走行位置にも入らない。** live の engine だけが毎 buffer 渡し、
+    /// 書き出し (`export.rs`) は呼ばない = 既定の on のまま走る (off のまま書き出しても同じ音。Q9)。
+    ///
+    /// off の間、発火の時計 (`follow_at` / `scene.at`) は止めずに **同じ格子の次の周期へ送り続ける**
+    /// ([`Self::apply_follow`] / [`Self::tick_scene_follow`])。鳴っているセルの位相には触らないので
+    /// そのまま回り続け (ループしないセルは最後まで鳴って止まる)、on に戻した後の最初の境界で 1 回だけ
+    /// 発火する (過ぎたぶんをまとめて撃たない。ループしないセルが止まった後の行も、on のときと同じく
+    /// 時計は生きているので、その境界で発火する)。off にする前に発火済みの量子化待ちは取り消さない。
+    /// 乱数は `f(seed, 発火拍)` の純関数なので、見送った回の抽選を引かなくても後の目は変わらない。
+    pub fn set_follow_enabled(&mut self, enabled: bool) {
+        self.follow_enabled = enabled;
     }
 
     /// 直前に解いた行の供給元テーブル。
@@ -1105,12 +1125,21 @@ impl LauncherRuntime {
     ) -> RowPhase {
         let phase = self.rows[idx].phase;
         let clip_id = self.rows[idx].follow_clip_id;
+        let due = self.rows[idx].follow_at;
         self.rows[idx].follow_clip_id = 0;
         self.rows[idx].follow_at = f64::INFINITY;
         let Some(cell) = cells.find_by_clip(clip_id) else {
             // 追う対象が消えた。鳴っていれば `resync_cells` が既に無音へ落としている。
             return phase;
         };
+        if !self.follow_enabled {
+            // 全体 off ([`Self::set_follow_enabled`]): 発火を見送り、時計だけ同じ格子の次の周期へ送る。
+            if let Some(at) = follow::next_due_beat(&cell.follow, due, cell.length_beats, fire) {
+                self.rows[idx].follow_clip_id = clip_id;
+                self.rows[idx].follow_at = at;
+            }
+            return phase;
+        }
         let n = fill_row_occupancy(&mut self.occupied, &song, cells);
         let from = song.index.scene_pos(cell.scene_id).unwrap_or(0);
         let seed = follow::row_seed(self.rows[idx].key.packed(), clip_id);
@@ -1901,6 +1930,79 @@ mod tests {
         // 最長セル 4 拍 → 拍 4.0 で列 2 へ (track 1 は 11、列 2 が空の track 2 は停止)。
         step(&mut rt, &song, 3.99);
         assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(11), "次の列へ行かない");
+        assert_eq!(rt.rows().track_row(1).tail, RowPhase::Silent);
+    }
+
+    /// r.md #161: 全体 off の間はクリップのフォローアクションが発火せず、セルは撃った位相のまま回り続ける。
+    /// on に戻すと、撃った拍からの格子の **次の境界** で 1 回だけ発火する (戻した瞬間にも、過ぎた回数ぶんにも
+    /// 撃たない)。
+    #[test]
+    fn 全体_off_の間クリップのフォローアクションは発火せず_on_で次の境界から再開する() {
+        let mut song = two_rows();
+        song.tracks[0].session_clips[0].launch.follow = FollowAction {
+            enabled: true,
+            a: FollowActionKind::Next,
+            chance_a: 100,
+            ..FollowAction::default()
+        };
+        let mut rt = LauncherRuntime::for_song(&song);
+        step(&mut rt, &song, 0.0);
+        press(&mut rt, 1, 10, true);
+        step(&mut rt, &song, 0.0);
+        let launched = rt.rows().track_row(0).tail;
+        assert_eq!(launched.cell_clip_id(), Some(10));
+
+        rt.set_follow_enabled(false);
+        // 拍 4.0 / 8.0 の発火を 2 回見送る。位相 (撃った拍) も変わらない = 同じセルがループし続ける。
+        for beat in [3.99, 4.5, 7.99, 8.5] {
+            step(&mut rt, &song, beat);
+            assert_eq!(rt.rows().track_row(0).tail, launched, "off の間に遷移した (拍 {beat})");
+        }
+
+        rt.set_follow_enabled(true);
+        // 戻した直後 (拍 9〜11) は鳴らしたまま。見送った 2 回ぶんをここで撃たない。
+        for beat in [9.0, 10.0, 11.5] {
+            step(&mut rt, &song, beat);
+            assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(10), "境界の前に発火した (拍 {beat})");
+        }
+        // 次の境界 = 拍 12.0 (撃った拍 0 から 4 拍の格子) で隣のセルへ。
+        step(&mut rt, &song, 11.99);
+        let next = rt.rows().track_row(0).tail;
+        assert_eq!(next.cell_clip_id(), Some(11), "on に戻しても再開しない");
+        assert!((cell_launch_beat(next) - 12.0).abs() < 1e-9, "格子からずれた: {next:?}");
+    }
+
+    /// r.md #161: 列 (シーン) のフォローアクションも同じ規則で止まり、同じ格子で再開する。
+    #[test]
+    fn 全体_off_の間列のフォローアクションは発火せず_on_で次の境界から再開する() {
+        let mut song = two_rows();
+        song.scenes[0].follow = FollowAction {
+            enabled: true,
+            a: FollowActionKind::Next,
+            chance_a: 100,
+            ..FollowAction::default()
+        };
+        let mut rt = LauncherRuntime::for_song(&song);
+        step(&mut rt, &song, 0.0);
+        rt.push_request(LaunchRequest::Scene { scene_id: 1, pressed: true, immediate: false });
+        step(&mut rt, &song, 0.0);
+        let rows = |rt: &LauncherRuntime| (rt.rows().track_row(0).tail, rt.rows().track_row(1).tail);
+        let launched = rows(&rt);
+        assert_eq!((launched.0.cell_clip_id(), launched.1.cell_clip_id()), (Some(10), Some(20)));
+
+        rt.set_follow_enabled(false);
+        for beat in [3.99, 4.5, 7.99] {
+            step(&mut rt, &song, beat);
+            assert_eq!(rows(&rt), launched, "off の間に列が進んだ (拍 {beat})");
+        }
+
+        rt.set_follow_enabled(true);
+        step(&mut rt, &song, 8.5);
+        step(&mut rt, &song, 11.0);
+        assert_eq!(rows(&rt), launched, "境界の前に列が進んだ");
+        // 拍 12.0 で列 2 へ (track 1 は 11、列 2 が空の track 2 は停止)。
+        step(&mut rt, &song, 11.99);
+        assert_eq!(rt.rows().track_row(0).tail.cell_clip_id(), Some(11), "on に戻しても列が進まない");
         assert_eq!(rt.rows().track_row(1).tail, RowPhase::Silent);
     }
 

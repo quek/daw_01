@@ -71,6 +71,78 @@ pub(super) fn daw_tabs_json(_this: &JsValue, _args: &[JsValue], _ctx: &mut Conte
     Ok(JsString::from(json.as_str()).into())
 }
 
+/// `daw.appCloseTab()` — アクティブなタブを **GUI の ✕ と同じ経路** (`TabEvent::Close`) で閉じる。未保存なら
+/// 確認モーダルが開き、plugin があれば閉じる前に state を取り直して比べる (r.md #160)。結果は
+/// [`daw_app_close_guard_json`] と `tabsJson` で見る。確認を飛ばして捨てるのは `closeTab`。
+pub(super) fn daw_app_close_tab(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    with_app(|app, _side, _io| {
+        let key = app.pk();
+        app.handle_event(crate::app::AppEvent::Tab(crate::event_tabs::TabEvent::Close(key)));
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.appCloseGuardJson()` — `{modal, stateRequests}`: 保存確認モーダルが開いているか (`"close"` / `"quit"` /
+/// `null`) と、応答待ちの plugin state の取り寄せの数 (アクティブなタブ)。
+pub(super) fn daw_app_close_guard_json(_this: &JsValue, _args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    use crate::app::DirtyGuardAction;
+    let json = with_app(|app, _side, _io| {
+        let modal = app.ui_ephemeral.dirty_guard.as_ref().map(|a| match a {
+            DirtyGuardAction::CloseTabs(_) => "close",
+            DirtyGuardAction::Quit(_) => "quit",
+        });
+        serde_json::json!({ "modal": modal, "stateRequests": app.cur.pipc.pending_state_queue.len() }).to_string()
+    });
+    Ok(JsString::from(json.as_str()).into())
+}
+
+/// `daw.pluginParamsJson(trackId, deviceIndex)` — plugin が申告した param 表
+/// `[{id, name, min, max, default, readonly, hidden, automatable}]` (読み込みの後に届く。まだなら `[]`)。
+pub(super) fn daw_plugin_params_json(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let track = u32::try_from_js(args.get_or_undefined(0), ctx)?;
+    let index = u32::try_from_js(args.get_or_undefined(1), ctx)?;
+    let json = with_app(move |app, _side, _io| {
+        let infos = super::device_id_at_app(app, track, index).and_then(|id| app.cur.pipc.plugin_params.get(&id));
+        let rows: Vec<serde_json::Value> = infos
+            .unwrap_or(&[])
+            .iter()
+            .map(|p| {
+                use common::protocol::plugin_param_flags as flags;
+                serde_json::json!({
+                    "id": p.id, "name": p.name, "min": p.min_value, "max": p.max_value,
+                    "default": p.default_value,
+                    "readonly": p.flags & flags::READONLY != 0,
+                    "hidden": p.flags & flags::HIDDEN != 0,
+                    "automatable": p.flags & flags::AUTOMATABLE != 0,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(rows).to_string()
+    });
+    Ok(JsString::from(json.as_str()).into())
+}
+
+/// `daw.appSetPluginParam(trackId, deviceIndex, paramId, value)` — インスペクタの plugin param のツマミと同じ
+/// `DeviceEvent::SetPluginParam` (Song の編集。値は param の実値)。
+pub(super) fn daw_app_set_plugin_param(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let track = u32::try_from_js(args.get_or_undefined(0), ctx)?;
+    let index = u32::try_from_js(args.get_or_undefined(1), ctx)?;
+    let param_id = u32::try_from_js(args.get_or_undefined(2), ctx)?;
+    let value_real = args.get_or_undefined(3).to_number(ctx)?;
+    let ok = with_app(move |app, _side, _io| {
+        let Some(device_id) = super::device_id_at_app(app, track, index) else {
+            return false;
+        };
+        let event = crate::event_device::DeviceEvent::SetPluginParam { device_id, param_id, value_real };
+        app.handle_event(crate::app::AppEvent::Device(event));
+        true
+    });
+    if !ok {
+        return Err(js_native(format!("appSetPluginParam: no device at (track {track}, index {index})")));
+    }
+    Ok(JsValue::undefined())
+}
+
 /// `daw.metricsJson()` — engine の負荷 (`MetricsBridge`、resource monitor と同じ面):
 /// `{dspLoadAvg, xrunCount, bufferFrames, sampleRate}`。`docs/plan_project_tabs.md` §7 の
 /// 「1 タブのコストは変更前と同等」を headless で実測するための口。

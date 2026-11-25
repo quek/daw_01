@@ -114,6 +114,13 @@ impl LauncherRuntime {
             return;
         };
         let follow = scene.follow.clone();
+        if !self.follow_enabled {
+            // 全体 off (r.md #161、[`Self::set_follow_enabled`]): 発火を見送り、時計だけ同じ格子
+            // (`base` は動かさない) の次の周期へ送る。
+            self.scene.at = follow::next_due_beat(&follow, self.scene.at, self.scene.longest, fire)
+                .unwrap_or(f64::INFINITY);
+            return;
+        }
         let n = self.fill_scene_occupancy(song);
         let seed = follow::row_seed(SCENE_SEED_SALT, self.scene.scene_id);
         let scene_pos = |id| song.index.scene_pos(id);

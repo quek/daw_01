@@ -372,7 +372,7 @@ fn 独立に複製したトラックの_device_はアーカイブの目次を複
     assert!(drain(&mut rx).iter().any(|m| matches!(m, PluginCommand::RequestAllStates { .. })), "前提: 最新の state を取り寄せる");
     let archive = AraArchive { bytes: b"melodyne".to_vec(), ids: vec![source_id(1), original.clone()] };
     let entries = vec![SlotState { device_id: DEVICE_A, data: None, ara_archive: Some(archive), error: None }];
-    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), entries }));
+    app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries }));
 
     let song = app.cur.song_doc.song();
     assert_eq!(song.tracks.len(), 3, "複製した");

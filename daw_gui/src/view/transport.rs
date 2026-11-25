@@ -45,6 +45,19 @@ const TIME_READOUT_W: f32 = 66.0;
 const TRANSPOSE_LABEL_W: f32 = 62.0;
 const TRANSPOSE_FIELD_W: f32 = 40.0;
 
+/// バーの左右の余白と、右端に固定する Panic ボタンの幅。
+const BAR_PAD: f32 = 12.0;
+const PANIC_W: f32 = 28.0;
+
+/// r.md #161: フォローアクションの全体 on/off ボタン (`Follow`) の幅。ラベルが収まることは
+/// `follow_actions_button_states` が実 measure で固定する。
+const FOLLOW_ACTIONS_W: f32 = 52.0;
+
+/// 右端の Panic ボタンの左端。左詰め列の最後尾 (`draw_launcher_controls`) は、ここへ食い込む要素を描かない。
+fn panic_left(area: Rect) -> f32 {
+    area.x + area.w - BAR_PAD - PANIC_W
+}
+
 /// Phase 5 Step 5.1 follow-up (gui_01 #035): BPM scrubable_number style。
 /// sensitivity 0.5 = `1 px drag で 0.5 BPM 変化` (Ableton 流の感度)、
 /// range は SetSongBpmFromScrub handler の clamp と同じ 1..=400。
@@ -219,6 +232,17 @@ fn style_click(theme: &Theme) -> ToggleButtonStyle {
     }
 }
 
+/// r.md #161: フォローアクションの全体 on/off ボタン。on は既定の `accent`、off は中立面 + 通常の文字。
+/// `available == false` (有効なフォローアクションが無い = グレー表示) は面をバーの地の色へ沈めて文字も
+/// 薄くし、off と見分ける (どちらもパレットのトークンなので明 / 暗の両テーマに追従する)。
+fn style_follow_actions(theme: &Theme, available: bool) -> ToggleButtonStyle {
+    let base = ToggleButtonStyle { font_size: 12.0, ..style_transport_button(theme) };
+    if available {
+        return base;
+    }
+    ToggleButtonStyle { off_color: theme.core.header, text_color: theme.core.text_faint, ..base }
+}
+
 fn ts_den_to_index(den: u8) -> usize {
     match den {
         2 => 0,
@@ -291,7 +315,7 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     let p = &app.theme.core;
     ui.panel("transport_bg", area, p.header, 0.0);
 
-    let pad = 12.0;
+    let pad = BAR_PAD;
     let cy = area.y + (area.h - 28.0) * 0.5;
     let bh = 28.0;
 
@@ -314,16 +338,10 @@ pub fn draw(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) {
     // (running `x` を使わず area 右端から逆算するので、 左側に何ボタンが増減しても常に
     // 右端に張り付く)。 ラベルは "!"、 背景は他ボタンと同じ中立色 (`style_panic`)。
     // click で `AppEvent::Panic` を発火 (再生停止 + 全 plugin 再初期化)。
-    let panic_w = 28.0;
     ui.toggle_button_at(
         "transport_panic",
         "!",
-        Rect {
-            x: area.x + area.w - pad - panic_w,
-            y: cy,
-            w: panic_w,
-            h: bh,
-        },
+        Rect { x: panic_left(area), y: cy, w: PANIC_W, h: bh },
         false,
         &style_panic(&app.theme),
         |_| Edit::mutate(|app: &mut AppData| app.handle_event(AppEvent::Panic)),
@@ -909,6 +927,8 @@ fn draw_recording_controls(
 /// **「アレンジに戻す (全行)」はここには置かない。** ランチャー帯の「返す列」上端が
 /// 唯一の口で、各行の返すボタンの真上にあるぶん「この列を全部」が視線どおりに読める
 /// (バー上の同義ボタンは行側と重複していた)。
+///
+/// 量子化の右隣にフォローアクションの全体 on/off ([`draw_follow_actions_toggle`]、r.md #161)。
 fn draw_launcher_controls(
     app: &AppData,
     ui: &mut Ui<'_, AppData>,
@@ -945,7 +965,44 @@ fn draw_launcher_controls(
             app.handle_event(AppEvent::Launcher(LauncherEvent::SetGlobalQuantize(q)));
         }));
     }
-    x + q_w + 12.0
+    x += q_w + 12.0;
+    draw_follow_actions_toggle(app, ui, area, x, cy, bh)
+}
+
+/// r.md #161: フォローアクションの全体 on/off (Live の Enable Follow Actions Globally)。Launch の量子化の右隣。
+///
+/// 見た目は 3 状態: **on** = 点灯 (accent)、**off** = 消灯 (他のボタンの off と同じ面 + 通常の文字)、
+/// **グレー** = 有効なフォローアクションが 1 つも無い (バーの地の色の面 + 薄い文字。押しても切り替わらない)。
+/// 状態は Song に載らない (`handler::follow_global`)。
+///
+/// 左詰め列の最後尾なので、窓が狭くて右端の Panic に食い込むときは描かない (Panic の上に重ねない)。
+fn draw_follow_actions_toggle(
+    app: &AppData,
+    ui: &mut Ui<'_, AppData>,
+    area: Rect,
+    x: f32,
+    cy: f32,
+    bh: f32,
+) -> f32 {
+    let end = x + FOLLOW_ACTIONS_W + 12.0;
+    if end > panic_left(area) {
+        return x;
+    }
+    let available = app.cur.song_doc.song().has_follow_actions();
+    let on = app.follow_actions_enabled();
+    ui.toggle_button_at(
+        "transport_follow_actions",
+        "Follow",
+        Rect { x, y: cy, w: FOLLOW_ACTIONS_W, h: bh },
+        available && on,
+        &style_follow_actions(&app.theme, available),
+        move |_| {
+            Edit::mutate(move |app: &mut AppData| {
+                app.handle_event(AppEvent::Launcher(LauncherEvent::SetFollowActionsEnabled(!on)));
+            })
+        },
+    );
+    end
 }
 
 #[cfg(test)]
@@ -1086,5 +1143,88 @@ mod tests {
         assert!(!right_click(&mut host, &mut app, on_learn).open, "2 度目の右クリックで閉じる");
         assert!(!frame(&mut host, &mut app, FrameInput::default()).open, "閉じたまま");
         assert!(right_click(&mut host, &mut app, on_learn).open, "3 度目でまた開く");
+    }
+
+    /// r.md #161: フォローアクションの全体 on/off ボタン。ラベルが幅に収まり、有効なフォローアクションが
+    /// 無い間 (グレー) は押しても切り替わらず、あれば押すたびに切り替わる。窓が狭くて右端の Panic に
+    /// 食い込むときは描かない (Panic の上に重ねない)。
+    #[test]
+    fn follow_actions_button_states() {
+        use daw_ui_core::PointerFrame;
+
+        const X: f32 = 10.0;
+        /// 1 フレーム描いて、ボタンが使った幅 (描かなければ 0) を返す。
+        fn frame(host: &mut UiHost<AppData>, app: &mut AppData, area_w: f32, pointer: PointerFrame) -> f32 {
+            let mut scene = Scene::new();
+            let screen = PhysicalSize { width: 1280, height: 720 };
+            let area = Rect { x: 0.0, y: 0.0, w: area_w, h: 28.0 };
+            let mut used = 0.0;
+            let input = FrameInput { pointer, ..FrameInput::default() };
+            let edits = host.frame_to_edits(app, &mut scene, screen, input, |app, ui| {
+                used = draw_follow_actions_toggle(app, ui, area, X, 4.0, 20.0) - X;
+            });
+            for e in edits {
+                e.apply(app);
+            }
+            used
+        }
+        fn click(host: &mut UiHost<AppData>, app: &mut AppData) {
+            let p = (X + FOLLOW_ACTIONS_W * 0.5, 14.0);
+            frame(host, app, 600.0, PointerFrame { pos: Some(p), ..PointerFrame::default() });
+            let down = PointerFrame { pos: Some(p), primary_just_pressed: true, primary_pressed: true, ..PointerFrame::default() };
+            frame(host, app, 600.0, down);
+            frame(host, app, 600.0, PointerFrame { pos: Some(p), primary_just_released: true, ..PointerFrame::default() });
+        }
+
+        let mut app = crate::test_support::headless_app();
+        let mut host: UiHost<AppData> = UiHost::no_redraw();
+
+        let mut label_w = 0.0_f32;
+        let mut scene = Scene::new();
+        let screen = PhysicalSize { width: 200, height: 100 };
+        host.frame_to_edits(&app, &mut scene, screen, FrameInput::default(), |_, ui| {
+            label_w = ui.measure_text("Follow", 12.0);
+        });
+        assert!(label_w + 8.0 <= FOLLOW_ACTIONS_W, "ラベル {label_w}px が幅 {FOLLOW_ACTIONS_W}px に収まる");
+
+        // 広い窓では描く。Panic の左端に届く窓では描かない (幅を使わない)。
+        assert!(frame(&mut host, &mut app, 600.0, PointerFrame::default()) > FOLLOW_ACTIONS_W);
+        let narrow = X + FOLLOW_ACTIONS_W + BAR_PAD + PANIC_W;
+        assert_eq!(frame(&mut host, &mut app, narrow, PointerFrame::default()), 0.0, "Panic に重ねない");
+
+        // フォローアクションが無い (グレー) 間は押しても切り替わらない。
+        assert!(!app.cur.song_doc.song().has_follow_actions());
+        click(&mut host, &mut app);
+        assert!(app.follow_actions_enabled(), "グレーの間は切り替わらない");
+
+        app.edit_song(|song| {
+            let id = song.push_scene();
+            let scene = song.scenes.iter_mut().find(|s| s.id == id).expect("足した列");
+            scene.follow.enabled = true;
+        });
+        click(&mut host, &mut app);
+        assert!(!app.follow_actions_enabled(), "押すと off");
+        click(&mut host, &mut app);
+        assert!(app.follow_actions_enabled(), "もう 1 度押すと on");
+    }
+
+    /// r.md #161: on / off / グレーの 3 状態が、明 / 暗どちらのテーマでも見分けられる。on と off は面の色、
+    /// off とグレーは文字の濃さで分かれ、グレーの文字も面に沈み切らない。
+    #[test]
+    fn follow_actions_button_states_are_distinguishable_in_both_themes() {
+        use daw_ui_core::theme::contrast_ratio;
+        for id in ["dark", "light"] {
+            let theme = crate::theme::Theme::builtin(id).expect("組み込みテーマ");
+            let live = style_follow_actions(&theme, true);
+            let gray = style_follow_actions(&theme, false);
+            let on_off = contrast_ratio(live.on_color, live.off_color);
+            let off_gray = contrast_ratio(live.text_color, gray.text_color);
+            let gray_legible = contrast_ratio(gray.text_color, gray.off_color);
+            let off_legible = contrast_ratio(live.text_color, live.off_color);
+            assert!(on_off >= 3.0, "{id}: on と off の面 {on_off}");
+            assert!(off_gray >= 1.8, "{id}: off とグレーの文字 {off_gray}");
+            assert!(gray_legible >= 2.0, "{id}: グレーの文字と面 {gray_legible}");
+            assert!(off_legible > gray_legible, "{id}: off の文字はグレーより読める ({off_legible} / {gray_legible})");
+        }
     }
 }

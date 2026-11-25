@@ -539,6 +539,11 @@ pub struct ProjectShared {
     /// `AudioCommand::SetDeltaDevices` で書き、RT が buffer 頭で読む。Song に載せない)。slot ごとに独立に
     /// 読むので、書き換えの途中を読んでも「1 buffer だけ古い / 新しい id が混ざる」だけで壊れない。
     pub delta_devices: [AtomicU64; common::model::MAX_DELTA_DEVICES],
+    /// r.md #161: クリップと列のフォローアクションを効かせるか (既定 on)。`sc_listen_device` と同じ扱い
+    /// (IPC スレッドが `AudioCommand::SetFollowActionsEnabled` で書き、RT が buffer 頭で 1 回読んで
+    /// `LauncherRuntime::set_follow_enabled` へ渡す。Song に載せない)。**書き出しは読まない** — 書き出しの
+    /// `LauncherRuntime` は既定 (on) のまま走るので、off のまま書き出しても同じ音になる。
+    pub follow_actions_enabled: AtomicBool,
 }
 
 impl ProjectShared {
@@ -590,6 +595,7 @@ impl ProjectShared {
             telemetry_slot,
             sc_listen_device: AtomicU64::new(0),
             delta_devices: std::array::from_fn(|_| AtomicU64::new(0)),
+            follow_actions_enabled: AtomicBool::new(true),
         }
     }
 }

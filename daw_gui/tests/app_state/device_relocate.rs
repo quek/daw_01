@@ -130,7 +130,7 @@ fn move_between_tracks_keeps_device_id_and_carries_lane() {
     })));
     // plugin state の round-trip 待ちに積まれるので、応答を fake して実行させる。
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
 
     assert!(track_devices(&app, t0).is_empty(), "元トラックから消える");
@@ -198,7 +198,7 @@ fn move_across_tracks_rekeys_lane_row_override() {
         copy: false,
     })));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
 
     let new_lane = app
@@ -248,7 +248,7 @@ fn move_across_tracks_drops_ara_archive() {
         copy: false,
     })));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
     assert_eq!(track_devices(&app, t0), vec![other, dev], "同一チェーン内で並べ替わる");
     let song = app.cur.song_doc.song();
@@ -268,7 +268,7 @@ fn move_across_tracks_drops_ara_archive() {
         copy: false,
     })));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
     let song = app.cur.song_doc.song();
     let (tr, _) = daw_gui::app::find_device_by_id(song, dev).unwrap();
@@ -304,7 +304,7 @@ fn copy_allocates_new_id_and_keeps_state() {
         copy: true,
     })));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
 
     assert_eq!(track_devices(&app, t0), vec![dev], "コピー元は残る");
@@ -364,7 +364,7 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
         copy: true,
     })));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
     let same_copy = track_devices(&app, t0)
         .into_iter()
@@ -389,7 +389,7 @@ fn copy_to_other_track_drops_ara_but_same_track_keeps_it() {
         copy: true,
     })));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
     let cross_copy = track_devices(&app, t1)[0];
     let song = app.cur.song_doc.song();
@@ -432,7 +432,7 @@ fn move_voicevox_moves_vocal_marker() {
         copy: false,
     })));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
 
     let src = app.cur.song_doc.song().tracks.iter().find(|t| t.id == t0).unwrap();
@@ -469,7 +469,7 @@ fn removing_one_of_two_voicevox_keeps_vocal_marker() {
     app.handle_event(AppEvent::Device(DeviceEvent::RemoveDevices { device_ids: vec![a] }));
     // 削除は plugin state の round-trip 待ちに積まれるので、応答を fake して実行させる。
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
     let src = app.cur.song_doc.song().tracks.iter().find(|t| t.id == t0).unwrap();
     assert_eq!(src.plugins().count(), 1, "1 本だけ消える (組み込み native は数えない)");
@@ -496,7 +496,7 @@ fn deleting_source_track_after_move_keeps_moved_device_loaded() {
         copy: false,
     })));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
 
     // plan は「Song から列挙する」ので、移動した device は元トラックの plan に出ない。
@@ -509,7 +509,7 @@ fn deleting_source_track_after_move_keeps_moved_device_loaded() {
     let _ = drain(&mut plugin_rx);
     app.handle_event(AppEvent::DeleteTracks(vec![t0]));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
     let msgs = drain(&mut plugin_rx);
     assert!(
@@ -537,7 +537,7 @@ fn master_chain_round_trip() {
         copy: false,
     })));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
     assert_eq!(
         track_devices(&app, master),
@@ -557,7 +557,7 @@ fn master_chain_round_trip() {
         copy: false,
     })));
     app.handle_event(AppEvent::Plugin(
-        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), entries: Vec::new() },
+        common::protocol::PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries: Vec::new() },
     ));
     assert!(track_devices(&app, master).is_empty(), "master から戻る");
     assert!(app.cur.song_doc.song().song_lanes.is_empty(), "lane も戻る");

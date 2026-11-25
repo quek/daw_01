@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use common::model::Song;
 
+use crate::handler::plugin_dirty::SavedPluginState;
 use crate::media_bundle::{self, TransferFailure};
 use crate::state::*;
 
@@ -103,7 +104,16 @@ impl AppData {
     /// (旧契約)、 audio engine へ新 project_dir + song を流す。 saved baseline = snapshot、
     /// `is_dirty` は live と snapshot の差で再計算する (state 待ちの間の編集が live に
     /// あれば dirty)。
-    pub(crate) fn finish_save(&mut self, mut snapshot: Box<Song>, path: PathBuf, snap_epoch: u64) {
+    ///
+    /// `plugin_state` (r.md #160) = この保存のために plugin から取り直した state。`None` は取り直していない保存
+    /// (plugin が無い)。
+    pub(crate) fn finish_save(
+        &mut self,
+        mut snapshot: Box<Song>,
+        path: PathBuf,
+        snap_epoch: u64,
+        plugin_state: Option<SavedPluginState>,
+    ) {
         let Some(dir) = path.parent().map(Path::to_path_buf) else {
             tracing::error!(path = %path.display(), "save path has no parent dir");
             self.ui_ephemeral.status_message = "保存先フォルダを決められません".into();
@@ -151,7 +161,16 @@ impl AppData {
         // 残す (replace_song は使わない)。 bundle へ運べなかった媒体は保存したファイルに
         // 入っていない (live は置き場を指して鳴り続ける) ので、 未保存のまま次の保存でやり直させる。
         if !edited_since_snapshot && failures.is_empty() {
-            self.cur.song_doc.mark_saved();
+            self.cur.song_doc.mark_song_saved();
+        }
+        // r.md #160: plugin の中身は、state を取り直す要求を送った時点までがファイルに入った。往復の間に
+        // 報告された変更は入っている保証が無いので降ろさない (下の再保存 loop / 次の保存が確定する)。
+        match plugin_state {
+            Some(saved) => {
+                self.cur.song_doc.mark_plugin_edits_saved(saved.through_edits);
+                self.rebase_plugin_state_on_save(saved.digest);
+            }
+            None => self.cur.song_doc.mark_plugin_edits_saved(self.cur.song_doc.plugin_edits()),
         }
         // 保存成功後、 この project の autosave (sidecar + 未保存→Save As
         // 用の session recovery file) を削除する。 save 後の .daw が
@@ -394,7 +413,7 @@ mod tests {
         std::fs::create_dir_all(&new_dir).unwrap();
         let epoch = app.cur.song_doc.edit_epoch();
         let snapshot = Box::new(app.cur.song_doc.song().clone());
-        app.finish_save(snapshot, new_daw.clone(), epoch);
+        app.finish_save(snapshot, new_daw.clone(), epoch, None);
 
         assert!(new_daw.exists(), "project file written");
         assert_eq!(app.cur.song_doc.file_path.as_deref(), Some(new_daw.as_path()));
@@ -409,7 +428,7 @@ mod tests {
         touch(&junk);
         let epoch = app.cur.song_doc.edit_epoch();
         let snapshot = Box::new(app.cur.song_doc.song().clone());
-        app.finish_save(snapshot, new_daw.clone(), epoch);
+        app.finish_save(snapshot, new_daw.clone(), epoch, None);
         assert!(!junk.exists(), "未参照はゴミ箱へ (status: {})", app.ui_ephemeral.status_message);
         assert!(new_dir.join("samples").join("b.wav").exists(), "undo 参照は残る");
         assert!(new_dir.join("samples").join("a.wav").exists());
@@ -433,7 +452,7 @@ mod tests {
         app.cur.song_doc.replace_song(song);
         let epoch = app.cur.song_doc.edit_epoch();
         let snapshot = Box::new(app.cur.song_doc.song().clone());
-        app.finish_save(snapshot, daw, epoch);
+        app.finish_save(snapshot, daw, epoch, None);
         assert!(junk.exists(), "相乗りフォルダでは掃除しない");
     }
 }

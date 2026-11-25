@@ -50,6 +50,8 @@ impl AppData {
         // (`pending_state_queue`) はそのまま残るので、drain 後に
         // `request_guarded_action` が終了で再評価する。
         self.clear_pending_guards();
+        // r.md #160: 新しい終了の確認。plugin の中身の比較は全タブでやり直す。
+        self.reset_unreported_checks();
         // `docs/plan_project_tabs.md` Q9: 未保存タブを 1 つずつ確認してから終了する。
         self.continue_quit(req);
     }

@@ -56,6 +56,11 @@ pub struct LauncherUiState {
     /// フォローアクションのたびに `*` が立ち、書き出しの再現性も壊れる
     /// (計画書 §1.4)。
     pub running: Vec<(u64, common::audio_bridge::LauncherRowSnapshot)>,
+    /// r.md #161: フォローアクションを全体で off にしているか (`false` = on、Live の Enable Follow Actions
+    /// Globally)。**聴き方の都合**で Song に書かず、保存も undo もしない (`*` も立たない)。プロジェクトを開くと
+    /// 常に on。書き込みと `AudioCommand::SetFollowActionsEnabled` の送信は
+    /// `handler::follow_global::set_follow_actions_enabled` だけ。
+    pub follow_actions_off: bool,
 }
 
 impl LauncherUiState {

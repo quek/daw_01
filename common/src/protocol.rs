@@ -773,6 +773,12 @@ pub enum AudioCommand {
     SwitchRowToArranger { project: ProjectKey, track_id: u32, lane_id: u32 },
     /// r.md #87: 全行の主導権をアレンジへ返す。
     SwitchAllToArranger { project: ProjectKey },
+    /// r.md #161: クリップと列のフォローアクションを全体で効かせるか (Live の Enable Follow Actions Globally)。
+    /// **聴き方の都合**で Song には書かない (`SetScListen` と同じ扱い: 書き出しは常に on で走り、engine は
+    /// LoadSong / project 切替でも値を変えない)。off の間は発火を見送り、鳴っているセルはそのまま回り続ける
+    /// (ループしないセルは最後まで鳴って止まる)。
+    /// on に戻すと、発火の格子 (撃った拍からの周期) の次の境界から再開する。slot の既定は on。
+    SetFollowActionsEnabled { project: ProjectKey, enabled: bool },
     /// Global Sampler (`docs/plan_global_sampler.md` §3.2): daw_gui が create した
     /// 音声リング (`sampler_ring::sampler_shmem_id`) を open し、次の buffer から
     /// `source` の音を書き続ける。既に開いているリングは置き換える (旧世代は
@@ -871,6 +877,7 @@ impl AudioCommand {
             | StopAllRows { project, .. }
             | SwitchRowToArranger { project, .. }
             | SwitchAllToArranger { project }
+            | SetFollowActionsEnabled { project, .. }
             | PreviewSequence { project, .. }
             | PreviewSequenceStop { project } => Some(*project),
             OpenSamplerRing { source, .. } => source.project(),
@@ -1156,7 +1163,11 @@ pub enum PluginCommand {
     RequestSlotState { device: DeviceAddr },
     /// Ask the plugin_host to capture state for every device of `project` at once.
     /// Reply is `PluginEvent::AllPluginStates`. Used for project save.
-    RequestAllStates { project: ProjectKey },
+    ///
+    /// `request` は daw_gui が要求ごとに振る番号で、応答がそのまま返す。daw_gui は「いま待っている番号」の
+    /// 応答だけを受ける — 応答を待ちきれずに破棄した要求の応答が後から届いても、次の要求の応答として
+    /// 受け取らない (その間に device が増減していると、古い時点の state を保存してしまう)。
+    RequestAllStates { project: ProjectKey, request: u64 },
     /// r.md #138: 鍵盤ごとの名前を取り直し、 前回送った内容から変わっていたら
     /// `PluginEvent::PluginKeyNames` を送る (変わっていなければ返事は無い)。 daw_gui が
     /// ピアノロールにその音源の鍵盤を出し始めたときに送る — 通知せずに名前を変える plugin の、
@@ -1356,8 +1367,9 @@ pub enum PluginEvent {
         device: DeviceAddr,
         data: Option<Vec<u8>>,
     },
-    /// Reply to `RequestAllStates { project }`: one entry per loaded device of that project.
-    AllPluginStates { project: ProjectKey, entries: Vec<SlotState> },
+    /// Reply to `RequestAllStates { project, request }`: one entry per loaded device of that project.
+    /// `request` は要求の番号をそのまま返す。
+    AllPluginStates { project: ProjectKey, request: u64, entries: Vec<SlotState> },
     /// r.md #65: エディタ窓のジオメトリ。open 直後 / **rect が変わったとき** /
     /// close 直前に送る。rect の変化は `WM_MOVE` / `WM_SIZE` だけが拾う
     /// (`EditorWindow::take_geometry_change` の不変条件。ドラッグ中は modal ループで
@@ -1434,6 +1446,15 @@ pub enum PluginEvent {
     },
     /// Plugin GUI で knob を release した通知 (gesture end)。
     PluginParamGestureEnd { device: DeviceAddr, param_id: u32 },
+    /// r.md #160: **ユーザーがプラグインの窓の中で中身を変えた**、という plugin の報告。daw_gui はそのタブを
+    /// 未保存 (`*`) にする (plugin の state は Song の外にあるので、Song の編集としては見えない)。
+    ///
+    /// 送る条件は plugin host が決める (`daw_plugin_host::user_edit` が正本): 報告の口 (param の値 /
+    /// CLAP `mark_dirty` / VST3 `setDirty`・`restartComponent(kParamValuesChanged)` …) のどれかが来て、
+    /// かつその device のエディタ窓が開いていて、直前に plugin host の窓 (どの plugin の窓かは区別しない) へ
+    /// 入力があったとき。daw_gui が state を取り直す (`RequestAllStates`) たびに device あたり 1 回だけ来る。
+    /// 読み込みの state 復元や、host が書いたオートメーションへの反応はここに来ない。
+    PluginStateChanged { device: DeviceAddr },
     /// builtin VOICEVOX plugin の合成スレッドの状態遷移 + 進捗。
     VoicevoxSynthStatus {
         device: DeviceAddr,
@@ -1463,6 +1484,7 @@ impl PluginEvent {
             | PluginParamTouched { device, .. }
             | PluginParamValueChanged { device, .. }
             | PluginParamGestureEnd { device, .. }
+            | PluginStateChanged { device }
             | VoicevoxSynthStatus { device, .. } => Some(device.project),
             AllPluginStates { project, .. } => Some(*project),
             PluginsReinitDone { project } => *project,
@@ -1627,7 +1649,7 @@ mod tests {
             Some(P2)
         );
         assert_eq!(
-            PluginEvent::AllPluginStates { project: P1, entries: vec![] }.project(),
+            PluginEvent::AllPluginStates { project: P1, request: 1, entries: vec![] }.project(),
             Some(P1)
         );
         assert_eq!(PluginEvent::PluginsReinitDone { project: None }.project(), None);
@@ -1772,6 +1794,7 @@ mod tests {
     fn all_plugin_states_roundtrip() {
         let msg = PluginEvent::AllPluginStates {
             project: P2,
+            request: 7,
             entries: vec![
                 SlotState {
                     device_id: 1,

@@ -198,6 +198,10 @@ impl AppData {
                 self.row_to_arranger(LauncherRow::Track(track_id));
             }
             T::SwitchAllToArranger if pressed => self.all_rows_to_arranger(),
+            // r.md #161: 押すたびに切り替える (トランスポートのボタンと同じ口)。
+            T::ToggleFollowActions if pressed => {
+                self.request_follow_actions_enabled(!self.follow_actions_enabled());
+            }
             _ => {}
         }
     }
@@ -269,6 +273,7 @@ impl AppData {
             E::RowToArranger { row } => self.row_to_arranger(row),
             E::AllToArranger => self.all_rows_to_arranger(),
             E::SetGlobalQuantize(q) => self.set_global_launch_quantize(q),
+            E::SetFollowActionsEnabled(on) => self.request_follow_actions_enabled(on),
 
             // ---- 表示 ----
             E::SetLayout(l) => self.cur.view.launcher_layout = l,

@@ -21,15 +21,13 @@ use clap_sys::events::{
     clap_event_note, clap_input_events, clap_output_events,
 };
 use clap_sys::events::{
-    CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_MOD,
+    CLAP_EVENT_DONT_RECORD, CLAP_EVENT_PARAM_GESTURE_BEGIN, CLAP_EVENT_PARAM_GESTURE_END, CLAP_EVENT_PARAM_MOD,
     CLAP_EVENT_PARAM_VALUE, CLAP_EVENT_TRANSPORT, CLAP_TRANSPORT_HAS_BEATS_TIMELINE,
     CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_HAS_TEMPO,
     CLAP_TRANSPORT_HAS_TIME_SIGNATURE, CLAP_TRANSPORT_IS_LOOP_ACTIVE, CLAP_TRANSPORT_IS_PLAYING,
     clap_event_param_mod, clap_event_param_value, clap_event_transport,
 };
-use clap_sys::ext::audio_ports::{
-    CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports,
-};
+use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_plugin_audio_ports};
 use clap_sys::ext::gui::{
     CLAP_EXT_GUI, CLAP_WINDOW_API_WIN32, clap_gui_resize_hints, clap_plugin_gui, clap_window,
     clap_window_handle,
@@ -55,6 +53,10 @@ use common::plugin_format::PluginFormat;
 use common::protocol::RenderMode;
 
 use crate::clap_host::Host;
+use crate::clap_ports::{
+    GetExtFn, query_aux_input_channels, query_aux_output_channels, query_output_channel_count,
+    query_port_channel_count,
+};
 use crate::module_cache::{ClapModule, ModuleCache};
 use crate::plugin_instance::{
     AudioHalf, AudioProcessorHalf, EditorSizer, HostCallbacks, LoadedPlugin, NoteTransition,
@@ -79,6 +81,8 @@ struct ClapParamMeta {
     /// 一致 = ある)。 buffer 頭の 1 pass で立て、 global mod を捨てる判定に使う (event ごとに
     /// 全 event を走査する O(n²) を避ける)。
     per_note_epoch: u64,
+    /// r.md #160: `CLAP_PARAM_IS_READONLY` — plugin が出すだけの値 (メーター)。値が動いても中身の変更ではない。
+    readonly: bool,
 }
 
 // ====================================================================
@@ -137,6 +141,13 @@ pub struct ClapAudioHalf {
     collected_out_param_touches: Vec<u32>,
     collected_out_param_values: Vec<(u32, f64)>,
     collected_out_param_releases: Vec<u32>,
+    /// r.md #160: 直前の `process()` が、記録してよい (`CLAP_EVENT_DONT_RECORD` でない)・読み取り専用でない
+    /// param の値を出したか。collector が立て、[`AudioProcessorHalf::take_out_user_edit`] が判定に使う。
+    out_value_edited: bool,
+    /// r.md #160: 上をユーザーの変更と判定した印 (worker が読むと降りる)。
+    collected_user_edit: bool,
+    /// r.md #160: エディタ窓が開いている間 (`HostCallbacks::editor_session` の写し)。
+    editor_session: crate::user_edit::EditorSession,
     /// r.md #140: プラグインの窓で掴まれている param (出力 event の gesture から立てる)。
     gestures: process_scaffold::GestureHold,
 }
@@ -238,6 +249,11 @@ impl ClapAudioHalf {
         }
         for &id in &self.collected_out_param_releases {
             self.gestures.end(id);
+        }
+        // r.md #160: 値を出しただけではユーザーの変更と限らない (内部の変調 / host の書き込みへの反応)。
+        // 窓が開いていて直前に入力があったときだけ数える。atomic の読み書きと `Instant::now()` だけ。
+        if std::mem::take(&mut self.out_value_edited) && self.editor_session.should_report() {
+            self.collected_user_edit = true;
         }
     }
 }
@@ -407,6 +423,8 @@ impl AudioProcessorHalf for ClapAudioHalf {
             param_touches: std::ptr::from_mut(&mut self.collected_out_param_touches),
             param_values: std::ptr::from_mut(&mut self.collected_out_param_values),
             param_releases: std::ptr::from_mut(&mut self.collected_out_param_releases),
+            param_meta: std::ptr::from_ref(&self.param_meta),
+            value_edited: std::ptr::from_mut(&mut self.out_value_edited),
         };
         let out_events = clap_output_events {
             ctx: std::ptr::from_mut(&mut out_collector) as *mut c_void,
@@ -484,6 +502,14 @@ impl AudioProcessorHalf for ClapAudioHalf {
 
     fn drain_out_param_releases_into(&mut self, out: &mut Vec<u32>) {
         out.append(&mut self.collected_out_param_releases);
+    }
+
+    fn take_out_user_edit(&mut self) -> bool {
+        std::mem::take(&mut self.collected_user_edit)
+    }
+
+    fn retry_out_user_edit(&mut self) {
+        self.collected_user_edit = true;
     }
 
     fn set_ara_idle(&mut self, idle: bool) {
@@ -728,6 +754,7 @@ impl ClapPlugin {
                     modulatable,
                     per_note,
                     per_note_epoch: 0,
+                    readonly: info.flags & common::protocol::plugin_param_flags::READONLY != 0,
                 },
             );
             last_param_value.insert(info.id, info.default_value);
@@ -773,6 +800,9 @@ impl ClapPlugin {
             collected_out_param_touches: Vec::with_capacity(64),
             collected_out_param_values: Vec::with_capacity(256),
             collected_out_param_releases: Vec::with_capacity(64),
+            out_value_edited: false,
+            collected_user_edit: false,
+            editor_session: host.callbacks.editor_session.clone(),
             gestures: Default::default(),
         }));
 
@@ -1187,6 +1217,7 @@ impl LoadedPlugin for ClapPlugin {
         // `set_parent` の内側から `request_resize` を投げるプラグインがあるので、
         // 窓は呼ぶ前に公開しておく (VST3 `attached` と同じ理由)。
         self.host.callbacks.editor_hwnd.store(hwnd, Ordering::Release);
+        self.host.callbacks.editor_session.open();
         let window = clap_window {
             api: CLAP_WINDOW_API_WIN32.as_ptr(),
             specific: clap_window_handle {
@@ -1225,15 +1256,15 @@ impl LoadedPlugin for ClapPlugin {
         // **先頭で** alive を落とす (r.md #65)。以後 `ClapSizer` は FFI を呼ばない。
         self.gui_alive.store(false, Ordering::Release);
         self.host.callbacks.editor_hwnd.store(0, Ordering::Release);
-        if !self.gui_created {
-            return;
-        }
-        if let Some(gui) = self.gui_ref()
+        if self.gui_created
+            && let Some(gui) = self.gui_ref()
             && let Some(f) = gui.destroy
         {
             unsafe { f(self.plugin) };
         }
         self.gui_created = false;
+        // r.md #160: `destroy` の中で確定した編集まで数えてから閉じる。
+        self.host.callbacks.editor_session.close();
     }
 }
 
@@ -1514,6 +1545,10 @@ struct OutEventCollector {
     param_touches: *mut Vec<u32>,
     param_values: *mut Vec<(u32, f64)>,
     param_releases: *mut Vec<u32>,
+    /// r.md #160: 読み取り専用の param を見分ける (`ClapAudioHalf::param_meta`)。
+    param_meta: *const std::collections::HashMap<u32, ClapParamMeta>,
+    /// r.md #160: 記録してよい・読み取り専用でない値が来たら立てる (`ClapAudioHalf::out_value_edited`)。
+    value_edited: *mut bool,
 }
 
 /// `try_push` callback shared by all CLAP plugins. Unknown types are
@@ -1638,6 +1673,14 @@ unsafe extern "C" fn collect_out_note_try_push(
                 if out.len() < out.capacity() {
                     out.push((pv.param_id, pv.value));
                 }
+            }
+            // r.md #160: MIDI CC で動いた値 (`events.h` の CLAP_EVENT_DONT_RECORD: "useful when a parameter
+            // changes because of a MIDI CC") とメーターは、中身の変更に数えない。
+            let recordable = header.flags & CLAP_EVENT_DONT_RECORD == 0;
+            let readonly = !collector.param_meta.is_null()
+                && unsafe { &*collector.param_meta }.get(&pv.param_id).is_some_and(|m| m.readonly);
+            if recordable && !readonly && !collector.value_edited.is_null() {
+                unsafe { *collector.value_edited = true };
             }
         }
         _ => {}
@@ -1788,126 +1831,6 @@ fn encode_note(transition: NoteTransition) -> clap_event_note {
     }
 }
 
-// ====================================================================
-// port queries
-// ====================================================================
-
-fn query_output_channel_count(plugin: *const clap_plugin, get_ext: GetExtFn) -> u32 {
-    query_port_channel_count(plugin, get_ext, false)
-}
-
-/// PR4 sidechain: enumerate the plugin's `is_main=false` input ports and
-/// return their channel counts in declaration order (capped at MAX_AUX_IN).
-fn query_aux_input_channels(plugin: *const clap_plugin, get_ext: GetExtFn) -> Vec<u32> {
-    let ext_ptr =
-        unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) } as *const clap_plugin_audio_ports;
-    if ext_ptr.is_null() {
-        return Vec::new();
-    }
-    let ext = unsafe { &*ext_ptr };
-    let Some(count_fn) = ext.count else {
-        return Vec::new();
-    };
-    let Some(get) = ext.get else {
-        return Vec::new();
-    };
-    let port_count = unsafe { count_fn(plugin, true) };
-    let mut aux: Vec<u32> = Vec::new();
-    for i in 0..port_count {
-        let mut info = std::mem::MaybeUninit::<clap_audio_port_info>::zeroed();
-        let ok = unsafe { get(plugin, i, true, info.as_mut_ptr()) };
-        if !ok {
-            continue;
-        }
-        let info = unsafe { info.assume_init() };
-        if info.flags & CLAP_AUDIO_PORT_IS_MAIN == 0 {
-            if aux.len() >= common::process_data::MAX_AUX_IN {
-                tracing::warn!(
-                    port_index = i,
-                    cap = common::process_data::MAX_AUX_IN,
-                    "plugin declared more aux input ports than the host caps to"
-                );
-                break;
-            }
-            // shmem aux buffer は MAX_CHANNELS plane しか持たないので clamp。
-            aux.push(info.channel_count.min(common::process_data::MAX_CHANNELS as u32));
-        }
-    }
-    aux
-}
-
-/// パラアウト: enumerate the plugin's `is_main=false` **output** ports
-/// (capped at MAX_AUX_OUT). Symmetric to `query_aux_input_channels`.
-fn query_aux_output_channels(plugin: *const clap_plugin, get_ext: GetExtFn) -> Vec<u32> {
-    let ext_ptr =
-        unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) } as *const clap_plugin_audio_ports;
-    if ext_ptr.is_null() {
-        return Vec::new();
-    }
-    let ext = unsafe { &*ext_ptr };
-    let Some(count_fn) = ext.count else {
-        return Vec::new();
-    };
-    let Some(get) = ext.get else {
-        return Vec::new();
-    };
-    let port_count = unsafe { count_fn(plugin, false) };
-    let mut aux: Vec<u32> = Vec::new();
-    for i in 0..port_count {
-        let mut info = std::mem::MaybeUninit::<clap_audio_port_info>::zeroed();
-        let ok = unsafe { get(plugin, i, false, info.as_mut_ptr()) };
-        if !ok {
-            continue;
-        }
-        let info = unsafe { info.assume_init() };
-        if info.flags & CLAP_AUDIO_PORT_IS_MAIN == 0 {
-            if aux.len() >= common::process_data::MAX_AUX_OUT {
-                tracing::warn!(
-                    port_index = i,
-                    cap = common::process_data::MAX_AUX_OUT,
-                    "plugin declared more aux output ports than the host caps to"
-                );
-                break;
-            }
-            aux.push(info.channel_count.min(common::process_data::MAX_CHANNELS as u32));
-        }
-    }
-    aux
-}
-
-/// Queries the plugin's first audio port in the given direction. Returns `0`
-/// when the plugin declares no port of that direction.
-fn query_port_channel_count(
-    plugin: *const clap_plugin,
-    get_ext: GetExtFn,
-    is_input: bool,
-) -> u32 {
-    let ext_ptr =
-        unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) } as *const clap_plugin_audio_ports;
-    if ext_ptr.is_null() {
-        // Extension missing entirely — assume stereo output, no input.
-        return if is_input { 0 } else { 2 };
-    }
-    let ext = unsafe { &*ext_ptr };
-    let count_fn = match ext.count {
-        Some(f) => f,
-        None => return if is_input { 0 } else { 2 },
-    };
-    let port_count = unsafe { count_fn(plugin, is_input) };
-    if port_count == 0 {
-        return 0;
-    }
-    let Some(get) = ext.get else {
-        return if is_input { 0 } else { 2 };
-    };
-    let mut info = std::mem::MaybeUninit::<clap_audio_port_info>::zeroed();
-    let ok = unsafe { get(plugin, 0, is_input, info.as_mut_ptr()) };
-    if !ok {
-        return if is_input { 0 } else { 2 };
-    }
-    unsafe { info.assume_init() }.channel_count
-}
-
 fn c_str_to_string(ptr: *const c_char) -> String {
     if ptr.is_null() {
         return String::new();
@@ -1953,8 +1876,6 @@ fn log_descriptor(index: u32, desc: &clap_plugin_descriptor) {
     let features = read_feature_list(desc.features);
     tracing::info!(index, %id, %name, %vendor, %version, ?features, "plugin descriptor");
 }
-
-type GetExtFn = unsafe extern "C" fn(*const clap_plugin, *const c_char) -> *const c_void;
 
 fn log_audio_ports(plugin: *const clap_plugin, get_ext: GetExtFn) {
     let ext_ptr = unsafe { get_ext(plugin, CLAP_EXT_AUDIO_PORTS.as_ptr()) }
@@ -2123,7 +2044,14 @@ mod tests {
     /// plugin 無しの audio half (`push_mod_event` / `track_plugin_param_edits` だけを回す)。
     /// param 1 = 非 modulatable、param 2 = modulatable。どちらも 0..=10、基準値 2。
     fn mod_half() -> ClapAudioHalf {
-        let meta = |modulatable| ClapParamMeta { min: 0.0, max: 10.0, modulatable, per_note: false, per_note_epoch: 0 };
+        let meta = |modulatable| ClapParamMeta {
+            min: 0.0,
+            max: 10.0,
+            modulatable,
+            per_note: false,
+            per_note_epoch: 0,
+            readonly: false,
+        };
         ClapAudioHalf {
             plugin: std::ptr::null(),
             processing: true,
@@ -2153,6 +2081,9 @@ mod tests {
             collected_out_param_touches: Vec::new(),
             collected_out_param_values: Vec::new(),
             collected_out_param_releases: Vec::new(),
+            out_value_edited: false,
+            collected_user_edit: false,
+            editor_session: Default::default(),
             gestures: Default::default(),
         }
     }

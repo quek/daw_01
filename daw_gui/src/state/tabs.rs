@@ -25,6 +25,9 @@ pub struct Tabs {
     /// タブ (戻し先)。swap 中にそのタブを閉じる経路 (`close_tab_now`) が「隣」ではなく
     /// ここへ戻るために読む。swap の外では `None`。
     pub(crate) visiting_from: Option<ProjectKey>,
+    /// 訪問中のタブをアクティブにした (`AppData::activate_visited_tab`)。`with_project` は訪問を終えても
+    /// 元のタブへ戻さない。
+    pub(crate) keep_visited: bool,
 }
 
 impl Tabs {
@@ -36,6 +39,7 @@ impl Tabs {
             order: vec![first],
             next_key: first.0 + 1,
             visiting_from: None,
+            keep_visited: false,
         }
     }
 

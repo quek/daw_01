@@ -21,6 +21,7 @@ mod plugin_scan;
 mod vst3_scan;
 mod clap_host;
 mod clap_plugin;
+mod clap_ports;
 mod editor_keys;
 mod key_names;
 mod load_bench;
@@ -32,6 +33,7 @@ mod process_scaffold;
 mod process_server;
 mod quiesce;
 mod thread_timer;
+mod user_edit;
 mod vst3_events;
 mod vst3_host;
 mod vst3_params;
@@ -809,6 +811,13 @@ impl PluginHost {
             // `gui_destroy`) が書き込む。plugin-main は窓の所有だけを持ち、
             // この atomic には触らない (「今どの窓に attach しているか」が SSoT)。
             editor_hwnd: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            editor_session: user_edit::EditorSession::default(),
+            on_state_changed: {
+                let tx = self.evt_tx.clone();
+                Arc::new(move || {
+                    let _ = tx.send(PluginEvent::PluginStateChanged { device });
+                })
+            },
         }
     }
 
@@ -950,9 +959,11 @@ impl PluginHost {
                 };
                 self.emit(PluginEvent::SlotPluginState { device, data });
             }
-            PluginCommand::RequestAllStates { project } => {
+            PluginCommand::RequestAllStates { project, request } => {
+                // r.md #160: 以後の「中身が変わった」はまた報告させる (集める前に — `user_edit` の doc)。
+                user_edit::note_state_requested();
                 let entries = self.collect_all_states(project);
-                self.emit(PluginEvent::AllPluginStates { project, entries });
+                self.emit(PluginEvent::AllPluginStates { project, request, entries });
             }
             PluginCommand::RefreshKeyNames { device } => self.refresh_key_names(device),
             PluginCommand::OpenSlotGuiEmbedded {
@@ -2436,11 +2447,11 @@ mod tests {
         set_silence(&mut host, b);
         while evt_rx.try_recv().is_ok() {}
 
-        host.handle_command(PluginCommand::RequestAllStates { project: ProjectKey(2) });
-        let Ok(PluginEvent::AllPluginStates { project, entries }) = evt_rx.try_recv() else {
+        host.handle_command(PluginCommand::RequestAllStates { project: ProjectKey(2), request: 41 });
+        let Ok(PluginEvent::AllPluginStates { project, request, entries }) = evt_rx.try_recv() else {
             panic!("AllPluginStates expected");
         };
-        assert_eq!(project, ProjectKey(2));
+        assert_eq!((project, request), (ProjectKey(2), 41), "要求の番号をそのまま返す");
         assert_eq!(entries.iter().map(|e| e.device_id).collect::<Vec<_>>(), vec![5]);
 
         host.handle_command(PluginCommand::ReinitAllPlugins { project: Some(ProjectKey(1)) });

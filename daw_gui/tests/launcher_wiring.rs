@@ -1715,3 +1715,147 @@ fn 停止点からの再開はセルを頭出ししない() {
     );
     assert!(!sent.iter().any(|c| matches!(c, AudioCommand::Play { project: _ })), "Play は出ない: {sent:?}");
 }
+
+/// r.md #161 のテスト用: 行 1 の列 0 にセルを置いて、そのフォローアクションを有効にする。
+fn put_follow_cell(app: &mut AppData) -> LauncherCellKey {
+    let cell = put_cell(app, 1, 0);
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetLaunchSettings {
+        cells: vec![cell],
+        edit: LaunchEdit::FollowEnabled(true),
+    }));
+    cell
+}
+
+/// engine へ送った「フォローアクションの全体 on/off」を順に取り出す (他の命令は捨てる)。
+fn follow_enabled_cmds(rx: &mut UnboundedReceiver<AudioCommand>) -> Vec<bool> {
+    let mut v = Vec::new();
+    while let Ok(c) = rx.try_recv() {
+        if let AudioCommand::SetFollowActionsEnabled { enabled, .. } = c {
+            v.push(enabled);
+        }
+    }
+    v
+}
+
+/// r.md #161: フォローアクションの全体 on/off は **聴き方の都合**。engine へ命令 1 本を送るだけで、
+/// `*` も undo も子プロセスへの Song の sync も動かさない (Song を書かない)。
+#[test]
+fn フォローアクションの全体切り替えは_song_を書かない() {
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 1, 1);
+    put_follow_cell(&mut app);
+    app.cur.song_doc.mark_saved();
+    let (depth, sync, edit) =
+        (app.cur.song_doc.undo_depth(), app.cur.song_doc.sync_epoch(), app.cur.song_doc.edit_epoch());
+    while audio_rx.try_recv().is_ok() {}
+    assert!(app.follow_actions_enabled(), "既定は on");
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetFollowActionsEnabled(false)));
+    assert!(!app.follow_actions_enabled());
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetFollowActionsEnabled(true)));
+    assert!(app.follow_actions_enabled());
+
+    assert_eq!(follow_enabled_cmds(&mut audio_rx), vec![false, true]);
+    assert!(!app.cur.song_doc.is_dirty(), "`*` は立たない");
+    assert_eq!(app.cur.song_doc.undo_depth(), depth, "undo に積まない");
+    assert_eq!(
+        (app.cur.song_doc.sync_epoch(), app.cur.song_doc.edit_epoch()),
+        (sync, edit),
+        "Song は書いていない"
+    );
+}
+
+/// 有効なフォローアクションが 1 つも無いプロジェクトでは切り替えるものが無い (ボタンはグレー表示) ので
+/// off にできない。列のフォローアクションでも「ある」に数える。
+#[test]
+fn フォローアクションが無ければ全体_off_にできない() {
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 1, 1);
+    put_cell(&mut app, 1, 0);
+    while audio_rx.try_recv().is_ok() {}
+    assert!(!app.cur.song_doc.song().has_follow_actions());
+
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetFollowActionsEnabled(false)));
+    assert!(app.follow_actions_enabled(), "切り替わらない");
+    assert!(follow_enabled_cmds(&mut audio_rx).is_empty(), "engine へも送らない");
+
+    let scene_id = app.cur.song_doc.song().scenes[0].id;
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetSceneFollow {
+        scene_ids: vec![scene_id],
+        edit: LaunchEdit::FollowEnabled(true),
+    }));
+    assert!(app.cur.song_doc.song().has_follow_actions(), "列のフォローアクションも数える");
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetFollowActionsEnabled(false)));
+    assert!(!app.follow_actions_enabled());
+    assert_eq!(follow_enabled_cmds(&mut audio_rx), vec![false]);
+
+    // off のまま最後のフォローアクションを消す (ボタンはグレー) → on へ戻すほうは受ける。断ると「見えない off」が
+    // 残り、後で足したフォローアクションが黙って発火しない。
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetSceneFollow {
+        scene_ids: vec![scene_id],
+        edit: LaunchEdit::FollowEnabled(false),
+    }));
+    assert!(!app.cur.song_doc.song().has_follow_actions());
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetFollowActionsEnabled(true)));
+    assert!(app.follow_actions_enabled(), "グレーの間でも on へは戻せる");
+    assert_eq!(follow_enabled_cmds(&mut audio_rx), vec![true]);
+}
+
+/// MIDI 割り当て: Learn したパッドを押すたびに全体 on/off が切り替わる (割り当てそのものは Song に載る)。
+#[test]
+fn midi_learn_したノートでフォローアクションの全体_on_off_を切り替える() {
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 1, 1);
+    put_follow_cell(&mut app);
+    app.handle_event(AppEvent::Launcher(LauncherEvent::StartLearn(
+        common::model::BindingTarget::ToggleFollowActions,
+    )));
+    app.handle_event(AppEvent::MidiNoteOn { channel: 9, pitch: 40, velocity: 100 });
+    assert_eq!(app.launcher_bindings().len(), 1, "Learn 中の 1 打で bind される");
+    assert!(app.follow_actions_enabled(), "bind した打鍵では切り替えない");
+    while audio_rx.try_recv().is_ok() {}
+
+    app.handle_event(AppEvent::MidiNoteOn { channel: 9, pitch: 40, velocity: 100 });
+    assert!(!app.follow_actions_enabled(), "1 打目で off");
+    app.handle_event(AppEvent::MidiNoteOff { channel: 9, pitch: 40 });
+    assert!(!app.follow_actions_enabled(), "離しても切り替えない");
+    app.handle_event(AppEvent::MidiNoteOn { channel: 9, pitch: 40, velocity: 100 });
+    assert!(app.follow_actions_enabled(), "2 打目で on");
+    assert_eq!(follow_enabled_cmds(&mut audio_rx), vec![false, true]);
+}
+
+/// 状態はプロジェクト (タブ) ごと。engine を作り直したら (既定は on)、off にしているタブだけ送り直す
+/// — 送らないと GUI のボタンは off なのにフォローアクションが発火する。
+#[test]
+fn engine_を作り直したら_off_のタブだけフォローアクションの全体_off_を送り直す() {
+    let (mut app, mut audio_rx, _p) = build_app();
+    seed(&mut app, 1, 1);
+    put_follow_cell(&mut app);
+    let off_tab = app.pk();
+    app.handle_event(AppEvent::Launcher(LauncherEvent::SetFollowActionsEnabled(false)));
+    app.handle_event(AppEvent::Tab(daw_gui::event_tabs::TabEvent::New));
+    let on_tab = app.pk();
+    assert!(app.follow_actions_enabled(), "新しいタブは on (状態はタブごと)");
+    while audio_rx.try_recv().is_ok() {}
+
+    app.restore_tabs_after_respawn(common::protocol::ChildKind::Audio);
+
+    let mut sent = Vec::new();
+    while let Ok(c) = audio_rx.try_recv() {
+        sent.push(c);
+    }
+    let follow: Vec<_> = sent
+        .iter()
+        .filter_map(|c| match c {
+            AudioCommand::SetFollowActionsEnabled { project, enabled } => Some((*project, *enabled)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(follow, vec![(off_tab, false)], "off のタブだけ送り直す: {sent:?}");
+    let pos = |pred: &dyn Fn(&AudioCommand) -> bool| sent.iter().position(pred);
+    let open = pos(&|c| matches!(c, AudioCommand::OpenProject { project } if *project == off_tab)).expect("OpenProject");
+    let set = pos(&|c| matches!(c, AudioCommand::SetFollowActionsEnabled { .. })).expect("送り直し");
+    assert!(open < set, "slot を開いた後に送る: {sent:?}");
+    assert_eq!(app.pk(), on_tab, "アクティブなタブは元のまま");
+    assert!(app.follow_actions_enabled());
+}

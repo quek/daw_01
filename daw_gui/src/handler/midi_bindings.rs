@@ -53,7 +53,9 @@ impl AppData {
             BindingTarget::StopLauncherRow { track_id } | BindingTarget::SwitchRowToArranger { track_id } => {
                 return format!("{}: {}", song.track_display_name(track_id), phrase());
             }
-            BindingTarget::StopAllLauncherRows | BindingTarget::SwitchAllToArranger => return phrase().into(),
+            BindingTarget::StopAllLauncherRows
+            | BindingTarget::SwitchAllToArranger
+            | BindingTarget::ToggleFollowActions => return phrase().into(),
         };
         let name = self.automation_target_label(&param);
         match track {

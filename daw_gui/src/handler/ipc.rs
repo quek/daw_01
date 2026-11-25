@@ -310,8 +310,8 @@ impl AppData {
                 self.on_plugin_load_failed_from_child(device_id, plugin_id, reason, generation);
             }
             PluginEvent::SlotPluginState { .. } => {}
-            PluginEvent::AllPluginStates { entries, .. } => {
-                self.on_all_states_from_child(entries);
+            PluginEvent::AllPluginStates { request, entries, .. } => {
+                self.on_all_states_from_child(request, entries);
             }
             PluginEvent::SlotGuiGeometry {
                 device: DeviceAddr { device_id, .. },
@@ -372,6 +372,9 @@ impl AppData {
             }
             PluginEvent::PluginParamGestureEnd { device: DeviceAddr { device_id, .. }, param_id } => {
                 self.plugin_window_gesture_end(device_id, param_id);
+            }
+            PluginEvent::PluginStateChanged { device: DeviceAddr { device_id, .. } } => {
+                self.on_plugin_state_changed(device_id);
             }
             PluginEvent::VoicevoxSynthStatus {
                 device: DeviceAddr { device_id, .. },
