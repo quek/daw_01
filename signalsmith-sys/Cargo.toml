@@ -12,6 +12,9 @@ license = "GPL-3.0-or-later AND MIT"
 repository.workspace = true
 publish.workspace = true
 
+# workspace.lints は継承しない (理由は root Cargo.toml)。空の表はその明示。
+[lints]
+
 [features]
 # Count C++ heap allocations so the RT no-alloc test can actually see them.
 # Rust の `#[global_allocator]` フック (assert_no_alloc) は Rust の

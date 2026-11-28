@@ -12,6 +12,9 @@ license = "GPL-3.0-or-later AND Apache-2.0"
 repository.workspace = true
 publish.workspace = true
 
+# workspace.lints は継承しない (理由は root Cargo.toml)。空の表はその明示。
+[lints]
+
 [features]
 # Regenerate src/bindings.rs from vendor/ARA_API/ARAInterface.h via bindgen.
 # Dev-only and requires libclang at build time. Normal builds (and CI / fresh

@@ -12,8 +12,8 @@
 //!    PATH munging. See `docs/plan_video_export_libav.md`.
 //!    `FFMPEG_LIBS_DIR` is set by `.cargo/config.toml` to `third_party/ffmpeg/lib`;
 //!    the DLLs live in the sibling `bin/`. We copy into the cargo target profile
-//!    dir (the parent of `OUT_DIR`'s build tree), which is where `daw_gui.exe`
-//!    lands.
+//!    dir (the parent of the `build` dir above `OUT_DIR`), which is where
+//!    `daw_gui.exe` lands.
 
 use std::{env, fs, path::PathBuf};
 
@@ -124,20 +124,39 @@ fn copy_ffmpeg_dlls() {
     let Ok(out_dir) = env::var("OUT_DIR") else {
         return;
     };
-    // OUT_DIR = target/<profile>/build/daw_gui-XXXX/out → ancestors()[3] = target/<profile>.
-    let Some(target_dir) = PathBuf::from(&out_dir).ancestors().nth(3).map(PathBuf::from) else {
+    // target/<profile> = the parent of OUT_DIR's `build` ancestor. Do NOT count path
+    // components: the depth differs by cargo version (`build/daw_gui-XXXX/out` up to
+    // 1.99, `build/daw_gui/XXXX/out` from 1.100), and a fixed `ancestors().nth(3)`
+    // silently copied the DLLs into `target/<profile>/build/` after the layout changed
+    // (daw_gui.exe then failed to start with "avcodec-61.dll not found").
+    // Assumes build-dir == target-dir (cargo's default; this repo sets neither
+    // `build.build-dir` nor CARGO_BUILD_BUILD_DIR). Split them and the exe lands
+    // elsewhere — cargo exposes no env var for the artifact dir to a build script.
+    let out_dir = PathBuf::from(&out_dir);
+    let Some(target_dir) = out_dir
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == "build"))
+        .and_then(|build| build.parent())
+        .map(PathBuf::from)
+    else {
+        println!(
+            "cargo:warning=cannot locate target/<profile> from OUT_DIR ({}); FFmpeg DLLs not copied",
+            out_dir.display()
+        );
         return;
     };
 
     // Windows resolves DLLs from the *loaded exe's* directory first. daw_gui.exe
-    // lives in target/<profile>, but test binaries land in deps/ and examples in
-    // examples/ — copy to all three so `cargo test` / `--example` exes load the
-    // FFmpeg DLLs without any PATH munging.
-    let dest_dirs = [
-        target_dir.clone(),
-        target_dir.join("deps"),
-        target_dir.join("examples"),
-    ];
+    // lives in target/<profile> and examples in examples/. Test binaries are run by
+    // cargo with target/<profile> on PATH; `deps/` only exists in the pre-1.100 layout
+    // (test exes lived there), so copy into it only when cargo created it. From 1.100
+    // a test exe started WITHOUT cargo (a debugger) has no DLLs beside it: put
+    // target/<profile> on PATH.
+    let mut dest_dirs = vec![target_dir.clone(), target_dir.join("examples")];
+    let deps = target_dir.join("deps");
+    if deps.is_dir() {
+        dest_dirs.push(deps);
+    }
 
     let Ok(entries) = fs::read_dir(&bin) else {
         println!("cargo:warning=FFmpeg bin dir not found: {}", bin.display());

@@ -290,8 +290,7 @@ impl SpectrumAnalyzer {
     fn fold_bands(&self, out: &mut [f32]) {
         for (b, bins) in self.band_bins.iter().enumerate() {
             let mut p = 0.0_f32;
-            for k in bins.lo..=bins.hi {
-                let v = self.bin_power[k];
+            for &v in &self.bin_power[bins.lo..=bins.hi] {
                 if v > p {
                     p = v;
                 }

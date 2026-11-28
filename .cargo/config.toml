@@ -18,7 +18,8 @@
 # FFMPEG_INCLUDE_DIR (instead of FFMPEG_BINDING_PATH), point LIBCLANG_PATH at a
 # clang-18 libclang (the PyPI `libclang==18.1.1` wheel's clang/native/
 # libclang.dll), `cargo clean -p rusty_ffmpeg`, build, then copy the produced
-# target/debug/build/rusty_ffmpeg-*/out/binding.rs back over the vendored file.
+# target/debug/build/rusty_ffmpeg/*/out/binding.rs (cargo 1.99 以前は
+# build/rusty_ffmpeg-*/out/) back over the vendored file.
 #
 # `relative = true` resolves against this config's parent (workspace root) so
 # paths stay valid across machines / git worktrees.

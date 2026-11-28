@@ -137,7 +137,8 @@ raw-window-handle = "0.6.2"
 wgpu = "29.0.1"
 
 # 旧 gui_01 の lints。ui/crates/* のみ [lints] workspace = true で opt-in する。
-# daw_01 既存 crate は opt-in しないので pedantic は適用されない。
+# daw_01 既存 crate は opt-in しないので pedantic は適用されない (各 manifest の空の `[lints]` が
+# その明示。無いと cargo 1.100 から `missing_lints_inheritance` の警告が出る)。
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 unused_must_use = "deny"

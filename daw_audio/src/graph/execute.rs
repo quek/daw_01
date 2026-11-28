@@ -1290,8 +1290,8 @@ mod send_tests {
             scratch[1].track_l[i] = 3.0;
         }
         send_0_to_1(&mut scratch, false, &song, SEND_ID, false);
-        for i in 0..FRAMES {
-            assert_eq!(scratch[1].track_l[i], 3.0, "disabled send must not change dst");
+        for &v in &scratch[1].track_l[..FRAMES] {
+            assert_eq!(v, 3.0, "disabled send must not change dst");
         }
     }
 
@@ -1306,11 +1306,8 @@ mod send_tests {
             scratch[1].track_l[i] = 3.0;
         }
         send_0_to_1(&mut scratch, false, &song, SEND_ID, false);
-        for i in 0..FRAMES {
-            assert_eq!(
-                scratch[1].track_l[i], 3.0,
-                "explicitly muted source must not feed its send"
-            );
+        for &v in &scratch[1].track_l[..FRAMES] {
+            assert_eq!(v, 3.0, "explicitly muted source must not feed its send");
         }
     }
 

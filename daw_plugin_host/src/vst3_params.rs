@@ -153,13 +153,7 @@ impl Vst3InParamChanges {
         let mut overflowed = false;
         for ev in events {
             // Reuse the queue already assigned to this param_id this buffer.
-            let mut qi = None;
-            for i in 0..n_used {
-                if self.queues[i].id_value() == ev.param_id {
-                    qi = Some(i);
-                    break;
-                }
-            }
+            let qi = self.queues[..n_used].iter().position(|q| q.id_value() == ev.param_id);
             let idx = match qi {
                 Some(i) => i,
                 None => {

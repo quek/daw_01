@@ -385,8 +385,7 @@ fn build_level_from_prev(prev: &MinMaxLevel, channels: usize) -> MinMaxLevel {
     let next_decimation = prev.decimation.saturating_mul(DECIMATION as u32);
 
     let mut per_channel: Vec<Vec<MinMaxPair>> = Vec::with_capacity(channels);
-    for ch in 0..channels {
-        let prev_ch = &prev.per_channel[ch];
+    for prev_ch in &prev.per_channel[..channels] {
         let mut this_ch = vec![MinMaxPair::ZERO; next_ppc];
         for (p, slot) in this_ch.iter_mut().enumerate().take(next_ppc) {
             let p_start = p * DECIMATION;
@@ -413,8 +412,7 @@ fn extend_level_1(
     if level.per_channel.len() < channels {
         level.per_channel.resize_with(channels, Vec::new);
     }
-    for ch in 0..channels {
-        let col = &mut level.per_channel[ch];
+    for (ch, col) in level.per_channel.iter_mut().enumerate().take(channels) {
         col.resize(new_ppc, MinMaxPair::ZERO);
         // index アクセスは samples / ch も併用するため enumerate に書き換えづらい (hot path)。
         #[allow(clippy::needless_range_loop)]

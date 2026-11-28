@@ -10,6 +10,9 @@ license = "GPL-3.0-or-later AND LGPL-2.1-or-later"
 repository.workspace = true
 publish.workspace = true
 
+# workspace.lints は継承しない (理由は root Cargo.toml)。空の表はその明示。
+[lints]
+
 [dependencies]
 common = { path = "../common" }
 anyhow.workspace = true

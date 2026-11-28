@@ -1098,8 +1098,7 @@ mod tests {
         );
         // 全 event が param_id 5、 frame offset 単調増加、 値は ramp に沿って増加。
         let mut last_time = 0u32;
-        for i in 0..pd.n_events_in as usize {
-            let e = &pd.events_in[i];
+        for (i, e) in pd.events_in[..pd.n_events_in as usize].iter().enumerate() {
             assert_eq!(e.param_id, 5);
             if i > 0 {
                 assert!(e.time > last_time, "frame offset 単調増加");
