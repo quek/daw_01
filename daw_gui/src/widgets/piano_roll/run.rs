@@ -1624,6 +1624,10 @@ pub fn piano_roll(app: &AppData, ui: &mut Ui<'_, AppData>, area: Rect) -> PianoR
                         // (commit 検出で 1 度だけ SetLyrics 発行 = 1 undo)。
                         |_new_text| Edit::mutate(|_: &mut AppData| {}),
                     );
+                    // 歌詞を打っている間は、ノートに重なるマウスカーソルを隠す (動かせば戻る)。
+                    if resp.typed {
+                        ui.hide_cursor_until_pointer_moves();
+                    }
 
                     // daw_01 #112「テキスト入力は focus loss で確定」: Enter (committed) と
                     // 外 click (blurred) のどちらでも歌詞を確定する。 違いは確定後の遷移で、

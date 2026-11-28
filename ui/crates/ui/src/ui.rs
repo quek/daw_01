@@ -37,6 +37,7 @@ use crate::theme::Palette;
 use crate::widgets::WidgetState;
 use crate::widgets::drag_in_rect::{DragInRectState, DragInfo, DragKind};
 
+mod cursor;
 mod debug_overlay;
 mod focused_keys;
 mod typography;
@@ -144,12 +145,9 @@ pub struct UiHost<M: ?Sized + 'static> {
     transient_clipboard_writes: Vec<String>,
     transient_dialog_requests: Vec<DialogRequest>,
     transient_consumed_dialog_results: HashSet<&'static str>,
-    /// M9 Phase 41b: 今フレームに `Ui::set_cursor` で要求された cursor (last call wins)。
-    /// `frame()` 末尾で `set_cursor_request` callback に flush され、None にリセットされる。
-    transient_cursor: Option<CursorIcon>,
-    /// 最後に OS へ送った cursor 形状。per-frame flush で「前回と違うときだけ送る」
-    /// ための dedup (毎フレーム Win32 を叩かないため)。`None` = 未送信。
-    last_flushed_cursor: Option<CursorIcon>,
+    /// カーソルの形状要求・「隠す」・最後に OS へ送った形状。`frame()` 末尾で
+    /// `set_cursor_request` callback に flush する ([`cursor::CursorState`])。
+    cursor_state: cursor::CursorState,
     /// 今フレームに `Ui::warp_cursor` で要求された cursor 位置 (物理 px、last call wins)。
     /// `frame()` 末尾で `set_cursor_pos_request` callback に flush され、None にリセットされる。
     transient_cursor_pos: Option<(f32, f32)>,
@@ -264,8 +262,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             transient_clipboard_writes: Vec::new(),
             transient_dialog_requests: Vec::new(),
             transient_consumed_dialog_results: HashSet::new(),
-            transient_cursor: None,
-            last_flushed_cursor: None,
+            cursor_state: cursor::CursorState::default(),
             transient_cursor_pos: None,
             set_cursor_request: None,
             set_cursor_pos_request: None,
@@ -514,6 +511,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
     ) where
         F: for<'a> FnOnce(&'a M, &mut Ui<'a, M>),
     {
+        let pointer = input.pointer;
         let edits = self.frame_to_edits_with_fonts(&*model, scene, screen, input, font_system, f);
         let had_edits = !edits.is_empty();
 
@@ -545,24 +543,8 @@ impl<M: ?Sized + 'static> UiHost<M> {
             self.pending_dialog_results.remove(name);
         }
 
-        // M9 Phase 41b: cursor flush (Ui::set_cursor で要求された形状を OS に伝える)。
-        //
-        // **per-frame セマンティクス** (daw_01 r.md #50): 誰も要求しなかったフレームは
-        // `Default` を送る。winit / OS 側は state-full なので、要求が無いときに何も
-        // 送らないと前フレームの形状が残り続ける。そのため旧仕様では *全 widget* が
-        // 「自分の担当矩形の中なら明示的に Default」という同じ boilerplate を書く
-        // 必要があり、書き忘れた widget の上でカーソルが貼り付いた (arrangement /
-        // piano_roll は書いていた、master_panel は書き忘れた = 設計欠陥のシグナル)。
-        //
-        // 実際に OS へ送るのは **前回と違うときだけ** なので、毎フレーム Win32 を
-        // 叩くことにはならない。
-        let want = self.transient_cursor.take().unwrap_or(CursorIcon::Default);
-        if self.last_flushed_cursor != Some(want)
-            && let Some(req) = self.set_cursor_request.as_ref()
-        {
-            req(want);
-            self.last_flushed_cursor = Some(want);
-        }
+        // cursor flush (Ui::set_cursor / hide_cursor_until_pointer_moves の要求を OS に伝える)。
+        self.cursor_state.flush(&pointer, self.set_cursor_request.as_deref());
 
         // cursor 位置 warp flush (Ui::warp_cursor で要求された位置を OS に伝える)。
         if let Some((x, y)) = self.transient_cursor_pos.take()
@@ -774,7 +756,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
         self.transient_clipboard_writes.clear();
         self.transient_dialog_requests.clear();
         self.transient_consumed_dialog_results.clear();
-        self.transient_cursor = None;
+        self.cursor_state.begin_frame();
         self.transient_cursor_pos = None;
         // M9 Phase 43: cache stats を frame 頭でリセット。with_widget_node 内で increment、
         // 末尾で `last_frame_stats` に転記。
@@ -917,7 +899,7 @@ impl<M: ?Sized + 'static> UiHost<M> {
             consumed_dialog_results: &mut self.transient_consumed_dialog_results,
             dialog_results: &self.pending_dialog_results,
             focus_order: &mut focus_order,
-            pending_cursor: &mut self.transient_cursor,
+            cursor_state: &mut self.cursor_state,
             pending_cursor_pos: &mut self.transient_cursor_pos,
             cache_hits: &mut self.current_cache_hits,
             cache_misses: &mut self.current_cache_misses,
@@ -1169,9 +1151,9 @@ pub struct Ui<'a, M: ?Sized + 'static> {
     /// frame 末尾で UiHost に保存し、Tab / arrow nav の対象にする。
     pub(crate) focus_order: &'a mut Vec<(WidgetId, Rect)>,
     // ---- M9 Phase 41b cursor ----
-    /// このフレーム末尾に OS に伝える cursor (last call wins)。
-    /// `Ui::set_cursor` で書き、`UiHost::frame` 末尾で `set_cursor_request` callback に流す。
-    pub(crate) pending_cursor: &'a mut Option<CursorIcon>,
+    /// `Ui::set_cursor` / `Ui::hide_cursor_until_pointer_moves` の書き先。
+    /// `UiHost::frame` 末尾で `set_cursor_request` callback に流す。
+    pub(crate) cursor_state: &'a mut cursor::CursorState,
     /// このフレーム末尾に OS に warp させる cursor 位置 (物理 px、last call wins)。
     /// `Ui::warp_cursor` で書き、`UiHost::frame` 末尾で `set_cursor_pos_request` callback に流す。
     pub(crate) pending_cursor_pos: &'a mut Option<(f32, f32)>,
@@ -1723,24 +1705,6 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
     // ============================================================
     // M9 Phase 41b: cursor 形状要求
     // ============================================================
-
-    /// このフレーム末尾に OS カーソル形状を変更要求する。同フレーム内で複数回呼ばれた
-    /// 場合は **last call wins** (= 直前 widget の要求は捨てられる)。
-    ///
-    /// `WindowBackend::set_cursor` callback が registered されていなければ no-op
-    /// (low-level constructor [`UiHost::new`] / [`UiHost::no_redraw`] で構築した場合)。
-    /// 通常 [`UiHost::with_window`] で構築すれば自動的に有効化される。
-    ///
-    /// **誰も `set_cursor` を呼ばなかったフレームは自動的に `Default` に戻る**
-    /// (daw_01 r.md #50)。OS 側は state-full なので、旧仕様 (要求が無ければ何も
-    /// 送らない) では全 widget が「自分の担当矩形の中なら明示的に Default」という
-    /// 同じ boilerplate を書く必要があり、書き忘れた widget の上でカーソルが
-    /// 貼り付いた。実際に OS へ送るのは前回と形状が変わったときだけ。
-    ///
-    /// したがって widget は「自分が形を変えたいときだけ呼ぶ」でよい。
-    pub fn set_cursor(&mut self, cursor: CursorIcon) {
-        *self.pending_cursor = Some(cursor);
-    }
 
     /// このフレーム末尾に OS カーソルを `(x, y)` (物理 px、ウィンドウ client 座標) へ
     /// warp 要求する。同フレーム内で複数回呼ばれた場合は **last call wins**。

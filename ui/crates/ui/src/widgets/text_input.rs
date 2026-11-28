@@ -174,6 +174,9 @@ pub struct TextInputResponse {
     pub nav_up: bool,
     /// (M14 Phase 86 / daw_01 #057) focus 中にこのフレームで ↓ キーが押されたか。 詳細は [`Self::nav_up`]。
     pub nav_down: bool,
+    /// focus 中にこのフレームでキー / IME / 編集 shortcut の入力を受けたか (text が変わったかは問わない)。
+    /// 「打っている間はカーソルを隠す」([`Ui::hide_cursor_until_pointer_moves`]) の合図に使う。
+    pub typed: bool,
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -264,6 +267,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
         let mut escape_pressed = false;
         let mut nav_up = false;
         let mut nav_down = false;
+        let mut typed = false;
         if was_focused {
             // typing-only shortcut (前フレームに `set_typing_focus(true)` を出していたフレームで
             // shortcut layer から keyboard_events に残してある) を先に拾う。
@@ -288,6 +292,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
                 || paste_pressed
                 || !ime_events.is_empty()
                 || !key_events.is_empty();
+            typed = any_input;
 
             if any_input {
                 let state: &mut TextInputState = self.widget_state(wid);
@@ -677,6 +682,7 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             blurred,
             nav_up,
             nav_down,
+            typed,
         }
     }
 

@@ -1173,6 +1173,33 @@ fn ui_set_cursor_calls_callback_on_frame_end() {
     assert_eq!(*captured.lock().unwrap(), Some(CursorIcon::EwResize));
 }
 
+/// 隠したカーソルは、呼び直さなくても隠れ続け、形状の要求にも負けず、ポインタを動かすと戻る。
+#[test]
+fn hidden_cursor_stays_until_pointer_moves() {
+    use std::sync::Mutex;
+    let sent: Arc<Mutex<Vec<CursorIcon>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&sent);
+    let mut host: UiHost<()> = UiHost::no_redraw();
+    host.set_cursor_request = Some(Box::new(move |c| sink.lock().unwrap().push(c)));
+    let mut scene = Scene::new();
+    let screen = PhysicalSize { width: 200, height: 100 };
+    let at = |x: f32, y: f32| FrameInput {
+        pointer: crate::input::PointerFrame { pos: Some((x, y)), ..Default::default() },
+        ..Default::default()
+    };
+
+    host.frame(&mut (), &mut scene, screen, at(50.0, 50.0), |(), ui| {
+        ui.hide_cursor_until_pointer_moves();
+    });
+    // 打鍵の無いフレーム。ポインタは 1px 揺れただけで、下の widget は形を要求している。
+    host.frame(&mut (), &mut scene, screen, at(51.0, 50.0), |(), ui| {
+        ui.set_cursor(CursorIcon::EwResize);
+    });
+    host.frame(&mut (), &mut scene, screen, at(70.0, 50.0), |(), _ui| {});
+
+    assert_eq!(*sent.lock().unwrap(), vec![CursorIcon::Hidden, CursorIcon::Default]);
+}
+
 #[test]
 fn ui_set_cursor_no_op_when_callback_unset() {
     // no_redraw / new で構築した UiHost は set_cursor_request = None。
