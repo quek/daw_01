@@ -1495,6 +1495,7 @@ impl AppData {
         }
         // r.md #160: 応答の state が確実に含むのは、この送信までに報告された plugin の変更。
         self.cur.pipc.state_request_plugin_edits = self.cur.song_doc.plugin_edits();
+        self.cur.pipc.plugin_state_baseline.note_request_sent();
         // 応答はこの番号で突き合わせる (`ProjectIpc::awaited_state_request`)。
         self.cur.pipc.last_state_request += 1;
         let request = self.cur.pipc.last_state_request;

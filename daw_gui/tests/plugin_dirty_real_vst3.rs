@@ -2,11 +2,11 @@
 //! うち、実物でしか分からないところを見る — シナリオと判定は `tests/scripts/plugin_dirty_real.js`:
 //!
 //! - 開いただけ / 再生しただけでは未保存にならない。
-//! - 触っていなければ、閉じる前に取り直した state は読み込み直後に取った基準と同じ (確認なしで閉じる)。
+//! - 触っていなければ確認なしで閉じる (ユーザーの手が届いていない device は state を比べない)。
 //! - 報告なしで値が変わると、閉じる前の比較が見つけて保存を聞く。
 //!
-//! 合成の state で同じ流れを見る検査は `tests/app_state/plugin_dirty.rs`。ここは「実物の plugin が返す state が
-//! 取るたびに同じで、値を変えると変わる」という前提そのものを確かめる。
+//! 合成の state で同じ流れを見る検査は `tests/app_state/plugin_dirty.rs`。ここは「実物の plugin が返す state は、
+//! 値を変えると変わる」という前提そのものを確かめる。
 //!
 //! 回し方は `make test-real-vst3` (env と `-- --ignored` の扱いは `real_vst3_support` の module doc)。
 

@@ -13,7 +13,13 @@
 //! - **B. 報告しない変更** — 閉じる / 終了の前に state を取り直し、基準 ([`PluginStateBaseline`]) と比べる。
 //!   違えば A と同じ印を立てて、いつもの保存確認に合流する。基準は「保存した blob」ではなく
 //!   **plugin が返した state** の hash (state を渡して取り直すと bytes が変わる plugin で、開くたびに
-//!   聞かれないように)。取るたびに中身が変わる plugin は毎回聞かれる (失うより聞く)。
+//!   聞かれないように)。比べるのは、**基準の後でユーザーの手が届いた device だけ** (エディタ窓への入力 =
+//!   `SlotState::editor_touch` の変化 / daw_gui が書いた値 = [`AppData::note_plugin_value_written`])。触って
+//!   いなくても取るたびに bytes が変わる plugin が多く (実測: 13 個中 9 個。末尾に未初期化の領域を書く /
+//!   zip の時刻を含める)、bytes だけで比べると「何も変えていないのに毎回聞かれる」。そういう plugin は、窓を
+//!   触った後だけ聞かれる (失うより聞く)。**拾えないもの**: plugin host の入力の hook に見えない操作
+//!   (エクスプローラからの OLE drag & drop、UI が別プロセスにある plugin) と、保存の後で効果が出る操作
+//!   (保存をまたぐ非同期のプリセット読み込み) で、かつ plugin が報告もしないもの。
 //!
 //! autosave は live の Song を書くので、報告された変更が Song の blob にまだ入っていなければ、先に取り直す
 //! ([`AppData::autosave_needs_plugin_state`])。
@@ -47,10 +53,18 @@ impl PluginStateDigest {
         Self(states.iter().filter(|s| s.error.is_none()).map(|s| (s.device_id, hash(s))).collect())
     }
 
-    /// 両方にある device のうち、指紋が違うものがあるか (`skip` の device は比べない)。片方にしか無い device は
-    /// 数えない — device の増減は Song の編集で、そちらの dirty が見ている。
-    fn differs_from(&self, baseline: &Self, skip: &HashSet<u64>) -> bool {
-        self.0.iter().any(|(id, hash)| !skip.contains(id) && baseline.0.get(id).is_some_and(|b| b != hash))
+    /// 両方にある device のうち、**基準の後でユーザーの手が届いていて** (`reached`) state の bytes も違うもの。
+    /// bytes だけでは比べない — 触っていなくても取るたびに bytes が変わる plugin が多い (module doc の B)。
+    /// `skip` の device は比べない。片方にしか無い device は数えない — device の増減は Song の編集で、
+    /// そちらの dirty が見ている。
+    fn differing(&self, baseline: &Self, reached: &HashSet<u64>, skip: &HashSet<u64>) -> Vec<u64> {
+        let differs = |(id, hash): (&u64, &u64)| {
+            let compared = reached.contains(id) && !skip.contains(id);
+            (compared && baseline.0.get(id).is_some_and(|b| b != hash)).then_some(*id)
+        };
+        let mut ids: Vec<u64> = self.0.iter().filter_map(differs).collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// `other` にしか無い device を足す (既にある device の指紋は変えない)。
@@ -95,6 +109,55 @@ pub struct PluginStateBaseline {
     /// 基準の無い plugin が載った。読み込みが全部確定したら取り寄せる
     /// ([`AppData::request_plugin_state_baseline_if_due`])。
     due: bool,
+    /// 基準を取った後でユーザーの手が届いた device (module doc の B)。比べるのはこの device だけ。保存で
+    /// 基準を取り直すと降りる。instance を作り直しても残す (削除 → undo で、触った後の state から載せ直した
+    /// device を見逃さない)。
+    reached: HashSet<u64>,
+    /// device ごとの、最後に受け取った `SlotState::editor_touch`。違う値が来たら、その間に窓を触った。
+    seen_touch: HashMap<u64, u64>,
+    /// いま出ている state の要求を送った後で、daw_gui が値を書いた device。その値が応答の state に入っている
+    /// 保証は無いので、保存の応答では `reached` から降ろさない。
+    written_since_request: HashSet<u64>,
+}
+
+impl PluginStateBaseline {
+    /// host の応答 (種類を問わない) の `editor_touch` を見る。前に受け取った値と違う device は、その間に
+    /// エディタ窓へ入力が届いた。初めて見る instance は、入力が届いていない (`0`) ところから数える。
+    pub(crate) fn observe_touches(&mut self, states: &[SlotState]) {
+        for s in states {
+            if self.seen_touch.insert(s.device_id, s.editor_touch).unwrap_or(0) != s.editor_touch {
+                self.reached.insert(s.device_id);
+            }
+        }
+    }
+
+    /// instance を載せ直した。新しい instance の `editor_touch` は `0` から始まる (`reached` は降ろさない)。
+    fn forget_instance(&mut self, device_id: u64) {
+        self.seen_touch.remove(&device_id);
+    }
+
+    /// daw_gui が plugin の値を書いた。
+    fn note_written(&mut self, device_id: u64) {
+        self.reached.insert(device_id);
+        self.written_since_request.insert(device_id);
+    }
+
+    /// state の要求を送った。ここまでに書いた値は、応答の state に入る。
+    pub(crate) fn note_request_sent(&mut self) {
+        self.written_since_request.clear();
+    }
+
+    /// 保存が `saved` の state をファイルに書いた。以後はそれが基準 (state を取れなかった device の基準は
+    /// 前のまま残す) で、その state に入っている分の「手が届いた」を降ろす。
+    fn rebase(&mut self, saved: PluginStateDigest) {
+        let pending = &self.written_since_request;
+        self.reached.retain(|id| !saved.0.contains_key(id) || pending.contains(id));
+        self.known.0.extend(saved.0);
+    }
+
+    fn changed_since_baseline(&self, states: &[SlotState], skip: &HashSet<u64>) -> Vec<u64> {
+        PluginStateDigest::of(states).differing(&self.known, &self.reached, skip)
+    }
 }
 
 impl AppData {
@@ -110,9 +173,11 @@ impl AppData {
 
     // ---- B. 基準 --------------------------------------------------------------
 
-    /// plugin を host に載せた (`SlotPluginLoaded`)。その device の基準はまだ無い。
-    pub(crate) fn mark_plugin_state_baseline_due(&mut self) {
-        self.cur.pipc.plugin_state_baseline.due = true;
+    /// plugin を host に載せた (`SlotPluginLoaded`)。その device の基準はまだ無い (載せ直しなら前の基準が残る)。
+    pub(crate) fn mark_plugin_state_baseline_due(&mut self, device_id: u64) {
+        let baseline = &mut self.cur.pipc.plugin_state_baseline;
+        baseline.due = true;
+        baseline.forget_instance(device_id);
     }
 
     /// 基準を取る段になっていれば取り寄せる。読み込みが全部確定してから (`handle_event` の一番外側の終わりで
@@ -142,12 +207,17 @@ impl AppData {
         self.cur.pipc.plugin_state_baseline.known.add_missing(PluginStateDigest::of(states));
     }
 
-    /// 保存が plugin から取った state をファイルに書いた。以後はそれが基準 (state を取れなかった device の
-    /// 基準は前のまま残す)。
+    /// 保存が plugin から取った state をファイルに書いた。以後はそれが基準。
     pub(crate) fn rebase_plugin_state_on_save(&mut self, saved: PluginStateDigest) {
-        self.cur.pipc.plugin_state_baseline.known.0.extend(saved.0);
+        self.cur.pipc.plugin_state_baseline.rebase(saved);
         // 終了の途中の保存 (「保存して終了」) の後で、同じ state をもう一度比べない。
         self.cur.pipc.unreported_check_passed = true;
+    }
+
+    /// daw_gui が plugin の値を書いた (インスペクタのツマミ / レーンの既定値)。Song の編集なので未保存の印は
+    /// そちらで立つが、undo で Song だけが戻ると plugin の値は動いたまま残り得るので、閉じるときに比べる。
+    pub(crate) fn note_plugin_value_written(&mut self, device_id: u64) {
+        self.cur.pipc.plugin_state_baseline.note_written(device_id);
     }
 
     // ---- B. 閉じるときの比較 --------------------------------------------------
@@ -184,10 +254,10 @@ impl AppData {
         if self.ui_ephemeral.status_message == CHECKING_PLUGIN_STATE {
             self.ui_ephemeral.status_message.clear();
         }
-        let baseline = &self.cur.pipc.plugin_state_baseline.known;
         let skip = host_driven_devices(self.cur.song_doc.song());
-        if PluginStateDigest::of(states).differs_from(baseline, &skip) {
-            tracing::info!("plugin state differs from the saved baseline; treating the project as unsaved");
+        let changed = self.cur.pipc.plugin_state_baseline.changed_since_baseline(states, &skip);
+        if !changed.is_empty() {
+            tracing::info!(device_ids = ?changed, "plugin state differs from the saved baseline; treating the project as unsaved");
             self.cur.song_doc.note_plugin_edit();
         } else {
             self.cur.pipc.unreported_check_passed = true;
@@ -263,22 +333,82 @@ impl AppData {
 mod tests {
     use super::*;
 
+    /// エディタ窓へ入力が届いていない instance の state。
     fn state(device_id: u64, data: &[u8]) -> SlotState {
-        SlotState { device_id, data: Some(data.to_vec()), ara_archive: None, error: None }
+        touched(device_id, data, 0)
+    }
+
+    /// 入力の印が `editor_touch` の state。
+    fn touched(device_id: u64, data: &[u8], editor_touch: u64) -> SlotState {
+        SlotState { device_id, data: Some(data.to_vec()), ara_archive: None, error: None, editor_touch }
+    }
+
+    /// `states` を保存した直後 (それが基準で、手が届いた device は無い)。
+    fn saved(states: &[SlotState]) -> PluginStateBaseline {
+        let mut baseline = PluginStateBaseline::default();
+        baseline.observe_touches(states);
+        baseline.rebase(PluginStateDigest::of(states));
+        baseline
+    }
+
+    /// 閉じる前の応答が `now` のとき、変更とみなす device。
+    fn changed(baseline: &mut PluginStateBaseline, now: &[SlotState], skip: &[u64]) -> Vec<u64> {
+        baseline.observe_touches(now);
+        baseline.changed_since_baseline(now, &skip.iter().copied().collect())
     }
 
     /// 比べるのは両方にある device だけ。取得に失敗した device は比べない。
     #[test]
     fn digest_compares_only_devices_present_on_both_sides() {
-        let none = HashSet::new();
-        let baseline = PluginStateDigest::of(&[state(1, b"a"), state(2, b"b")]);
-        assert!(!PluginStateDigest::of(&[state(1, b"a"), state(2, b"b")]).differs_from(&baseline, &none));
-        let changed = PluginStateDigest::of(&[state(1, b"a"), state(2, b"changed")]);
-        assert!(changed.differs_from(&baseline, &none));
-        assert!(!changed.differs_from(&baseline, &HashSet::from([2])), "host が値を書き続ける device");
-        assert!(!PluginStateDigest::of(&[state(1, b"a"), state(3, b"new")]).differs_from(&baseline, &none), "増えた device");
-        let failed = SlotState { error: Some("save failed".into()), data: None, ..state(2, b"") };
-        assert!(!PluginStateDigest::of(&[state(1, b"a"), failed]).differs_from(&baseline, &none), "取れなかった device");
+        let mut baseline = saved(&[state(1, b"a"), state(2, b"b")]);
+        assert!(changed(&mut baseline, &[touched(1, b"a", 7), touched(2, b"b", 7)], &[]).is_empty());
+        let now = [touched(1, b"a", 7), touched(2, b"changed", 7)];
+        assert_eq!(changed(&mut baseline, &now, &[]), [2]);
+        assert!(changed(&mut baseline, &now, &[2]).is_empty(), "host が値を書き続ける device");
+        assert!(changed(&mut baseline, &[touched(1, b"a", 7), touched(3, b"new", 7)], &[]).is_empty(), "増えた device");
+        let failed = SlotState { error: Some("save failed".into()), data: None, ..touched(2, b"", 7) };
+        assert!(changed(&mut baseline, &[touched(1, b"a", 7), failed], &[]).is_empty(), "取れなかった device");
+    }
+
+    /// bytes が違っても、基準の後でユーザーの手が届いていない device は変更に数えない (触っていなくても
+    /// 取るたびに bytes が変わる plugin)。手が届いた = 窓への入力か、daw_gui が書いた値。
+    #[test]
+    fn bytes_alone_do_not_count_without_evidence_that_the_user_reached_the_plugin() {
+        let at_save = [state(1, b"a"), touched(2, b"b", 7)];
+        let now = [state(1, b"padding differs"), touched(2, b"timestamp differs", 7)];
+        let mut baseline = saved(&at_save);
+        assert!(changed(&mut baseline, &now, &[]).is_empty(), "入力の印が保存のときと同じ");
+        baseline.note_written(1);
+        assert_eq!(changed(&mut baseline, &now, &[]), [1], "daw_gui が値を書いた");
+
+        let mut baseline = saved(&at_save);
+        let reached = [touched(1, b"padding differs", 8), touched(2, b"timestamp differs", 9)];
+        assert_eq!(changed(&mut baseline, &reached, &[]), [1, 2], "保存の後で窓を触った");
+    }
+
+    /// 窓を触った device は、instance を載せ直して印が `0` に戻っても比べる (削除 → undo で、触った後の state から
+    /// 載せ直した device)。触っていない device は、載せ直しても比べない。
+    #[test]
+    fn a_reached_device_stays_reached_across_an_instance_reload() {
+        let mut baseline = saved(&[touched(1, b"a", 7), touched(2, b"b", 7)]);
+        // 閉じる前の比較ではない応答 (削除の前の取り直し) が、device 1 への入力を運んできた。
+        baseline.observe_touches(&[touched(1, b"edited", 9), touched(2, b"b", 7)]);
+        baseline.forget_instance(1);
+        baseline.forget_instance(2);
+        let now = [state(1, b"edited"), state(2, b"timestamp differs")];
+        assert_eq!(changed(&mut baseline, &now, &[]), [1]);
+    }
+
+    /// 保存は、その state に入っている分の「手が届いた」を降ろす。state の要求を送った後で書いた値は降ろさない
+    /// (応答の state に入っている保証が無い)。
+    #[test]
+    fn saving_clears_reach_except_for_values_written_after_the_request_was_sent() {
+        let mut baseline = saved(&[state(1, b"a"), state(2, b"b")]);
+        baseline.note_written(2);
+        baseline.note_request_sent();
+        baseline.note_written(1);
+        baseline.rebase(PluginStateDigest::of(&[state(1, b"a2"), state(2, b"b2")]));
+        assert_eq!(changed(&mut baseline, &[state(1, b"a3"), state(2, b"b3")], &[]), [1]);
     }
 
     /// 比較から外すのは、host が値を書く device だけ: param にクリップのあるレーンか変調が掛かっている。
@@ -309,8 +439,8 @@ mod tests {
     fn a_later_baseline_does_not_overwrite_known_devices() {
         let mut known = PluginStateDigest::of(&[state(1, b"at load")]);
         known.add_missing(PluginStateDigest::of(&[state(1, b"touched since"), state(2, b"new")]));
-        let none = HashSet::new();
-        assert!(PluginStateDigest::of(&[state(1, b"touched since")]).differs_from(&known, &none));
-        assert!(!PluginStateDigest::of(&[state(2, b"new")]).differs_from(&known, &none));
+        let (reached, none) = (HashSet::from([1, 2]), HashSet::new());
+        assert_eq!(PluginStateDigest::of(&[state(1, b"touched since")]).differing(&known, &reached, &none), [1]);
+        assert!(PluginStateDigest::of(&[state(2, b"new")]).differing(&known, &reached, &none).is_empty());
     }
 }

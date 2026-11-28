@@ -480,6 +480,7 @@ fn deferred_delete_captures_plugin_state_before_removing() {
             data: Some(b"knob-turned".to_vec()),
             ara_archive: None,
             error: None,
+            editor_touch: 0,
         }],
     }));
     assert!(

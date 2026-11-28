@@ -81,7 +81,7 @@ fn 無効化は_state_を書き戻してから降ろし_有効化と_undo_redo_�
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates {
         project: app.pk(),
         request: app.awaited_state_request(),
-        entries: vec![SlotState { device_id, data: Some(vec![7, 7, 7]), ara_archive: None, error: None }],
+        entries: vec![SlotState { device_id, data: Some(vec![7, 7, 7]), ara_archive: None, error: None, editor_touch: 0 }],
     }));
     let msgs = drain(&mut plugin_rx);
     assert!(!app.cur.song_doc.song().track_effectively_enabled(track_id));

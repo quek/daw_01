@@ -184,7 +184,7 @@ impl AppData {
             self.ui_ephemeral.status_message = msg;
         }
         // r.md #160: この device の「閉じるときに比べる基準」はまだ無い (読み込みが全部確定したら取る)。
-        self.mark_plugin_state_baseline_due();
+        self.mark_plugin_state_baseline_due(device_id);
         // device 単位での load 状態 cache。 reconcile の device-level diff
         // (Undo で plugin 構成が変化した場合の同期) と、 track 削除前の
         // `ClosePluginShmem` の対象確認 (use-after-free deadlock 防止) に使う。
@@ -1049,6 +1049,8 @@ impl AppData {
         let write_back = PluginStateWriteBack::new(&states);
         self.cur.song_doc.write_back_plugin_state(|song| write_back.apply(song));
         write_back.warn_missing(self.cur.song_doc.song());
+        // r.md #160: どの種類の応答でも、エディタ窓へ入力が届いた device を控える (閉じるときに比べる対象)。
+        self.cur.pipc.plugin_state_baseline.observe_touches(&states);
         // r.md #160: この応答が確実に含むのは、要求を送った時点までに報告された変更。
         let plugin_edits = self.cur.pipc.state_request_plugin_edits;
         self.cur.song_doc.note_plugin_state_written_back(plugin_edits);

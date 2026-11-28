@@ -16,19 +16,29 @@ use daw_gui::shutdown::QuitRequest;
 use super::support::{build_app, drain, load_instrument, select_track_single, send_plugin_loaded};
 
 /// plugin host の `RequestAllStates` 応答を模す (アクティブなタブの `device_id` の今の state = `data`)。
+/// エディタ窓は触られていない。
 fn respond(app: &mut AppData, device_id: u64, data: &[u8]) {
-    respond_to(app, app.pk(), device_id, data);
+    respond_to(app, app.pk(), device_id, data, UNTOUCHED);
 }
 
+/// [`respond`] の、基準を取った後でユーザーがエディタ窓を触っていた版。
+fn respond_touched(app: &mut AppData, device_id: u64, data: &[u8]) {
+    respond_to(app, app.pk(), device_id, data, TOUCHED);
+}
+
+/// `SlotState::editor_touch`: エディタ窓へ入力が届いていない / 届いた。
+const UNTOUCHED: u64 = 0;
+const TOUCHED: u64 = 1;
+
 /// [`respond`] の、宛先のタブを指定する版 (背景タブ宛の応答)。そのタブがいま待っている要求への応答。
-fn respond_to(app: &mut AppData, project: ProjectKey, device_id: u64, data: &[u8]) {
+fn respond_to(app: &mut AppData, project: ProjectKey, device_id: u64, data: &[u8], editor_touch: u64) {
     let request = app.with_project(project, |app| app.awaited_state_request()).expect("tab is open");
-    respond_as(app, project, request, device_id, data);
+    respond_as(app, project, request, device_id, data, editor_touch);
 }
 
 /// 要求の番号を指定して応答する (待っていない番号 = 破棄した要求の遅れた応答)。
-fn respond_as(app: &mut AppData, project: ProjectKey, request: u64, device_id: u64, data: &[u8]) {
-    let entries = vec![SlotState { device_id, data: Some(data.to_vec()), ara_archive: None, error: None }];
+fn respond_as(app: &mut AppData, project: ProjectKey, request: u64, device_id: u64, data: &[u8], editor_touch: u64) {
+    let entries = vec![SlotState { device_id, data: Some(data.to_vec()), ara_archive: None, error: None, editor_touch }];
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project, request, entries }));
 }
 
@@ -128,7 +138,7 @@ fn 消した_device_宛ての遅れた報告は未保存にしない() {
 }
 
 #[test]
-fn 触っていなければ_state_を比べて黙って終了する() {
+fn 触っていなければ_state_を取り直して黙って終了する() {
     let dir = tempfile::tempdir().unwrap();
     let (mut app, mut plugin_rx, device_id) = saved_project_with_plugin(&dir.path().join("proj.daw"), &[1]);
 
@@ -142,13 +152,42 @@ fn 触っていなければ_state_を比べて黙って終了する() {
     assert_eq!(requests(&drain(&mut plugin_rx)), 0, "同じ終了の中で 2 度は比べない");
 }
 
+/// 触っていなくても取るたびに bytes が変わる plugin (末尾に未初期化の領域を書く / zip の時刻を含める):
+/// エディタ窓へ入力が届いていなければ、bytes が違っても聞かない。
+#[test]
+fn 窓を触っていなければ_state_の_bytes_が違っても聞かない() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, _plugin_rx, device_id) = saved_project_with_plugin(&dir.path().join("proj.daw"), &[1]);
+
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
+    respond(&mut app, device_id, &[2]);
+    assert!(app.shutdown.is_shutting_down(), "確認なしで終了");
+    assert!(app.ui_ephemeral.dirty_guard.is_none());
+}
+
+/// 窓を触って保存した後は、その入力は保存した state に入っている。もう一度触るまで聞かない。
+#[test]
+fn 保存の前に窓を触っていても_保存の後で触っていなければ聞かない() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut app, _plugin_rx, device_id) = saved_project_with_plugin(&dir.path().join("proj.daw"), &[1]);
+    let track = app.cur.song_doc.song().tracks[0].id;
+    app.handle_event(AppEvent::SetTrackVolume { track, amp: 0.5 });
+    app.handle_event(AppEvent::Save);
+    respond_touched(&mut app, device_id, &[2]);
+    assert!(!app.cur.song_doc.is_dirty(), "{}", app.ui_ephemeral.status_message);
+
+    app.handle_event(AppEvent::Quit(QuitRequest::USER));
+    respond_touched(&mut app, device_id, &[3]);
+    assert!(app.shutdown.is_shutting_down(), "入力の印が保存のときと同じ → 聞かない");
+}
+
 #[test]
 fn 報告の無い変更は閉じる前の比較で見つけて保存を聞く() {
     let dir = tempfile::tempdir().unwrap();
     let (mut app, mut plugin_rx, device_id) = saved_project_with_plugin(&dir.path().join("proj.daw"), &[1]);
 
     app.handle_event(AppEvent::Quit(QuitRequest::USER));
-    respond(&mut app, device_id, &[2]);
+    respond_touched(&mut app, device_id, &[2]);
     assert!(app.cur.song_doc.is_dirty(), "基準と違う → 未保存");
     assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::Quit(QuitRequest::USER)));
     assert!(!app.shutdown.is_shutting_down());
@@ -173,11 +212,11 @@ fn 保存して終了は_取り直した_state_を書いて終わる() {
     let (mut app, mut plugin_rx, device_id) = saved_project_with_plugin(&path, &[1]);
 
     app.handle_event(AppEvent::Quit(QuitRequest::USER));
-    respond(&mut app, device_id, &[2]);
+    respond_touched(&mut app, device_id, &[2]);
     drain(&mut plugin_rx);
     app.handle_event(AppEvent::DirtyGuardSave);
     assert_eq!(requests(&drain(&mut plugin_rx)), 1, "保存の state の取り直し");
-    respond(&mut app, device_id, &[2]);
+    respond_touched(&mut app, device_id, &[2]);
     assert!(app.shutdown.is_shutting_down(), "{}", app.ui_ephemeral.status_message);
     assert_eq!(requests(&drain(&mut plugin_rx)), 0, "保存した state をもう一度比べない");
 
@@ -197,7 +236,7 @@ fn 開いた直後に取った_state_を基準に比べる() {
 
     let (mut app, _plugin_rx, device_id) = opened_project_with_plugin(&[1]);
     app.handle_event(AppEvent::Quit(QuitRequest::USER));
-    respond(&mut app, device_id, &[2]);
+    respond_touched(&mut app, device_id, &[2]);
     assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::Quit(QuitRequest::USER)));
 }
 
@@ -227,7 +266,7 @@ fn タブを閉じるときも比べ_違えばそのタブで聞く() {
 
     app.handle_event(AppEvent::Tab(TabEvent::Close(key)));
     assert!(app.tab(key).is_some(), "応答までは閉じない");
-    respond(&mut app, device_id, &[2]);
+    respond_touched(&mut app, device_id, &[2]);
     assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::CloseTabs(vec![key])));
     assert!(app.tab(key).is_some());
 }
@@ -246,7 +285,7 @@ fn 比較を待つ間に別のタブへ移っても_閉じようとしたタブ�
     app.handle_event(AppEvent::Tab(TabEvent::Close(closing)));
     app.handle_event(AppEvent::Tab(TabEvent::Switch(other)));
     assert_eq!(app.cur.key, other);
-    respond_to(&mut app, closing, device_id, &[2]);
+    respond_to(&mut app, closing, device_id, &[2], TOUCHED);
     assert_eq!(app.cur.key, closing, "閉じようとしたタブがアクティブ");
     assert_eq!(app.ui_ephemeral.dirty_guard, Some(DirtyGuardAction::CloseTabs(vec![closing])));
 
@@ -287,11 +326,11 @@ fn 破棄した要求の遅れた応答を_次の保存の応答として受け�
     let current = last_request(&drain(&mut plugin_rx));
     assert_ne!(stale, current, "要求ごとに別の番号");
 
-    respond_as(&mut app, project, stale, device_id, &[9]);
+    respond_as(&mut app, project, stale, device_id, &[9], UNTOUCHED);
     assert!(!app.shutdown.is_shutting_down() && app.cur.song_doc.is_dirty(), "古い応答では保存しない");
     assert_eq!(app.cur.pipc.pending_state_queue.len(), 1, "保存はまだ応答を待っている");
 
-    respond_as(&mut app, project, current, device_id, &[2]);
+    respond_as(&mut app, project, current, device_id, &[2], UNTOUCHED);
     assert!(app.shutdown.is_shutting_down(), "{}", app.ui_ephemeral.status_message);
     let saved = common::project::load_project(&path).expect("reload");
     let state = saved.song.tracks[0].plugins().next().expect("synth").state.clone();

@@ -1464,6 +1464,10 @@ impl LoadedPlugin for Vst3Plugin {
         unsafe { self.audio.getLatencySamples() }
     }
 
+    fn editor_touch(&self) -> u64 {
+        self.editor_session.touch()
+    }
+
     fn state_save(&self) -> Result<Option<Vec<u8>>> {
         let write = ComWrapper::new(Vst3WriteStream::new());
         let stream_ptr = write

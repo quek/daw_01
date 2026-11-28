@@ -93,8 +93,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DLGC_WANTALLKEYS, DLGC_WANTCHARS, GUITHREADINFO, GetClassNameW,
     GetGUIThreadInfo, HC_ACTION, HHOOK, IsChild, MSG, PM_REMOVE,
     SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, SetWindowsHookExW, UnhookWindowsHookEx,
-    WH_GETMESSAGE, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP, WM_MOUSEFIRST, WM_MOUSELAST, WM_MOUSEMOVE,
-    WM_NULL, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WH_GETMESSAGE, WM_DROPFILES, WM_GETDLGCODE, WM_KEYDOWN, WM_KEYUP, WM_MOUSEFIRST, WM_MOUSELAST,
+    WM_MOUSEMOVE, WM_NULL, WM_POINTERDOWN, WM_POINTERHWHEEL, WM_POINTERUP, WM_POINTERWHEEL,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TOUCH,
 };
 
 use crate::editor_window::{WM_EDITOR_KEY_RELAY_DOWN, WM_EDITOR_KEY_RELAY_UP};
@@ -256,6 +257,11 @@ impl KeyRouter {
     pub fn unregister_editor(&mut self, device: DeviceAddr) {
         self.editors.retain(|(id, _)| *id != device);
         self.swallowed_keys.clear();
+    }
+
+    /// `hwnd` がエディタ窓のコンテナ本体 (枠を持つ、 この process の窓) か。 plugin の窓はその子。
+    fn is_container(&self, hwnd: HWND) -> bool {
+        self.editors.iter().any(|&(_, container)| container == hwnd.0 as u64)
     }
 
     /// `hwnd` がどの device のエディタ窓 (コンテナ本体 or その子孫) かを返す。
@@ -420,18 +426,27 @@ impl Drop for KeyHook {
 /// ユーザーの変更とみなすかの材料)。 daw_gui へ横取りしたキー (`swallowed`) は plugin が使わなかったキー
 /// なので、 数えたものを取り消す — 子窓宛で一度 plugin へ渡したキーが、 未消化でコンテナ窓へ戻ってきて
 /// 飲み込まれる (JUCE は `PostMessage`、 iPlug2 は `SendMessage` → relay。 module doc) のがその経路。
-/// 最初から横取りしたキーは数えていないので、 取り消しても変わらない。
-fn note_user_input(msg: &MSG, swallowed: bool) {
+/// 最初から横取りしたキー (数えていない) でも取り消しを呼ぶが、 取り消されるのは直前に数えた同じキーの分だけ
+/// (`user_edit::retract_key_input`)。
+///
+/// **コンテナ窓宛 (`to_container`) のポインタ入力は数えない。** plugin の窓はコンテナの子なので、 plugin への
+/// 入力は子窓宛で届く。 コンテナ宛に来るのは枠の操作 — タイトルバーの × や移動は `DefWindowProc` がマウスを
+/// capture して追うので、 ボタンの解放が `WM_LBUTTONUP` (クライアント領域の message) としてこの hook を通る
+/// (数えると、 保存の後でエディタ窓を閉じただけで「plugin を触った」 ことになる)。
+fn note_user_input(msg: &MSG, swallowed: bool, to_container: bool) {
     // `WM_MOUSEMOVE` の wParam: MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2。
     const MK_ANY_BUTTON: usize = 0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040;
+    // key 系の message (relay も `wParam` をそのまま運ぶ) の `wParam` = 仮想キーコード。
+    let vk = msg.wParam.0;
     match msg.message {
-        WM_EDITOR_KEY_RELAY_DOWN => crate::user_edit::retract_key_input(),
+        WM_EDITOR_KEY_RELAY_DOWN => crate::user_edit::retract_key_input(vk),
         m if swallowed => {
             if is_key_down(m) {
-                crate::user_edit::retract_key_input();
+                crate::user_edit::retract_key_input(vk);
             }
         }
-        m if is_key_down(m) => crate::user_edit::note_key_input(),
+        m if is_key_down(m) => crate::user_edit::note_key_input(vk),
+        _ if to_container => {}
         // ボタンを押していない移動は入力に数えない (窓の上を通っただけ)。
         WM_MOUSEMOVE => {
             if msg.wParam.0 & MK_ANY_BUTTON != 0 {
@@ -439,6 +454,11 @@ fn note_user_input(msg: &MSG, swallowed: bool) {
             }
         }
         m if (WM_MOUSEFIRST..=WM_MOUSELAST).contains(&m) => crate::user_edit::note_mouse_input(),
+        // マウスの message に直されない入力: `WM_POINTER*` を自分で捌く plugin へのペン / タッチと、
+        // `DragAcceptFiles` の窓へのファイルの drop。
+        WM_POINTERDOWN | WM_POINTERUP | WM_POINTERWHEEL | WM_POINTERHWHEEL | WM_TOUCH | WM_DROPFILES => {
+            crate::user_edit::note_mouse_input();
+        }
         _ => {}
     }
 }
@@ -463,9 +483,10 @@ unsafe extern "system" fn get_message_hook(code: i32, wparam: WPARAM, lparam: LP
         }
         // WM_GETDLGCODE の問い合わせ先 WNDPROC が更にポンプすると再入するので、
         // 借用中なら判定せず素通し (安全側 = プラグインへ渡す)。
-        let swallowed = ROUTER
-            .with(|r| r.try_borrow_mut().map(|mut r| r.handle(msg)).unwrap_or(false));
-        note_user_input(msg, swallowed);
+        let (swallowed, to_container) = ROUTER.with(|r| {
+            r.try_borrow_mut().map(|mut r| (r.handle(msg), r.is_container(msg.hwnd))).unwrap_or((false, false))
+        });
+        note_user_input(msg, swallowed, to_container);
         if swallowed {
             msg.message = WM_NULL;
             msg.wParam = WPARAM(0);

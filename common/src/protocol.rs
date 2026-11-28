@@ -279,6 +279,9 @@ pub struct SlotState {
     /// `PluginInstance.ara_archive_ids`).
     pub ara_archive: Option<AraArchive>,
     pub error: Option<String>,
+    /// r.md #160: この device のエディタ窓へ届いた最後のユーザーの入力の印 (`0` = 届いていない。前に受け取った
+    /// 値と違えば、その間に窓を触った)。daw_gui は閉じるときの state の比較を、これが変わった device に絞る。
+    pub editor_touch: u64,
 }
 
 /// plug-in host が書いた ARA アーカイブと、その **目次** (中にある audio source / audio modification の persistent id)。
@@ -1807,12 +1810,14 @@ mod tests {
                     data: Some(vec![1, 2, 3, 4]),
                     ara_archive: None,
                     error: None,
+                    editor_touch: 3,
                 },
                 SlotState {
                     device_id: 9,
                     data: None,
                     ara_archive: None,
                     error: Some("state save failed".to_string()),
+                    editor_touch: 0,
                 },
             ],
         };

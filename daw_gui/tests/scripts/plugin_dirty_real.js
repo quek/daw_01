@@ -4,9 +4,9 @@
 //
 //   1. 開いただけ / 再生しただけでは未保存にならない (読み込みの state 復元や再生で、plugin が
 //      「中身が変わった」と報告しても数えない)。
-//   2. 触っていなければ、閉じる前に取り直した state は基準と同じ → 確認なしで閉じる
-//      (実物の state が取るたびに変わると、ここで毎回聞かれる)。
-//   3. plugin の値を **報告なしで** 変えると、閉じる前の比較が見つけて保存を聞く
+//   2. 触っていなければ確認なしで閉じる (ユーザーの手が届いていない plugin は state を比べない —
+//      触っていなくても取るたびに bytes が変わる plugin が多い)。
+//   3. plugin の値を **報告なしで** 変えると (インスペクタのツマミ → undo)、閉じる前の比較が見つけて保存を聞く
 //      (実物の state が param の値を含んでいて、hash が変わること)。
 //
 // 窓の中の操作 (ユーザーの入力) は headless では起こせない — 報告の判定は daw_plugin_host の unit test と
@@ -104,7 +104,7 @@ daw.sleepMs(300);
 if (activeTab().dirty) fail("再生しただけで未保存になった");
 
 closeAndSettle();
-if (guard().modal !== null) fail("触っていないのに保存を聞かれた (state が取るたびに変わる?): " + JSON.stringify(guard()));
+if (guard().modal !== null) fail("触っていないのに保存を聞かれた: " + JSON.stringify(guard()));
 if (activeTab().key === key) fail("触っていないタブが閉じなかった: " + JSON.stringify(JSON.parse(daw.tabsJson())));
 
 // ---- 3: 報告なしで値を変える → 閉じる前の比較が見つける --------------------------------------

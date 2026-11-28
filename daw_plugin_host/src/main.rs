@@ -1594,6 +1594,8 @@ impl PluginHost {
             let Some(rec) = self.instances.get_mut(&device) else {
                 continue;
             };
+            // r.md #160: state を集める前に読む — 集めている最中の入力は次の応答に載せる。
+            let editor_touch = rec.plugin.editor_touch();
             let (data, error) = match rec.plugin.state_save() {
                 Ok(s) => (s, None),
                 Err(e) => {
@@ -1612,6 +1614,7 @@ impl PluginHost {
                 data,
                 ara_archive: rec.plugin.store_ara_archive(),
                 error,
+                editor_touch,
             });
         }
         out

@@ -1036,6 +1036,10 @@ impl LoadedPlugin for ClapPlugin {
         crate::key_names::from_clap(self.plugin)
     }
 
+    fn editor_touch(&self) -> u64 {
+        self.host.callbacks.editor_session.touch()
+    }
+
     /// Serializes the plugin's internal state via `clap_plugin_state.save`.
     fn state_save(&self) -> Result<Option<Vec<u8>>> {
         let Some(state) = self.state_ext else {

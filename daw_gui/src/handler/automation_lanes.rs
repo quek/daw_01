@@ -717,6 +717,8 @@ impl AppData {
             legacy_device_index: None,
         };
         self.write_param_lane_default(track_id, target.clone(), norm);
+        // r.md #160: undo で Song だけが戻っても plugin の値は動いたまま残るので、閉じるときに state を比べる。
+        self.note_plugin_value_written(device_id);
         // 表示名は `automation_target_label` 1 本に寄せる (r.md #72 / #78)。
         // かつてここだけ `format!("{module} {name}")` を手組みしていたため、
         // 同じ param が経路によって別名で出ていた。

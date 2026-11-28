@@ -15,7 +15,7 @@ use super::support::{build_app, drain, fake_plugin_loaded, load_instrument};
 
 /// plugin host の `RequestAllStates` 応答を模す (`device_id` の今の state = `data`)。
 fn respond(app: &mut AppData, device_id: u64, data: &[u8]) {
-    let entries = vec![SlotState { device_id, data: Some(data.to_vec()), ara_archive: None, error: None }];
+    let entries = vec![SlotState { device_id, data: Some(data.to_vec()), ara_archive: None, error: None, editor_touch: 0 }];
     app.handle_event(AppEvent::Plugin(PluginEvent::AllPluginStates { project: app.pk(), request: app.awaited_state_request(), entries }));
 }
 

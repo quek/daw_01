@@ -264,6 +264,10 @@ impl AppData {
         }) else {
             return;
         };
+        // r.md #160: plugin の値を書いた (`set_plugin_param` と同じ値の置き場)。
+        if let common::model::AutomationTarget::PluginParam { device_id, .. } = target {
+            self.note_plugin_value_written(device_id);
+        }
         let display_name = self.automation_target_label(&target);
         self.cur.peph.last_touched_param = Some(TouchedParam {
             track_id,

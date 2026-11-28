@@ -718,6 +718,12 @@ pub trait LoadedPlugin: Send {
     }
 
     // --- persistence (plugin-main thread) --------------------------------
+    /// r.md #160: エディタ窓へ届いた最後の入力の印 (`user_edit::EditorSession::touch`)。
+    /// 窓を持たない plugin は 0 のまま。
+    fn editor_touch(&self) -> u64 {
+        0
+    }
+
     fn state_save(&self) -> Result<Option<Vec<u8>>>;
     fn state_load(&mut self, data: &[u8]) -> Result<()>;
 
