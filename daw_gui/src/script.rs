@@ -130,6 +130,7 @@ const DAW_API: &[(&str, NativeFunctionPointer, usize)] = &[
     ("clearScaleChanges", editing::daw_clear_scale_changes, 0),
     ("toggleSnapOnDraw", editing::daw_toggle_snap_on_draw, 0),
     ("toggleSnapLiveInput", editing::daw_toggle_snap_live_input, 0),
+    ("appPreviewPitch", editing::daw_app_preview_pitch, 2),
     ("toggleVirtualKeyboard", editing::daw_toggle_virtual_keyboard, 0),
     ("virtualKeyboardKey", editing::daw_virtual_keyboard_key, 3),
     ("toggleFoldToScale", editing::daw_toggle_fold_to_scale, 0),

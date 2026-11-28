@@ -134,6 +134,21 @@ pub fn key_for_sing_phrase(phrase_query_json: &str, singer_id: u32, chunk_secs: 
     h.finish()
 }
 
+/// 鍵盤プレビューの 1 音の WAV のキー = `hash(schema, "key-preview", score_json, singer_id)`。
+///
+/// `score_json` は 1 音だけの楽譜 (高さ・長さ・歌詞を含む) なので、それらを変えれば鍵も変わる。
+/// フレーズ WAV ([`key_for_sing_phrase`]) と鍵空間を分けるのは、あちらが塊クエリの切り出しを合成したもので、
+/// こちらは 1 音を単体でクエリしたものだから (同じ楽譜でも音が違う)。
+#[must_use]
+pub fn key_for_key_preview(score_json: &str, singer_id: u32) -> CacheKey {
+    let mut h = DefaultHasher::new();
+    "key-preview".hash(&mut h);
+    CACHE_SCHEMA_VERSION.hash(&mut h);
+    score_json.hash(&mut h);
+    singer_id.hash(&mut h);
+    h.finish()
+}
+
 /// `/sing_frame_audio_query` **応答 JSON** のキー = `hash(schema, "sing-query", score_json)`。
 /// speaker は常に [`crate::voicevox::QUERY_SPEAKER`] (= 6000) なので混ぜない。
 ///

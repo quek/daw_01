@@ -379,6 +379,44 @@ impl AppData {
             .filter(|id| self.cur.pipc.loaded_devices.contains_key(id))
     }
 
+    /// 鍵盤プレビュー (鍵盤レーンの click / ノート移動の試聴 / MIDI 入力のモニター) が鳴らす `key` の 1 音を、
+    /// トラックの builtin VOICEVOX に用意させる。VOICEVOX を持たないトラックでは何もしない。
+    ///
+    /// 発音そのものは `AudioCommand::PreviewNoteOn` が運ぶ (呼び出し側 = `send_preview_key_on`)。こちらを
+    /// 先に送るが、経路が別なので順序は保証されない — device は「押されている間に届いたら鳴らす」。
+    pub(crate) fn prepare_vocal_key_preview(&self, track_id: u32, key: u8) {
+        let Some(track) = self.cur.song_doc.song().track_by_id(track_id) else {
+            return;
+        };
+        let Some(device_id) = self.voicevox_plugin_id_for_track(track) else {
+            return;
+        };
+        self.send_plugin(PluginCommand::PrepareVocalKeyPreview {
+            device: self.dev(device_id),
+            key,
+            singer_id: self.key_preview_singer_id(track),
+        });
+    }
+
+    /// 鍵盤プレビューを歌わせる歌手: 選んでいるクリップ (= ピアノロールで開いているクリップ) がこのトラックの
+    /// 歌うクリップならその声 (未設定 `0` もそのまま — そのクリップは既定の歌手で歌う)、違えばトラックで
+    /// 最初に声を持つ歌うクリップの声。`0` = 未設定 (device が既定の歌手にする)。
+    ///
+    /// 見るのは **歌うクリップだけ** ([`crate::handler::clips::clip_sings`])。
+    fn key_preview_singer_id(&self, track: &common::model::Track) -> u32 {
+        let song = self.cur.song_doc.song();
+        let sings = |c: &&Clip| crate::handler::clips::clip_sings(&song.clip_contents, c);
+        let selected = self
+            .selected_clip_ref()
+            .filter(|k| k.track_id == track.id)
+            .and_then(|k| song.clip_by_key(k))
+            .filter(sings);
+        if let Some(clip) = selected {
+            return clip.speaker_id;
+        }
+        track.all_clips().filter(sings).map(|c| c.speaker_id).find(|id| *id != 0).unwrap_or(0)
+    }
+
     /// track の歌唱/読み上げ WAV 合成が進行中か (= 所属 builtin VOICEVOX が busy)。
     pub fn track_wav_synthesizing(&self, track_id: u32) -> bool {
         let Some(track) = self.cur.song_doc.song().tracks.iter().find(|t| t.id == track_id) else {

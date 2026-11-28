@@ -3,7 +3,8 @@
 //! Split-half (`docs/plan_arch_refactor.md` §6): [`VoicevoxBuiltin`] が
 //! main half (state / lyrics / synth thread pipeline)、[`VoicevoxAudioHalf`]
 //! が audio half (出力 buffer / voice / transport edge)。両 half は
-//! `Arc<ArcSwapOption<SynthResult>>` (lock-free) だけを共有するので、
+//! `Arc<ArcSwapOption<SynthResult>>` と鍵盤プレビューの
+//! [`SharedKeyBank`] (どちらも lock-free) だけを共有するので、
 //! `set_note_metadata` (main) と `process()` (worker) の並行実行は Rust の
 //! aliasing 的にも RT 的にも安全。
 //!
@@ -50,6 +51,7 @@ use common::plugin_format::PluginFormat;
 use common::plugin_metadata::{NoteMetadata, TalkMetadata};
 use common::protocol::{RenderMode, VocalSynthFailure, VocalSynthProgress};
 use common::voicevox_phrase::{MAX_CHUNK_SECS, MIN_CHUNK_SECS};
+use crate::builtin::voicevox_key_preview::{KeyPreviewPlayer, KeyPreviewWorker, SharedKeyBank};
 use crate::builtin::voicevox_render::{MemoryCache, PhraseRenderer, RenderOutcome};
 
 use crate::plugin_instance::{
@@ -224,6 +226,10 @@ struct VoicevoxAudioHalf {
     was_playing: bool,
     /// 共有 synth 結果 (synth thread が store、ここは load のみ)。
     synth_result: Arc<ArcSwapOption<SynthResult>>,
+    /// 鍵盤プレビュー (書かれていない高さの 1 音) の合成済みの鍵。worker が store、ここは load のみ。
+    key_bank: SharedKeyBank,
+    /// 鍵盤プレビューの発音。上の `preview` (合成済みのノートの試聴) と違い、再生中も鳴らす。
+    key_preview: KeyPreviewPlayer,
     /// RT quiescence epoch。`process()` の入口 / 出口で +1 する (入口後 = 奇数、
     /// 出口後 = 偶数)。synth thread は publish 直後にこれを読み、
     /// 「store より前に始まった `process()` が終わった」ことを確認してから旧 Arc を
@@ -242,7 +248,11 @@ impl Drop for RtEpochGuard<'_> {
 }
 
 impl VoicevoxAudioHalf {
-    fn new(synth_result: Arc<ArcSwapOption<SynthResult>>, rt_epoch: Arc<AtomicU64>) -> Self {
+    fn new(
+        synth_result: Arc<ArcSwapOption<SynthResult>>,
+        key_bank: SharedKeyBank,
+        rt_epoch: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             out_l: Vec::new(),
             out_r: Vec::new(),
@@ -250,6 +260,8 @@ impl VoicevoxAudioHalf {
             preview: None,
             was_playing: false,
             synth_result,
+            key_bank,
+            key_preview: KeyPreviewPlayer::default(),
             rt_epoch,
         }
     }
@@ -432,6 +444,20 @@ impl AudioProcessorHalf for VoicevoxAudioHalf {
             }
         }
 
+        // === 鍵盤プレビュー (書かれていない高さの 1 音) ============================
+        // 鍵盤レーンの click 等は曲に無い高さを鳴らすので、歌声の buffer とは別の 1 音を重ねる。
+        // 他の音源と同じく transport に関係なく鳴らす。
+        for ev in events {
+            self.key_preview.on_event(&ev.event);
+        }
+        let key_bank = self.key_bank.load(); // arch-lint: allow-arcswap-load (RT だが書き手は swap + rt_epoch の quiesce 付き retire。voicevox_key_preview::publish)
+        self.key_preview.render(
+            key_bank.as_deref(),
+            host_sr,
+            &mut self.out_l[..out_n],
+            &mut self.out_r[..out_n],
+        );
+
         Ok(0)
     }
 
@@ -456,11 +482,13 @@ impl AudioProcessorHalf for VoicevoxAudioHalf {
 
     fn on_deactivate(&mut self) {
         self.preview = None;
+        self.key_preview.reset();
     }
 
     fn set_processing(&mut self, on: bool) {
         if !on {
             self.preview = None;
+            self.key_preview.reset();
         }
     }
 }
@@ -502,6 +530,8 @@ pub struct VoicevoxBuiltin {
     /// `VoicevoxAudioHalf::new` と `start_synth_thread` の両方へ `Arc::clone` する
     /// (`synth_result` と同じ配り方)。
     rt_epoch: Arc<AtomicU64>,
+    /// 鍵盤プレビューの 1 音の合成 (歌の合成とは別の thread・別の bank。世代にも進捗にも関わらない)。
+    key_preview: KeyPreviewWorker,
     /// 合成状態 + 進捗の報告 callback
     /// (`HostCallbacks::on_vocal_synth_status`、load 時に device_id capture 済)。
     report: StatusFn,
@@ -514,8 +544,10 @@ impl VoicevoxBuiltin {
     pub(super) fn new(report: StatusFn) -> Self {
         let synth_result: Arc<ArcSwapOption<SynthResult>> = Arc::new(ArcSwapOption::from(None));
         let rt_epoch = Arc::new(AtomicU64::new(0));
+        let key_bank: SharedKeyBank = Arc::new(ArcSwapOption::from(None));
         let audio = AudioHalf::new(Box::new(VoicevoxAudioHalf::new(
             Arc::clone(&synth_result),
+            Arc::clone(&key_bank),
             Arc::clone(&rt_epoch),
         )));
         Self {
@@ -531,6 +563,7 @@ impl VoicevoxBuiltin {
             synth_heartbeat: Arc::new(AtomicU64::new(0)),
             // `f64::NAN` = 未設定 (トランスポートを一度も動かしていない)。
             priority_beats: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
+            key_preview: KeyPreviewWorker::new(key_bank, Arc::clone(&rt_epoch)),
             rt_epoch,
             report,
             audio,
@@ -838,6 +871,9 @@ impl VoicevoxBuiltin {
     }
 
     fn stop_synth_thread(&mut self) {
+        // 鍵盤プレビューの thread も一緒に止める (次に押されたら起こし直す)。先に両方へ止まるよう伝えて
+        // から待つ (片方の join を待つ間、もう片方が合成を続けない)。
+        self.key_preview.request_stop();
         // shutdown flag を立てると、engine 未起動で永久 retry 中の thread も
         // 即 return する。
         self.synth_shutdown.store(true, Ordering::SeqCst);
@@ -846,6 +882,7 @@ impl VoicevoxBuiltin {
         if let Some(handle) = self.synth_thread.take() {
             let _ = handle.join();
         }
+        self.key_preview.stop();
         // 停止したら必ず idle を報告する (busy のまま deactivate すると
         // daw_gui の overlay / clip スピナーが残り続けるため)。
         (self.report)(VocalSynthProgress::default());
@@ -925,6 +962,10 @@ impl VocalSynth for VoicevoxBuiltin {
     fn set_priority_beats(&mut self, playhead_beats: f64) {
         self.priority_beats
             .store(playhead_beats.to_bits(), Ordering::SeqCst);
+    }
+
+    fn prepare_key_preview(&mut self, key: u8, singer_id: u32) {
+        self.key_preview.request(key, singer_id);
     }
 
     /// 合成完了待ち用に `(queued_gen, done_gen, phrase_heartbeat)` を公開。
@@ -1068,7 +1109,11 @@ mod tests {
     /// audio half を直接組んで activate 相当まで進める test helper。
     fn mk_half(sample_rate: f64) -> (VoicevoxAudioHalf, Arc<ArcSwapOption<SynthResult>>) {
         let result: Arc<ArcSwapOption<SynthResult>> = Arc::new(ArcSwapOption::from(None));
-        let mut h = VoicevoxAudioHalf::new(Arc::clone(&result), Arc::new(AtomicU64::new(0)));
+        let mut h = VoicevoxAudioHalf::new(
+            Arc::clone(&result),
+            Arc::new(ArcSwapOption::from(None)),
+            Arc::new(AtomicU64::new(0)),
+        );
         h.on_activate(sample_rate, 256);
         h.set_processing(true);
         (h, result)

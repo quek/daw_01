@@ -4,6 +4,7 @@
 //! 発火する。 JS smoke test (`tests/scripts/scale_smoke.js`) で
 //! scale_changes の編集 / snap apply / quantize / fold mode の挙動を verify。
 
+use boa_engine::value::TryFromJs;
 use boa_engine::{Context, JsArgs, JsNativeError, JsResult, JsValue};
 
 use super::with_app;
@@ -88,6 +89,24 @@ pub(super) fn daw_toggle_snap_live_input(
 ) -> JsResult<JsValue> {
     with_app(move |app, _side, _io| {
         app.handle_event(AppEvent::ToggleSnapLiveInput);
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `daw.appPreviewPitch(trackId, pitch)` — ピアノロールの鍵盤レーンを押す / 離す
+/// (`AppEvent::PreviewPitchChanged`。widget が毎フレーム出す差分と同じ口)。`pitch` が数値でなければ離す。
+pub(super) fn daw_app_preview_pitch(
+    _this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let track_id = u32::try_from_js(args.get_or_undefined(0), ctx)?;
+    let pitch = match args.get_or_undefined(1) {
+        v if v.is_number() => Some(u8::try_from_js(v, ctx)?),
+        _ => None,
+    };
+    with_app(move |app, _side, _io| {
+        app.handle_event(AppEvent::PreviewPitchChanged { track_id, pitch });
     });
     Ok(JsValue::undefined())
 }

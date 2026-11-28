@@ -230,7 +230,7 @@ pub(super) fn clear_published(result_arc: &ArcSwapOption<SynthResult>, rt_epoch:
 /// なり、audio thread 上で数十 MB の解放が起きる)。
 ///
 /// 待ちは有界 (`FINAL_PUBLISH_WAIT`)。**非 RT スレッドからのみ呼ぶこと。**
-fn release_when_quiesced(mut arc: Arc<SynthResult>, e: u64, rt_epoch: &AtomicU64) {
+pub(super) fn release_when_quiesced<T>(mut arc: Arc<T>, e: u64, rt_epoch: &AtomicU64) {
     let deadline = Instant::now() + FINAL_PUBLISH_WAIT;
     loop {
         if e.is_multiple_of(2) || rt_epoch.load(Ordering::Acquire) != e {
@@ -242,7 +242,7 @@ fn release_when_quiesced(mut arc: Arc<SynthResult>, e: u64, rt_epoch: &AtomicU64
         }
         if Instant::now() >= deadline {
             tracing::warn!(
-                "VoicevoxBuiltin: 旧 synth buffer の quiesce 待ちが上限を超えた (解放先が RT になり得る)"
+                "VoicevoxBuiltin: 差し替えた旧 buffer の quiesce 待ちが上限を超えた (解放先が RT になり得る)"
             );
             return;
         }

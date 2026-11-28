@@ -82,8 +82,15 @@ const SYNTH_HTTP_TIMEOUT_SECS: u64 = 120;
 
 /// 合成 HTTP client (timeout 付き) を作る。塊クエリ / フレーズ合成 / talk が共用する。
 pub fn synth_client() -> Result<reqwest::blocking::Client, SynthError> {
+    synth_client_with_timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
+}
+
+/// [`synth_client`] の timeout を選べる版 (鍵盤プレビューは遅れて届いても鳴らす相手が居ないので短く切る)。
+pub fn synth_client_with_timeout(
+    timeout: std::time::Duration,
+) -> Result<reqwest::blocking::Client, SynthError> {
     reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(SYNTH_HTTP_TIMEOUT_SECS))
+        .timeout(timeout)
         .build()
         .map_err(|e| unreachable(e, "building HTTP client"))
 }

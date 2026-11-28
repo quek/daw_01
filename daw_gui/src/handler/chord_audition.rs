@@ -32,12 +32,8 @@ impl AppData {
         for &pitch in &pitches {
             let key = self.transposed_preview_key(track_id, pitch);
             if let Some(k) = key {
-                self.send_audio(common::protocol::AudioCommand::PreviewNoteOn {
-                    project: self.pk(),
-                    track_id,
-                    pitch: k,
-                    velocity: PREVIEW_VELOCITY,
-                });
+                // プレビュー発音の口を通す (VOICEVOX のトラックは 1 音を用意させる。単音なので最後の音が鳴る)。
+                self.send_preview_key_on(track_id, k, PREVIEW_VELOCITY);
             }
             notes.push(HeldPreview { track_id, pitch, key });
         }

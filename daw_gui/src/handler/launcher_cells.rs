@@ -847,13 +847,15 @@ fn create_cell_in(song: &mut Song, row: LauncherRow, scene_id: u32) -> Option<La
     let length_beats = new_cell_length_beats(song);
     match row {
         LauncherRow::Track(track_id) => {
+            // 歌唱トラックのセルは声を引き継ぐ (アレンジの新規クリップと同じ 1 本)。
+            let (speaker_id, singer_name, style_name) = crate::handler::clips::inherited_voice(
+                song.track_by_id(track_id)?,
+                &song.clip_contents,
+            );
             let track = song.track_by_id_mut(track_id)?;
             if track.session_clip(scene_id).is_some() {
                 return None;
             }
-            // 歌唱トラックのセルは声を引き継ぐ (アレンジの新規クリップと同じ 1 本)。
-            let (speaker_id, singer_name, style_name) =
-                crate::handler::clips::inherited_voice(track);
             let id = track.alloc_clip_id();
             track.session_clips.push(SessionClip {
                 scene_id,

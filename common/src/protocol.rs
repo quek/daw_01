@@ -1127,6 +1127,12 @@ pub enum PluginCommand {
     /// (`daw_gui::AppData::vocal_synth_priority_beat`) が「その行がいま何を
     /// 鳴らす行か」で座標を選ぶ。 (名前は song の playhead を送っていた頃の名残)
     SetVocalSynthPriority { device: DeviceAddr, playhead_beats: f64 },
+    /// builtin VOICEVOX に **鍵盤プレビューの 1 音** (`key` の高さ、歌手 `singer_id`) を用意させる。
+    /// 歌声は合成済みのノートしか持たないので、鍵盤レーンの click 等 ([`AudioCommand::PreviewNoteOn`]) が
+    /// 鳴らす高さは別に合成が要る。発音と消音は `PreviewNoteOn` / `PreviewNoteOff` が運び、こちらは
+    /// 「その高さの音を持っておけ」だけ (既に持っていれば何もしない)。`singer_id == 0` は既定の歌手。
+    /// 合成はトリガしない別物なので、`SetBuiltinPluginNoteMetadata` の再送デデュープにも合成の世代にも関わらない。
+    PrepareVocalKeyPreview { device: DeviceAddr, key: u8, singer_id: u32 },
     /// Load / replace the plugin instance for `device` (安定 id、
     /// `Song.next_device_id` 採番 + project)。 `generation` は per-device 単調増加の
     /// 要求世代 — 応答 (`SlotPluginLoaded` / `SlotPluginLoadFailed`) に echo され、

@@ -170,6 +170,8 @@ impl AppData {
 
     /// 解いた鍵盤 `key` をそのまま鳴らす ([`Self::send_preview_on`] / 既にあるノートの試聴 [`Self::note_preview_key`])。
     pub(crate) fn send_preview_key_on(&self, track_id: u32, key: u8, velocity: u8) {
+        // VOICEVOX のトラックは、その高さの 1 音を先に用意させる (歌声は合成済みのノートしか持たない)。
+        self.prepare_vocal_key_preview(track_id, key);
         self.send_audio(AudioCommand::PreviewNoteOn { project: self.pk(), track_id, pitch: key, velocity });
     }
 

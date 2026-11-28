@@ -1052,6 +1052,14 @@ impl PluginHost {
                     vs.set_priority_beats(playhead_beats);
                 }
             }
+            PluginCommand::PrepareVocalKeyPreview { device, key, singer_id } => {
+                // device 未発見は黙って捨てる (鍵盤を押すたびに来る。load 前なら鳴らす相手も居ない)。
+                if let Some(rec) = self.instances.get_mut(&device)
+                    && let Some(vs) = rec.plugin.as_vocal_synth()
+                {
+                    vs.prepare_key_preview(key, singer_id);
+                }
+            }
             PluginCommand::SetupAraDocument { device, clips, bpm, time_sig, archive, archive_ids } => {
                 self.setup_ara_document(device, &clips, bpm, time_sig, archive.as_deref(), &archive_ids);
             }
@@ -2345,6 +2353,10 @@ fn log_command(cmd: &PluginCommand) {
         // 下の catch-all は `info!` なので、arm が無いとログが優先度ヒントで溢れる。
         PluginCommand::SetVocalSynthPriority { device, playhead_beats } => {
             tracing::trace!(?device, playhead_beats, "received SetVocalSynthPriority");
+        }
+        // 鍵盤を押すたびに来るので、こちらも catch-all の `info!` に落とさない。
+        PluginCommand::PrepareVocalKeyPreview { device, key, singer_id } => {
+            tracing::trace!(?device, key, singer_id, "received PrepareVocalKeyPreview");
         }
         PluginCommand::SetupAraDocument { device, clips, bpm, archive, .. } => {
             tracing::info!(

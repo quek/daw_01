@@ -236,7 +236,7 @@ impl AppData {
             song.clip_contents.insert(content_id, ClipContent::default());
             let track = song.tracks.get_mut(track_idx as usize)?;
             let track_id = track.id;
-            let (speaker_id, singer_name, style_name) = inherited_voice(track);
+            let (speaker_id, singer_name, style_name) = inherited_voice(track, &song.clip_contents);
             let new_clip_id = track.place_clip(Clip {
                 id: 0,
                 start_beat,
@@ -287,19 +287,32 @@ impl AppData {
     }
 }
 
+type ClipContents = std::collections::HashMap<common::model::ContentId, ClipContent>;
+
+/// 歌うクリップか (ノートを持つ content)。読み上げ (Text) クリップの `speaker_id` は talk の話者で、歌手とは
+/// id 空間が別 — 歌の合成へ渡すと engine が拒否するので、歌手を探すときは歌うクリップだけを見る。
+pub(crate) fn clip_sings(contents: &ClipContents, clip: &Clip) -> bool {
+    contents.get(&clip.content_id).is_some_and(|c| c.notes().is_some())
+}
+
 /// 新規クリップ / セルが引き継ぐ声 (VOICEVOX)。
 ///
 /// vocal トラックなら同トラックの直前 (= `start_beat` 最大の既存クリップ、
 /// **セルも含む**) の声、無ければアプリ既定。非 vocal トラックは未設定 (0)。
 /// アレンジの新規クリップとランチャーの空セルで**同じ 1 本**を通す — 別々に
 /// 書くと「同じトラックの同じ操作なのに、帯で作ったセルだけ歌わない」になる。
-pub(crate) fn inherited_voice(track: &common::model::Track) -> (u32, String, String) {
+///
+/// 引き継ぐのは **歌うクリップの声だけ** ([`clip_sings`])。
+pub(crate) fn inherited_voice(
+    track: &common::model::Track,
+    contents: &ClipContents,
+) -> (u32, String, String) {
     if !track.is_voicevox_vocal() {
         return (0, String::new(), String::new());
     }
     track
         .all_clips()
-        .filter(|c| c.speaker_id != 0)
+        .filter(|c| c.speaker_id != 0 && clip_sings(contents, c))
         .max_by(|a, b| a.start_beat.total_cmp(&b.start_beat))
         .map(|c| (c.speaker_id, c.singer_name.clone(), c.style_name.clone()))
         .unwrap_or_else(|| {

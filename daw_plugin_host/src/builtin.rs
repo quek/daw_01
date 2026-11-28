@@ -32,6 +32,7 @@ use crate::plugin_instance::{
 };
 
 mod voicevox;
+mod voicevox_key_preview;
 mod voicevox_render;
 mod voicevox_synth;
 

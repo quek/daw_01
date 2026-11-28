@@ -605,6 +605,10 @@ pub trait VocalSynth {
     /// **再合成はトリガしない** (順序だけを変える)。
     fn set_priority_beats(&mut self, playhead_beats: f64);
 
+    /// 鍵盤プレビュー (`note_id == NOTE_ID_NONE` の note-on) が鳴らす `key` の 1 音を、歌手 `singer_id`
+    /// (`0` = 既定) で用意する。既に持っていれば何もしない。歌の合成 (世代・進捗) には関わらない。
+    fn prepare_key_preview(&mut self, key: u8, singer_id: u32);
+
     /// `(queued_gen, done_gen, phrase_heartbeat)`。bounce / 書き出し前の合成完了待ち
     /// (`PrepareVocalSynth`) は `done >= queued` を待ち、**heartbeat が動いている間は
     /// 打ち切らない** (総時間で切ると長い曲が部分ミックスで書き出される)。
