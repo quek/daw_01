@@ -56,8 +56,18 @@ const LATE_SAMPLE_WAIT_MS: f64 = 2000.0;
 
 /// 1 音ぶんの mono PCM (**音の頭から** — query の先頭の無音は落としてある)。
 pub(super) struct KeySample {
+    /// 身元 (process 内で一意、`0` にはならない)。鳴らしている途中で別のサンプルへ差し替わったかを
+    /// audio thread が比べる (番地は、解放直後の確保で同じ値になり得るので使わない)。
+    id: u64,
     samples: Vec<f32>,
     sample_rate: u32,
+}
+
+impl KeySample {
+    fn new(samples: Vec<f32>, sample_rate: u32) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), samples, sample_rate }
+    }
 }
 
 type KeySlots = [Option<Arc<KeySample>>; KEY_COUNT];
@@ -137,6 +147,8 @@ impl KeyPreviewWorker {
     }
 
     fn start(&mut self) {
+        // 前の thread が残っていたら (`request_stop` だけで `stop` していない)、先に畳んで中身を受け取る。
+        self.stop();
         let (tx, rx) = mpsc::channel::<KeyRequest>();
         let bank = Arc::clone(&self.bank);
         let rt_epoch = Arc::clone(&self.rt_epoch);
@@ -156,6 +168,13 @@ impl KeyPreviewWorker {
             }
             Err(e) => {
                 tracing::error!(error = ?e, "VoicevoxBuiltin: 鍵盤プレビューの thread を起こせない");
+                // 引き継ぐはずだった中身は closure ごと失われた。bank も空にして揃える (残すと、歌手を
+                // 変えた後も前の歌手の声で鳴る)。
+                let prev = self.bank.swap(None);
+                let epoch = self.rt_epoch.load(Ordering::Acquire);
+                if let Some(prev) = prev {
+                    release_when_quiesced(prev, epoch, &self.rt_epoch);
+                }
             }
         }
     }
@@ -300,7 +319,7 @@ fn trim_leading_rest((mut samples, sample_rate): (Vec<f32>, u32)) -> Result<KeyS
     if samples.is_empty() {
         return Err("先頭の無音より短い WAV".to_string());
     }
-    Ok(KeySample { samples, sample_rate })
+    Ok(KeySample::new(samples, sample_rate))
 }
 
 // ====================================================================
@@ -315,8 +334,8 @@ struct KeyVoice {
     gain: f32,
     /// 鍵が離された。
     released: bool,
-    /// 鳴らしているサンプルの身元 (番地。`0` = まだ鳴り始めていない)。比べるだけで、辿らない。
-    sample_id: usize,
+    /// 鳴らしているサンプルの身元 ([`KeySample::id`]。`0` = まだ鳴り始めていない)。
+    sample_id: u64,
     /// 鳴り始めてから出した host frame 数 ([`MIN_SOUND_MS`] の判定)。
     sounded: u64,
     /// 離されてから、鳴り始めないまま待った host frame 数 ([`LATE_SAMPLE_WAIT_MS`] の判定)。
@@ -340,7 +359,7 @@ impl KeyVoice {
             .and_then(|b| b.keys.get(usize::from(self.key)))
             .and_then(Option::as_deref)
             .filter(|s| s.sample_rate > 0);
-        let sample_id = sample.map_or(0, |s| std::ptr::from_ref(s) as usize);
+        let sample_id = sample.map_or(0, |s| s.id);
         if self.sample_id != 0 && self.sample_id != sample_id {
             // 鳴っている途中でサンプルが消えた / 差し替わった (歌手が変わった)。前の声の続きとしては
             // 鳴らさない: 離された音はそこで終え、押されている音は新しい声を頭から。
@@ -461,7 +480,7 @@ mod tests {
 
     fn bank_with(key: u8, samples: Vec<f32>) -> KeyBank {
         let mut keys = empty_slots();
-        keys[usize::from(key)] = Some(Arc::new(KeySample { samples, sample_rate: 48_000 }));
+        keys[usize::from(key)] = Some(Arc::new(KeySample::new(samples, 48_000)));
         KeyBank { keys }
     }
 

@@ -398,23 +398,25 @@ impl AppData {
         });
     }
 
-    /// 鍵盤プレビューを歌わせる歌手: 選んでいるクリップ (= ピアノロールで開いているクリップ) がこのトラックの
-    /// 歌うクリップならその声 (未設定 `0` もそのまま — そのクリップは既定の歌手で歌う)、違えばトラックで
-    /// 最初に声を持つ歌うクリップの声。`0` = 未設定 (device が既定の歌手にする)。
+    /// 鍵盤プレビューを歌わせる歌手: このトラックで選んでいる歌うクリップ (ピアノロールで開いているのは
+    /// 選択のうち開始が一番早いクリップ) があればその声 (未設定 `0` もそのまま — そのクリップは既定の
+    /// 歌手で歌う)。無ければ、ここに新しく作るクリップが引き継ぐ声と同じ ([`inherited_voice`])。
     ///
-    /// 見るのは **歌うクリップだけ** ([`crate::handler::clips::clip_sings`])。
+    /// 見るのは **歌うクリップだけ** ([`clip_sings`])。
     fn key_preview_singer_id(&self, track: &common::model::Track) -> u32 {
+        use crate::handler::clips::{clip_sings, inherited_voice};
         let song = self.cur.song_doc.song();
-        let sings = |c: &&Clip| crate::handler::clips::clip_sings(&song.clip_contents, c);
+        // 選択は開始拍順。複数トラックにまたがる選択でも、このトラックのぶんを見る。
         let selected = self
-            .selected_clip_ref()
+            .selected_clip_refs()
+            .into_iter()
             .filter(|k| k.track_id == track.id)
-            .and_then(|k| song.clip_by_key(k))
-            .filter(sings);
-        if let Some(clip) = selected {
-            return clip.speaker_id;
+            .filter_map(|k| song.clip_by_key(k))
+            .find(|c| clip_sings(&song.clip_contents, c));
+        match selected {
+            Some(clip) => clip.speaker_id,
+            None => inherited_voice(track, &song.clip_contents).0,
         }
-        track.all_clips().filter(sings).map(|c| c.speaker_id).find(|id| *id != 0).unwrap_or(0)
     }
 
     /// track の歌唱/読み上げ WAV 合成が進行中か (= 所属 builtin VOICEVOX が busy)。
