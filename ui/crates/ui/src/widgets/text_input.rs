@@ -174,9 +174,18 @@ pub struct TextInputResponse {
     pub nav_up: bool,
     /// (M14 Phase 86 / daw_01 #057) focus 中にこのフレームで ↓ キーが押されたか。 詳細は [`Self::nav_up`]。
     pub nav_down: bool,
-    /// focus 中にこのフレームでキー / IME / 編集 shortcut の入力を受けたか (text が変わったかは問わない)。
+    /// focus 中にこのフレームでキーの押下 / IME / 編集 shortcut の入力を受けたか (text が変わったかは
+    /// 問わない。キーの解放と修飾キー単独は数えない)。
     /// 「打っている間はカーソルを隠す」([`Ui::hide_cursor_until_pointer_moves`]) の合図に使う。
     pub typed: bool,
+}
+
+/// 「打った」([`TextInputResponse::typed`]) に数えるキー入力か。キーの解放と修飾キー単独 (文字を持たない
+/// `Other`) は数えない — 打ち終えてマウスへ手を移した後の解放や、Ctrl+click のための Ctrl で
+/// カーソルを隠さないため。
+fn is_typing_press(k: &daw_ui_platform::KeyEvent) -> bool {
+    matches!(k.state, ElementState::Pressed)
+        && (k.text.is_some() || !matches!(k.physical_key, PhysicalKey::Other(_)))
 }
 
 impl<'a, M: ?Sized + 'static> Ui<'a, M> {
@@ -285,14 +294,14 @@ impl<'a, M: ?Sized + 'static> Ui<'a, M> {
             let ime_events = self.take_ime_events_if_focused(wid);
             let key_events = self.take_keyboard_events_if_focused(wid);
             let mods = pointer.modifiers;
-            let any_input = select_all_pressed
+            let edited = select_all_pressed
                 || delete_pressed
                 || cut_pressed
                 || copy_pressed
                 || paste_pressed
-                || !ime_events.is_empty()
-                || !key_events.is_empty();
-            typed = any_input;
+                || !ime_events.is_empty();
+            let any_input = edited || !key_events.is_empty();
+            typed = edited || key_events.iter().any(is_typing_press);
 
             if any_input {
                 let state: &mut TextInputState = self.widget_state(wid);

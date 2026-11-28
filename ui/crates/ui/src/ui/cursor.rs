@@ -46,18 +46,20 @@ impl CursorState {
         pointer: &PointerFrame,
         sink: Option<&(dyn Fn(CursorIcon) + Send + Sync)>,
     ) {
+        let pressed = pointer.primary_just_pressed
+            || pointer.primary_pressed
+            || pointer.secondary_just_pressed;
         if let Some((hx, hy)) = self.hidden_at {
             let stayed = pointer
                 .pos
                 .is_some_and(|(x, y)| (x - hx).hypot(y - hy) <= CURSOR_UNHIDE_DISTANCE_PX);
-            let pressed = pointer.primary_just_pressed
-                || pointer.primary_pressed
-                || pointer.secondary_just_pressed;
             if !stayed || pressed {
                 self.hidden_at = None;
             }
         }
-        if std::mem::take(&mut self.hide_requested) {
+        // ボタンが押されているフレームの要求は捨てる: 変換中に欄の外を click すると、IME の確定が
+        // press と同じフレームに届く。そこで隠すと、click した場所でカーソルが消えたままになる。
+        if std::mem::take(&mut self.hide_requested) && !pressed {
             // 打鍵のたびに基準を取り直す (打ちながら少し動いた分で戻らない)。窓の外なら隠す相手が無い。
             self.hidden_at = pointer.pos;
         }
