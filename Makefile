@@ -305,8 +305,11 @@ preflight-no-app:
 # preflight は **prerequisite に置く**。recipe の 1 行目に置くと build / test-rt が先に
 # 走ってしまい、実機が動いている最中に 40 秒ビルドしてから止まる (2026-08-22 に実測)。
 # build 自体も daw_gui 起動中は ERROR 5 で落ちうるので、先に止めるのが正しい。
+# PATH に target/debug を足すのは daw_gui の doctest のため: doctest の exe は一時ディレクトリから
+# 起動され、cargo 1.100 からは FFmpeg DLL のある target/debug が PATH に入らない (exe が
+# 「avcodec-61.dll が見つからない」で起動できず、テスト名も出さずに `doctest failed` で落ちる)。
 test: preflight-no-app gates build test-rt
-	cargo test $(TEST_PKGS) --features daw_gui/script
+	PATH="$(CURDIR)/target/debug:$$PATH" cargo test $(TEST_PKGS) --features daw_gui/script
 	@$(BASH) "$(CURDIR)/scripts/test_real_vst3.sh" --if-configured
 
 # 実物の VST3 (商用プラグイン) を読む検査。`#[ignore]` なので素の `cargo test` では回らない。
